@@ -11,7 +11,7 @@
 
 Alphabetical ordering means `Archive_2019` gets fresh stats while `Orders` (47M modifications) times out.  Job got killed at 5 AM? Good luck figuring out what actually ran.  Someone set `NORECOMPUTE` in 2019 and forgot? SQL Server will never auto-update those.
 
-**sp_StatUpdate**: Worst stats first. Time limits that work. START/END markers so you know if it finished.
+**sp_StatUpdate**: Worst stats first.  Time limits that work.  START/END markers so you know if it finished.
 
 | Problem | Fix |
 |---------|-----|
@@ -37,15 +37,6 @@ EXEC dbo.sp_StatUpdate
     @ModificationThreshold = 1000;     -- Min modifications to qualify
     -- Defaults: @TimeLimit=3600 (1hr), @TieredThresholds=1, @LogToTable='Y'
 ```
-
-## Key Features
-
-- **Priority Ordering**: Worst stats first - your 50M-modification table before `AAA_Archive`
-- **Time Limits**: Actually stops when you tell it to (no more killed jobs at 5 AM)
-- **Run Tracking**: START/END markers so you know if it finished or got killed
-- **Queue-Based Parallelism**: Multiple Agent jobs can work together without stepping on each other
-- **NORECOMPUTE Handling**: Finds and refreshes those stats someone set to NORECOMPUTE in 2019
-- **Cross-Database**: `USER_DATABASES`, wildcards, exclusions - Ola Hallengren style
 
 ## Requirements
 
@@ -200,14 +191,9 @@ ORDER BY s.StartTime DESC;
 
 ## When to Use This (vs IndexOptimize)
 
-**IndexOptimize** is battle-tested and handles indexes + stats together. Use it for general maintenance.
+**IndexOptimize** is battle-tested and handles indexes + stats together.  Use it for general maintenance.
 
-**sp_StatUpdate** is for when priority matters:
-
-- Your `Orders` table has 50M modifications and starts with "O" (alphabetically... not great)
-- You need to hunt down NORECOMPUTE orphans from 2019
-- Your 2-hour window means only the worst stats get fixed
-- You need to know if last night's job finished or got killed
+**sp_StatUpdate** is for when you need priority ordering, time-limited runs, or NORECOMPUTE targeting.
 
 ## Contributing
 
@@ -235,9 +221,9 @@ Based on patterns from [Ola Hallengren's SQL Server Maintenance Solution](https:
 
 ## Acknowledgments
 
-- [Ola Hallengren](https://ola.hallengren.com) - sp_StatUpdate wouldn't exist without his SQL Server Maintenance Solution. We use his CommandLog table, Queue patterns, and database selection syntax. If you're not already using his tools, start there.
+- [Ola Hallengren](https://ola.hallengren.com) - sp_StatUpdate wouldn't exist without his SQL Server Maintenance Solution.  We use his CommandLog table, Queue patterns, and database selection syntax.  If you're not already using his tools, start there.
 - [Brent Ozar](https://www.brentozar.com) - years of Office Hours audio and videos emphasizing stats and proper fillfactor over index reorgs/rebuilds, First Responder Kit, and SQL Saturdays / many events.
-- [Erik Darling](https://www.erikdarling.com) - T-SQL coding style ([CLAUDE.md](https://github.com/erikdarlingdata/DarlingData/blob/main/CLAUDE.md)) and performance insights with glorious snark. I also love sp_LogHunter and sp_QuickieStore.
+- [Erik Darling](https://www.erikdarling.com) - T-SQL coding style ([CLAUDE.md](https://github.com/erikdarlingdata/DarlingData/blob/main/CLAUDE.md)) and performance insights with glorious snark.  I also love sp_LogHunter and sp_QuickieStore.
 - [Colleen Morrow](https://www.sqlservercentral.com/blogs/better-living-thru-powershell-update-statistics-in-parallel) - parallel statistics maintenance concept
 - [Tiger Team's AdaptiveIndexDefrag](https://github.com/microsoft/tigertoolbox) - the 5-tier adaptive threshold formula comes directly from their work
 - [Claude Code](https://claude.com/product/claude-code) - AI is an amazing tool.
