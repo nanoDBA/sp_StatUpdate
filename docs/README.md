@@ -2,7 +2,7 @@
 
 **Priority-based statistics maintenance for SQL Server 2016+**
 
-*Updates worst stats first. Stops when you tell it to. Tells you if it got killed.*
+*Updates worst stats first.  Stops when you tell it to.  Tells you if it got killed.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![SQL Server 2016+](https://img.shields.io/badge/SQL%20Server-2016%2B-blue.svg)](https://www.microsoft.com/sql-server)
@@ -70,7 +70,7 @@ EXEC dbo.sp_StatUpdate
 
 **Note**: `dbo.QueueStatistic` is auto-created on first parallel run if `dbo.Queue` exists.
 
-**Note**: `dbo.CommandExecute` is NOT required. sp_StatUpdate handles its own command execution.
+**Note**: `dbo.CommandExecute` is NOT required.  sp_StatUpdate handles its own command execution.
 
 ## Common Usage Patterns
 

@@ -1658,37 +1658,35 @@ BEGIN
                     ELEMENTS
             );
 
-        BEGIN TRY
-            INSERT INTO
-                dbo.CommandLog
-            (
-                DatabaseName,
-                SchemaName,
-                ObjectName,
-                ObjectType,
-                Command,
-                CommandType,
-                StartTime,
-                ExtendedInfo
-            )
-            VALUES
-            (
-                ISNULL(@Databases, DB_NAME()),
-                N'dbo',
-                N'sp_StatUpdate',
-                N'P',
-                N'EXECUTE dbo.sp_StatUpdate @Databases = N''' + ISNULL(@Databases, DB_NAME()) + N'''...',
-                N'SP_STATUPDATE_START',
-                @start_time,
-                @parameters_xml
-            );
+        /*
+        START marker must succeed - abort if it fails
+        This ensures SP_STATUPDATE_START is always the first entry for any run
+        */
+        INSERT INTO
+            dbo.CommandLog
+        (
+            DatabaseName,
+            SchemaName,
+            ObjectName,
+            ObjectType,
+            Command,
+            CommandType,
+            StartTime,
+            ExtendedInfo
+        )
+        VALUES
+        (
+            ISNULL(@Databases, DB_NAME()),
+            N'dbo',
+            N'sp_StatUpdate',
+            N'P',
+            N'EXECUTE dbo.sp_StatUpdate @Databases = N''' + ISNULL(@Databases, DB_NAME()) + N'''...',
+            N'SP_STATUPDATE_START',
+            @start_time,
+            @parameters_xml
+        );
 
-            RAISERROR(N'Run: %s (logged to CommandLog)', 10, 1, @run_label) WITH NOWAIT;
-        END TRY
-        BEGIN CATCH
-            SELECT @log_error_msg = LEFT(ERROR_MESSAGE(), 3900);
-            RAISERROR(N'WARNING: Failed to log to CommandLog (%s). Continuing...', 10, 1, @log_error_msg) WITH NOWAIT;
-        END CATCH;
+        RAISERROR(N'Run: %s (logged to CommandLog)', 10, 1, @run_label) WITH NOWAIT;
         RAISERROR(N'', 10, 1) WITH NOWAIT;
     END;
 
