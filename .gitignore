@@ -1,0 +1,22 @@
+# sp_StatUpdate .gitignore
+# WHITELIST APPROACH: Ignore everything, then allow only specific files
+#
+# Files published to GitHub (3 files):
+#   - sp_StatUpdate.sql (main procedure)
+#   - README.md
+#   - LICENSE
+
+# Ignore everything by default
+*
+
+# Allow repo files at root
+!sp_StatUpdate.sql
+!README.md
+!LICENSE
+!.gitignore
+
+# Also allow from src/docs if using that structure
+!src/
+!src/sp_StatUpdate.sql
+!docs/
+!docs/README.md
