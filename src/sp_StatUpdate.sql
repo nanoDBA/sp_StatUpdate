@@ -36,11 +36,26 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.3.2026.0119 (Major.Minor.Year.MMDD)
+Version:    1.4.2026.0119b (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    1.3.2026.0119 - Multi-database support: Ola Hallengren-style keywords
+History:    1.4.2026.0119b - Bug fix: @StatsInParallel=Y table claiming bug. @claimed_tables
+                            table variable was not cleared between loop iterations, causing
+                            SELECT TOP 1 to return stale data from previous claim attempts.
+                            Workers would exit early with COMPLETED after processing 1 stat.
+            1.4.2026.0119 - Query Store prioritization: @QueryStorePriority cross-references
+                            sys.query_store_plan to prioritize statistics used by active queries.
+                            @QueryStoreMinExecutions and @QueryStoreRecentHours control thresholds.
+                            New QUERY_STORE sort order for query-driven maintenance.
+                            Filtered statistics handling: @FilteredStatsMode (INCLUDE/EXCLUDE/
+                            ONLY/PRIORITY) and @FilteredStatsStaleFactor detect filtered stats
+                            with selectivity drift (unfiltered_rows/rows ratio) on partitioned data.
+                            New FILTERED_DRIFT sort order. ExtendedInfo now logs HasFilter,
+                            FilterDefinition, UnfilteredRows, FilteredDriftRatio, QSPlanCount,
+                            QSTotalExecutions, QSLastExecution. QualifyReason now includes
+                            QUERY_STORE_PRIORITY and FILTERED_DRIFT.
+            1.3.2026.0119 - Multi-database support: Ola Hallengren-style keywords
                             (SYSTEM_DATABASES, USER_DATABASES, ALL_DATABASES,
                             AVAILABILITY_GROUP_DATABASES), wildcards (%), exclusions (-).
                             @IncludeSystemObjects parameter for system object statistics.
@@ -130,6 +145,24 @@ ALTER PROCEDURE
 
     /*
     ============================================================================
+    FILTERED STATISTICS (edge case handling for partitioned data)
+    ============================================================================
+    */
+    @FilteredStatsMode nvarchar(10) = N'INCLUDE', /*INCLUDE = normal, EXCLUDE = skip filtered, ONLY = filtered only, PRIORITY = boost filtered priority*/
+    @FilteredStatsStaleFactor float = 2.0, /*filtered stats stale when (unfiltered_rows/rows) > factor (default: 2x row drift)*/
+
+    /*
+    ============================================================================
+    QUERY STORE PRIORITIZATION (query-driven stat maintenance)
+    ============================================================================
+    */
+    @QueryStorePriority nvarchar(1) = N'N', /*Y = prioritize stats used by Query Store plans, N = ignore*/
+    @QueryStoreMetric nvarchar(20) = N'CPU', /*CPU = total CPU time (default), EXECUTIONS = count, DURATION = elapsed time, READS = logical I/O*/
+    @QueryStoreMinExecutions bigint = 100, /*minimum plan executions to boost priority*/
+    @QueryStoreRecentHours integer = 168, /*only consider plans executed in last N hours (default: 7 days)*/
+
+    /*
+    ============================================================================
     UPDATE BEHAVIOR (both modes)
     ============================================================================
     */
@@ -152,7 +185,7 @@ ALTER PROCEDURE
     */
     @TimeLimit integer = 3600, /*seconds (default: 1 hour, NULL = unlimited)*/
     @BatchLimit integer = NULL, /*max stats to update per run*/
-    @SortOrder nvarchar(50) = N'MODIFICATION_COUNTER', /*priority: MODIFICATION_COUNTER, DAYS_STALE, RANDOM, PAGE_COUNT*/
+    @SortOrder nvarchar(50) = N'MODIFICATION_COUNTER', /*priority: MODIFICATION_COUNTER, DAYS_STALE, RANDOM, PAGE_COUNT, QUERY_STORE, FILTERED_DRIFT*/
     @DelayBetweenStats integer = NULL, /*seconds between stats updates*/
 
     /*
@@ -218,7 +251,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '1.3.2026.0119',
+        @procedure_version varchar(20) = '1.4.2026.0119b',
         @procedure_version_date datetime = '20260119',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -315,7 +348,19 @@ BEGIN
                     WHEN N'@BatchLimit'
                     THEN N'maximum number of stats to update per run'
                     WHEN N'@SortOrder'
-                    THEN N'priority ordering: MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM'
+                    THEN N'priority ordering: MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT'
+                    WHEN N'@FilteredStatsMode'
+                    THEN N'INCLUDE = all stats, EXCLUDE = skip filtered, ONLY = filtered only, PRIORITY = boost filtered with drift'
+                    WHEN N'@FilteredStatsStaleFactor'
+                    THEN N'filtered stats stale when unfiltered_rows/rows > factor (default 2.0)'
+                    WHEN N'@QueryStorePriority'
+                    THEN N'Y = prioritize stats used by Query Store plans, N = ignore'
+                    WHEN N'@QueryStoreMetric'
+                    THEN N'CPU = total CPU time (default), DURATION = elapsed time, READS = logical I/O, EXECUTIONS = count'
+                    WHEN N'@QueryStoreMinExecutions'
+                    THEN N'minimum plan executions to boost priority (default 100)'
+                    WHEN N'@QueryStoreRecentHours'
+                    THEN N'only consider plans executed in last N hours (default 168 = 7 days)'
                     WHEN N'@DelayBetweenStats'
                     THEN N'seconds to wait between stats updates (pacing)'
                     WHEN N'@LockTimeout'
@@ -355,7 +400,13 @@ BEGIN
                     WHEN N'@TargetNorecompute'
                     THEN N'Y, N, BOTH'
                     WHEN N'@SortOrder'
-                    THEN N'MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM'
+                    THEN N'MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT'
+                    WHEN N'@FilteredStatsMode'
+                    THEN N'INCLUDE, EXCLUDE, ONLY, PRIORITY'
+                    WHEN N'@QueryStorePriority'
+                    THEN N'Y, N'
+                    WHEN N'@QueryStoreMetric'
+                    THEN N'CPU, DURATION, READS, EXECUTIONS'
                     WHEN N'@StatisticsSample'
                     THEN N'NULL, 1-100 (100 = FULLSCAN)'
                     WHEN N'@LogToTable'
@@ -410,6 +461,18 @@ BEGIN
                     THEN N'NULL (no limit)'
                     WHEN N'@SortOrder'
                     THEN N'MODIFICATION_COUNTER'
+                    WHEN N'@FilteredStatsMode'
+                    THEN N'INCLUDE'
+                    WHEN N'@FilteredStatsStaleFactor'
+                    THEN N'2.0'
+                    WHEN N'@QueryStorePriority'
+                    THEN N'N'
+                    WHEN N'@QueryStoreMetric'
+                    THEN N'CPU'
+                    WHEN N'@QueryStoreMinExecutions'
+                    THEN N'100'
+                    WHEN N'@QueryStoreRecentHours'
+                    THEN N'168 (7 days)'
                     WHEN N'@DelayBetweenStats'
                     THEN N'NULL'
                     WHEN N'@LockTimeout'
@@ -670,7 +733,20 @@ BEGIN
         @current_page_count bigint = NULL,
         @current_persisted_sample_percent float = NULL,
         @current_partition_number integer = NULL,
-        @current_forwarded_records bigint = NULL;
+        @current_forwarded_records bigint = NULL,
+        /* Filtered statistics metadata */
+        @current_has_filter bit = NULL,
+        @current_filter_definition nvarchar(max) = NULL,
+        @current_unfiltered_rows bigint = NULL,
+        @current_filtered_drift_ratio float = NULL,
+        /* Query Store priority metadata */
+        @current_qs_plan_count integer = NULL,
+        @current_qs_total_executions bigint = NULL,
+        @current_qs_total_cpu_ms bigint = NULL,
+        @current_qs_total_duration_ms bigint = NULL,
+        @current_qs_total_logical_reads bigint = NULL,
+        @current_qs_last_execution datetime2(3) = NULL,
+        @current_qs_priority_boost bigint = NULL;
 
     /*
     Command building
@@ -764,6 +840,23 @@ BEGIN
         page_count bigint NOT NULL DEFAULT 0,
         partition_number integer NULL,
         persisted_sample_percent float NULL, /*existing persisted sample (warn if overriding)*/
+        /* Filtered statistics metadata */
+        has_filter bit NOT NULL DEFAULT 0,
+        filter_definition nvarchar(max) NULL,
+        unfiltered_rows bigint NULL, /*total rows in table, vs rows matching filter*/
+        filtered_drift_ratio AS /*computed: unfiltered_rows / NULLIF(row_count, 0) - measures selectivity drift*/
+            CASE WHEN row_count > 0 AND unfiltered_rows IS NOT NULL
+                 THEN CONVERT(float, unfiltered_rows) / row_count
+                 ELSE NULL
+            END,
+        /* Query Store priority metadata */
+        qs_plan_count integer NULL, /*distinct plans referencing this stat*/
+        qs_total_executions bigint NULL, /*total executions of plans using stat*/
+        qs_total_cpu_ms bigint NULL, /*total CPU time in ms (avg_cpu_time * count_executions / 1000)*/
+        qs_total_duration_ms bigint NULL, /*total elapsed time in ms*/
+        qs_total_logical_reads bigint NULL, /*total logical I/O reads*/
+        qs_last_execution datetime2(3) NULL, /*most recent plan execution*/
+        qs_priority_boost bigint NOT NULL DEFAULT 0, /*calculated boost for QS stats*/
         priority integer NOT NULL DEFAULT 0,
         processed bit NOT NULL DEFAULT 0
     );
@@ -926,22 +1019,22 @@ BEGIN
 
         CREATE TABLE dbo.QueueStatistic
         (
-            QueueID int NOT NULL,
+            QueueID integer NOT NULL,
             DatabaseName sysname NOT NULL,
             SchemaName sysname NOT NULL,
             ObjectName sysname NOT NULL,
-            ObjectID int NOT NULL,
-            TablePriority int NOT NULL DEFAULT 0,
-            StatsCount int NOT NULL DEFAULT 1,
+            ObjectID integer NOT NULL,
+            TablePriority integer NOT NULL DEFAULT 0,
+            StatsCount integer NOT NULL DEFAULT 1,
             MaxModificationCounter bigint NOT NULL DEFAULT 0,
             TableStartTime datetime2(7) NULL,
             TableEndTime datetime2(7) NULL,
             SessionID smallint NULL,
-            RequestID int NULL,
+            RequestID integer NULL,
             RequestStartTime datetime NULL,
-            StatsUpdated int NULL,
-            StatsFailed int NULL,
-            StatsSkipped int NULL,
+            StatsUpdated integer NULL,
+            StatsFailed integer NULL,
+            StatsSkipped integer NULL,
             CONSTRAINT PK_QueueStatistic
                 PRIMARY KEY CLUSTERED (QueueID, DatabaseName, SchemaName, ObjectName)
         );
@@ -975,20 +1068,6 @@ BEGIN
         SELECT
             error_message =
                 N'The value for @TargetNorecompute is not supported. Use Y, N, or BOTH.',
-            error_severity = 16;
-    END;
-
-    IF @SortOrder NOT IN (N'MODIFICATION_COUNTER', N'DAYS_STALE', N'RANDOM', N'PAGE_COUNT')
-    BEGIN
-        INSERT INTO
-            @errors
-        (
-            error_message,
-            error_severity
-        )
-        SELECT
-            error_message =
-                N'The value for @SortOrder is not supported. Use MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, or RANDOM.',
             error_severity = 16;
     END;
 
@@ -1099,6 +1178,74 @@ BEGIN
         SELECT
             error_message =
                 N'The value for @StatisticsFromTable contains invalid characters.',
+            error_severity = 16;
+    END;
+
+    /*
+    Validate @FilteredStatsMode
+    */
+    IF @FilteredStatsMode NOT IN (N'INCLUDE', N'EXCLUDE', N'ONLY', N'PRIORITY')
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @FilteredStatsMode is not supported. Use INCLUDE, EXCLUDE, ONLY, or PRIORITY.',
+            error_severity = 16;
+    END;
+
+    /*
+    Validate @QueryStorePriority
+    */
+    IF @QueryStorePriority NOT IN (N'Y', N'N')
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @QueryStorePriority is not supported. Use Y or N.',
+            error_severity = 16;
+    END;
+
+    /*
+    Validate @QueryStoreMetric
+    */
+    IF @QueryStoreMetric NOT IN (N'CPU', N'DURATION', N'READS', N'EXECUTIONS')
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @QueryStoreMetric is not supported. Use CPU, DURATION, READS, or EXECUTIONS.',
+            error_severity = 16;
+    END;
+
+    /*
+    Validate @SortOrder (add new options)
+    */
+    IF @SortOrder NOT IN (N'MODIFICATION_COUNTER', N'DAYS_STALE', N'PAGE_COUNT', N'RANDOM', N'QUERY_STORE', N'FILTERED_DRIFT')
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @SortOrder is not supported. Use MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, or FILTERED_DRIFT.',
             error_severity = 16;
     END;
 
@@ -1297,7 +1444,7 @@ BEGIN
     /*
     Get count for display
     */
-    SELECT @database_count = COUNT(*)
+    SELECT @database_count = COUNT_BIG(*)
     FROM @tmpDatabases
     WHERE Selected = 1;
 
@@ -1358,12 +1505,12 @@ BEGIN
     WHERE td.Selected = 1
     AND   EXISTS (SELECT 1/0 FROM @ag_secondary_cache AS c WHERE c.DatabaseName = td.DatabaseName);
 
-    SELECT @ag_secondary_count = @@ROWCOUNT;
+    SELECT @ag_secondary_count = ROWCOUNT_BIG();
 
     /*
     Update database count after AG exclusion and validate
     */
-    SELECT @database_count = COUNT(*)
+    SELECT @database_count = COUNT_BIG(*)
     FROM @tmpDatabases
     WHERE Selected = 1;
 
@@ -1585,13 +1732,13 @@ BEGIN
     END;
 
     /*
-    Bit parameters must be cast to int for RAISERROR display
+    Bit parameters must be cast to integer for RAISERROR display
     */
     DECLARE
-        @TieredThresholds_int int = @TieredThresholds,
-        @StatisticsResample_int int = @StatisticsResample,
-        @UpdateIncremental_int int = @UpdateIncremental,
-        @FailFast_int int = @FailFast;
+        @TieredThresholds_int integer = @TieredThresholds,
+        @StatisticsResample_int integer = @StatisticsResample,
+        @UpdateIncremental_int integer = @UpdateIncremental,
+        @FailFast_int integer = @FailFast;
 
     RAISERROR(N'  @TieredThresholds        = %d', 10, 1, @TieredThresholds_int) WITH NOWAIT;
     RAISERROR(N'  @ThresholdLogic          = %s', 10, 1, @ThresholdLogic) WITH NOWAIT;
@@ -2138,10 +2285,54 @@ BEGIN
             days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, GETDATE()), 9999),
             page_count = ISNULL(pgs.total_pages, 0),
             persisted_sample_percent = sp.persisted_sample_percent,
+            /* Filtered statistics metadata */
+            has_filter = s.has_filter,
+            filter_definition = s.filter_definition,
+            unfiltered_rows = sp.unfiltered_rows,
+            /* Query Store priority (NULL if QS disabled or not requested) */
+            qs_plan_count = qs_stats.plan_count,
+            qs_total_executions = qs_stats.total_executions,
+            qs_total_cpu_ms = qs_stats.total_cpu_ms,
+            qs_total_duration_ms = qs_stats.total_duration_ms,
+            qs_total_logical_reads = qs_stats.total_logical_reads,
+            qs_last_execution = qs_stats.last_execution,
+            /*
+            Priority boost based on selected metric - uses resource consumption, not just execution count.
+            Normalized to provide consistent ordering across metrics.
+            */
+            qs_priority_boost =
+                CASE
+                    WHEN @QueryStorePriority_param = N''Y''
+                    AND  ISNULL(qs_stats.total_executions, 0) >= @QueryStoreMinExecutions_param
+                    THEN CASE @QueryStoreMetric_param
+                             WHEN N''CPU'' THEN ISNULL(qs_stats.total_cpu_ms, 0)
+                             WHEN N''DURATION'' THEN ISNULL(qs_stats.total_duration_ms, 0)
+                             WHEN N''READS'' THEN ISNULL(qs_stats.total_logical_reads, 0) / 1000 /* scale down */
+                             WHEN N''EXECUTIONS'' THEN ISNULL(qs_stats.total_executions, 0)
+                             ELSE ISNULL(qs_stats.total_cpu_ms, 0) /* default to CPU */
+                         END
+                    ELSE 0
+                END,
             priority =
                 ROW_NUMBER() OVER
                 (
                     ORDER BY
+                        /*
+                        Query Store boost based on selected metric.
+                        Uses actual resource consumption to prioritize expensive queries.
+                        */
+                        CASE
+                            WHEN @QueryStorePriority_param = N''Y''
+                            AND  ISNULL(qs_stats.total_executions, 0) >= @QueryStoreMinExecutions_param
+                            THEN CASE @QueryStoreMetric_param
+                                     WHEN N''CPU'' THEN ISNULL(qs_stats.total_cpu_ms, 0)
+                                     WHEN N''DURATION'' THEN ISNULL(qs_stats.total_duration_ms, 0)
+                                     WHEN N''READS'' THEN ISNULL(qs_stats.total_logical_reads, 0) / 1000
+                                     WHEN N''EXECUTIONS'' THEN ISNULL(qs_stats.total_executions, 0)
+                                     ELSE ISNULL(qs_stats.total_cpu_ms, 0)
+                                 END
+                            ELSE 0
+                        END +
                         CASE @SortOrder_param
                             WHEN N''MODIFICATION_COUNTER''
                             THEN ISNULL(sp.modification_counter, 0)
@@ -2151,6 +2342,21 @@ BEGIN
                             THEN ISNULL(pgs.total_pages, 0)
                             WHEN N''RANDOM''
                             THEN CHECKSUM(NEWID())
+                            WHEN N''QUERY_STORE''
+                            THEN CASE @QueryStoreMetric_param
+                                     WHEN N''CPU'' THEN ISNULL(qs_stats.total_cpu_ms, 0)
+                                     WHEN N''DURATION'' THEN ISNULL(qs_stats.total_duration_ms, 0)
+                                     WHEN N''READS'' THEN ISNULL(qs_stats.total_logical_reads, 0) / 1000
+                                     WHEN N''EXECUTIONS'' THEN ISNULL(qs_stats.total_executions, 0)
+                                     ELSE ISNULL(qs_stats.total_cpu_ms, 0)
+                                 END
+                            WHEN N''FILTERED_DRIFT''
+                            THEN CASE
+                                     WHEN s.has_filter = 1 AND ISNULL(sp.rows, 0) > 0 AND sp.unfiltered_rows IS NOT NULL
+                                     THEN CONVERT(bigint, (CONVERT(float, sp.unfiltered_rows) / sp.rows) * 1000000)
+                                     ELSE 0
+                                 END
+                            ELSE ISNULL(sp.modification_counter, 0)
                         END DESC
                 )
         FROM sys.stats AS s
@@ -2174,6 +2380,51 @@ BEGIN
             WHERE p.object_id = s.object_id
             AND   p.index_id IN (0, 1)
         ) AS pgs
+        /*
+        QUERY STORE CROSS-REFERENCE: Find plans that reference this object''s statistics.
+        This identifies stats that are actively used by the query optimizer.
+        Only runs the join if @QueryStorePriority_param = ''Y'' to avoid overhead.
+
+        Query Store must be enabled on the database for this to return data.
+        We use sys.query_store_plan to find plans, then aggregate resource consumption
+        from sys.query_store_runtime_stats.
+
+        RESOURCE METRICS (following sp_QuickieStore patterns):
+        - total_cpu_ms: Total CPU consumption (avg_cpu_time is microseconds, * count / 1000 = ms)
+        - total_duration_ms: Total elapsed time
+        - total_logical_reads: Total I/O operations
+
+        These help prioritize stats causing the most resource consumption, not just
+        the most frequently executed. A single 10-second query matters more than
+        1000 1-millisecond queries.
+
+        Note: We match by object_id since Query Store tracks plans by object, not by
+        individual statistic. A stat on a hot table will be prioritized even if
+        we can''t determine exactly which stat column the plan used.
+        */
+        OUTER APPLY
+        (
+            SELECT
+                plan_count = COUNT_BIG(DISTINCT qsp.plan_id),
+                total_executions = SUM(qsrs.count_executions),
+                /* CPU time: avg_cpu_time is in microseconds, convert to milliseconds */
+                total_cpu_ms = SUM(qsrs.avg_cpu_time * qsrs.count_executions) / 1000,
+                /* Duration: avg_duration is in microseconds, convert to milliseconds */
+                total_duration_ms = SUM(qsrs.avg_duration * qsrs.count_executions) / 1000,
+                /* Logical reads: direct sum of avg * count */
+                total_logical_reads = SUM(CONVERT(bigint, qsrs.avg_logical_io_reads * qsrs.count_executions)),
+                last_execution = MAX(qsrs.last_execution_time)
+            FROM sys.query_store_plan AS qsp
+            JOIN sys.query_store_query AS qsq
+              ON qsq.query_id = qsp.query_id
+            JOIN sys.query_store_runtime_stats AS qsrs
+              ON qsrs.plan_id = qsp.plan_id
+            JOIN sys.query_store_runtime_stats_interval AS qsrsi
+              ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
+            WHERE qsq.object_id = s.object_id
+            AND   @QueryStorePriority_param = N''Y''
+            AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, GETDATE())
+        ) AS qs_stats
         WHERE (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
         AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @IncludeSystemObjects_param = N''Y'')
         /* NORECOMPUTE filter */
@@ -2284,6 +2535,33 @@ BEGIN
                       FROM STRING_SPLIT(@Tables_param, N'','') AS ss
                   )
               )
+        /*
+        FILTERED STATISTICS FILTER
+        ==========================
+        INCLUDE (default) = normal behavior, include all stats
+        EXCLUDE = skip filtered stats entirely
+        ONLY = only process filtered stats
+        PRIORITY = include all, but filtered stats with drift get priority boost
+        */
+        AND   (
+                  @FilteredStatsMode_param = N''INCLUDE''
+               OR @FilteredStatsMode_param = N''PRIORITY''
+               OR (@FilteredStatsMode_param = N''EXCLUDE'' AND s.has_filter = 0)
+               OR (@FilteredStatsMode_param = N''ONLY'' AND s.has_filter = 1)
+              )
+        /*
+        FILTERED STATS STALENESS: If using PRIORITY mode, filtered stats with high drift
+        (unfiltered_rows / rows > factor) are considered stale regardless of mod_counter.
+        This catches filtered stats on partitioned data that become selectivity-stale.
+        */
+        AND   (
+                  @FilteredStatsMode_param <> N''PRIORITY''
+               OR s.has_filter = 0
+               OR sp.unfiltered_rows IS NULL
+               OR ISNULL(sp.rows, 0) = 0
+               OR (CONVERT(float, sp.unfiltered_rows) / sp.rows) >= @FilteredStatsStaleFactor_param
+               OR ISNULL(sp.modification_counter, 0) >= @ModificationThreshold_param
+              )
         ORDER BY
             priority
         OPTION (RECOMPILE);'; /*Prevents plan caching issues with varying parameters*/
@@ -2299,7 +2577,13 @@ BEGIN
                 @DaysStaleThreshold_param integer,
                 @MinPageCount_param bigint,
                 @IncludeSystemObjects_param nvarchar(1),
-                @Tables_param nvarchar(max)';
+                @Tables_param nvarchar(max),
+                @FilteredStatsMode_param nvarchar(10),
+                @FilteredStatsStaleFactor_param float,
+                @QueryStorePriority_param nvarchar(1),
+                @QueryStoreMetric_param nvarchar(20),
+                @QueryStoreMinExecutions_param bigint,
+                @QueryStoreRecentHours_param integer';
 
         /*
         Execute discovery in target database
@@ -2322,6 +2606,16 @@ BEGIN
             days_stale,
             page_count,
             persisted_sample_percent,
+            has_filter,
+            filter_definition,
+            unfiltered_rows,
+            qs_plan_count,
+            qs_total_executions,
+            qs_total_cpu_ms,
+            qs_total_duration_ms,
+            qs_total_logical_reads,
+            qs_last_execution,
+            qs_priority_boost,
             priority
         )
             EXECUTE sys.sp_executesql
@@ -2336,7 +2630,13 @@ BEGIN
                 @DaysStaleThreshold_param = @DaysStaleThreshold,
                 @MinPageCount_param = @MinPageCount,
                 @IncludeSystemObjects_param = @IncludeSystemObjects,
-                @Tables_param = @Tables;
+                @Tables_param = @Tables,
+                @FilteredStatsMode_param = @FilteredStatsMode,
+                @FilteredStatsStaleFactor_param = @FilteredStatsStaleFactor,
+                @QueryStorePriority_param = @QueryStorePriority,
+                @QueryStoreMetric_param = @QueryStoreMetric,
+                @QueryStoreMinExecutions_param = @QueryStoreMinExecutions,
+                @QueryStoreRecentHours_param = @QueryStoreRecentHours;
 
             /*
             Mark this database as completed
@@ -2557,7 +2857,7 @@ BEGIN
                       WHERE qs.QueueID = @queue_id
                   );
 
-            IF @@ROWCOUNT = 1
+            IF ROWCOUNT_BIG() = 1
             BEGIN
                 /*
                 Successfully claimed queue - populate QueueStatistic with tables.
@@ -2601,7 +2901,7 @@ BEGIN
                             CASE WHEN @SortOrder = N'DAYS_STALE' THEN MAX(stp.days_stale) END DESC,
                             CASE WHEN @SortOrder = N'RANDOM' THEN CHECKSUM(NEWID()) END DESC
                     ),
-                    StatsCount = COUNT(*),
+                    StatsCount = COUNT_BIG(*),
                     MaxModificationCounter = MAX(stp.modification_counter)
                 FROM #stats_to_process AS stp
                 GROUP BY
@@ -2611,7 +2911,7 @@ BEGIN
                     stp.object_id;
 
                 DECLARE
-                    @Tables_queued integer = @@ROWCOUNT;
+                    @Tables_queued integer = ROWCOUNT_BIG();
 
                 RAISERROR(N'  Queued %d tables for processing', 10, 1, @Tables_queued) WITH NOWAIT;
             END;
@@ -2773,10 +3073,13 @@ BEGIN
                           AND   r.start_time = qs.RequestStartTime
                       );
 
-                IF @@ROWCOUNT > 0
+                DECLARE
+                    @released_count integer = ROWCOUNT_BIG();
+
+                IF @released_count > 0
                 AND @Debug = 1
                 BEGIN
-                    RAISERROR(N'  Released %d tables from dead workers', 10, 1, @@ROWCOUNT) WITH NOWAIT;
+                    RAISERROR(N'  Released %d tables from dead workers', 10, 1, @released_count) WITH NOWAIT;
                 END;
 
                 /*
@@ -2791,6 +3094,14 @@ BEGIN
                         ObjectName sysname,
                         ObjectID integer
                     );
+
+                /*
+                Clear table variable from previous iterations.
+                DECLARE does not reset table variables inside loops - they persist
+                and OUTPUT INTO appends rather than replaces. Without this DELETE,
+                SELECT TOP 1 could return stale data from a prior claim attempt.
+                */
+                DELETE FROM @claimed_tables;
 
                 UPDATE
                     qs
@@ -2886,7 +3197,20 @@ BEGIN
             @current_days_stale = stp.days_stale,
             @current_page_count = stp.page_count,
             @current_persisted_sample_percent = stp.persisted_sample_percent,
-            @current_forwarded_records = NULL
+            @current_forwarded_records = NULL,
+            /* Filtered statistics metadata */
+            @current_has_filter = stp.has_filter,
+            @current_filter_definition = stp.filter_definition,
+            @current_unfiltered_rows = stp.unfiltered_rows,
+            @current_filtered_drift_ratio = stp.filtered_drift_ratio,
+            /* Query Store priority metadata */
+            @current_qs_plan_count = stp.qs_plan_count,
+            @current_qs_total_executions = stp.qs_total_executions,
+            @current_qs_total_cpu_ms = stp.qs_total_cpu_ms,
+            @current_qs_total_duration_ms = stp.qs_total_duration_ms,
+            @current_qs_total_logical_reads = stp.qs_total_logical_reads,
+            @current_qs_last_execution = stp.qs_last_execution,
+            @current_qs_priority_boost = stp.qs_priority_boost
         FROM #stats_to_process AS stp
         WHERE stp.processed = 0
         /*
@@ -3269,9 +3593,29 @@ BEGIN
                                 @current_is_heap AS IsHeap,
                                 @current_forwarded_records AS ForwardedRecords,
                                 @current_is_memory_optimized AS IsMemoryOptimized,
+                                /* Filtered statistics metadata */
+                                @current_has_filter AS HasFilter,
+                                LEFT(@current_filter_definition, 500) AS FilterDefinition, /*truncate for XML*/
+                                @current_unfiltered_rows AS UnfilteredRows,
+                                @current_filtered_drift_ratio AS FilteredDriftRatio,
+                                /* Query Store priority metadata */
+                                @current_qs_plan_count AS QSPlanCount,
+                                @current_qs_total_executions AS QSTotalExecutions,
+                                @current_qs_total_cpu_ms AS QSTotalCpuMs,
+                                @current_qs_total_duration_ms AS QSTotalDurationMs,
+                                @current_qs_total_logical_reads AS QSTotalLogicalReads,
+                                @current_qs_last_execution AS QSLastExecution,
+                                @current_qs_priority_boost AS QSPriorityBoost,
+                                @QueryStoreMetric AS QSMetric,
                                 CASE
                                     WHEN @mode IN (N'DIRECT_STRING', N'DIRECT_TABLE')
                                     THEN N'DIRECT_MODE'
+                                    WHEN @current_qs_priority_boost > 0
+                                    THEN N'QUERY_STORE_PRIORITY'
+                                    WHEN @current_has_filter = 1
+                                    AND  @FilteredStatsMode = N'PRIORITY'
+                                    AND  @current_filtered_drift_ratio >= @FilteredStatsStaleFactor
+                                    THEN N'FILTERED_DRIFT'
                                     WHEN @current_no_recompute = 1
                                     AND  @TargetNorecompute IN (N'Y', N'BOTH')
                                     THEN N'NORECOMPUTE_TARGET'
