@@ -51,6 +51,10 @@ History:    1.5.2026.0120 - CRITICAL: Fixed @ExcludeStatistics filter not workin
                             reporting failure when procedure stops gracefully at configured
                             limits. Return code remains 0 for successful execution; non-zero
                             only when actual stat update failures occur.
+                          - Removed @StatisticsResample parameter (unnecessary/confusing).
+                            RESAMPLE is now used automatically when appropriate: (1) when
+                            PERSIST_SAMPLE_PERCENT is configured, (2) for incremental stats,
+                            (3) for memory-optimized tables on SQL 2014. "Do no harm" approach.
             1.5.2026.0119 - Core logic fixes and new parameters based on code review analysis:
                             (1) Incremental stats partition targeting: Now queries
                                 sys.dm_db_incremental_stats_properties to find which partitions
@@ -108,7 +112,7 @@ History:    1.5.2026.0120 - CRITICAL: Fixed @ExcludeStatistics filter not workin
                             AND/OR threshold logic (@ThresholdLogic),
                             version-aware PERSIST_SAMPLE_PERCENT and MAXDOP.
                             Erik Darling style refactor, @Help parameter,
-                            incremental stats (@UpdateIncremental), @StatisticsResample,
+                            incremental stats (@UpdateIncremental),
                             AG awareness, heap handling (index_id=0, PageCount),
                             memory-optimized tables, saner defaults.
             1.0.2026.0113 - Initial release with versioning, RUN_HEADER/FOOTER logging
@@ -204,7 +208,6 @@ ALTER PROCEDURE
     ============================================================================
     */
     @StatisticsSample integer = NULL, /*NULL = SQL Server decides, 100 = FULLSCAN*/
-    @StatisticsResample bit = 0, /*1 = use RESAMPLE (preserves previous sample rate)*/
     @PersistSamplePercent nvarchar(1) = N'Y', /*Y = add PERSIST_SAMPLE_PERCENT = ON*/
     @MaxDOP integer = NULL, /*MAXDOP for FULLSCAN (SQL 2016 SP2+)*/
 
@@ -375,8 +378,6 @@ BEGIN
                     THEN N'minimum used_page_count (125000 = ~1GB tables only)'
                     WHEN N'@StatisticsSample'
                     THEN N'sample percent: NULL = SQL Server decides, 100 = FULLSCAN'
-                    WHEN N'@StatisticsResample'
-                    THEN N'1 = use RESAMPLE (preserves previous sample rate, required for incremental)'
                     WHEN N'@PersistSamplePercent'
                     THEN N'Y = add PERSIST_SAMPLE_PERCENT = ON to preserve sample rate'
                     WHEN N'@MaxDOP'
@@ -493,8 +494,6 @@ BEGIN
                     THEN N'0'
                     WHEN N'@StatisticsSample'
                     THEN N'NULL (SQL Server decides)'
-                    WHEN N'@StatisticsResample'
-                    THEN N'0'
                     WHEN N'@PersistSamplePercent'
                     THEN N'Y'
                     WHEN N'@MaxDOP'
@@ -583,11 +582,6 @@ BEGIN
                     N'Discovery - Large Tables Only',
                     N'Only tables with 1GB+ data',
                     N'EXECUTE dbo.sp_StatUpdate @MinPageCount = 125000, @TimeLimit = 7200;'
-                ),
-                (
-                    N'With RESAMPLE',
-                    N'Preserve previous sample rate (required for incremental stats)',
-                    N'EXECUTE dbo.sp_StatUpdate @StatisticsResample = 1;'
                 ),
                 (
                     N'Parallel Mode',
@@ -1592,24 +1586,6 @@ BEGIN
             error_severity = 16;
     END;
 
-    /*
-    RESAMPLE and sample percent are mutually exclusive
-    */
-    IF  @StatisticsResample = 1
-    AND @StatisticsSample IS NOT NULL
-    BEGIN
-        INSERT INTO
-            @errors
-        (
-            error_message,
-            error_severity
-        )
-        SELECT
-            error_message =
-                N'Cannot specify both @StatisticsResample = 1 and @StatisticsSample. Choose one.',
-            error_severity = 16;
-    END;
-
     IF  @MaxDOP IS NOT NULL
     AND (
             @MaxDOP < 0
@@ -1784,7 +1760,6 @@ BEGIN
     */
     DECLARE
         @TieredThresholds_int integer = @TieredThresholds,
-        @StatisticsResample_int integer = @StatisticsResample,
         @UpdateIncremental_int integer = @UpdateIncremental,
         @FailFast_int integer = @FailFast;
 
@@ -1800,7 +1775,6 @@ BEGIN
     BEGIN
         RAISERROR(N'  @StatisticsSample        = %d%%', 10, 1, @StatisticsSample) WITH NOWAIT;
     END;
-    RAISERROR(N'  @StatisticsResample      = %d', 10, 1, @StatisticsResample_int) WITH NOWAIT;
     RAISERROR(N'  @UpdateIncremental       = %d', 10, 1, @UpdateIncremental_int) WITH NOWAIT;
     RAISERROR(N'  @TimeLimit               = %s seconds', 10, 1, @TimeLimit_display) WITH NOWAIT;
     RAISERROR(N'  @BatchLimit              = %s stats', 10, 1, @BatchLimit_display) WITH NOWAIT;
@@ -1843,7 +1817,6 @@ BEGIN
                     @MinPageCount AS MinPageCount,
                     @IncludeSystemObjects AS IncludeSystemObjects,
                     @StatisticsSample AS StatisticsSample,
-                    @StatisticsResample AS StatisticsResample,
                     @UpdateIncremental AS UpdateIncremental,
                     @TimeLimit AS TimeLimit,
                     @BatchLimit AS BatchLimit,
@@ -3424,7 +3397,6 @@ BEGIN
         AND @sql_version < 13
         AND @StatisticsSample IS NOT NULL
         AND @StatisticsSample < 100
-        AND @StatisticsResample = 0
         BEGIN
             /*
             Force FULLSCAN for memory-optimized on SQL 2014
@@ -3437,15 +3409,6 @@ BEGIN
             BEGIN
                 RAISERROR(N'  Note: Memory-optimized table on SQL 2014 requires FULLSCAN', 10, 1) WITH NOWAIT;
             END;
-        END;
-        ELSE IF @StatisticsResample = 1
-        BEGIN
-            /*
-            RESAMPLE: use previous sample rate (required for incremental stats)
-            */
-            SELECT
-                @with_clause = N'RESAMPLE',
-                @has_with_option = 1;
         END;
         ELSE IF @StatisticsSample = 100
         BEGIN
@@ -3470,7 +3433,6 @@ BEGIN
         */
         ELSE IF @StatisticsSample IS NULL
         AND     @current_persisted_sample_percent IS NOT NULL
-        AND     @StatisticsResample = 0  /*Don't double-specify RESAMPLE*/
         BEGIN
             SELECT
                 @with_clause = N'RESAMPLE',
@@ -3580,8 +3542,7 @@ BEGIN
             /*
             Incremental stats require RESAMPLE
             */
-            IF @StatisticsResample = 0
-            AND @StatisticsSample IS NULL
+            IF @StatisticsSample IS NULL
             BEGIN
                 IF @has_with_option = 0
                 BEGIN
@@ -3802,7 +3763,6 @@ BEGIN
                                     ELSE N'THRESHOLD_MATCH'
                                 END AS QualifyReason,
                                 @StatisticsSample AS SamplePct,
-                                @StatisticsResample AS UsedResample,
                                 @mode AS Mode
                             FOR
                                 XML RAW(N'ExtendedInfo'),
@@ -4264,14 +4224,6 @@ EXECUTE dbo.sp_StatUpdate
 EXECUTE dbo.sp_StatUpdate
     @MinPageCount = 125000,
     @TimeLimit = 14400;
-
--------------------------------------------------------------------------------
-WITH RESAMPLE (preserves sample rate, required for incremental stats)
--------------------------------------------------------------------------------
-
-EXECUTE dbo.sp_StatUpdate
-    @StatisticsResample = 1,
-    @TimeLimit = 7200;
 
 -------------------------------------------------------------------------------
 DRY RUN
