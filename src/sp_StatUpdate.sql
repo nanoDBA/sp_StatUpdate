@@ -36,11 +36,44 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.4.2026.0119c (Major.Minor.Year.MMDD)
+Version:    1.5.2026.0120 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    1.4.2026.0119c - Bug fix: Arithmetic overflow (8115) in FILTERED_DRIFT sort order
+History:    1.5.2026.0120 - CRITICAL: Fixed @ExcludeStatistics filter not working. The OR between
+                            threshold logic blocks had incorrect operator precedence, causing
+                            table/exclusion filters to only apply when @ThresholdLogic='AND'.
+                            Wrapped both OR and AND threshold blocks in parentheses.
+                          - Fix: @TargetNorecompute='N' now correctly filters to regular stats
+                            only (no_recompute=0). Previously included all stats.
+                          - Fix: Time/batch limit messages now use severity 10 (informational)
+                            instead of severity 16 (error). Prevents SQL Agent jobs from
+                            reporting failure when procedure stops gracefully at configured
+                            limits. Return code remains 0 for successful execution; non-zero
+                            only when actual stat update failures occur.
+            1.5.2026.0119 - Core logic fixes and new parameters based on code review analysis:
+                            (1) Incremental stats partition targeting: Now queries
+                                sys.dm_db_incremental_stats_properties to find which partitions
+                                have modifications and only updates those (ON PARTITIONS clause).
+                                Previously updated ALL partitions, defeating the purpose of
+                                incremental statistics. SQL 2016 compatible (FOR XML PATH fallback).
+                            (2) Query Store join reorder: Filter by object_id FIRST through
+                                sys.query_store_query, then join to plans. Reduces intermediate
+                                result set size on large Query Store catalogs.
+                            (3) New @ExcludeStatistics parameter: Exclude stats by name pattern
+                                (supports % wildcard), e.g., '_WA_Sys%' to skip auto-created stats.
+                            (4) New @ProgressLogInterval parameter: Log SP_STATUPDATE_PROGRESS
+                                to CommandLog every N stats for Agent job monitoring visibility.
+            1.4.2026.0119d - Code review fixes:
+                            (1) Tiered threshold cliff effect at 500/501 rows - added SQRT
+                                alternative to first tier to smooth the transition.
+                            (2) FilteredStatsStaleFactor now uses selectivity-adjusted threshold
+                                instead of ratio check (ratio measures selectivity, not staleness).
+                            (3) @parameters_string TRIM to prevent duplicate queues from whitespace.
+                            (4) Query Store state check - only query if actual_state IN (1,2)
+                                for READ_ONLY/READ_WRITE modes (avoids errors on disabled QS).
+                            (5) Style: Changed 1/0 to 1 in EXISTS checks for clarity.
+            1.4.2026.0119c - Bug fix: Arithmetic overflow (8115) in FILTERED_DRIFT sort order
                             and Query Store metric calculations. Changed int to bigint for
                             large value handling; added IIF() cap for ratio calculations.
             1.4.2026.0119b - Bug fix: @StatsInParallel=Y table claiming bug. @claimed_tables
@@ -137,6 +170,7 @@ ALTER PROCEDURE
     */
     @Databases nvarchar(max) = NULL, /*NULL = current database, SYSTEM_DATABASES, USER_DATABASES, ALL_DATABASES (excludes system), AVAILABILITY_GROUP_DATABASES, comma-separated, wildcards (%), exclusions (-)*/
     @Tables nvarchar(max) = NULL, /*NULL = all tables, or comma-separated 'Schema.Table'*/
+    @ExcludeStatistics nvarchar(max) = NULL, /*comma-separated patterns to exclude (supports % wildcard), e.g., '_WA_Sys%' to skip auto-created stats*/
     @TargetNorecompute nvarchar(10) = N'BOTH', /*Y = NORECOMPUTE only, N = regular only, BOTH = all (default)*/
     @ModificationThreshold bigint = 1000, /*minimum modification_counter to qualify*/
     @ModificationPercent float = NULL, /*alternative: min mod % of rows (SQRT-based)*/
@@ -152,7 +186,7 @@ ALTER PROCEDURE
     ============================================================================
     */
     @FilteredStatsMode nvarchar(10) = N'INCLUDE', /*INCLUDE = normal, EXCLUDE = skip filtered, ONLY = filtered only, PRIORITY = boost filtered priority*/
-    @FilteredStatsStaleFactor float = 2.0, /*filtered stats stale when (unfiltered_rows/rows) > factor (default: 2x row drift)*/
+    @FilteredStatsStaleFactor float = 2.0, /*PRIORITY mode threshold multiplier - filtered stats use threshold * selectivity * factor*/
 
     /*
     ============================================================================
@@ -198,6 +232,7 @@ ALTER PROCEDURE
     */
     @LockTimeout integer = NULL, /*seconds to wait for locks (NULL = no limit)*/
     @LogToTable nvarchar(1) = N'Y', /*Y = log to dbo.CommandLog (requires table), N = no logging*/
+    @ProgressLogInterval int = NULL, /*log progress to CommandLog every N stats (for Agent job monitoring)*/
     @Execute nvarchar(1) = N'Y', /*Y = execute, N = print only (dry run)*/
     @FailFast bit = 0, /*1 = abort on first error*/
     @Debug bit = 0, /*1 = verbose output*/
@@ -254,8 +289,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '1.4.2026.0119c',
-        @procedure_version_date datetime = '20260119',
+        @procedure_version varchar(20) = '1.5.2026.0120',
+        @procedure_version_date datetime = '20260120',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -320,6 +355,8 @@ BEGIN
                     THEN N'DISCOVERY: database(s) - NULL=current, SYSTEM_DATABASES, USER_DATABASES, ALL_DATABASES (excludes system), AVAILABILITY_GROUP_DATABASES, wildcards (%), exclusions (-)'
                     WHEN N'@Tables'
                     THEN N'DISCOVERY MODE: table filter (NULL = all, comma-separated Schema.Table)'
+                    WHEN N'@ExcludeStatistics'
+                    THEN N'DISCOVERY MODE: exclude stats by name pattern (supports % wildcard)'
                     WHEN N'@IncludeSystemObjects'
                     THEN N'Y = include system object statistics (sys.* tables/views), N = user objects only'
                     WHEN N'@TargetNorecompute'
@@ -355,7 +392,7 @@ BEGIN
                     WHEN N'@FilteredStatsMode'
                     THEN N'INCLUDE = all stats, EXCLUDE = skip filtered, ONLY = filtered only, PRIORITY = boost filtered with drift'
                     WHEN N'@FilteredStatsStaleFactor'
-                    THEN N'filtered stats stale when unfiltered_rows/rows > factor (default 2.0)'
+                    THEN N'PRIORITY mode threshold multiplier for selectivity-adjusted threshold (default 2.0)'
                     WHEN N'@QueryStorePriority'
                     THEN N'Y = prioritize stats used by Query Store plans, N = ignore'
                     WHEN N'@QueryStoreMetric'
@@ -370,6 +407,8 @@ BEGIN
                     THEN N'seconds to wait for locks (NULL = no limit)'
                     WHEN N'@LogToTable'
                     THEN N'Y = log to dbo.CommandLog table'
+                    WHEN N'@ProgressLogInterval'
+                    THEN N'log SP_STATUPDATE_PROGRESS to CommandLog every N stats (Agent job monitoring)'
                     WHEN N'@Execute'
                     THEN N'Y = execute commands, N = print only (dry run)'
                     WHEN N'@FailFast'
@@ -414,6 +453,8 @@ BEGIN
                     THEN N'NULL, 1-100 (100 = FULLSCAN)'
                     WHEN N'@LogToTable'
                     THEN N'Y, N'
+                    WHEN N'@ProgressLogInterval'
+                    THEN N'NULL, 1-N (e.g., 10, 50, 100)'
                     WHEN N'@Execute'
                     THEN N'Y, N'
                     WHEN N'@PersistSamplePercent'
@@ -432,6 +473,8 @@ BEGIN
                     THEN N'NULL (current database)'
                     WHEN N'@Tables'
                     THEN N'NULL (all tables)'
+                    WHEN N'@ExcludeStatistics'
+                    THEN N'NULL (no exclusions)'
                     WHEN N'@IncludeSystemObjects'
                     THEN N'N'
                     WHEN N'@TargetNorecompute'
@@ -482,6 +525,8 @@ BEGIN
                     THEN N'NULL'
                     WHEN N'@LogToTable'
                     THEN N'Y'
+                    WHEN N'@ProgressLogInterval'
+                    THEN N'NULL (disabled)'
                     WHEN N'@Execute'
                     THEN N'Y'
                     WHEN N'@FailFast'
@@ -942,7 +987,7 @@ BEGIN
     AND NOT EXISTS
         (
             SELECT
-                1/0
+                1
             FROM sys.objects AS o
             JOIN sys.schemas AS s
               ON s.schema_id = o.schema_id
@@ -970,7 +1015,7 @@ BEGIN
     AND NOT EXISTS
         (
             SELECT
-                1/0
+                1
             FROM sys.objects AS o
             JOIN sys.schemas AS s
               ON s.schema_id = o.schema_id
@@ -998,7 +1043,7 @@ BEGIN
     AND NOT EXISTS
         (
             SELECT
-                1/0
+                1
             FROM sys.objects AS o
             JOIN sys.schemas AS s
               ON s.schema_id = o.schema_id
@@ -1009,7 +1054,7 @@ BEGIN
     AND EXISTS
         (
             SELECT
-                1/0
+                1
             FROM sys.objects AS o
             JOIN sys.schemas AS s
               ON s.schema_id = o.schema_id
@@ -1395,7 +1440,7 @@ BEGIN
             CASE
                 WHEN EXISTS
                 (
-                    SELECT 1/0
+                    SELECT 1
                     FROM sys.dm_hadr_database_replica_states AS drs
                     WHERE drs.database_id = d.database_id
                     AND   drs.is_local = 1
@@ -1500,13 +1545,13 @@ BEGIN
         @ag_secondary_list = @ag_secondary_list + td.DatabaseName + N', '
     FROM @tmpDatabases AS td
     WHERE td.Selected = 1
-    AND   EXISTS (SELECT 1/0 FROM @ag_secondary_cache AS c WHERE c.DatabaseName = td.DatabaseName);
+    AND   EXISTS (SELECT 1 FROM @ag_secondary_cache AS c WHERE c.DatabaseName = td.DatabaseName);
 
     UPDATE td
     SET td.Selected = 0
     FROM @tmpDatabases AS td
     WHERE td.Selected = 1
-    AND   EXISTS (SELECT 1/0 FROM @ag_secondary_cache AS c WHERE c.DatabaseName = td.DatabaseName);
+    AND   EXISTS (SELECT 1 FROM @ag_secondary_cache AS c WHERE c.DatabaseName = td.DatabaseName);
 
     SELECT @ag_secondary_count = ROWCOUNT_BIG();
 
@@ -1634,7 +1679,7 @@ BEGIN
     IF EXISTS
        (
            SELECT
-               1/0
+               1
            FROM @errors
        )
     BEGIN
@@ -1764,6 +1809,8 @@ BEGIN
     RAISERROR(N'  @StatsInParallel         = %s', 10, 1, @StatsInParallel) WITH NOWAIT;
     RAISERROR(N'  @Execute                 = %s', 10, 1, @Execute) WITH NOWAIT;
     RAISERROR(N'  @FailFast                = %d', 10, 1, @FailFast_int) WITH NOWAIT;
+    IF @ExcludeStatistics IS NOT NULL
+        RAISERROR(N'  @ExcludeStatistics       = %s', 10, 1, @ExcludeStatistics) WITH NOWAIT;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     /*
@@ -2019,7 +2066,7 @@ BEGIN
                     WHEN EXISTS
                          (
                              SELECT
-                                 1/0
+                                 1
                              FROM sys.indexes AS i
                              WHERE i.object_id = s.object_id
                              AND   i.index_id = 0
@@ -2140,7 +2187,7 @@ BEGIN
                     WHEN EXISTS
                          (
                              SELECT
-                                 1/0
+                                 1
                              FROM sys.indexes AS i
                              WHERE i.object_id = s.object_id
                              AND   i.index_id = 0
@@ -2226,7 +2273,7 @@ BEGIN
         LOOP OVER SELECTED DATABASES
         ========================================================================
         */
-        WHILE EXISTS (SELECT 1/0 FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
+        WHILE EXISTS (SELECT 1 FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
         BEGIN
             /*
             Get next database to process
@@ -2275,7 +2322,7 @@ BEGIN
                     WHEN EXISTS
                          (
                              SELECT
-                                 1/0
+                                 1
                              FROM sys.indexes AS ix
                              WHERE ix.object_id = s.object_id
                              AND   ix.index_id = 0
@@ -2407,6 +2454,11 @@ BEGIN
         */
         OUTER APPLY
         (
+            /*
+            OPTIMIZED JOIN ORDER: Filter by object_id FIRST through sys.query_store_query,
+            then join to plans. This dramatically reduces intermediate result set size
+            on databases with large Query Store catalogs (Erin Stellato recommendation).
+            */
             SELECT
                 plan_count = COUNT_BIG(DISTINCT qsp.plan_id),
                 total_executions = SUM(qsrs.count_executions),
@@ -2417,22 +2469,33 @@ BEGIN
                 /* Logical reads: direct sum of avg * count */
                 total_logical_reads = SUM(CONVERT(bigint, qsrs.avg_logical_io_reads * qsrs.count_executions)),
                 last_execution = MAX(qsrs.last_execution_time)
-            FROM sys.query_store_plan AS qsp
-            JOIN sys.query_store_query AS qsq
-              ON qsq.query_id = qsp.query_id
+            FROM sys.query_store_query AS qsq  /* Filter by object_id FIRST */
+            JOIN sys.query_store_plan AS qsp
+              ON qsp.query_id = qsq.query_id
             JOIN sys.query_store_runtime_stats AS qsrs
               ON qsrs.plan_id = qsp.plan_id
             JOIN sys.query_store_runtime_stats_interval AS qsrsi
               ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
-            WHERE qsq.object_id = s.object_id
+            WHERE qsq.object_id = s.object_id  /* Early filter reduces join cardinality */
             AND   @QueryStorePriority_param = N''Y''
             AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, GETDATE())
+            /*
+            Check Query Store is enabled and readable before querying.
+            actual_state: 0=OFF, 1=READ_ONLY, 2=READ_WRITE, 3=ERROR
+            Only query if state is READ_ONLY (1) or READ_WRITE (2).
+            */
+            AND   EXISTS
+                  (
+                      SELECT 1
+                      FROM sys.database_query_store_options AS qso
+                      WHERE qso.actual_state IN (1, 2)
+                  )
         ) AS qs_stats
         WHERE (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
         AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @IncludeSystemObjects_param = N''Y'')
         /* NORECOMPUTE filter */
         AND   (
-                  @TargetNorecompute_param = N''N''
+                  (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
                OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
                OR @TargetNorecompute_param = N''BOTH''
               )
@@ -2445,13 +2508,14 @@ BEGIN
         AND mode: stat qualifies only if ALL specified thresholds are met
 
         When @TieredThresholds_param = 1, uses Tiger Toolbox 5-tier formula:
-          0-500 rows: 500 modifications (includes small tables)
+          0-500 rows: 500 modifications OR SQRT(rows * 1000) - avoids cliff effect
           501-10K rows: 20% + 500 OR SQRT(rows * 1000)
           10K-100K rows: 15% + 500 OR SQRT(rows * 1000)
           100K-1M rows: 10% + 500 OR SQRT(rows * 1000)
           1M+ rows: 5% + 500 OR SQRT(rows * 1000)
         */
         AND   (
+              (
                   /* OR Logic: Any threshold triggers update */
                   @ThresholdLogic_param = N''OR''
                   AND (
@@ -2470,8 +2534,8 @@ BEGIN
                       OR (
                           @TieredThresholds_param = 1
                           AND (
-                              /* 0-500 rows: 500 modifications (includes small tables) */
-                              (ISNULL(sp.rows, 0) <= 500 AND ISNULL(sp.modification_counter, 0) >= 500)
+                              /* 0-500 rows: 500 modifications OR SQRT(rows * 1000) - avoids cliff effect at 500/501 boundary */
+                              (ISNULL(sp.rows, 0) <= 500 AND (ISNULL(sp.modification_counter, 0) >= 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
                               /* 501-10K rows: 20% + 500 OR SQRT(rows * 1000) */
                               OR (ISNULL(sp.rows, 0) BETWEEN 501 AND 10000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 20) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
                               /* 10K-100K rows: 15% + 500 OR SQRT(rows * 1000) */
@@ -2509,7 +2573,7 @@ BEGIN
                       (@ModificationPercent_param IS NULL AND @TieredThresholds_param = 0)
                       OR (@TieredThresholds_param = 0 AND sp.modification_counter >= (@ModificationPercent_param * SQRT(ISNULL(sp.rows, 1))))
                       OR (@TieredThresholds_param = 1 AND (
-                          (ISNULL(sp.rows, 0) <= 500 AND ISNULL(sp.modification_counter, 0) >= 500)
+                          (ISNULL(sp.rows, 0) <= 500 AND (ISNULL(sp.modification_counter, 0) >= 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
                           OR (ISNULL(sp.rows, 0) BETWEEN 501 AND 10000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 20) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
                           OR (ISNULL(sp.rows, 0) BETWEEN 10001 AND 100000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 15) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
                           OR (ISNULL(sp.rows, 0) BETWEEN 100001 AND 1000000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 10) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
@@ -2522,6 +2586,7 @@ BEGIN
                       OR DATEDIFF(DAY, sp.last_updated, GETDATE()) >= @DaysStaleThreshold_param
                   )
               )
+              ) /* End of threshold logic wrapper - ensures table/exclusion filters apply to both OR and AND modes */
         /* Table filter */
         AND   (
                   @Tables_param IS NULL
@@ -2536,6 +2601,16 @@ BEGIN
                       SELECT
                           LTRIM(RTRIM(ss.value))
                       FROM STRING_SPLIT(@Tables_param, N'','') AS ss
+                  )
+              )
+        /* Statistics exclusion filter (pattern-based) */
+        AND   (
+                  @ExcludeStatistics_param IS NULL
+               OR NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
+                      WHERE s.name LIKE LTRIM(RTRIM(ex.value))
                   )
               )
         /*
@@ -2553,16 +2628,26 @@ BEGIN
                OR (@FilteredStatsMode_param = N''ONLY'' AND s.has_filter = 1)
               )
         /*
-        FILTERED STATS STALENESS: If using PRIORITY mode, filtered stats with high drift
-        (unfiltered_rows / rows > factor) are considered stale regardless of mod_counter.
-        This catches filtered stats on partitioned data that become selectivity-stale.
+        FILTERED STATS STALENESS: In PRIORITY mode, filtered stats use a LOWER modification
+        threshold proportional to their selectivity. A filter covering 10% of rows should
+        update after 10% of the normal modifications (adjusted by @FilteredStatsStaleFactor).
+
+        The formula: mod_counter >= @ModificationThreshold * selectivity * factor
+        Where selectivity = rows / unfiltered_rows (0.1 for 10% filter)
+
+        Note: unfiltered_rows/rows measures selectivity, not staleness. Filtered stats on
+        small subsets need lower absolute thresholds since each modification has more impact.
         */
         AND   (
                   @FilteredStatsMode_param <> N''PRIORITY''
                OR s.has_filter = 0
                OR sp.unfiltered_rows IS NULL
                OR ISNULL(sp.rows, 0) = 0
-               OR (CONVERT(float, sp.unfiltered_rows) / sp.rows) >= @FilteredStatsStaleFactor_param
+               /* Filtered stat qualifies if mod_counter exceeds selectivity-adjusted threshold */
+               OR ISNULL(sp.modification_counter, 0) >=
+                  (@ModificationThreshold_param * @FilteredStatsStaleFactor_param *
+                   (CONVERT(float, ISNULL(sp.rows, 1)) / CONVERT(float, ISNULL(sp.unfiltered_rows, 1))))
+               /* Or if it meets the normal threshold anyway */
                OR ISNULL(sp.modification_counter, 0) >= @ModificationThreshold_param
               )
         ORDER BY
@@ -2581,6 +2666,7 @@ BEGIN
                 @MinPageCount_param bigint,
                 @IncludeSystemObjects_param nvarchar(1),
                 @Tables_param nvarchar(max),
+                @ExcludeStatistics_param nvarchar(max),
                 @FilteredStatsMode_param nvarchar(10),
                 @FilteredStatsStaleFactor_param float,
                 @QueryStorePriority_param nvarchar(1),
@@ -2634,6 +2720,7 @@ BEGIN
                 @MinPageCount_param = @MinPageCount,
                 @IncludeSystemObjects_param = @IncludeSystemObjects,
                 @Tables_param = @Tables,
+                @ExcludeStatistics_param = @ExcludeStatistics,
                 @FilteredStatsMode_param = @FilteredStatsMode,
                 @FilteredStatsStaleFactor_param = @FilteredStatsStaleFactor,
                 @QueryStorePriority_param = @QueryStorePriority,
@@ -2748,15 +2835,19 @@ BEGIN
         Build parameters string to identify this run.
         Workers with matching parameters share the same queue.
         */
+        /*
+        Normalize parameter values with TRIM to prevent duplicate queues from
+        whitespace differences (e.g., 'MyDB' vs ' MyDB').
+        */
         SELECT
             @parameters_string =
-                N'@Databases=' + ISNULL(@Databases, N'') +
-                N',@Tables=' + ISNULL(@Tables, N'') +
-                N',@TargetNorecompute=' + ISNULL(@TargetNorecompute, N'') +
+                N'@Databases=' + ISNULL(LTRIM(RTRIM(@Databases)), N'') +
+                N',@Tables=' + ISNULL(LTRIM(RTRIM(@Tables)), N'') +
+                N',@TargetNorecompute=' + ISNULL(LTRIM(RTRIM(@TargetNorecompute)), N'') +
                 N',@ModificationThreshold=' + ISNULL(CONVERT(nvarchar(20), @ModificationThreshold), N'') +
                 N',@MinPageCount=' + ISNULL(CONVERT(nvarchar(20), @MinPageCount), N'') +
-                N',@IncludeSystemObjects=' + ISNULL(@IncludeSystemObjects, N'') +
-                N',@SortOrder=' + ISNULL(@SortOrder, N'');
+                N',@IncludeSystemObjects=' + ISNULL(LTRIM(RTRIM(@IncludeSystemObjects)), N'') +
+                N',@SortOrder=' + ISNULL(LTRIM(RTRIM(@SortOrder)), N'');
 
         BEGIN TRY
             /*
@@ -2839,7 +2930,7 @@ BEGIN
             AND   NOT EXISTS
                   (
                       SELECT
-                          1/0
+                          1
                       FROM sys.dm_exec_requests AS r
                       WHERE r.session_id = q.SessionID
                       AND   r.request_id = q.RequestID
@@ -2851,7 +2942,7 @@ BEGIN
             AND   NOT EXISTS
                   (
                       SELECT
-                          1/0
+                          1
                       FROM dbo.QueueStatistic AS qs
                       JOIN sys.dm_exec_requests AS r
                         ON r.session_id = qs.SessionID
@@ -3018,7 +3109,7 @@ BEGIN
         AND DATEDIFF(SECOND, @start_time, SYSDATETIME()) >= @TimeLimit
         BEGIN
             RAISERROR(N'', 10, 1) WITH NOWAIT;
-            RAISERROR(N'Time limit (%d seconds) reached. Stopping gracefully.', 16, 1, @TimeLimit) WITH NOWAIT;
+            RAISERROR(N'Time limit (%d seconds) reached. Stopping gracefully.', 10, 1, @TimeLimit) WITH NOWAIT;
             SELECT
                 @stop_reason = N'TIME_LIMIT';
             BREAK;
@@ -3031,7 +3122,7 @@ BEGIN
         AND @stats_processed >= @BatchLimit
         BEGIN
             RAISERROR(N'', 10, 1) WITH NOWAIT;
-            RAISERROR(N'Batch limit (%d stats) reached. Stopping gracefully.', 16, 1, @BatchLimit) WITH NOWAIT;
+            RAISERROR(N'Batch limit (%d stats) reached. Stopping gracefully.', 10, 1, @BatchLimit) WITH NOWAIT;
             SELECT
                 @stop_reason = N'BATCH_LIMIT';
             BREAK;
@@ -3069,7 +3160,7 @@ BEGIN
                 AND   NOT EXISTS
                       (
                           SELECT
-                              1/0
+                              1
                           FROM sys.dm_exec_requests AS r
                           WHERE r.session_id = qs.SessionID
                           AND   r.request_id = qs.RequestID
@@ -3394,19 +3485,96 @@ BEGIN
 
         /*
         Incremental statistics: ON PARTITIONS()
-        Only applies to incremental stats on partitioned tables
+        Only applies to incremental stats on partitioned tables.
+        Query sys.dm_db_incremental_stats_properties to find stale partitions.
         */
+        DECLARE
+            @incremental_partitions nvarchar(max) = NULL,
+            @incremental_partition_count int = 0,
+            @incremental_total_partitions int = 0;
+
         IF  @UpdateIncremental = 1
         AND @current_is_incremental = 1
         BEGIN
             /*
-            For incremental stats, we need to determine which partitions
-            have modifications. For simplicity, we update all partitions.
-            A more sophisticated approach would query sys.dm_db_incremental_stats_properties
+            Query dm_db_incremental_stats_properties to find partitions with modifications.
+            Only update partitions that exceed the modification threshold.
+            This is the correct behavior for incremental statistics - updating all
+            partitions defeats the purpose of incremental stats.
             */
-            IF @Debug = 1
+            DECLARE @partition_sql nvarchar(max) = N'
+                SELECT @partitions_out = STRING_AGG(CONVERT(nvarchar(10), isp.partition_number), N'', '')
+                                         WITHIN GROUP (ORDER BY isp.partition_number),
+                       @count_out = COUNT(*),
+                       @total_out = (SELECT COUNT(*) FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id))
+                FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id) AS isp
+                WHERE isp.modification_counter > 0';
+
+            BEGIN TRY
+                EXEC sys.sp_executesql
+                    @partition_sql,
+                    N'@obj_id int, @stat_id int, @partitions_out nvarchar(max) OUTPUT, @count_out int OUTPUT, @total_out int OUTPUT',
+                    @obj_id = @current_object_id,
+                    @stat_id = @current_stats_id,
+                    @partitions_out = @incremental_partitions OUTPUT,
+                    @count_out = @incremental_partition_count OUTPUT,
+                    @total_out = @incremental_total_partitions OUTPUT;
+            END TRY
+            BEGIN CATCH
+                /*
+                If STRING_AGG fails (SQL 2016), fall back to FOR XML PATH
+                */
+                SELECT @partition_sql = N'
+                    SELECT @partitions_out = STUFF((
+                               SELECT N'', '' + CONVERT(nvarchar(10), isp.partition_number)
+                               FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id) AS isp
+                               WHERE isp.modification_counter > 0
+                               ORDER BY isp.partition_number
+                               FOR XML PATH(''''), TYPE
+                           ).value(''.'', ''nvarchar(max)''), 1, 2, N''''),
+                           @count_out = (SELECT COUNT(*) FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id)
+                                         WHERE modification_counter > 0),
+                           @total_out = (SELECT COUNT(*) FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id))';
+
+                EXEC sys.sp_executesql
+                    @partition_sql,
+                    N'@obj_id int, @stat_id int, @partitions_out nvarchar(max) OUTPUT, @count_out int OUTPUT, @total_out int OUTPUT',
+                    @obj_id = @current_object_id,
+                    @stat_id = @current_stats_id,
+                    @partitions_out = @incremental_partitions OUTPUT,
+                    @count_out = @incremental_partition_count OUTPUT,
+                    @total_out = @incremental_total_partitions OUTPUT;
+            END CATCH;
+
+            /*
+            Add ON PARTITIONS clause if we found specific stale partitions.
+            If ALL partitions are stale, skip ON PARTITIONS (full RESAMPLE is more efficient).
+            If NO partitions are stale, we shouldn't be here (discovery should have filtered).
+            */
+            IF  @incremental_partitions IS NOT NULL
+            AND @incremental_partition_count > 0
+            AND @incremental_partition_count < @incremental_total_partitions
             BEGIN
-                RAISERROR(N'  Note: Incremental statistics - full update (all partitions)', 10, 1) WITH NOWAIT;
+                SELECT
+                    @current_command += N' ON PARTITIONS(' + @incremental_partitions + N')';
+
+                IF @Debug = 1
+                BEGIN
+                    RAISERROR(N'  Note: Incremental statistics - updating %d of %d partitions', 10, 1,
+                        @incremental_partition_count, @incremental_total_partitions) WITH NOWAIT;
+                END;
+            END;
+            ELSE IF @Debug = 1
+            BEGIN
+                IF @incremental_partition_count = @incremental_total_partitions
+                BEGIN
+                    RAISERROR(N'  Note: Incremental statistics - all %d partitions stale, full RESAMPLE', 10, 1,
+                        @incremental_total_partitions) WITH NOWAIT;
+                END;
+                ELSE
+                BEGIN
+                    RAISERROR(N'  Note: Incremental statistics - full update (partition info unavailable)', 10, 1) WITH NOWAIT;
+                END;
             END;
 
             /*
@@ -3672,6 +3840,48 @@ BEGIN
                         NULL,
                         @current_extended_info
                     );
+
+                    /*
+                    Progress logging at interval (for Agent job monitoring).
+                    Logs SP_STATUPDATE_PROGRESS entry every N stats processed.
+                    */
+                    IF  @ProgressLogInterval IS NOT NULL
+                    AND @stats_processed % @ProgressLogInterval = 0
+                    BEGIN
+                        INSERT INTO
+                            dbo.CommandLog
+                        (
+                            DatabaseName,
+                            SchemaName,
+                            ObjectName,
+                            ObjectType,
+                            Command,
+                            CommandType,
+                            StartTime,
+                            EndTime,
+                            ExtendedInfo
+                        )
+                        VALUES
+                        (
+                            ISNULL(@Databases, DB_NAME()),
+                            N'dbo',
+                            N'sp_StatUpdate',
+                            N'P',
+                            N'Progress: ' + CONVERT(nvarchar(10), @stats_processed) + N'/' + CONVERT(nvarchar(10), @total_stats) + N' stats processed',
+                            N'SP_STATUPDATE_PROGRESS',
+                            @start_time,
+                            SYSDATETIME(),
+                            (
+                                SELECT
+                                    @stats_processed AS StatsProcessed,
+                                    @stats_succeeded AS StatsSucceeded,
+                                    @stats_failed AS StatsFailed,
+                                    @total_stats AS StatsTotal,
+                                    DATEDIFF(SECOND, @start_time, SYSDATETIME()) AS ElapsedSeconds
+                                FOR XML RAW(N'Progress'), ELEMENTS
+                            )
+                        );
+                    END;
                 END;
             END TRY
             BEGIN CATCH
