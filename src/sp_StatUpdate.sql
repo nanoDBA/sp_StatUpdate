@@ -36,11 +36,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.4.2026.0119b (Major.Minor.Year.MMDD)
+Version:    1.4.2026.0119c (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    1.4.2026.0119b - Bug fix: @StatsInParallel=Y table claiming bug. @claimed_tables
+History:    1.4.2026.0119c - Bug fix: Arithmetic overflow (8115) in FILTERED_DRIFT sort order
+                            and Query Store metric calculations. Changed int to bigint for
+                            large value handling; added IIF() cap for ratio calculations.
+            1.4.2026.0119b - Bug fix: @StatsInParallel=Y table claiming bug. @claimed_tables
                             table variable was not cleared between loop iterations, causing
                             SELECT TOP 1 to return stale data from previous claim attempts.
                             Workers would exit early with COMPLETED after processing 1 stat.
@@ -251,7 +254,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '1.4.2026.0119b',
+        @procedure_version varchar(20) = '1.4.2026.0119c',
         @procedure_version_date datetime = '20260119',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -2353,7 +2356,7 @@ BEGIN
                             WHEN N''FILTERED_DRIFT''
                             THEN CASE
                                      WHEN s.has_filter = 1 AND ISNULL(sp.rows, 0) > 0 AND sp.unfiltered_rows IS NOT NULL
-                                     THEN CONVERT(bigint, (CONVERT(float, sp.unfiltered_rows) / sp.rows) * 1000000)
+                                     THEN CONVERT(bigint, IIF((CONVERT(float, sp.unfiltered_rows) / sp.rows) > 9000000000000.0, 9000000000000.0, (CONVERT(float, sp.unfiltered_rows) / sp.rows)) * 1000000)
                                      ELSE 0
                                  END
                             ELSE ISNULL(sp.modification_counter, 0)
@@ -2470,13 +2473,13 @@ BEGIN
                               /* 0-500 rows: 500 modifications (includes small tables) */
                               (ISNULL(sp.rows, 0) <= 500 AND ISNULL(sp.modification_counter, 0) >= 500)
                               /* 501-10K rows: 20% + 500 OR SQRT(rows * 1000) */
-                              OR (ISNULL(sp.rows, 0) BETWEEN 501 AND 10000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 20) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(ISNULL(sp.rows, 1) * 1000)))
+                              OR (ISNULL(sp.rows, 0) BETWEEN 501 AND 10000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 20) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
                               /* 10K-100K rows: 15% + 500 OR SQRT(rows * 1000) */
-                              OR (ISNULL(sp.rows, 0) BETWEEN 10001 AND 100000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 15) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(ISNULL(sp.rows, 1) * 1000)))
+                              OR (ISNULL(sp.rows, 0) BETWEEN 10001 AND 100000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 15) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
                               /* 100K-1M rows: 10% + 500 OR SQRT(rows * 1000) */
-                              OR (ISNULL(sp.rows, 0) BETWEEN 100001 AND 1000000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 10) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(ISNULL(sp.rows, 1) * 1000)))
+                              OR (ISNULL(sp.rows, 0) BETWEEN 100001 AND 1000000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 10) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
                               /* 1M+ rows: 5% + 500 OR SQRT(rows * 1000) */
-                              OR (ISNULL(sp.rows, 0) >= 1000001 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 5) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(ISNULL(sp.rows, 1) * 1000)))
+                              OR (ISNULL(sp.rows, 0) >= 1000001 AND (ISNULL(sp.modification_counter, 0) >= CONVERT(bigint, CONVERT(float, ISNULL(sp.rows, 0)) * 5 / 100) + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
                           )
                       )
                       /* Days stale threshold */
@@ -2507,10 +2510,10 @@ BEGIN
                       OR (@TieredThresholds_param = 0 AND sp.modification_counter >= (@ModificationPercent_param * SQRT(ISNULL(sp.rows, 1))))
                       OR (@TieredThresholds_param = 1 AND (
                           (ISNULL(sp.rows, 0) <= 500 AND ISNULL(sp.modification_counter, 0) >= 500)
-                          OR (ISNULL(sp.rows, 0) BETWEEN 501 AND 10000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 20) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(ISNULL(sp.rows, 1) * 1000)))
-                          OR (ISNULL(sp.rows, 0) BETWEEN 10001 AND 100000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 15) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(ISNULL(sp.rows, 1) * 1000)))
-                          OR (ISNULL(sp.rows, 0) BETWEEN 100001 AND 1000000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 10) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(ISNULL(sp.rows, 1) * 1000)))
-                          OR (ISNULL(sp.rows, 0) >= 1000001 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 5) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(ISNULL(sp.rows, 1) * 1000)))
+                          OR (ISNULL(sp.rows, 0) BETWEEN 501 AND 10000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 20) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
+                          OR (ISNULL(sp.rows, 0) BETWEEN 10001 AND 100000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 15) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
+                          OR (ISNULL(sp.rows, 0) BETWEEN 100001 AND 1000000 AND (ISNULL(sp.modification_counter, 0) >= (ISNULL(sp.rows, 0) * 10) / 100 + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
+                          OR (ISNULL(sp.rows, 0) >= 1000001 AND (ISNULL(sp.modification_counter, 0) >= CONVERT(bigint, CONVERT(float, ISNULL(sp.rows, 0)) * 5 / 100) + 500 OR ISNULL(sp.modification_counter, 0) >= SQRT(CONVERT(float, ISNULL(sp.rows, 1)) * 1000)))
                       ))
                   )
                   AND (
@@ -3299,7 +3302,7 @@ BEGIN
             SELECT
                 @current_command =
                     N'SET LOCK_TIMEOUT ' +
-                    CONVERT(nvarchar(20), @LockTimeout * 1000) +
+                    CONVERT(nvarchar(20), CONVERT(bigint, @LockTimeout) * 1000) +
                     N'; ';
         END;
 
@@ -3581,7 +3584,7 @@ BEGIN
                                 @current_modification_counter AS ModificationCounter,
                                 CASE
                                     WHEN @current_row_count > 0
-                                    THEN CONVERT(decimal(10, 2), (@current_modification_counter * 100.0 / @current_row_count))
+                                    THEN CONVERT(decimal(18, 2), (@current_modification_counter * 100.0 / @current_row_count))
                                     ELSE 0
                                 END AS ModificationPct,
                                 @current_days_stale AS DaysStale,
