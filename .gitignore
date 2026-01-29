@@ -20,3 +20,7 @@
 !src/sp_StatUpdate.sql
 !docs/
 !docs/README.md
+
+# Tools directory - supplementary scripts
+!tools/
+!tools/sp_StatUpdate_XE_Session.sql
