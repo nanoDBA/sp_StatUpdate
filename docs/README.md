@@ -143,8 +143,8 @@ Skip tables you don't care about. Focus on what matters.
 ```sql
 EXEC dbo.sp_StatUpdate
     @Databases = N'Production',
-    @ExcludeTables = N'%.Archive%, %.History%, %.Audit%',
-    @ExcludeStatistics = N'_WA_Sys%',     -- Skip auto-created too
+    @ExcludeTables = N'%Archive%, %History%, %Audit%',
+    @ExcludeStatistics = N'_WA_Sys%',
     @TimeLimit = 7200;
 ```
 
