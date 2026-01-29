@@ -62,6 +62,24 @@ EXEC dbo.sp_StatUpdate
 
 ## Real-World Scenarios
 
+### Quick Start with Presets (v1.9+)
+
+Don't want to figure out all the parameters? Use a preset:
+
+```sql
+-- Nightly maintenance (1hr, tiered thresholds, balanced)
+EXEC dbo.sp_StatUpdate @Preset = 'NIGHTLY_MAINTENANCE', @Databases = 'USER_DATABASES';
+
+-- Weekly comprehensive (4hr, lower thresholds)
+EXEC dbo.sp_StatUpdate @Preset = 'WEEKLY_FULL', @Databases = 'USER_DATABASES';
+
+-- OLTP with minimal impact (30min, high thresholds, delays)
+EXEC dbo.sp_StatUpdate @Preset = 'OLTP_LIGHT', @Databases = 'MyOLTPDatabase';
+
+-- Data warehouse full refresh (no limit, FULLSCAN)
+EXEC dbo.sp_StatUpdate @Preset = 'WAREHOUSE_AGGRESSIVE', @Databases = 'MyDW';
+```
+
 ### "Our maintenance job keeps getting killed at 5 AM"
 
 The job runs alphabetically, never reaches the important tables, and gets killed when the business day starts. You need worst-first ordering with a hard stop time.
@@ -212,6 +230,14 @@ ORDER BY SequenceNum;
 | `@LongRunningThresholdMinutes` | `NULL` | Stats that took longer get forced sample rate |
 | `@LongRunningSamplePercent` | `10` | Sample percent for long-running stats |
 
+### Presets (v1.9+)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `@Preset` | `NULL` | Common configurations: `NIGHTLY_MAINTENANCE`, `WEEKLY_FULL`, `OLTP_LIGHT`, `WAREHOUSE_AGGRESSIVE` |
+| `@GroupByJoinPattern` | `'Y'` | Update commonly-joined tables together (prevents optimization cliffs). Falls back silently if QS disabled. |
+| `@JoinPatternMinExecutions` | `100` | Minimum plan executions to detect join patterns |
+
 ### Execution Control
 
 | Parameter | Default | Description |
@@ -264,12 +290,24 @@ ORDER BY SequenceNum;
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `@CleanupOrphanedRuns` | `'N'` | Mark killed runs with END markers |
+| `@CleanupOrphanedRuns` | `'Y'` | Mark killed runs (>24h old) with END markers |
 | `@Help` | `0` | `1` = show parameter documentation |
 
 Run `EXEC sp_StatUpdate @Help = 1` for complete parameter documentation.
 
 ## Monitoring
+
+### Real-Time Progress (v1.9+)
+
+Query from another session while sp_StatUpdate is running:
+
+```sql
+SELECT * FROM ##sp_StatUpdate_Progress;
+-- Returns: RunLabel, StatsFound, StatsProcessed, StatsSucceeded, StatsFailed,
+--          CurrentDatabase, CurrentTable, ElapsedSeconds, Status
+```
+
+### Run History
 
 ```sql
 -- Recent runs: did they finish or get killed?
@@ -286,6 +324,33 @@ LEFT JOIN dbo.CommandLog e
         s.ExtendedInfo.value('(/Parameters/RunLabel)[1]', 'nvarchar(100)')
 WHERE s.CommandType = 'SP_STATUPDATE_START'
 ORDER BY s.StartTime DESC;
+```
+
+### Why Did This Stat Use That Sample Rate?
+
+Three systems can influence sample rate: explicit `@StatisticsSample`, adaptive sampling (history-based), and SQL Server auto-sample. The `SampleSource` field in ExtendedInfo tells you exactly which one was used:
+
+```sql
+-- Find sample rate decisions for a specific stat
+SELECT
+    StatisticsName,
+    StartTime,
+    ExtendedInfo.value('(/ExtendedInfo/RequestedSamplePct)[1]', 'int') AS RequestedPct,
+    ExtendedInfo.value('(/ExtendedInfo/EffectiveSamplePct)[1]', 'int') AS EffectivePct,
+    ExtendedInfo.value('(/ExtendedInfo/SampleSource)[1]', 'nvarchar(20)') AS SampleSource
+FROM dbo.CommandLog
+WHERE CommandType = 'UPDATE_STATISTICS'
+AND StatisticsName = 'YourStatName'
+ORDER BY StartTime DESC;
+
+-- SampleSource values:
+--   EXPLICIT        = User passed @StatisticsSample
+--   ADAPTIVE        = History showed this stat was slow, overridden
+--   ADAPTIVE_CAPPED = Adaptive but capped at ~10M rows
+--   AUTO            = SQL Server decided (NULL passed)
+--   RESAMPLE_PERSIST= Respecting PERSIST_SAMPLE_PERCENT setting
+--   RESAMPLE_INCR   = Incremental stats require RESAMPLE
+--   FULLSCAN_MEMOPT = Memory-optimized table on SQL 2014
 ```
 
 ## Troubleshooting
@@ -332,6 +397,7 @@ Based on patterns from [Ola Hallengren's SQL Server Maintenance Solution](https:
 
 ## Version History
 
+- **1.9.2026.0128** - New @Preset parameter (NIGHTLY_MAINTENANCE, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE_AGGRESSIVE), @GroupByJoinPattern (update joined tables together), ##sp_StatUpdate_Progress global temp table for monitoring, @CleanupOrphanedRuns default Y, LOCK_TIMEOUT restores original value, XML entity decoding complete, READPAST hint for parallel mode, @WhatIfOutputTable data type validation, Query Store READ_ONLY warning, debug threshold explanation
 - **1.8.2026.0128** - Code review fixes (P1/P2): @LongRunningSamplePercent row cap, staged discovery phase validation, FOR XML entity decoding, LOCK_TIMEOUT reset, incremental partition cross-ref, @WhatIfOutputTable schema validation. Added XE troubleshooting session.
 - **1.7.2026.0127** - BREAKING: @ModificationThreshold default 1000 → 5000 (less aggressive)
 - **1.6.2026.0128** - Staged discovery (6-phase for 10K+ stats), adaptive sampling (@LongRunningThresholdMinutes), @ExcludeTables, @WhatIfOutputTable, @CleanupOrphanedRuns, @CollectHeapForwarding, AUTO_CREATED sort order
