@@ -60,90 +60,108 @@ EXEC dbo.sp_StatUpdate
 
 **Note**: `dbo.CommandExecute` is NOT required. sp_StatUpdate handles its own command execution.
 
-## Common Usage Patterns
+## Real-World Scenarios
 
-### Nightly Maintenance (All Stats)
+### "Our maintenance job keeps getting killed at 5 AM"
+
+The job runs alphabetically, never reaches the important tables, and gets killed when the business day starts. You need worst-first ordering with a hard stop time.
 
 ```sql
+-- Nightly job: 11 PM - 4 AM window (5 hours)
 EXEC dbo.sp_StatUpdate
-    @Databases = N'USER_DATABASES',     -- All user databases
-    @TargetNorecompute = N'BOTH',
-    @TimeLimit = 18000,                  -- 5 hours
-    @SortOrder = N'MODIFICATION_COUNTER';
+    @Databases = N'USER_DATABASES, -DevDB, -ReportingDB',
+    @TimeLimit = 18000,
+    @SortOrder = N'MODIFICATION_COUNTER';  -- Worst stats first
+
+-- Check next morning: did it finish or get killed?
+SELECT CommandType, StartTime,
+    ExtendedInfo.value('(/Summary/StopReason)[1]', 'nvarchar(50)') AS StopReason
+FROM dbo.CommandLog
+WHERE CommandType LIKE 'SP_STATUPDATE%'
+ORDER BY StartTime DESC;
 ```
 
-### Multi-Database with Exclusions
+### "Someone set NORECOMPUTE in 2019 and forgot"
+
+NORECOMPUTE stats never auto-update. SQL Server ignores them. Meanwhile, the data has changed 500 million times.
 
 ```sql
--- All user databases except dev/test
+-- Find and refresh the forgotten NORECOMPUTE stats
 EXEC dbo.sp_StatUpdate
-    @Databases = N'USER_DATABASES, -DevDB, -TestDB',
-    @TargetNorecompute = N'BOTH',
-    @TimeLimit = 14400;
-
--- Databases matching pattern
-EXEC dbo.sp_StatUpdate
-    @Databases = N'%Prod%',
-    @TimeLimit = 7200;
+    @Databases = N'Production',
+    @TargetNorecompute = N'Y',            -- Only NORECOMPUTE stats
+    @ModificationThreshold = 50000,
+    @TimeLimit = 1800;
 ```
 
-### Query Store Prioritization (v1.4+)
+### "The Orders table gets 10M inserts/day"
+
+High-churn tables with ascending keys (OrderID, TransactionDate) need more frequent updates. Run this every 4 hours during business hours.
 
 ```sql
--- Prioritize stats on tables with highest CPU consumption
+-- High-frequency job for specific tables
+EXEC dbo.sp_StatUpdate
+    @Databases = N'Production',
+    @Tables = N'Sales.Orders, Sales.OrderDetails, Sales.Transactions',
+    @ModificationThreshold = 10000,       -- Lower threshold = more sensitive
+    @TimeLimit = 900;                     -- 15 min max
+```
+
+### "Query Store shows one stat is causing 40% of our CPU"
+
+Use Query Store metrics to prioritize stats that are actually hurting performance.
+
+```sql
+-- Let Query Store tell you what matters
 EXEC dbo.sp_StatUpdate
     @Databases = N'Production',
     @QueryStorePriority = N'Y',
-    @QueryStoreMetric = N'CPU',          -- CPU, DURATION, READS, or EXECUTIONS
-    @QueryStoreRecentHours = 48,         -- Last 48 hours of query activity
+    @QueryStoreMetric = N'CPU',           -- Or DURATION, READS
+    @QueryStoreRecentHours = 24,          -- Last 24 hours
     @SortOrder = N'QUERY_STORE',
     @TimeLimit = 3600;
 ```
 
-### Adaptive Sampling for Large Tables (v1.6+)
+### "The 100% FULLSCAN stats never finish"
+
+Some stats were configured with 100% sample years ago. They take 6 hours each and blow your maintenance window. Use adaptive sampling to auto-reduce them.
 
 ```sql
--- Stats that historically took >4 hours get 5% sample instead
+-- Stats that historically took >2 hours get 5% sample
 EXEC dbo.sp_StatUpdate
     @Databases = N'Production',
-    @LongRunningThresholdMinutes = 240,
+    @LongRunningThresholdMinutes = 120,
     @LongRunningSamplePercent = 5,
-    @TimeLimit = 18000;
+    @TimeLimit = 14400;
 ```
 
-### Target NORECOMPUTE Orphans Only
+### "Don't waste time on Archive tables"
+
+Skip tables you don't care about. Focus on what matters.
 
 ```sql
 EXEC dbo.sp_StatUpdate
     @Databases = N'Production',
-    @TargetNorecompute = N'Y',
-    @ModificationThreshold = 100000,
-    @BatchLimit = 50,
-    @TimeLimit = 1800;
+    @ExcludeTables = N'%.Archive%, %.History%, %.Audit%',
+    @ExcludeStatistics = N'_WA_Sys%',     -- Skip auto-created too
+    @TimeLimit = 7200;
 ```
 
-### Skip Auto-Created Stats
+### "Preview before committing"
+
+See exactly what commands would run without executing anything.
 
 ```sql
--- Focus on user-defined stats, skip _WA_Sys% auto-created
-EXEC dbo.sp_StatUpdate
-    @Databases = N'Production',
-    @ExcludeStatistics = N'_WA_Sys%',
-    @SortOrder = N'AUTO_CREATED',        -- User-created first
-    @TimeLimit = 3600;
-```
-
-### Dry Run with Command Output
-
-```sql
--- Preview commands and save to table
 EXEC dbo.sp_StatUpdate
     @Databases = N'Production',
     @Execute = N'N',
-    @WhatIfOutputTable = N'#WhatIfCommands',
+    @WhatIfOutputTable = N'#Preview',
     @Debug = 1;
 
-SELECT * FROM #WhatIfCommands ORDER BY SequenceNum;
+-- Review the commands
+SELECT DatabaseName, SchemaName, TableName, StatName, Command
+FROM #Preview
+ORDER BY SequenceNum;
 ```
 
 ## Parameter Reference
