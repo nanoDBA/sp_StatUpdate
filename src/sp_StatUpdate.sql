@@ -5864,68 +5864,207 @@ USAGE EXAMPLES
 ===============================================================================
 
 -------------------------------------------------------------------------------
-HELP
+HELP - Because RTFM is a lifestyle
 -------------------------------------------------------------------------------
 
--- Show help in SSMS result set
+-- Show help in SSMS result set (40+ parameters, you'll need this)
 EXECUTE dbo.sp_StatUpdate @Help = 1;
 
--- Get version info
+-- Get version info (for when someone asks "what version are you running?")
 DECLARE @v varchar(20), @d datetime;
-EXECUTE dbo.sp_StatUpdate @version = @v OUTPUT, @version_date = @d OUTPUT;
-SELECT @v AS version, @d AS version_date;
+EXECUTE dbo.sp_StatUpdate @Version = @v OUTPUT, @VersionDate = @d OUTPUT;
+SELECT @v AS Version, @d AS VersionDate;
 
 -------------------------------------------------------------------------------
-DIRECT MODE - Update specific statistics
+PRESETS - For those who just want it to work
 -------------------------------------------------------------------------------
 
--- Update a single specific statistic
+-- "I don't care about the details, just fix my stats overnight"
 EXECUTE dbo.sp_StatUpdate
-    @Statistics = N'dbo.Customers._WA_Sys_00000001_ABC123';
+    @Preset = N'NIGHTLY_MAINTENANCE',
+    @Databases = N'USER_DATABASES';
 
--- Update multiple specific statistics
+-- "It's Sunday, we have 4 hours, go nuts"
 EXECUTE dbo.sp_StatUpdate
-    @Statistics = N'dbo.Customers._WA_Sys_00000001_ABC123, dbo.Orders.PK_Orders',
-    @Execute = N'N';
+    @Preset = N'WEEKLY_FULL',
+    @Databases = N'USER_DATABASES';
+
+-- "It's 2pm and the CEO's dashboard is slow. Be gentle."
+EXECUTE dbo.sp_StatUpdate
+    @Preset = N'OLTP_LIGHT',
+    @Databases = N'SalesDB';
+
+-- "It's a data warehouse. Nobody's watching. FULLSCAN everything."
+EXECUTE dbo.sp_StatUpdate
+    @Preset = N'WAREHOUSE_AGGRESSIVE',
+    @Databases = N'DW_Production';
 
 -------------------------------------------------------------------------------
-DIRECT MODE (TABLE) - From QueryStore priority queue
+THE CLASSIC PROBLEM: "Our maintenance job keeps getting killed at 5 AM"
 -------------------------------------------------------------------------------
 
+-- Your job runs alphabetically, spends 4 hours on AAA_Archive, then gets
+-- killed when business hours start. Meanwhile, Orders and Customers are stale.
+-- Solution: Worst-first ordering with a hard stop time.
+
 EXECUTE dbo.sp_StatUpdate
-    @StatisticsFromTable = N'Maintenance.dbo.StatsPriorityQueue',
-    @StatisticsSample = 100,
+    @Databases = N'USER_DATABASES',
+    @SortOrder = N'MODIFICATION_COUNTER',  -- Most stale first
+    @TimeLimit = 14400,                     -- 4 hours max, then stop gracefully
+    @TargetNorecompute = N'BOTH';           -- Regular and NORECOMPUTE stats
+
+-------------------------------------------------------------------------------
+THE NORECOMPUTE PROBLEM: "Who turned off auto-update on these stats?"
+-------------------------------------------------------------------------------
+
+-- Someone (maybe you, maybe a vendor, maybe a consultant from 2019) set
+-- NORECOMPUTE on critical statistics. SQL Server won't auto-update them.
+-- They're now 6 months stale. This is fine.
+
+EXECUTE dbo.sp_StatUpdate
+    @Databases = N'VendorApp',
+    @TargetNorecompute = N'Y',              -- Only NORECOMPUTE stats
+    @ModificationThreshold = 1000,          -- Pretty much all of them
+    @TimeLimit = 7200;
+
+-------------------------------------------------------------------------------
+THE PARANOID DBA: "Show me what you'd do, but don't touch anything"
+-------------------------------------------------------------------------------
+
+-- Dry run with debug output. Trust, but verify.
+EXECUTE dbo.sp_StatUpdate
+    @Databases = N'Production',
+    @Execute = N'N',                        -- Don't actually do anything
+    @Debug = 1;                             -- But tell me everything
+
+-- Capture commands to a table for review/automation
+EXECUTE dbo.sp_StatUpdate
+    @Databases = N'Production',
+    @Execute = N'N',
+    @WhatIfOutputTable = N'tempdb.dbo.StatsToUpdate';
+
+SELECT * FROM tempdb.dbo.StatsToUpdate ORDER BY SequenceNum;
+
+-------------------------------------------------------------------------------
+THE "QUERY STORE KNOWS BEST" APPROACH
+-------------------------------------------------------------------------------
+
+-- Let Query Store tell you which stats actually matter. Why update stats
+-- on tables nobody queries? Focus on the hot paths.
+
+EXECUTE dbo.sp_StatUpdate
+    @Databases = N'Production',
+    @QueryStorePriority = N'Y',             -- Boost stats used by QS plans
+    @QueryStoreMetric = N'CPU',             -- Prioritize by CPU consumption
+    @QueryStoreRecentHours = 48,            -- Only recent activity
+    @SortOrder = N'QUERY_STORE',            -- QS priority ordering
     @TimeLimit = 3600;
 
 -------------------------------------------------------------------------------
-DISCOVERY MODE - DMV-based candidate selection
+THE PARTITIONED TABLE NIGHTMARE
 -------------------------------------------------------------------------------
 
--- Update NORECOMPUTE stats only
-EXECUTE dbo.sp_StatUpdate
-    @TargetNorecompute = N'Y',
-    @ModificationThreshold = 10000,
-    @TimeLimit = 1800;
+-- You have a 2TB partitioned fact table. FULLSCAN takes 6 hours.
+-- Incremental stats only update modified partitions. Much faster.
 
--- Update all stale stats > 30 days
 EXECUTE dbo.sp_StatUpdate
-    @TargetNorecompute = N'BOTH',
-    @DaysStaleThreshold = 30,
-    @TimeLimit = 7200;
+    @Databases = N'DataWarehouse',
+    @Tables = N'dbo.FactSales',
+    @UpdateIncremental = N'Y';              -- Only stale partitions
 
--- Large tables only (1GB+)
+-------------------------------------------------------------------------------
+THE "THIS ONE STAT TAKES 4 HOURS" PROBLEM
+-------------------------------------------------------------------------------
+
+-- Some genius set 100% sample on a billion-row table. It never finishes.
+-- Query CommandLog for historically slow stats and force a lower sample.
+
 EXECUTE dbo.sp_StatUpdate
-    @MinPageCount = 125000,
+    @Databases = N'BigData',
+    @LongRunningThresholdMinutes = 60,      -- Stats that took >1hr before
+    @LongRunningSamplePercent = 5,          -- Force 5% sample on those
     @TimeLimit = 14400;
 
 -------------------------------------------------------------------------------
-DRY RUN
+MULTI-DATABASE WITH EXCLUSIONS
 -------------------------------------------------------------------------------
 
+-- All user databases except the ones that always cause problems
 EXECUTE dbo.sp_StatUpdate
-    @TargetNorecompute = N'BOTH',
-    @Execute = N'N',
-    @Debug = 1;
+    @Databases = N'USER_DATABASES, -DevDB, -TestDB, -ReportServerTempDB';
+
+-- All databases matching a pattern
+EXECUTE dbo.sp_StatUpdate
+    @Databases = N'%_Production';
+
+-- Skip archive and staging tables entirely
+EXECUTE dbo.sp_StatUpdate
+    @Databases = N'MyDatabase',
+    @ExcludeTables = N'dbo.%Archive%, dbo.Staging_%';
+
+-------------------------------------------------------------------------------
+PARALLEL MODE - When one worker isn't enough
+-------------------------------------------------------------------------------
+
+-- Run this SAME command from 4 SQL Agent jobs simultaneously.
+-- They coordinate via dbo.QueueStatistic. No duplicate work.
+
+EXECUTE dbo.sp_StatUpdate
+    @Databases = N'USER_DATABASES',
+    @StatsInParallel = N'Y',                -- Enable queue-based coordination
+    @LockTimeout = 30,                      -- Don't wait forever for locks
+    @TimeLimit = 7200;
+
+-- Monitor parallel progress from another session
+SELECT * FROM dbo.QueueStatistic WHERE QueueID = 1 AND StatStartTime IS NOT NULL;
+
+-------------------------------------------------------------------------------
+DIRECT MODE - When you know exactly what needs updating
+-------------------------------------------------------------------------------
+
+-- "Just update these two stats and stop bothering me"
+EXECUTE dbo.sp_StatUpdate
+    @Statistics = N'dbo.Orders.IX_Orders_CustomerID, dbo.Customers.PK_Customers';
+
+-- From a priority queue table (for custom prioritization logic)
+EXECUTE dbo.sp_StatUpdate
+    @StatisticsFromTable = N'Maintenance.dbo.StatsPriorityQueue',
+    @TimeLimit = 3600;
+
+-------------------------------------------------------------------------------
+MONITORING YOUR RUN
+-------------------------------------------------------------------------------
+
+-- Secure: Write progress to CommandLog every 50 stats
+EXECUTE dbo.sp_StatUpdate
+    @Databases = N'Production',
+    @ProgressLogInterval = 50;
+
+-- Less secure but convenient: Global temp table (visible to all sessions!)
+EXECUTE dbo.sp_StatUpdate
+    @Databases = N'Production',
+    @ExposeProgressToAllSessions = N'Y';
+
+-- Then from another session:
+SELECT * FROM ##sp_StatUpdate_Progress;
+
+-------------------------------------------------------------------------------
+AFTER THE RUN: Did it finish or get killed?
+-------------------------------------------------------------------------------
+
+SELECT
+    CASE WHEN e.ID IS NOT NULL THEN 'Completed' ELSE 'KILLED' END AS Status,
+    s.StartTime,
+    e.ExtendedInfo.value('(/Summary/StopReason)[1]', 'nvarchar(50)') AS StopReason,
+    e.ExtendedInfo.value('(/Summary/StatsProcessed)[1]', 'int') AS Processed,
+    e.ExtendedInfo.value('(/Summary/StatsRemaining)[1]', 'int') AS Remaining
+FROM dbo.CommandLog s
+LEFT JOIN dbo.CommandLog e
+    ON e.CommandType = 'SP_STATUPDATE_END'
+    AND e.ExtendedInfo.value('(/Summary/RunLabel)[1]', 'nvarchar(100)') =
+        s.ExtendedInfo.value('(/Parameters/RunLabel)[1]', 'nvarchar(100)')
+WHERE s.CommandType = 'SP_STATUPDATE_START'
+ORDER BY s.StartTime DESC;
 
 ===============================================================================
 */
