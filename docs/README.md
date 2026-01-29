@@ -276,7 +276,8 @@ ORDER BY SequenceNum;
 |-----------|---------|-------------|
 | `@LogToTable` | `'Y'` | Log to dbo.CommandLog |
 | `@WhatIfOutputTable` | `NULL` | Table for dry-run commands |
-| `@ProgressLogInterval` | `NULL` | Log progress every N stats |
+| `@ProgressLogInterval` | `NULL` | Log progress every N stats (secure - uses CommandLog) |
+| `@ExposeProgressToAllSessions` | `'N'` | `'Y'` = create ##sp_StatUpdate_Progress (**SECURITY:** visible to all sessions) |
 | `@Debug` | `0` | `1` = verbose diagnostic output |
 
 ### Parallel Mode
@@ -299,12 +300,24 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete parameter documentation.
 
 ### Real-Time Progress (v1.9+)
 
-Query from another session while sp_StatUpdate is running:
+**Opt-in due to security:** Global temp tables are visible to ALL sessions on the server.
 
 ```sql
+-- Enable progress monitoring (exposes database/table names to all sessions)
+EXEC sp_StatUpdate
+    @Databases = 'USER_DATABASES',
+    @ExposeProgressToAllSessions = 'Y';
+
+-- Query from another session while running:
 SELECT * FROM ##sp_StatUpdate_Progress;
 -- Returns: RunLabel, StatsFound, StatsProcessed, StatsSucceeded, StatsFailed,
 --          CurrentDatabase, CurrentTable, ElapsedSeconds, Status
+```
+
+**Secure alternative:** Use `@ProgressLogInterval` which writes to CommandLog (access-controlled):
+
+```sql
+EXEC sp_StatUpdate @Databases = 'USER_DATABASES', @ProgressLogInterval = 50;
 ```
 
 ### Run History
@@ -397,7 +410,7 @@ Based on patterns from [Ola Hallengren's SQL Server Maintenance Solution](https:
 
 ## Version History
 
-- **1.9.2026.0128** - New @Preset parameter (NIGHTLY_MAINTENANCE, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE_AGGRESSIVE), @GroupByJoinPattern (update joined tables together), ##sp_StatUpdate_Progress global temp table for monitoring, @CleanupOrphanedRuns default Y, LOCK_TIMEOUT restores original value, XML entity decoding complete, READPAST hint for parallel mode, @WhatIfOutputTable data type validation, Query Store READ_ONLY warning, debug threshold explanation
+- **1.9.2026.0128** - New @Preset parameter (NIGHTLY_MAINTENANCE, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE_AGGRESSIVE), @GroupByJoinPattern (update joined tables together), ##sp_StatUpdate_Progress global temp table (opt-in via @ExposeProgressToAllSessions for security), @CleanupOrphanedRuns default Y, LOCK_TIMEOUT restores original value, XML entity decoding complete, READPAST hint for parallel mode, @WhatIfOutputTable data type validation, Query Store READ_ONLY warning, debug threshold explanation
 - **1.8.2026.0128** - Code review fixes (P1/P2): @LongRunningSamplePercent row cap, staged discovery phase validation, FOR XML entity decoding, LOCK_TIMEOUT reset, incremental partition cross-ref, @WhatIfOutputTable schema validation. Added XE troubleshooting session.
 - **1.7.2026.0127** - BREAKING: @ModificationThreshold default 1000 → 5000 (less aggressive)
 - **1.6.2026.0128** - Staged discovery (6-phase for 10K+ stats), adaptive sampling (@LongRunningThresholdMinutes), @ExcludeTables, @WhatIfOutputTable, @CleanupOrphanedRuns, @CollectHeapForwarding, AUTO_CREATED sort order
