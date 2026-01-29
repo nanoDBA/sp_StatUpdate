@@ -36,11 +36,80 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.5.2026.0120 (Major.Minor.Year.MMDD)
+Version:    1.8.2026.0128 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    1.5.2026.0120 - CRITICAL: Fixed @ExcludeStatistics filter not working. The OR between
+History:    1.8.2026.0128 - Code Review Fixes (P1 & P2 issues from CODE_REVIEW_ANALYSIS.md):
+                          - P1 #24: @LongRunningSamplePercent now caps at ~10M rows sampled.
+                            10% of 1B = 100M rows was worse than auto-sample. For tables >10M rows,
+                            sample percent is automatically reduced. Min 1% (SQL Server floor).
+                          - P1 #22: Added row-count validation between staged discovery phases.
+                            Debug output shows Phase 1-5 counts. Warns if CROSS APPLY loses rows.
+                          - P1 #27: FOR XML PATH error aggregation decodes XML entities (&lt; etc.)
+                          - P1 #23: LOCK_TIMEOUT reset to -1 after UPDATE STATISTICS to prevent
+                            session-level persistence affecting subsequent operations.
+                          - P1 #26: Incremental partition targeting now cross-references sys.partitions.
+                            Detects truncated/empty partitions missing from DMV, forces full RESAMPLE.
+                          - P2 #4: @DeadWorkerTimeoutMinutes default reduced from 30 to 15 minutes.
+                          - P2 #10: @WhatIfOutputTable validates schema when table exists. Clear
+                            error message if required columns (DatabaseName, SchemaName, etc.) missing.
+                          - P2 #20: Query Store Phase 6 operations skipped when QS disabled on DB.
+                            Previously touched all rows to initialize qs_priority_boost even when
+                            unnecessary. Now only runs when @QueryStorePriority=Y AND QS enabled.
+            1.7.2026.0127 - BREAKING: @ModificationThreshold default 1000 → 5000 (less aggressive)
+            1.6.2026.0127 - RunLabel in individual stat ExtendedInfo for run correlation
+            1.6.2026.0128 - Staged Discovery (Performance):
+                            New @StagedDiscovery parameter (default Y). 6-phase discovery
+                            eliminates O(n²) DMV joins by: (1) collect basic candidates from
+                            sys.stats, (2) batch enrich with sys.dm_db_stats_properties,
+                            (3) pre-calculate tier thresholds (no inline SQRT), (4) apply
+                            threshold filters, (5) add page counts for qualifying only,
+                            (6) add Query Store data if enabled. Expected 6-12x improvement
+                            on databases with 10K+ statistics. Use @StagedDiscovery=N for
+                            legacy single-query behavior if needed.
+                          - Adaptive Sampling for Long-Running Stats:
+                            New @LongRunningThresholdMinutes and @LongRunningSamplePercent
+                            parameters. Queries CommandLog for stats that historically took
+                            longer than the threshold (or were killed) and automatically
+                            applies a lower sample rate. Addresses the common problem of
+                            large tables with 100% sample rates that never complete within
+                            maintenance windows. Example: @LongRunningThresholdMinutes=240
+                            forces 10% sample on stats that historically took >4 hours.
+                          - New @ExcludeTables parameter: Exclude tables by pattern (supports %)
+                            to skip problematic or low-priority tables entirely.
+                          - New @CollectHeapForwarding parameter (default N): Controls whether
+                            to query sys.dm_db_index_physical_stats for heap forwarding counts.
+                            Default N for performance; set Y if you need forwarding diagnostics.
+                          - New @WhatIfOutputTable parameter: When @Execute=N, writes generated
+                            commands to specified table instead of just printing. Useful for
+                            automation and command review. Table is auto-created if it doesn't
+                            exist with columns: SequenceNum (IDENTITY), DatabaseName, SchemaName,
+                            TableName, StatName, Command, ModificationCounter, DaysStale, PageCount.
+                          - New @DeadWorkerTimeoutMinutes parameter (default 30): Enhanced dead
+                            worker detection for parallel mode. In addition to checking
+                            dm_exec_requests for session existence, considers worker dead if
+                            no progress for N minutes (handles blocked/hung workers).
+                          - Discovery now captures auto_created flag (sys.stats.auto_created)
+                            and logs AutoCreated in ExtendedInfo XML. Enables deprioritization
+                            of auto-created stats which SQL Server can recreate if needed.
+                          - Discovery captures histogram step count (steps from dm_db_stats_properties)
+                            and logs HistogramSteps in ExtendedInfo for diagnostic insight.
+                          - New @CleanupOrphanedRuns parameter (default N): When Y, finds
+                            SP_STATUPDATE_START entries without matching END (killed runs) and
+                            inserts END markers with StopReason='KILLED' for clean audit trail.
+                          - New @SortOrder = 'AUTO_CREATED': Processes user-created stats first
+                            (auto_created=0), then auto-created stats. Useful when time-limited
+                            to prioritize manually defined statistics over SQL Server auto-created.
+                          - @WhatIfOutputTable auto-creates table if it doesn't exist (no longer
+                            requires user to pre-create with specific schema).
+                          - Created tools/sp_StatUpdate_XE_Session.sql: Extended Events session
+                            for troubleshooting. Captures UPDATE STATISTICS commands, errors,
+                            wait stats (LCK_M_SCH_*, CXPACKET), and long-running statements.
+                          - Code quality: Replaced cursor-based error reporting with FOR XML
+                            aggregation (SQL 2016 compatible). All validation errors now reported
+                            in a single RAISERROR call instead of per-error cursor iteration.
+            1.5.2026.0120 - CRITICAL: Fixed @ExcludeStatistics filter not working. The OR between
                             threshold logic blocks had incorrect operator precedence, causing
                             table/exclusion filters to only apply when @ThresholdLogic='AND'.
                             Wrapped both OR and AND threshold blocks in parentheses.
@@ -174,14 +243,15 @@ ALTER PROCEDURE
     */
     @Databases nvarchar(max) = NULL, /*NULL = current database, SYSTEM_DATABASES, USER_DATABASES, ALL_DATABASES (excludes system), AVAILABILITY_GROUP_DATABASES, comma-separated, wildcards (%), exclusions (-)*/
     @Tables nvarchar(max) = NULL, /*NULL = all tables, or comma-separated 'Schema.Table'*/
+    @ExcludeTables nvarchar(max) = NULL, /*comma-separated patterns to exclude (supports % wildcard), e.g., 'dbo.OrderHistory%' to skip archive tables*/
     @ExcludeStatistics nvarchar(max) = NULL, /*comma-separated patterns to exclude (supports % wildcard), e.g., '_WA_Sys%' to skip auto-created stats*/
-    @TargetNorecompute nvarchar(10) = N'BOTH', /*Y = NORECOMPUTE only, N = regular only, BOTH = all (default)*/
-    @ModificationThreshold bigint = 1000, /*minimum modification_counter to qualify*/
+    @TargetNorecompute nvarchar(10) = N'BOTH', /*Y = only NORECOMPUTE stats (primary use case - SQL auto-update ignores these), N = only regular stats, BOTH = all stats (default)*/
+    @ModificationThreshold bigint = 5000, /*minimum modification_counter (note: when @TieredThresholds=1, tiered thresholds apply first; this value only affects large tables where tiered threshold is higher than this floor)*/
     @ModificationPercent float = NULL, /*alternative: min mod % of rows (SQRT-based)*/
-    @TieredThresholds bit = 1, /*1 = use Tiger Toolbox 5-tier adaptive thresholds (default), 0 = use fixed @ModificationThreshold*/
+    @TieredThresholds bit = 1, /*1 = use Tiger Toolbox 5-tier adaptive thresholds based on table size (0-500: 500 mods, 501-10K: 20%, 10K-100K: 15%, 100K-1M: 10%, 1M+: 5%). 0 = use fixed @ModificationThreshold*/
     @ThresholdLogic nvarchar(3) = N'OR', /*OR = any threshold qualifies (default), AND = all thresholds must be met*/
     @DaysStaleThreshold integer = NULL, /*minimum days since last update*/
-    @MinPageCount bigint = 0, /*minimum used_page_count (125000 = ~1GB)*/
+    @MinPageCount bigint = 0, /*minimum table page count to process. 0 = no filter, 125 = ~1MB, 125000 = ~1GB. Use to skip tiny tables*/
     @IncludeSystemObjects nvarchar(1) = N'N', /*Y = include system object statistics (sys.* tables/views)*/
 
     /*
@@ -189,27 +259,27 @@ ALTER PROCEDURE
     FILTERED STATISTICS (edge case handling for partitioned data)
     ============================================================================
     */
-    @FilteredStatsMode nvarchar(10) = N'INCLUDE', /*INCLUDE = normal, EXCLUDE = skip filtered, ONLY = filtered only, PRIORITY = boost filtered priority*/
-    @FilteredStatsStaleFactor float = 2.0, /*PRIORITY mode threshold multiplier - filtered stats use threshold * selectivity * factor*/
+    @FilteredStatsMode nvarchar(10) = N'INCLUDE', /*INCLUDE = process all (default), EXCLUDE = skip filtered stats, ONLY = only process filtered stats, PRIORITY = boost filtered stats that show selectivity drift*/
+    @FilteredStatsStaleFactor float = 2.0, /*for PRIORITY mode: trigger update when unfiltered_rows/rows exceeds this factor (detects filter predicate distribution changes)*/
 
     /*
     ============================================================================
     QUERY STORE PRIORITIZATION (query-driven stat maintenance)
     ============================================================================
     */
-    @QueryStorePriority nvarchar(1) = N'N', /*Y = prioritize stats used by Query Store plans, N = ignore*/
-    @QueryStoreMetric nvarchar(20) = N'CPU', /*CPU = total CPU time (default), EXECUTIONS = count, DURATION = elapsed time, READS = logical I/O*/
+    @QueryStorePriority nvarchar(1) = N'N', /*Y = boost priority for stats on tables actively used by Query Store plans. Identifies "hot" tables for query-driven maintenance (not necessarily bad plans). N = ignore QS data*/
+    @QueryStoreMetric nvarchar(20) = N'CPU', /*resource metric for priority: CPU (total CPU ms, default), DURATION (elapsed time), READS (logical I/O), EXECUTIONS (count)*/
     @QueryStoreMinExecutions bigint = 100, /*minimum plan executions to boost priority*/
-    @QueryStoreRecentHours integer = 168, /*only consider plans executed in last N hours (default: 7 days)*/
+    @QueryStoreRecentHours integer = 168, /*plans executed in last N hours (default: 7 days). Intentionally short - recent query activity more relevant than 30-day history*/
 
     /*
     ============================================================================
     UPDATE BEHAVIOR (both modes)
     ============================================================================
     */
-    @StatisticsSample integer = NULL, /*NULL = SQL Server decides, 100 = FULLSCAN*/
-    @PersistSamplePercent nvarchar(1) = N'Y', /*Y = add PERSIST_SAMPLE_PERCENT = ON*/
-    @MaxDOP integer = NULL, /*MAXDOP for FULLSCAN (SQL 2016 SP2+)*/
+    @StatisticsSample integer = NULL, /*sample percent: NULL = let SQL Server decide (recommended), 1-100 = explicit %, 100 = FULLSCAN*/
+    @PersistSamplePercent nvarchar(1) = N'Y', /*Y = add PERSIST_SAMPLE_PERCENT = ON (SQL 2016 SP1 CU4+) to remember sample rate*/
+    @MaxDOP integer = NULL, /*MAXDOP for UPDATE STATISTICS (SQL 2016 SP2+ / SQL 2017 CU3+). NULL = server default*/
 
     /*
     ============================================================================
@@ -225,20 +295,40 @@ ALTER PROCEDURE
     */
     @TimeLimit integer = 3600, /*seconds (default: 1 hour, NULL = unlimited)*/
     @BatchLimit integer = NULL, /*max stats to update per run*/
-    @SortOrder nvarchar(50) = N'MODIFICATION_COUNTER', /*priority: MODIFICATION_COUNTER, DAYS_STALE, RANDOM, PAGE_COUNT, QUERY_STORE, FILTERED_DRIFT*/
-    @DelayBetweenStats integer = NULL, /*seconds between stats updates*/
+    @SortOrder nvarchar(50) = N'MODIFICATION_COUNTER', /*priority: MODIFICATION_COUNTER, DAYS_STALE, RANDOM, PAGE_COUNT, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED*/
+    @DelayBetweenStats integer = NULL, /*seconds to wait between stats updates. Use during OLTP hours to reduce contention; NULL = no delay*/
+
+    /*
+    ============================================================================
+    ADAPTIVE SAMPLING FOR LONG-RUNNING STATS
+    Addresses stats that historically take too long (e.g., >4 hours with 100% sample)
+    by automatically applying a lower sample rate based on CommandLog history.
+    ============================================================================
+    */
+    @LongRunningThresholdMinutes int = NULL, /*stats that took longer than this in CommandLog get forced sample rate. Requires existing CommandLog history - first run with this enabled will find nothing. (NULL = disabled)*/
+    @LongRunningSamplePercent int = 10, /*sample percent to use for long-running stats (default: 10%)*/
+
+    /*
+    ============================================================================
+    PERFORMANCE OPTIMIZATION
+    ============================================================================
+    */
+    @StagedDiscovery nvarchar(1) = N'Y', /*Y = use 6-phase staged discovery (faster for large DBs), N = legacy single-query discovery*/
+    @CollectHeapForwarding nvarchar(1) = N'N', /*Y = query dm_db_index_physical_stats for heap forwarding counts (slow), N = skip*/
 
     /*
     ============================================================================
     LOGGING & OUTPUT (both modes)
     ============================================================================
     */
-    @LockTimeout integer = NULL, /*seconds to wait for locks (NULL = no limit)*/
+    @LockTimeout integer = NULL, /*seconds to wait for schema locks before failing (NULL = no limit). Recommended for parallel mode to prevent blocking chains*/
     @LogToTable nvarchar(1) = N'Y', /*Y = log to dbo.CommandLog (requires table), N = no logging*/
     @ProgressLogInterval int = NULL, /*log progress to CommandLog every N stats (for Agent job monitoring)*/
     @Execute nvarchar(1) = N'Y', /*Y = execute, N = print only (dry run)*/
+    @WhatIfOutputTable nvarchar(500) = NULL, /*table to receive commands when @Execute = N (for automation)*/
     @FailFast bit = 0, /*1 = abort on first error*/
     @Debug bit = 0, /*1 = verbose output*/
+    @CleanupOrphanedRuns nvarchar(1) = N'N', /*Y = mark orphaned SP_STATUPDATE_START entries (no END) as KILLED*/
 
     /*
     ============================================================================
@@ -256,6 +346,7 @@ ALTER PROCEDURE
     ============================================================================
     */
     @StatsInParallel nvarchar(1) = N'N', /*Y = use queue-based parallel processing*/
+    @DeadWorkerTimeoutMinutes int = 15, /*consider worker dead if no progress for N minutes (NULL = only check dm_exec_requests). P2 #4: Reduced from 30 to 15 min.*/
 
     /*
     ============================================================================
@@ -292,8 +383,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '1.5.2026.0120',
-        @procedure_version_date datetime = '20260120',
+        @procedure_version varchar(20) = '1.8.2026.0128',
+        @procedure_version_date datetime = '20260128',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -358,6 +449,8 @@ BEGIN
                     THEN N'DISCOVERY: database(s) - NULL=current, SYSTEM_DATABASES, USER_DATABASES, ALL_DATABASES (excludes system), AVAILABILITY_GROUP_DATABASES, wildcards (%), exclusions (-)'
                     WHEN N'@Tables'
                     THEN N'DISCOVERY MODE: table filter (NULL = all, comma-separated Schema.Table)'
+                    WHEN N'@ExcludeTables'
+                    THEN N'DISCOVERY MODE: exclude tables by name pattern (supports % wildcard)'
                     WHEN N'@ExcludeStatistics'
                     THEN N'DISCOVERY MODE: exclude stats by name pattern (supports % wildcard)'
                     WHEN N'@IncludeSystemObjects'
@@ -389,7 +482,7 @@ BEGIN
                     WHEN N'@BatchLimit'
                     THEN N'maximum number of stats to update per run'
                     WHEN N'@SortOrder'
-                    THEN N'priority ordering: MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT'
+                    THEN N'priority ordering: MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED (user stats first)'
                     WHEN N'@FilteredStatsMode'
                     THEN N'INCLUDE = all stats, EXCLUDE = skip filtered, ONLY = filtered only, PRIORITY = boost filtered with drift'
                     WHEN N'@FilteredStatsStaleFactor'
@@ -404,6 +497,14 @@ BEGIN
                     THEN N'only consider plans executed in last N hours (default 168 = 7 days)'
                     WHEN N'@DelayBetweenStats'
                     THEN N'seconds to wait between stats updates (pacing)'
+                    WHEN N'@LongRunningThresholdMinutes'
+                    THEN N'stats that took longer than this in CommandLog get forced sample rate (NULL = disabled)'
+                    WHEN N'@LongRunningSamplePercent'
+                    THEN N'sample percent for long-running stats (default 10%)'
+                    WHEN N'@StagedDiscovery'
+                    THEN N'Y = 6-phase staged discovery (faster for large DBs), N = legacy single query'
+                    WHEN N'@CollectHeapForwarding'
+                    THEN N'Y = collect heap forwarding pointer counts (slow), N = skip for performance'
                     WHEN N'@LockTimeout'
                     THEN N'seconds to wait for locks (NULL = no limit)'
                     WHEN N'@LogToTable'
@@ -412,12 +513,18 @@ BEGIN
                     THEN N'log SP_STATUPDATE_PROGRESS to CommandLog every N stats (Agent job monitoring)'
                     WHEN N'@Execute'
                     THEN N'Y = execute commands, N = print only (dry run)'
+                    WHEN N'@WhatIfOutputTable'
+                    THEN N'table to receive commands when @Execute = N (for automation scripts)'
                     WHEN N'@FailFast'
                     THEN N'1 = abort on first error, 0 = continue processing'
                     WHEN N'@Debug'
                     THEN N'1 = verbose diagnostic output'
+                    WHEN N'@CleanupOrphanedRuns'
+                    THEN N'Y = mark orphaned START entries (killed runs) in CommandLog with END marker'
                     WHEN N'@StatsInParallel'
                     THEN N'Y = use queue-based parallel processing (requires Queue tables)'
+                    WHEN N'@DeadWorkerTimeoutMinutes'
+                    THEN N'parallel mode: consider worker dead if no progress for N minutes (default 30)'
                     WHEN N'@Help'
                     THEN N'1 = show this help information'
                     WHEN N'@Version'
@@ -443,7 +550,7 @@ BEGIN
                     WHEN N'@TargetNorecompute'
                     THEN N'Y, N, BOTH'
                     WHEN N'@SortOrder'
-                    THEN N'MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT'
+                    THEN N'MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED'
                     WHEN N'@FilteredStatsMode'
                     THEN N'INCLUDE, EXCLUDE, ONLY, PRIORITY'
                     WHEN N'@QueryStorePriority'
@@ -462,6 +569,10 @@ BEGIN
                     THEN N'Y, N'
                     WHEN N'@StatsInParallel'
                     THEN N'Y, N'
+                    WHEN N'@CollectHeapForwarding'
+                    THEN N'Y, N'
+                    WHEN N'@CleanupOrphanedRuns'
+                    THEN N'Y, N'
                     ELSE N''
                 END,
             defaults =
@@ -474,6 +585,8 @@ BEGIN
                     THEN N'NULL (current database)'
                     WHEN N'@Tables'
                     THEN N'NULL (all tables)'
+                    WHEN N'@ExcludeTables'
+                    THEN N'NULL (no exclusions)'
                     WHEN N'@ExcludeStatistics'
                     THEN N'NULL (no exclusions)'
                     WHEN N'@IncludeSystemObjects'
@@ -481,7 +594,7 @@ BEGIN
                     WHEN N'@TargetNorecompute'
                     THEN N'BOTH'
                     WHEN N'@ModificationThreshold'
-                    THEN N'1000'
+                    THEN N'5000'
                     WHEN N'@ModificationPercent'
                     THEN N'NULL'
                     WHEN N'@TieredThresholds'
@@ -520,6 +633,14 @@ BEGIN
                     THEN N'168 (7 days)'
                     WHEN N'@DelayBetweenStats'
                     THEN N'NULL'
+                    WHEN N'@LongRunningThresholdMinutes'
+                    THEN N'NULL (disabled)'
+                    WHEN N'@LongRunningSamplePercent'
+                    THEN N'10'
+                    WHEN N'@StagedDiscovery'
+                    THEN N'Y'
+                    WHEN N'@CollectHeapForwarding'
+                    THEN N'N'
                     WHEN N'@LockTimeout'
                     THEN N'NULL'
                     WHEN N'@LogToTable'
@@ -528,12 +649,18 @@ BEGIN
                     THEN N'NULL (disabled)'
                     WHEN N'@Execute'
                     THEN N'Y'
+                    WHEN N'@WhatIfOutputTable'
+                    THEN N'NULL'
                     WHEN N'@FailFast'
                     THEN N'0'
                     WHEN N'@Debug'
                     THEN N'0'
+                    WHEN N'@CleanupOrphanedRuns'
+                    THEN N'N'
                     WHEN N'@StatsInParallel'
                     THEN N'N'
+                    WHEN N'@DeadWorkerTimeoutMinutes'
+                    THEN N'30'
                     WHEN N'@Help'
                     THEN N'0'
                     ELSE N''
@@ -769,11 +896,13 @@ BEGIN
         @current_is_incremental bit = NULL,
         @current_is_memory_optimized bit = NULL,
         @current_is_heap bit = NULL,
+        @current_auto_created bit = NULL,
         @current_modification_counter bigint = NULL,
         @current_row_count bigint = NULL,
         @current_days_stale integer = NULL,
         @current_page_count bigint = NULL,
         @current_persisted_sample_percent float = NULL,
+        @current_histogram_steps int = NULL,
         @current_partition_number integer = NULL,
         @current_forwarded_records bigint = NULL,
         /* Filtered statistics metadata */
@@ -858,6 +987,22 @@ BEGIN
         @ag_role_desc nvarchar(60) = NULL;
 
     /*
+    Long-running stats table (for adaptive sampling)
+    Stores stats that historically took longer than @LongRunningThresholdMinutes
+    */
+    DECLARE @long_running_stats TABLE
+    (
+        database_name sysname NOT NULL,
+        schema_name sysname NOT NULL,
+        table_name sysname NOT NULL,
+        stat_name sysname NOT NULL,
+        max_duration_minutes int NOT NULL,
+        last_occurrence datetime2(7) NOT NULL,
+        occurrence_count int NOT NULL DEFAULT 1,
+        PRIMARY KEY (database_name, schema_name, table_name, stat_name)
+    );
+
+    /*
     ============================================================================
     TEMP TABLE FOR STATS TO PROCESS
     ============================================================================
@@ -876,12 +1021,14 @@ BEGIN
         is_incremental bit NOT NULL DEFAULT 0,
         is_memory_optimized bit NOT NULL DEFAULT 0,
         is_heap bit NOT NULL DEFAULT 0,
+        auto_created bit NOT NULL DEFAULT 0,
         modification_counter bigint NOT NULL DEFAULT 0,
         row_count bigint NOT NULL DEFAULT 0,
         days_stale integer NOT NULL DEFAULT 0,
         page_count bigint NOT NULL DEFAULT 0,
         partition_number integer NULL,
         persisted_sample_percent float NULL, /*existing persisted sample (warn if overriding)*/
+        histogram_steps int NULL, /*number of histogram steps for diagnostic insight*/
         /* Filtered statistics metadata */
         has_filter bit NOT NULL DEFAULT 0,
         filter_definition nvarchar(max) NULL,
@@ -1127,6 +1274,112 @@ BEGIN
             error_severity = 16;
     END;
 
+    IF @CleanupOrphanedRuns NOT IN (N'Y', N'N')
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @CleanupOrphanedRuns is not supported. Use Y or N.',
+            error_severity = 16;
+    END;
+
+    IF  @WhatIfOutputTable IS NOT NULL
+    AND @Execute = N'Y'
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'@WhatIfOutputTable requires @Execute = N (dry run mode).',
+            error_severity = 16;
+    END;
+
+    /*
+    Auto-create @WhatIfOutputTable if it doesn't exist, or validate schema if it does.
+    P2 #10: Validate schema when table exists to give clear error message.
+    */
+    IF  @WhatIfOutputTable IS NOT NULL
+    AND @Execute = N'N'
+    BEGIN
+        DECLARE @whatif_create_sql nvarchar(max) = N'
+            IF OBJECT_ID(N''' + REPLACE(@WhatIfOutputTable, N'''', N'''''') + N''', N''U'') IS NULL
+            BEGIN
+                CREATE TABLE ' + @WhatIfOutputTable + N' (
+                    SequenceNum int IDENTITY(1,1) PRIMARY KEY,
+                    DatabaseName sysname NOT NULL,
+                    SchemaName sysname NOT NULL,
+                    TableName sysname NOT NULL,
+                    StatName sysname NOT NULL,
+                    Command nvarchar(max) NOT NULL,
+                    ModificationCounter bigint NULL,
+                    DaysStale int NULL,
+                    PageCount bigint NULL
+                );
+            END;';
+
+        BEGIN TRY
+            /* Use EXECUTE() instead of sp_executesql so temp table persists to caller scope */
+            EXECUTE (@whatif_create_sql);
+        END TRY
+        BEGIN CATCH
+            INSERT INTO
+                @errors
+            (
+                error_message,
+                error_severity
+            )
+            SELECT
+                error_message =
+                    N'Failed to create @WhatIfOutputTable: ' + ERROR_MESSAGE(),
+                error_severity = 16;
+        END CATCH;
+
+        /*
+        Validate required columns exist if table already existed.
+        Required: DatabaseName, SchemaName, TableName, StatName, Command
+        Uses COL_LENGTH() which works for both temp tables and regular tables.
+        */
+        DECLARE @whatif_validate_sql nvarchar(max) = N'
+            DECLARE @missing_cols nvarchar(500) = N'''';
+            DECLARE @tbl nvarchar(500) = N''' + REPLACE(@WhatIfOutputTable, N'''', N'''''') + N''';
+
+            IF COL_LENGTH(@tbl, N''DatabaseName'') IS NULL SET @missing_cols += N''DatabaseName, '';
+            IF COL_LENGTH(@tbl, N''SchemaName'') IS NULL SET @missing_cols += N''SchemaName, '';
+            IF COL_LENGTH(@tbl, N''TableName'') IS NULL SET @missing_cols += N''TableName, '';
+            IF COL_LENGTH(@tbl, N''StatName'') IS NULL SET @missing_cols += N''StatName, '';
+            IF COL_LENGTH(@tbl, N''Command'') IS NULL SET @missing_cols += N''Command, '';
+
+            IF LEN(@missing_cols) > 0
+            BEGIN
+                SET @missing_cols = LEFT(@missing_cols, LEN(@missing_cols) - 1);
+                RAISERROR(N''@WhatIfOutputTable is missing required columns: %s. Expected schema: SequenceNum, DatabaseName, SchemaName, TableName, StatName, Command, ModificationCounter, DaysStale, PageCount'', 16, 1, @missing_cols);
+            END;';
+
+        BEGIN TRY
+            EXECUTE (@whatif_validate_sql);
+        END TRY
+        BEGIN CATCH
+            INSERT INTO
+                @errors
+            (
+                error_message,
+                error_severity
+            )
+            SELECT
+                error_message = ERROR_MESSAGE(),
+                error_severity = 16;
+        END CATCH;
+    END;
+
     IF @LogToTable NOT IN (N'Y', N'N')
     BEGIN
         INSERT INTO
@@ -1277,7 +1530,7 @@ BEGIN
     /*
     Validate @SortOrder (add new options)
     */
-    IF @SortOrder NOT IN (N'MODIFICATION_COUNTER', N'DAYS_STALE', N'PAGE_COUNT', N'RANDOM', N'QUERY_STORE', N'FILTERED_DRIFT')
+    IF @SortOrder NOT IN (N'MODIFICATION_COUNTER', N'DAYS_STALE', N'PAGE_COUNT', N'RANDOM', N'QUERY_STORE', N'FILTERED_DRIFT', N'AUTO_CREATED')
     BEGIN
         INSERT INTO
             @errors
@@ -1287,7 +1540,7 @@ BEGIN
         )
         SELECT
             error_message =
-                N'The value for @SortOrder is not supported. Use MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, or FILTERED_DRIFT.',
+                N'The value for @SortOrder is not supported. Use MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, or AUTO_CREATED.',
             error_severity = 16;
     END;
 
@@ -1604,6 +1857,57 @@ BEGIN
             error_severity = 16;
     END;
 
+    /*
+    Validate @LongRunningThresholdMinutes and @LongRunningSamplePercent
+    */
+    IF  @LongRunningThresholdMinutes IS NOT NULL
+    AND @LongRunningThresholdMinutes < 1
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @LongRunningThresholdMinutes must be >= 1.',
+            error_severity = 16;
+    END;
+
+    IF  @LongRunningSamplePercent IS NOT NULL
+    AND (
+            @LongRunningSamplePercent < 1
+         OR @LongRunningSamplePercent > 100
+        )
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @LongRunningSamplePercent must be between 1 and 100.',
+            error_severity = 16;
+    END;
+
+    IF  @LongRunningThresholdMinutes IS NOT NULL
+    AND @LogToTable = N'N'
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'@LongRunningThresholdMinutes requires @LogToTable = ''Y'' (needs CommandLog history).',
+            error_severity = 16;
+    END;
+
     IF  @TimeLimit IS NOT NULL
     AND @TimeLimit < 0
     BEGIN
@@ -1634,6 +1938,34 @@ BEGIN
             error_severity = 16;
     END;
 
+    IF @StagedDiscovery NOT IN (N'Y', N'N')
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @StagedDiscovery must be Y or N.',
+            error_severity = 16;
+    END;
+
+    IF @CollectHeapForwarding NOT IN (N'Y', N'N')
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @CollectHeapForwarding must be Y or N.',
+            error_severity = 16;
+    END;
+
     IF  @DelayBetweenStats IS NOT NULL
     AND @DelayBetweenStats < 0
     BEGIN
@@ -1659,38 +1991,30 @@ BEGIN
            FROM @errors
        )
     BEGIN
-        DECLARE
-            @error_cursor cursor,
-            @error_msg nvarchar(max) = N'',
-            @error_sev integer = 0;
+        /*
+        Aggregate all error messages using FOR XML (SQL 2016 compatible).
+        STRING_AGG would be cleaner but requires SQL 2017+.
+        */
+        DECLARE @all_errors nvarchar(max);
 
-        SET @error_cursor = CURSOR LOCAL FAST_FORWARD FOR
-            SELECT
-                e.error_message,
-                e.error_severity
+        SELECT @all_errors = STUFF((
+            SELECT CHAR(13) + CHAR(10) + e.error_message
             FROM @errors AS e
-            ORDER BY
-                e.id;
+            ORDER BY e.id
+            FOR XML PATH(''), TYPE
+        ).value('.', 'nvarchar(max)'), 1, 2, '');
 
-        OPEN @error_cursor;
+        /*
+        DECODE XML ENTITIES (P1 #27)
+        FOR XML PATH encodes special characters. Decode them for readable output.
+        Order matters: decode &amp; last since it affects other entities.
+        */
+        SELECT @all_errors = REPLACE(REPLACE(REPLACE(@all_errors,
+            N'&lt;', N'<'),
+            N'&gt;', N'>'),
+            N'&amp;', N'&');
 
-        FETCH NEXT
-        FROM @error_cursor
-        INTO
-            @error_msg,
-            @error_sev;
-
-        WHILE @@FETCH_STATUS = 0
-        BEGIN
-            RAISERROR(@error_msg, @error_sev, 1) WITH NOWAIT;
-
-            FETCH NEXT
-            FROM @error_cursor
-            INTO
-                @error_msg,
-                @error_sev;
-        END;
-
+        RAISERROR(@all_errors, 16, 1) WITH NOWAIT;
         RAISERROR(N'', 10, 1) WITH NOWAIT;
         RAISERROR(N'Documentation: https://ola.hallengren.com/sql-server-index-and-statistics-maintenance.html', 10, 1) WITH NOWAIT;
 
@@ -1783,8 +2107,15 @@ BEGIN
     RAISERROR(N'  @StatsInParallel         = %s', 10, 1, @StatsInParallel) WITH NOWAIT;
     RAISERROR(N'  @Execute                 = %s', 10, 1, @Execute) WITH NOWAIT;
     RAISERROR(N'  @FailFast                = %d', 10, 1, @FailFast_int) WITH NOWAIT;
+    IF @ExcludeTables IS NOT NULL
+        RAISERROR(N'  @ExcludeTables           = %s', 10, 1, @ExcludeTables) WITH NOWAIT;
     IF @ExcludeStatistics IS NOT NULL
         RAISERROR(N'  @ExcludeStatistics       = %s', 10, 1, @ExcludeStatistics) WITH NOWAIT;
+    IF @LongRunningThresholdMinutes IS NOT NULL
+    BEGIN
+        RAISERROR(N'  @LongRunningThreshold    = %d minutes', 10, 1, @LongRunningThresholdMinutes) WITH NOWAIT;
+        RAISERROR(N'  @LongRunningSamplePct    = %d%%', 10, 1, @LongRunningSamplePercent) WITH NOWAIT;
+    END;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     /*
@@ -1822,7 +2153,9 @@ BEGIN
                     @BatchLimit AS BatchLimit,
                     @SortOrder AS SortOrder,
                     @StatsInParallel AS StatsInParallel,
-                    @FailFast AS FailFast
+                    @FailFast AS FailFast,
+                    @LongRunningThresholdMinutes AS LongRunningThresholdMinutes,
+                    @LongRunningSamplePercent AS LongRunningSamplePercent
                 FOR
                     XML RAW(N'Parameters'),
                     ELEMENTS
@@ -1858,6 +2191,158 @@ BEGIN
 
         RAISERROR(N'Run: %s (logged to CommandLog)', 10, 1, @run_label) WITH NOWAIT;
         RAISERROR(N'', 10, 1) WITH NOWAIT;
+    END;
+
+    /*
+    ============================================================================
+    CLEANUP ORPHANED RUNS (runs that started but never ended - killed jobs)
+    ============================================================================
+    When @CleanupOrphanedRuns = 'Y', find SP_STATUPDATE_START entries without
+    matching SP_STATUPDATE_END and insert END markers with StopReason='KILLED'.
+    This helps with run analysis and prevents orphaned entries from accumulating.
+    */
+    IF  @CleanupOrphanedRuns = N'Y'
+    AND @LogToTable = N'Y'
+    AND @commandlog_exists = 1
+    BEGIN
+        DECLARE @orphaned_count int = 0;
+
+        /*
+        Insert SP_STATUPDATE_END for each orphaned SP_STATUPDATE_START
+        Match on RunLabel from ExtendedInfo XML to identify the specific run
+        */
+        INSERT INTO dbo.CommandLog
+        (
+            DatabaseName,
+            SchemaName,
+            ObjectName,
+            ObjectType,
+            Command,
+            CommandType,
+            StartTime,
+            EndTime,
+            ExtendedInfo
+        )
+        SELECT
+            cl_start.DatabaseName,
+            N'dbo',
+            N'sp_StatUpdate',
+            N'P',
+            N'sp_StatUpdate killed (orphaned run cleanup)',
+            N'SP_STATUPDATE_END',
+            cl_start.StartTime,
+            SYSDATETIME(),
+            (
+                SELECT
+                    cl_start.ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)') AS [Version],
+                    cl_start.ExtendedInfo.value('(/Parameters/RunLabel)[1]', 'nvarchar(100)') AS RunLabel,
+                    0 AS StatsFound,
+                    0 AS StatsProcessed,
+                    0 AS StatsSucceeded,
+                    0 AS StatsFailed,
+                    0 AS StatsRemaining,
+                    0 AS DurationSeconds,
+                    N'KILLED' AS StopReason
+                FOR XML RAW(N'Summary'), ELEMENTS
+            )
+        FROM dbo.CommandLog AS cl_start
+        WHERE cl_start.CommandType = N'SP_STATUPDATE_START'
+        AND   NOT EXISTS
+              (
+                  SELECT 1
+                  FROM dbo.CommandLog AS cl_end
+                  WHERE cl_end.CommandType = N'SP_STATUPDATE_END'
+                  AND   cl_end.ExtendedInfo.value('(/Summary/RunLabel)[1]', 'nvarchar(100)') =
+                        cl_start.ExtendedInfo.value('(/Parameters/RunLabel)[1]', 'nvarchar(100)')
+              );
+
+        SELECT @orphaned_count = @@ROWCOUNT;
+
+        IF @orphaned_count > 0
+        BEGIN
+            RAISERROR(N'Cleaned up %d orphaned run(s) from CommandLog', 10, 1, @orphaned_count) WITH NOWAIT;
+            RAISERROR(N'', 10, 1) WITH NOWAIT;
+        END;
+    END;
+
+    /*
+    ============================================================================
+    QUERY COMMANDLOG FOR LONG-RUNNING STATS (adaptive sampling)
+    ============================================================================
+    */
+    IF  @LongRunningThresholdMinutes IS NOT NULL
+    AND @commandlog_exists = 1
+    BEGIN
+        /*
+        Find stats that historically took longer than @LongRunningThresholdMinutes.
+        These will get a forced sample rate of @LongRunningSamplePercent.
+        Also includes stats that were killed (EndTime IS NULL but ErrorNumber set).
+        Uses CTE to extract stat name from XML before GROUP BY (XML methods not allowed in GROUP BY).
+
+        LIMITATION: We don't know WHY stats were slow - could be table size, I/O
+        contention, blocking, or high sample rate. Wall-clock time is the best
+        available proxy. Consider XE session (tools/sp_StatUpdate_XE_Session.sql)
+        for deeper analysis.
+        */
+        ;WITH long_running_candidates AS
+        (
+            SELECT
+                database_name = cl.DatabaseName,
+                schema_name = cl.SchemaName,
+                table_name = cl.ObjectName,
+                stat_name = COALESCE(
+                    cl.ExtendedInfo.value('(/StatInfo/StatisticName)[1]', 'sysname'),
+                    cl.StatisticsName,
+                    cl.IndexName
+                ),
+                duration_minutes = DATEDIFF(MINUTE, cl.StartTime, ISNULL(cl.EndTime, SYSDATETIME())),
+                start_time = cl.StartTime
+            FROM dbo.CommandLog AS cl
+            WHERE cl.CommandType = N'UPDATE_STATISTICS'
+            AND   (
+                      /*Stats that exceeded threshold*/
+                      DATEDIFF(MINUTE, cl.StartTime, ISNULL(cl.EndTime, SYSDATETIME())) >= @LongRunningThresholdMinutes
+                      /*Or stats that were killed/failed (EndTime NULL but error exists)*/
+                      OR (cl.EndTime IS NULL AND cl.ErrorNumber IS NOT NULL)
+                  )
+        )
+        INSERT INTO @long_running_stats
+        (
+            database_name,
+            schema_name,
+            table_name,
+            stat_name,
+            max_duration_minutes,
+            last_occurrence,
+            occurrence_count
+        )
+        SELECT
+            database_name,
+            schema_name,
+            table_name,
+            stat_name,
+            max_duration_minutes = MAX(duration_minutes),
+            last_occurrence = MAX(start_time),
+            occurrence_count = COUNT(*)
+        FROM long_running_candidates
+        WHERE stat_name IS NOT NULL
+        GROUP BY
+            database_name,
+            schema_name,
+            table_name,
+            stat_name;
+
+        DECLARE @long_running_count int = (SELECT COUNT(*) FROM @long_running_stats);
+
+        IF @long_running_count > 0
+        BEGIN
+            DECLARE @lr_msg nvarchar(500);
+            SET @lr_msg = N'Adaptive Sampling: Found ' + CONVERT(nvarchar(10), @long_running_count) +
+                          N' stats with historical duration >= ' + CONVERT(nvarchar(10), @LongRunningThresholdMinutes) +
+                          N' min (will use ' + CONVERT(nvarchar(10), @LongRunningSamplePercent) + N'%% sample)';
+            RAISERROR(@lr_msg, 10, 1) WITH NOWAIT;
+            RAISERROR(N'', 10, 1) WITH NOWAIT;
+        END;
     END;
 
     /*
@@ -2262,6 +2747,497 @@ BEGIN
             RAISERROR(N'  Scanning database: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
 
             /*
+            ========================================================================
+            STAGED DISCOVERY (6-phase approach for better performance)
+            ========================================================================
+            When @StagedDiscovery = 'Y', uses a phased approach:
+              Phase 1: Collect basic candidate stats (fast - only sys.stats/objects)
+              Phase 2: Batch-enrich with stats properties (one CROSS APPLY)
+              Phase 3: Pre-calculate tier thresholds (no inline SQRT)
+              Phase 4: Apply threshold filters (early elimination)
+              Phase 5: Add page counts (only for qualifying stats)
+              Phase 6: Add Query Store data (only if enabled, only for qualifying)
+
+            This is significantly faster for large databases (10K+ stats) because:
+              - Expensive DMV calls only run on candidates that might qualify
+              - No inline SQRT calculations in WHERE clause
+              - Query Store join (most expensive) runs last and only if needed
+            */
+            IF @StagedDiscovery = N'Y'
+            BEGIN
+                DECLARE @staged_sql nvarchar(max);
+
+                SET @staged_sql = N'
+                USE ' + QUOTENAME(@CurrentDatabaseName) + N';
+
+                /*
+                Phase row count tracking for validation (P1 #22)
+                Prevents silent failures when phases don''t process expected rows.
+                */
+                DECLARE
+                    @phase1_count int = 0,
+                    @phase2_count int = 0,
+                    @phase4_qualifying int = 0,
+                    @phase5_remaining int = 0;
+
+                /*
+                ================================================================
+                PHASE 1: Collect basic candidate stats (FAST)
+                Only touches sys.stats and sys.objects - no DMV cross-applies.
+                ================================================================
+                */
+                CREATE TABLE #stat_candidates (
+                    object_id int NOT NULL,
+                    stats_id int NOT NULL,
+                    stat_name sysname NOT NULL,
+                    schema_name sysname NOT NULL,
+                    table_name sysname NOT NULL,
+                    no_recompute bit NOT NULL,
+                    is_incremental bit NOT NULL,
+                    has_filter bit NOT NULL,
+                    filter_definition nvarchar(max) NULL,
+                    is_memory_optimized bit NOT NULL DEFAULT 0,
+                    auto_created bit NOT NULL DEFAULT 0,
+                    PRIMARY KEY CLUSTERED (object_id, stats_id)
+                );
+
+                INSERT INTO #stat_candidates
+                    (object_id, stats_id, stat_name, schema_name, table_name,
+                     no_recompute, is_incremental, has_filter, filter_definition, is_memory_optimized, auto_created)
+                SELECT
+                    s.object_id,
+                    s.stats_id,
+                    s.name,
+                    OBJECT_SCHEMA_NAME(s.object_id),
+                    OBJECT_NAME(s.object_id),
+                    s.no_recompute,
+                    s.is_incremental,
+                    s.has_filter,
+                    s.filter_definition,
+                    ISNULL(t.is_memory_optimized, 0),
+                    s.auto_created
+                FROM sys.stats AS s
+                JOIN sys.objects AS o ON o.object_id = s.object_id
+                LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
+                WHERE (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
+                AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @IncludeSystemObjects_param = N''Y'')
+                /* NORECOMPUTE filter */
+                AND   (
+                          (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
+                       OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
+                       OR @TargetNorecompute_param = N''BOTH''
+                      )
+                /* Table filter */
+                AND   (
+                          @Tables_param IS NULL
+                       OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) IN
+                          (SELECT LTRIM(RTRIM(ss.value)) FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                       OR OBJECT_NAME(s.object_id) IN
+                          (SELECT LTRIM(RTRIM(ss.value)) FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                      )
+                /* Table exclusion filter */
+                AND   (
+                          @ExcludeTables_param IS NULL
+                       OR NOT EXISTS
+                          (
+                              SELECT 1
+                              FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
+                              WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) LIKE LTRIM(RTRIM(ex.value))
+                          )
+                      )
+                /* Statistics exclusion filter */
+                AND   (
+                          @ExcludeStatistics_param IS NULL
+                       OR NOT EXISTS
+                          (
+                              SELECT 1
+                              FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
+                              WHERE s.name LIKE LTRIM(RTRIM(ex.value))
+                          )
+                      )
+                /* Filtered stats mode filter */
+                AND   (
+                          @FilteredStatsMode_param = N''INCLUDE''
+                       OR @FilteredStatsMode_param = N''PRIORITY''
+                       OR (@FilteredStatsMode_param = N''EXCLUDE'' AND s.has_filter = 0)
+                       OR (@FilteredStatsMode_param = N''ONLY'' AND s.has_filter = 1)
+                      );
+
+                SELECT @phase1_count = @@ROWCOUNT;
+
+                IF @Debug_param = 1
+                    RAISERROR(N''    Phase 1 (candidates): %d stats'', 10, 1, @phase1_count) WITH NOWAIT;
+
+                /*
+                ================================================================
+                PHASE 2: Enrich with stats properties (batch CROSS APPLY)
+                ================================================================
+                */
+                ALTER TABLE #stat_candidates ADD
+                    modification_counter bigint NULL,
+                    rows bigint NULL,
+                    last_updated datetime2 NULL,
+                    unfiltered_rows bigint NULL,
+                    persisted_sample_percent float NULL,
+                    histogram_steps int NULL;
+
+                UPDATE sc
+                SET
+                    sc.modification_counter = ISNULL(sp.modification_counter, 0),
+                    sc.rows = ISNULL(sp.rows, 0),
+                    sc.last_updated = sp.last_updated,
+                    sc.unfiltered_rows = sp.unfiltered_rows,
+                    sc.persisted_sample_percent = sp.persisted_sample_percent,
+                    sc.histogram_steps = sp.steps
+                FROM #stat_candidates AS sc
+                CROSS APPLY sys.dm_db_stats_properties(sc.object_id, sc.stats_id) AS sp;
+
+                SELECT @phase2_count = @@ROWCOUNT;
+
+                IF @Debug_param = 1
+                    RAISERROR(N''    Phase 2 (enriched): %d stats'', 10, 1, @phase2_count) WITH NOWAIT;
+
+                /*
+                VALIDATION: CROSS APPLY filters out stats with no properties.
+                This is expected for never-updated stats. Log if significant.
+                */
+                IF @phase2_count < @phase1_count AND @Debug_param = 1
+                BEGIN
+                    DECLARE @missing_count int = @phase1_count - @phase2_count;
+                    RAISERROR(N''    Warning: %d stats have no properties (never updated)'', 10, 1, @missing_count) WITH NOWAIT;
+                END;
+
+                /*
+                ================================================================
+                PHASE 3: Pre-calculate tier thresholds (avoids inline SQRT)
+                ================================================================
+                */
+                ALTER TABLE #stat_candidates ADD
+                    tier_threshold bigint NULL,
+                    sqrt_threshold bigint NULL,
+                    days_stale int NULL;
+
+                UPDATE #stat_candidates
+                SET
+                    tier_threshold =
+                        CASE
+                            WHEN rows <= 500 THEN 500
+                            WHEN rows <= 10000 THEN (rows * 20) / 100 + 500
+                            WHEN rows <= 100000 THEN (rows * 15) / 100 + 500
+                            WHEN rows <= 1000000 THEN (rows * 10) / 100 + 500
+                            ELSE CONVERT(bigint, CONVERT(float, rows) * 5 / 100) + 500
+                        END,
+                    sqrt_threshold = CONVERT(bigint, SQRT(CONVERT(float, ISNULL(rows, 1)) * 1000)),
+                    days_stale = ISNULL(DATEDIFF(DAY, last_updated, GETDATE()), 9999);
+
+                /*
+                ================================================================
+                PHASE 4: Apply threshold filters (early elimination)
+                ================================================================
+                */
+                ALTER TABLE #stat_candidates ADD qualifies bit NOT NULL DEFAULT 0;
+
+                /* Apply threshold logic */
+                IF @ThresholdLogic_param = N''OR''
+                BEGIN
+                    UPDATE #stat_candidates
+                    SET qualifies = 1
+                    WHERE (
+                        /* Fixed modification threshold */
+                        (@ModificationThreshold_param IS NOT NULL AND modification_counter >= @ModificationThreshold_param)
+                        /* Modification percent (non-tiered) */
+                        OR (@TieredThresholds_param = 0 AND @ModificationPercent_param IS NOT NULL
+                            AND modification_counter >= (@ModificationPercent_param * SQRT(CONVERT(float, ISNULL(rows, 1)))))
+                        /* Tiered thresholds */
+                        OR (@TieredThresholds_param = 1 AND (modification_counter >= tier_threshold OR modification_counter >= sqrt_threshold))
+                        /* Days stale */
+                        OR (@DaysStaleThreshold_param IS NOT NULL AND days_stale >= @DaysStaleThreshold_param)
+                        /* No thresholds = include all */
+                        OR (@ModificationThreshold_param IS NULL AND @ModificationPercent_param IS NULL
+                            AND @TieredThresholds_param = 0 AND @DaysStaleThreshold_param IS NULL)
+                    );
+                END
+                ELSE /* AND logic */
+                BEGIN
+                    UPDATE #stat_candidates
+                    SET qualifies = 1
+                    WHERE (
+                        @ModificationThreshold_param IS NULL OR modification_counter >= @ModificationThreshold_param
+                    )
+                    AND (
+                        (@ModificationPercent_param IS NULL AND @TieredThresholds_param = 0)
+                        OR (@TieredThresholds_param = 0 AND modification_counter >= (@ModificationPercent_param * SQRT(CONVERT(float, ISNULL(rows, 1)))))
+                        OR (@TieredThresholds_param = 1 AND (modification_counter >= tier_threshold OR modification_counter >= sqrt_threshold))
+                    )
+                    AND (
+                        @DaysStaleThreshold_param IS NULL OR days_stale >= @DaysStaleThreshold_param
+                    );
+                END;
+
+                /* Delete non-qualifying stats early */
+                DELETE FROM #stat_candidates WHERE qualifies = 0;
+
+                SELECT @phase4_qualifying = (SELECT COUNT(*) FROM #stat_candidates);
+
+                IF @Debug_param = 1
+                    RAISERROR(N''    Phase 4 (after thresholds): %d stats qualify'', 10, 1, @phase4_qualifying) WITH NOWAIT;
+
+                /*
+                VALIDATION: If 0 stats qualify after threshold filtering, we can exit early.
+                This is normal when no stats need updating.
+                */
+                IF @phase4_qualifying = 0
+                BEGIN
+                    IF @Debug_param = 1
+                        RAISERROR(N''    No stats qualify - skipping remaining phases'', 10, 1) WITH NOWAIT;
+
+                    /* Return empty result set with correct schema */
+                    SELECT
+                        database_name = DB_NAME(),
+                        schema_name = CONVERT(sysname, NULL),
+                        table_name = CONVERT(sysname, NULL),
+                        stat_name = CONVERT(sysname, NULL),
+                        object_id = CONVERT(int, NULL),
+                        stats_id = CONVERT(int, NULL),
+                        no_recompute = CONVERT(bit, NULL),
+                        is_incremental = CONVERT(bit, NULL),
+                        is_memory_optimized = CONVERT(bit, NULL),
+                        is_heap = CONVERT(bit, NULL),
+                        auto_created = CONVERT(bit, NULL),
+                        modification_counter = CONVERT(bigint, NULL),
+                        row_count = CONVERT(bigint, NULL),
+                        days_stale = CONVERT(int, NULL),
+                        page_count = CONVERT(bigint, NULL),
+                        persisted_sample_percent = CONVERT(float, NULL),
+                        histogram_steps = CONVERT(int, NULL),
+                        has_filter = CONVERT(bit, NULL),
+                        filter_definition = CONVERT(nvarchar(max), NULL),
+                        unfiltered_rows = CONVERT(bigint, NULL),
+                        qs_plan_count = CONVERT(int, NULL),
+                        qs_total_executions = CONVERT(bigint, NULL),
+                        qs_total_cpu_ms = CONVERT(bigint, NULL),
+                        qs_total_duration_ms = CONVERT(bigint, NULL),
+                        qs_total_logical_reads = CONVERT(bigint, NULL),
+                        qs_last_execution = CONVERT(datetime2, NULL),
+                        qs_priority_boost = CONVERT(bigint, NULL),
+                        priority = CONVERT(bigint, NULL)
+                    WHERE 1 = 0;
+
+                    DROP TABLE #stat_candidates;
+                    RETURN;
+                END;
+
+                /*
+                ================================================================
+                PHASE 5: Add page counts (only for qualifying stats)
+                ================================================================
+                */
+                ALTER TABLE #stat_candidates ADD
+                    page_count bigint NULL,
+                    is_heap bit NULL;
+
+                UPDATE sc
+                SET
+                    sc.page_count = ISNULL(pgs.total_pages, 0),
+                    sc.is_heap = CASE WHEN ix.index_id IS NOT NULL THEN 1 ELSE 0 END
+                FROM #stat_candidates AS sc
+                OUTER APPLY (
+                    SELECT SUM(p.used_page_count) AS total_pages
+                    FROM sys.dm_db_partition_stats AS p
+                    WHERE p.object_id = sc.object_id
+                    AND   p.index_id IN (0, 1)
+                ) AS pgs
+                LEFT JOIN sys.indexes AS ix ON ix.object_id = sc.object_id AND ix.index_id = 0;
+
+                /* Apply MinPageCount filter */
+                DELETE FROM #stat_candidates WHERE ISNULL(page_count, 0) < @MinPageCount_param;
+
+                SELECT @phase5_remaining = (SELECT COUNT(*) FROM #stat_candidates);
+
+                IF @Debug_param = 1
+                    RAISERROR(N''    Phase 5 (after MinPageCount): %d stats remain'', 10, 1, @phase5_remaining) WITH NOWAIT;
+
+                /*
+                ================================================================
+                PHASE 6: Add Query Store data (only if enabled)
+                P2 #20: Skip QS operations when QS is disabled.
+                ================================================================
+                */
+                ALTER TABLE #stat_candidates ADD
+                    qs_plan_count int NULL,
+                    qs_total_executions bigint NULL,
+                    qs_total_cpu_ms bigint NULL,
+                    qs_total_duration_ms bigint NULL,
+                    qs_total_logical_reads bigint NULL,
+                    qs_last_execution datetime2 NULL,
+                    qs_priority_boost bigint NULL;
+
+                /*
+                Only populate QS data if:
+                1. User requested QS priority (@QueryStorePriority = Y)
+                2. Query Store is enabled on this database (actual_state IN 1, 2)
+                If neither, skip the UPDATE - NULL will be handled by ISNULL in ORDER BY.
+                This avoids touching all rows when QS is disabled (10K+ stat databases).
+                */
+                IF @QueryStorePriority_param = N''Y''
+                AND EXISTS (SELECT 1 FROM sys.database_query_store_options WHERE actual_state IN (1, 2))
+                BEGIN
+                    /* Initialize qs_priority_boost to 0 for rows that won''t get QS data */
+                    UPDATE #stat_candidates SET qs_priority_boost = 0;
+                    UPDATE sc
+                    SET
+                        sc.qs_plan_count = qs.plan_count,
+                        sc.qs_total_executions = qs.total_executions,
+                        sc.qs_total_cpu_ms = qs.total_cpu_ms,
+                        sc.qs_total_duration_ms = qs.total_duration_ms,
+                        sc.qs_total_logical_reads = qs.total_logical_reads,
+                        sc.qs_last_execution = qs.last_execution,
+                        sc.qs_priority_boost =
+                            CASE
+                                WHEN ISNULL(qs.total_executions, 0) >= @QueryStoreMinExecutions_param
+                                THEN CASE @QueryStoreMetric_param
+                                         WHEN N''CPU'' THEN ISNULL(qs.total_cpu_ms, 0)
+                                         WHEN N''DURATION'' THEN ISNULL(qs.total_duration_ms, 0)
+                                         WHEN N''READS'' THEN ISNULL(qs.total_logical_reads, 0) / 1000
+                                         WHEN N''EXECUTIONS'' THEN ISNULL(qs.total_executions, 0)
+                                         ELSE ISNULL(qs.total_cpu_ms, 0)
+                                     END
+                                ELSE 0
+                            END
+                    FROM #stat_candidates AS sc
+                    CROSS APPLY (
+                        SELECT
+                            COUNT_BIG(DISTINCT qsp.plan_id) AS plan_count,
+                            SUM(qsrs.count_executions) AS total_executions,
+                            SUM(qsrs.avg_cpu_time * qsrs.count_executions) / 1000 AS total_cpu_ms,
+                            SUM(qsrs.avg_duration * qsrs.count_executions) / 1000 AS total_duration_ms,
+                            SUM(CONVERT(bigint, qsrs.avg_logical_io_reads * qsrs.count_executions)) AS total_logical_reads,
+                            MAX(qsrs.last_execution_time) AS last_execution
+                        FROM sys.query_store_query AS qsq
+                        JOIN sys.query_store_plan AS qsp ON qsp.query_id = qsq.query_id
+                        JOIN sys.query_store_runtime_stats AS qsrs ON qsrs.plan_id = qsp.plan_id
+                        JOIN sys.query_store_runtime_stats_interval AS qsrsi
+                            ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
+                        WHERE qsq.object_id = sc.object_id
+                        AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, GETDATE())
+                    ) AS qs;
+                END;
+
+                /*
+                ================================================================
+                FINAL: Return results with priority ordering
+                ================================================================
+                */
+                SELECT
+                    database_name = DB_NAME(),
+                    schema_name,
+                    table_name,
+                    stat_name,
+                    object_id,
+                    stats_id,
+                    no_recompute,
+                    is_incremental,
+                    is_memory_optimized,
+                    ISNULL(is_heap, 0) AS is_heap,
+                    ISNULL(auto_created, 0) AS auto_created,
+                    ISNULL(modification_counter, 0) AS modification_counter,
+                    row_count = ISNULL(rows, 0),
+                    ISNULL(days_stale, 9999) AS days_stale,
+                    ISNULL(page_count, 0) AS page_count,
+                    persisted_sample_percent,
+                    histogram_steps,
+                    has_filter,
+                    filter_definition,
+                    unfiltered_rows,
+                    qs_plan_count,
+                    qs_total_executions,
+                    qs_total_cpu_ms,
+                    qs_total_duration_ms,
+                    qs_total_logical_reads,
+                    qs_last_execution,
+                    ISNULL(qs_priority_boost, 0) AS qs_priority_boost,
+                    priority = ROW_NUMBER() OVER (
+                        ORDER BY
+                            ISNULL(qs_priority_boost, 0) +
+                            CASE @SortOrder_param
+                                WHEN N''MODIFICATION_COUNTER'' THEN modification_counter
+                                WHEN N''DAYS_STALE'' THEN days_stale
+                                WHEN N''PAGE_COUNT'' THEN ISNULL(page_count, 0)
+                                WHEN N''RANDOM'' THEN CHECKSUM(NEWID())
+                                WHEN N''QUERY_STORE'' THEN ISNULL(qs_priority_boost, 0)
+                                WHEN N''FILTERED_DRIFT'' THEN
+                                    CASE WHEN has_filter = 1 AND ISNULL(rows, 0) > 0 AND unfiltered_rows IS NOT NULL
+                                         THEN CONVERT(bigint, IIF((CONVERT(float, unfiltered_rows) / rows) > 9000000000000.0, 9000000000000.0, (CONVERT(float, unfiltered_rows) / rows)) * 1000000)
+                                         ELSE 0
+                                    END
+                                WHEN N''AUTO_CREATED'' THEN
+                                    /* User-created first (auto_created=0), then auto-created (1) */
+                                    CASE WHEN ISNULL(auto_created, 0) = 0 THEN CONVERT(bigint, 1000000000000) ELSE 0 END + ISNULL(modification_counter, 0)
+                                ELSE modification_counter
+                            END DESC
+                    )
+                FROM #stat_candidates;
+
+                DROP TABLE #stat_candidates;
+                ';
+
+                /*
+                Execute staged discovery and insert results
+                */
+                INSERT INTO #stats_to_process
+                (
+                    database_name, schema_name, table_name, stat_name, object_id, stats_id,
+                    no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created,
+                    modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
+                    has_filter, filter_definition, unfiltered_rows,
+                    qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
+                    qs_total_logical_reads, qs_last_execution, qs_priority_boost, priority
+                )
+                EXECUTE sys.sp_executesql
+                    @staged_sql,
+                    N'@SortOrder_param nvarchar(50),
+                      @TargetNorecompute_param nvarchar(10),
+                      @ModificationThreshold_param bigint,
+                      @ModificationPercent_param float,
+                      @TieredThresholds_param bit,
+                      @ThresholdLogic_param nvarchar(3),
+                      @DaysStaleThreshold_param integer,
+                      @MinPageCount_param bigint,
+                      @IncludeSystemObjects_param nvarchar(1),
+                      @Tables_param nvarchar(max),
+                      @ExcludeTables_param nvarchar(max),
+                      @ExcludeStatistics_param nvarchar(max),
+                      @FilteredStatsMode_param nvarchar(10),
+                      @QueryStorePriority_param nvarchar(1),
+                      @QueryStoreMetric_param nvarchar(20),
+                      @QueryStoreMinExecutions_param bigint,
+                      @QueryStoreRecentHours_param integer,
+                      @Debug_param bit',
+                    @SortOrder_param = @SortOrder,
+                    @TargetNorecompute_param = @TargetNorecompute,
+                    @ModificationThreshold_param = @ModificationThreshold,
+                    @ModificationPercent_param = @ModificationPercent,
+                    @TieredThresholds_param = @TieredThresholds,
+                    @ThresholdLogic_param = @ThresholdLogic,
+                    @DaysStaleThreshold_param = @DaysStaleThreshold,
+                    @MinPageCount_param = @MinPageCount,
+                    @IncludeSystemObjects_param = @IncludeSystemObjects,
+                    @Tables_param = @Tables,
+                    @ExcludeTables_param = @ExcludeTables,
+                    @ExcludeStatistics_param = @ExcludeStatistics,
+                    @FilteredStatsMode_param = @FilteredStatsMode,
+                    @QueryStorePriority_param = @QueryStorePriority,
+                    @QueryStoreMetric_param = @QueryStoreMetric,
+                    @QueryStoreMinExecutions_param = @QueryStoreMinExecutions,
+                    @QueryStoreRecentHours_param = @QueryStoreRecentHours,
+                    @Debug_param = @Debug;
+            END /* End of staged discovery */
+            ELSE
+            BEGIN
+            /*
+            ========================================================================
+            LEGACY DISCOVERY (single-query approach)
+            ========================================================================
             Build dynamic SQL to run in target database context
 
             HEAP HANDLING NOTES:
@@ -2303,11 +3279,13 @@ BEGIN
                     THEN 1
                     ELSE 0
                 END,
+            auto_created = s.auto_created,
             modification_counter = ISNULL(sp.modification_counter, 0),
             row_count = ISNULL(sp.rows, 0),
             days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, GETDATE()), 9999),
             page_count = ISNULL(pgs.total_pages, 0),
             persisted_sample_percent = sp.persisted_sample_percent,
+            histogram_steps = sp.steps,
             /* Filtered statistics metadata */
             has_filter = s.has_filter,
             filter_definition = s.filter_definition,
@@ -2379,6 +3357,9 @@ BEGIN
                                      THEN CONVERT(bigint, IIF((CONVERT(float, sp.unfiltered_rows) / sp.rows) > 9000000000000.0, 9000000000000.0, (CONVERT(float, sp.unfiltered_rows) / sp.rows)) * 1000000)
                                      ELSE 0
                                  END
+                            WHEN N''AUTO_CREATED''
+                            THEN /* User-created first (auto_created=0), then auto-created (1) */
+                                 CASE WHEN ISNULL(s.auto_created, 0) = 0 THEN CONVERT(bigint, 1000000000000) ELSE 0 END + ISNULL(sp.modification_counter, 0)
                             ELSE ISNULL(sp.modification_counter, 0)
                         END DESC
                 )
@@ -2430,7 +3411,7 @@ BEGIN
             /*
             OPTIMIZED JOIN ORDER: Filter by object_id FIRST through sys.query_store_query,
             then join to plans. This dramatically reduces intermediate result set size
-            on databases with large Query Store catalogs (Erin Stellato recommendation).
+            on databases with large Query Store catalogs.
             */
             SELECT
                 plan_count = COUNT_BIG(DISTINCT qsp.plan_id),
@@ -2576,6 +3557,16 @@ BEGIN
                       FROM STRING_SPLIT(@Tables_param, N'','') AS ss
                   )
               )
+        /* Table exclusion filter (pattern-based) */
+        AND   (
+                  @ExcludeTables_param IS NULL
+               OR NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
+                      WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) LIKE LTRIM(RTRIM(ex.value))
+                  )
+              )
         /* Statistics exclusion filter (pattern-based) */
         AND   (
                   @ExcludeStatistics_param IS NULL
@@ -2639,6 +3630,7 @@ BEGIN
                 @MinPageCount_param bigint,
                 @IncludeSystemObjects_param nvarchar(1),
                 @Tables_param nvarchar(max),
+                @ExcludeTables_param nvarchar(max),
                 @ExcludeStatistics_param nvarchar(max),
                 @FilteredStatsMode_param nvarchar(10),
                 @FilteredStatsStaleFactor_param float,
@@ -2663,11 +3655,13 @@ BEGIN
             is_incremental,
             is_memory_optimized,
             is_heap,
+            auto_created,
             modification_counter,
             row_count,
             days_stale,
             page_count,
             persisted_sample_percent,
+            histogram_steps,
             has_filter,
             filter_definition,
             unfiltered_rows,
@@ -2693,6 +3687,7 @@ BEGIN
                 @MinPageCount_param = @MinPageCount,
                 @IncludeSystemObjects_param = @IncludeSystemObjects,
                 @Tables_param = @Tables,
+                @ExcludeTables_param = @ExcludeTables,
                 @ExcludeStatistics_param = @ExcludeStatistics,
                 @FilteredStatsMode_param = @FilteredStatsMode,
                 @FilteredStatsStaleFactor_param = @FilteredStatsStaleFactor,
@@ -2701,8 +3696,10 @@ BEGIN
                 @QueryStoreMinExecutions_param = @QueryStoreMinExecutions,
                 @QueryStoreRecentHours_param = @QueryStoreRecentHours;
 
+            END; /* End of legacy discovery ELSE */
+
             /*
-            Mark this database as completed
+            Mark this database as completed (runs for both staged and legacy)
             */
             UPDATE @tmpDatabases
             SET Completed = 1
@@ -3130,14 +4127,23 @@ BEGIN
                 WHERE qs.QueueID = @queue_id
                 AND   qs.TableStartTime IS NOT NULL
                 AND   qs.TableEndTime IS NULL
-                AND   NOT EXISTS
-                      (
-                          SELECT
-                              1
-                          FROM sys.dm_exec_requests AS r
-                          WHERE r.session_id = qs.SessionID
-                          AND   r.request_id = qs.RequestID
-                          AND   r.start_time = qs.RequestStartTime
+                AND   (
+                          /* Original check: worker not in dm_exec_requests (session ended) */
+                          NOT EXISTS
+                          (
+                              SELECT
+                                  1
+                              FROM sys.dm_exec_requests AS r
+                              WHERE r.session_id = qs.SessionID
+                              AND   r.request_id = qs.RequestID
+                              AND   r.start_time = qs.RequestStartTime
+                          )
+                          OR
+                          /* Timeout check: worker stuck for too long (might be blocked or hung) */
+                          (
+                              @DeadWorkerTimeoutMinutes IS NOT NULL
+                              AND DATEDIFF(MINUTE, qs.TableStartTime, SYSDATETIME()) > @DeadWorkerTimeoutMinutes
+                          )
                       );
 
                 DECLARE
@@ -3259,11 +4265,13 @@ BEGIN
             @current_is_incremental = stp.is_incremental,
             @current_is_memory_optimized = stp.is_memory_optimized,
             @current_is_heap = stp.is_heap,
+            @current_auto_created = stp.auto_created,
             @current_modification_counter = stp.modification_counter,
             @current_row_count = stp.row_count,
             @current_days_stale = stp.days_stale,
             @current_page_count = stp.page_count,
             @current_persisted_sample_percent = stp.persisted_sample_percent,
+            @current_histogram_steps = stp.histogram_steps,
             @current_forwarded_records = NULL,
             /* Filtered statistics metadata */
             @current_has_filter = stp.has_filter,
@@ -3305,8 +4313,10 @@ BEGIN
             Forwarding pointers occur when rows grow and must be relocated.
             High counts indicate fragmentation that hurts scan performance.
             Note: Uses SAMPLED mode for performance (DETAILED is very slow).
+            Controlled by @CollectHeapForwarding (default N for performance).
             */
             IF @current_is_heap = 1
+            AND @CollectHeapForwarding = N'Y'
             BEGIN
                 SELECT
                     @current_forwarded_records = ps.forwarded_record_count
@@ -3386,17 +4396,74 @@ BEGIN
         */
         DECLARE
             @has_with_option bit = 0,
-            @with_clause nvarchar(max) = N'';
+            @with_clause nvarchar(max) = N'',
+            @is_long_running_stat bit = 0,
+            @effective_sample_percent int = @StatisticsSample;
+
+        /*
+        ADAPTIVE SAMPLING: Check if this stat is historically long-running
+        If so, override the sample rate with @LongRunningSamplePercent
+        */
+        IF @LongRunningThresholdMinutes IS NOT NULL
+        BEGIN
+            IF EXISTS
+            (
+                SELECT 1
+                FROM @long_running_stats AS lrs
+                WHERE lrs.database_name = @current_database
+                AND   lrs.schema_name = @current_schema_name
+                AND   lrs.table_name = @current_table_name
+                AND   lrs.stat_name = @current_stat_name
+            )
+            BEGIN
+                SELECT
+                    @is_long_running_stat = 1;
+
+                /*
+                CAP SAMPLE PERCENT TO AVOID EXCESSIVE ROW COUNTS
+                10% of 1B rows = 100M rows, which is worse than auto-sample.
+                Cap at ~10M rows sampled. For a 1B row table: 10M/1B*100 = 1%.
+                Minimum 1% (SQL Server's floor for SAMPLE PERCENT).
+                */
+                SELECT @effective_sample_percent =
+                    CASE
+                        WHEN @current_row_count <= 0 THEN @LongRunningSamplePercent
+                        WHEN @current_row_count <= 10000000 THEN @LongRunningSamplePercent
+                        ELSE
+                            CASE
+                                WHEN CEILING(10000000.0 / @current_row_count * 100) < @LongRunningSamplePercent
+                                THEN CONVERT(int, CEILING(10000000.0 / @current_row_count * 100))
+                                ELSE @LongRunningSamplePercent
+                            END
+                    END;
+
+                /* Ensure minimum 1% (SQL Server requirement for SAMPLE PERCENT) */
+                IF @effective_sample_percent < 1
+                    SELECT @effective_sample_percent = 1;
+
+                DECLARE @lr_hist_msg nvarchar(500);
+                SELECT @lr_hist_msg =
+                    N'  Adaptive Sampling: ' + @current_stat_name +
+                    N' (historically slow, forcing ' + CONVERT(nvarchar(10), @effective_sample_percent) + N'%% sample' +
+                    CASE
+                        WHEN @effective_sample_percent < @LongRunningSamplePercent
+                        THEN N', capped from ' + CONVERT(nvarchar(10), @LongRunningSamplePercent) + N'%%'
+                        ELSE N''
+                    END + N')';
+                RAISERROR(@lr_hist_msg, 10, 1) WITH NOWAIT;
+            END;
+        END;
 
         /*
         Memory-optimized tables have special requirements
         - SQL Server 2014: Requires FULLSCAN or RESAMPLE, no sampling
         - SQL Server 2016+: Supports sampling
+        Note: Memory-optimized takes precedence over adaptive sampling
         */
         IF  @current_is_memory_optimized = 1
         AND @sql_version < 13
-        AND @StatisticsSample IS NOT NULL
-        AND @StatisticsSample < 100
+        AND @effective_sample_percent IS NOT NULL
+        AND @effective_sample_percent < 100
         BEGIN
             /*
             Force FULLSCAN for memory-optimized on SQL 2014
@@ -3410,18 +4477,18 @@ BEGIN
                 RAISERROR(N'  Note: Memory-optimized table on SQL 2014 requires FULLSCAN', 10, 1) WITH NOWAIT;
             END;
         END;
-        ELSE IF @StatisticsSample = 100
+        ELSE IF @effective_sample_percent = 100
         BEGIN
             SELECT
                 @with_clause = N'FULLSCAN',
                 @has_with_option = 1;
         END;
-        ELSE IF @StatisticsSample IS NOT NULL
+        ELSE IF @effective_sample_percent IS NOT NULL
         BEGIN
             SELECT
                 @with_clause =
                     N'SAMPLE ' +
-                    CONVERT(nvarchar(10), @StatisticsSample) +
+                    CONVERT(nvarchar(10), @effective_sample_percent) +
                     N' PERCENT',
                 @has_with_option = 1;
         END;
@@ -3430,9 +4497,11 @@ BEGIN
         When @StatisticsSample is NULL and the stat has a persisted sample,
         honor the existing setting by using RESAMPLE.
         This preserves the sample rate without overriding DBA-tuned values.
+        Exception: Long-running stats use forced sample rate instead of RESAMPLE.
         */
-        ELSE IF @StatisticsSample IS NULL
+        ELSE IF @effective_sample_percent IS NULL
         AND     @current_persisted_sample_percent IS NOT NULL
+        AND     @is_long_running_stat = 0
         BEGIN
             SELECT
                 @with_clause = N'RESAMPLE',
@@ -3453,11 +4522,29 @@ BEGIN
         DECLARE
             @incremental_partitions nvarchar(max) = NULL,
             @incremental_partition_count int = 0,
-            @incremental_total_partitions int = 0;
+            @incremental_total_partitions int = 0,
+            @physical_partition_count int = 0;
 
         IF  @UpdateIncremental = 1
         AND @current_is_incremental = 1
         BEGIN
+            /*
+            P1 #26: Cross-reference with sys.partitions
+            dm_db_incremental_stats_properties may miss truncated/empty partitions.
+            Get physical partition count from sys.partitions as authoritative source.
+            */
+            DECLARE @physical_sql nvarchar(max) = N'
+                SELECT @count_out = COUNT(DISTINCT partition_number)
+                FROM sys.partitions
+                WHERE object_id = @obj_id
+                AND   index_id IN (0, 1)';
+
+            EXEC sys.sp_executesql
+                @physical_sql,
+                N'@obj_id int, @count_out int OUTPUT',
+                @obj_id = @current_object_id,
+                @count_out = @physical_partition_count OUTPUT;
+
             /*
             Query dm_db_incremental_stats_properties to find partitions with modifications.
             Only update partitions that exceed the modification threshold.
@@ -3512,8 +4599,24 @@ BEGIN
             Add ON PARTITIONS clause if we found specific stale partitions.
             If ALL partitions are stale, skip ON PARTITIONS (full RESAMPLE is more efficient).
             If NO partitions are stale, we shouldn't be here (discovery should have filtered).
+
+            P1 #26: Check for missing partitions.
+            If DMV reports fewer partitions than sys.partitions, some are missing
+            (likely truncated/empty). Force full RESAMPLE in this case.
             */
-            IF  @incremental_partitions IS NOT NULL
+            DECLARE @partitions_missing bit = 0;
+            IF @physical_partition_count > @incremental_total_partitions
+            BEGIN
+                SELECT @partitions_missing = 1;
+                IF @Debug = 1
+                BEGIN
+                    RAISERROR(N'  Note: DMV shows %d partitions but sys.partitions has %d - missing partitions detected', 10, 1,
+                        @incremental_total_partitions, @physical_partition_count) WITH NOWAIT;
+                END;
+            END;
+
+            IF  @partitions_missing = 0
+            AND @incremental_partitions IS NOT NULL
             AND @incremental_partition_count > 0
             AND @incremental_partition_count < @incremental_total_partitions
             BEGIN
@@ -3528,7 +4631,11 @@ BEGIN
             END;
             ELSE IF @Debug = 1
             BEGIN
-                IF @incremental_partition_count = @incremental_total_partitions
+                IF @partitions_missing = 1
+                BEGIN
+                    RAISERROR(N'  Note: Incremental statistics - full RESAMPLE (missing partitions)', 10, 1) WITH NOWAIT;
+                END;
+                ELSE IF @incremental_partition_count = @incremental_total_partitions
                 BEGIN
                     RAISERROR(N'  Note: Incremental statistics - all %d partitions stale, full RESAMPLE', 10, 1,
                         @incremental_total_partitions) WITH NOWAIT;
@@ -3638,6 +4745,17 @@ BEGIN
             @current_command += N';';
 
         /*
+        RESET LOCK_TIMEOUT (P1 #23)
+        SET LOCK_TIMEOUT persists at session level after sp_executesql returns.
+        Reset to -1 (infinite) to prevent affecting subsequent operations.
+        */
+        IF @LockTimeout IS NOT NULL
+        BEGIN
+            SELECT
+                @current_command += N' SET LOCK_TIMEOUT -1;';
+        END;
+
+        /*
         ========================================================================
         OUTPUT / EXECUTE
         ========================================================================
@@ -3706,6 +4824,13 @@ BEGIN
                 IF  @LogToTable = N'Y'
                 AND @commandlog_exists = 1
                 BEGIN
+                    /*
+                    Build ExtendedInfo XML for CommandLog.
+                    NOTE: RunLabel is intentionally denormalized into each stat's ExtendedInfo.
+                    This enables simple correlation queries without complex joins:
+                      SELECT * FROM CommandLog WHERE ExtendedInfo.value('...RunLabel...') = 'server_20260128_123456'
+                    Trade-off: ~50 bytes per row vs. join complexity. Acceptable for maintenance logs.
+                    */
                     SELECT
                         @current_extended_info =
                         (
@@ -3725,6 +4850,8 @@ BEGIN
                                 @current_is_heap AS IsHeap,
                                 @current_forwarded_records AS ForwardedRecords,
                                 @current_is_memory_optimized AS IsMemoryOptimized,
+                                @current_auto_created AS AutoCreated,
+                                @current_histogram_steps AS HistogramSteps,
                                 /* Filtered statistics metadata */
                                 @current_has_filter AS HasFilter,
                                 LEFT(@current_filter_definition, 500) AS FilterDefinition, /*truncate for XML*/
@@ -3763,7 +4890,8 @@ BEGIN
                                     ELSE N'THRESHOLD_MATCH'
                                 END AS QualifyReason,
                                 @StatisticsSample AS SamplePct,
-                                @mode AS Mode
+                                @mode AS Mode,
+                                @run_label AS RunLabel
                             FOR
                                 XML RAW(N'ExtendedInfo'),
                                 ELEMENTS
@@ -3918,6 +5046,30 @@ BEGIN
             Dry run - just show command
             */
             RAISERROR(N'  [DRY RUN] %s', 10, 1, @current_command) WITH NOWAIT;
+
+            /*
+            If @WhatIfOutputTable is specified, insert the command into that table
+            */
+            IF @WhatIfOutputTable IS NOT NULL
+            BEGIN
+                DECLARE @whatif_insert_sql nvarchar(max) = N'
+                    INSERT INTO ' + @WhatIfOutputTable + N'
+                    (DatabaseName, SchemaName, TableName, StatName, Command, ModificationCounter, DaysStale, PageCount)
+                    VALUES (@db, @schema, @table, @stat, @cmd, @mods, @days, @pages)';
+
+                EXEC sys.sp_executesql
+                    @whatif_insert_sql,
+                    N'@db sysname, @schema sysname, @table sysname, @stat sysname, @cmd nvarchar(max), @mods bigint, @days int, @pages bigint',
+                    @db = @current_database,
+                    @schema = @current_schema_name,
+                    @table = @current_table_name,
+                    @stat = @current_stat_name,
+                    @cmd = @current_command,
+                    @mods = @current_modification_counter,
+                    @days = @current_days_stale,
+                    @pages = @current_page_count;
+            END;
+
             SELECT
                 @stats_skipped += 1,
                 @claimed_table_stats_skipped += CASE WHEN @StatsInParallel = N'Y' THEN 1 ELSE 0 END;
