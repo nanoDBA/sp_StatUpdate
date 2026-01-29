@@ -52,6 +52,7 @@ History:    1.9.2026.0128 - Additional Code Review Fixes (addressing remaining S
                           - @WhatIfOutputTable validates column DATA TYPES, not just names
                           - Query Store READ_ONLY warning when using @QueryStorePriority
                           - ##sp_StatUpdate_Progress global temp table for external monitoring
+                            (opt-in via @ExposeProgressToAllSessions due to security - visible to all sessions)
                           - Debug mode now explains threshold interaction logic
             1.8.2026.0128 - Code Review Fixes (P1 & P2 issues from CODE_REVIEW_ANALYSIS.md):
                           - P1 #24: @LongRunningSamplePercent now caps at ~10M rows sampled.
@@ -356,6 +357,7 @@ ALTER PROCEDURE
     @WhatIfOutputTable nvarchar(500) = NULL, /*table to receive commands when @Execute = N (for automation)*/
     @FailFast bit = 0, /*1 = abort on first error*/
     @Debug bit = 0, /*1 = verbose output*/
+    @ExposeProgressToAllSessions nvarchar(1) = N'N', /*Y = create ##sp_StatUpdate_Progress global temp table (SECURITY NOTE: visible to ALL sessions on server). N = disabled (use @ProgressLogInterval for secure monitoring)*/
     @CleanupOrphanedRuns nvarchar(1) = N'Y', /*Y = mark orphaned SP_STATUPDATE_START entries (>24h old, no END) as KILLED. v1.9: Default changed from N to Y*/
 
     /*
@@ -553,6 +555,8 @@ BEGIN
                     THEN N'1 = abort on first error, 0 = continue processing'
                     WHEN N'@Debug'
                     THEN N'1 = verbose diagnostic output'
+                    WHEN N'@ExposeProgressToAllSessions'
+                    THEN N'Y = create ##sp_StatUpdate_Progress (SECURITY: visible to ALL sessions). Use @ProgressLogInterval for secure monitoring.'
                     WHEN N'@CleanupOrphanedRuns'
                     THEN N'Y (default) = mark orphaned START entries >24h old (killed runs) with END marker'
                     WHEN N'@StatsInParallel'
@@ -606,6 +610,8 @@ BEGIN
                     WHEN N'@CollectHeapForwarding'
                     THEN N'Y, N'
                     WHEN N'@CleanupOrphanedRuns'
+                    THEN N'Y, N'
+                    WHEN N'@ExposeProgressToAllSessions'
                     THEN N'Y, N'
                     ELSE N''
                 END,
@@ -689,8 +695,10 @@ BEGIN
                     THEN N'0'
                     WHEN N'@Debug'
                     THEN N'0'
-                    WHEN N'@CleanupOrphanedRuns'
+                    WHEN N'@ExposeProgressToAllSessions'
                     THEN N'N'
+                    WHEN N'@CleanupOrphanedRuns'
+                    THEN N'Y'
                     WHEN N'@StatsInParallel'
                     THEN N'N'
                     WHEN N'@DeadWorkerTimeoutMinutes'
@@ -2409,8 +2417,13 @@ BEGIN
     Create ##sp_StatUpdate_Progress table for external monitoring.
     Query from another session: SELECT * FROM ##sp_StatUpdate_Progress
     Table is auto-dropped when the session ends.
+
+    SECURITY NOTE: Global temp tables are visible to ALL sessions on the server.
+    This is opt-in via @ExposeProgressToAllSessions = 'Y' because it exposes
+    database/table names to anyone who can query tempdb. For secure monitoring,
+    use @ProgressLogInterval which writes to CommandLog (access-controlled).
     */
-    IF @Execute = N'Y'
+    IF @Execute = N'Y' AND @ExposeProgressToAllSessions = N'Y'
     BEGIN
         /* Create unique progress table name using run_label for multiple concurrent runs */
         DECLARE @progress_table_name nvarchar(128) = N'##sp_StatUpdate_Progress';
@@ -5578,6 +5591,7 @@ BEGIN
         Only update every 10 stats or on completion to reduce overhead.
         */
         IF  @Execute = N'Y'
+        AND @ExposeProgressToAllSessions = N'Y'
         AND (@stats_processed % 10 = 0 OR @stats_processed = @total_stats)
         AND OBJECT_ID('tempdb..##sp_StatUpdate_Progress', 'U') IS NOT NULL
         BEGIN
@@ -5693,6 +5707,7 @@ BEGIN
     Update global progress table with final status (v1.9)
     */
     IF  @Execute = N'Y'
+    AND @ExposeProgressToAllSessions = N'Y'
     AND OBJECT_ID('tempdb..##sp_StatUpdate_Progress', 'U') IS NOT NULL
     BEGIN
         BEGIN TRY
