@@ -96,15 +96,16 @@ EXEC dbo.sp_StatUpdate
 
 ### "The Orders table gets 10M inserts/day"
 
-High-churn tables with ascending keys (OrderID, TransactionDate) need more frequent updates. Run this every 4 hours during business hours.
+High-churn tables with ascending keys need attention, but UPDATE STATISTICS takes locks. Run during low-activity windows, not business hours.
 
 ```sql
--- High-frequency job for specific tables
+-- Midday lull or after-hours for high-churn tables
 EXEC dbo.sp_StatUpdate
     @Databases = N'Production',
-    @Tables = N'Sales.Orders, Sales.OrderDetails, Sales.Transactions',
-    @ModificationThreshold = 10000,       -- Lower threshold = more sensitive
-    @TimeLimit = 900;                     -- 15 min max
+    @Tables = N'Sales.Orders, Sales.OrderDetails',
+    @ModificationThreshold = 100000,
+    @LockTimeout = 5,                     -- Skip if blocked after 5 sec
+    @TimeLimit = 600;
 ```
 
 ### "Query Store shows one stat is causing 40% of our CPU"
