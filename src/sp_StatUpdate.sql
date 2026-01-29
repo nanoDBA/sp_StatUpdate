@@ -36,11 +36,15 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.9.2026.0128 (Major.Minor.Year.MMDD)
+Version:    1.9.2026.0129 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    1.9.2026.0128 - Additional Code Review Fixes (addressing remaining SME concerns):
+History:    1.9.2026.0129 - Fix: Changed @long_running_stats table variable PK from CLUSTERED to
+                            NONCLUSTERED to eliminate "maximum key length 900 bytes" warning.
+                            (4 sysname columns = 1024 bytes exceeds clustered limit but is fine
+                            for nonclustered indexes which support up to 1700 bytes in SQL 2016+)
+            1.9.2026.0128 - Additional Code Review Fixes (addressing remaining SME concerns):
                           - New @Preset parameter: NIGHTLY_MAINTENANCE, WEEKLY_FULL, OLTP_LIGHT,
                             WAREHOUSE_AGGRESSIVE for common configuration patterns
                           - @GroupByJoinPattern parameter (default Y): Updates commonly-joined tables together
@@ -413,8 +417,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '1.9.2026.0128',
-        @procedure_version_date datetime = '20260128',
+        @procedure_version varchar(20) = '1.9.2026.0129',
+        @procedure_version_date datetime = '20260129',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -1046,7 +1050,7 @@ BEGIN
         max_duration_minutes int NOT NULL,
         last_occurrence datetime2(7) NOT NULL,
         occurrence_count int NOT NULL DEFAULT 1,
-        PRIMARY KEY (database_name, schema_name, table_name, stat_name)
+        PRIMARY KEY NONCLUSTERED (database_name, schema_name, table_name, stat_name)
     );
 
     /*
