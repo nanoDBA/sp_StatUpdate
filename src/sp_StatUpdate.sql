@@ -2041,6 +2041,26 @@ BEGIN
     END;
 
     /*
+    Validate @LockTimeout
+    -1 is valid (infinite wait), 0+ is valid (timeout in seconds)
+    Negative values other than -1 are invalid
+    */
+    IF  @LockTimeout IS NOT NULL
+    AND @LockTimeout < -1
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @LockTimeout must be -1 (infinite) or >= 0 seconds.',
+            error_severity = 16;
+    END;
+
+    /*
     Validate @LongRunningThresholdMinutes and @LongRunningSamplePercent
     */
     IF  @LongRunningThresholdMinutes IS NOT NULL
