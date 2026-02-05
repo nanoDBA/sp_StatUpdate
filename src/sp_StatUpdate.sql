@@ -5088,7 +5088,13 @@ BEGIN
                 FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id) AS isp
                 WHERE isp.modification_counter > 0';
 
-            BEGIN TRY
+            /*
+            Use STRING_AGG on SQL 2017+ (faster, cleaner)
+            Fall back to FOR XML PATH on SQL 2016
+            */
+            IF @sql_major_version >= 14
+            BEGIN
+                /* SQL 2017+: Use STRING_AGG */
                 EXEC sys.sp_executesql
                     @partition_sql,
                     N'@obj_id int, @stat_id int, @partitions_out nvarchar(max) OUTPUT, @count_out int OUTPUT, @total_out int OUTPUT',
@@ -5097,11 +5103,10 @@ BEGIN
                     @partitions_out = @incremental_partitions OUTPUT,
                     @count_out = @incremental_partition_count OUTPUT,
                     @total_out = @incremental_total_partitions OUTPUT;
-            END TRY
-            BEGIN CATCH
-                /*
-                If STRING_AGG fails (SQL 2016), fall back to FOR XML PATH
-                */
+            END
+            ELSE
+            BEGIN
+                /* SQL 2016: Use FOR XML PATH */
                 SELECT @partition_sql = N'
                     SELECT @partitions_out = STUFF((
                                SELECT N'', '' + CONVERT(nvarchar(10), isp.partition_number)
@@ -5122,7 +5127,7 @@ BEGIN
                     @partitions_out = @incremental_partitions OUTPUT,
                     @count_out = @incremental_partition_count OUTPUT,
                     @total_out = @incremental_total_partitions OUTPUT;
-            END CATCH;
+            END;
 
             /*
             Add ON PARTITIONS clause if we found specific stale partitions.
