@@ -4855,13 +4855,18 @@ BEGIN
 
         /*
         Lock timeout
+        -1 = infinite wait (pass through as-is, don't multiply)
+        0+ = timeout in seconds (convert to milliseconds)
         */
         IF @LockTimeout IS NOT NULL
         BEGIN
             SELECT
                 @current_command =
                     N'SET LOCK_TIMEOUT ' +
-                    CONVERT(nvarchar(20), CONVERT(bigint, @LockTimeout) * 1000) +
+                    CASE
+                        WHEN @LockTimeout = -1 THEN N'-1'
+                        ELSE CONVERT(nvarchar(20), CONVERT(bigint, @LockTimeout) * 1000)
+                    END +
                     N'; ';
         END;
 
