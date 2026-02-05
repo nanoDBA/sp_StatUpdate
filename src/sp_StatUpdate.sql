@@ -2271,8 +2271,11 @@ BEGIN
     DECLARE
         @TieredThresholds_int integer = @TieredThresholds,
         @UpdateIncremental_int integer = @UpdateIncremental,
-        @FailFast_int integer = @FailFast;
+        @FailFast_int integer = @FailFast,
+        @Debug_int integer = @Debug;
 
+    IF @Preset IS NOT NULL
+        RAISERROR(N'  @Preset                  = %s', 10, 1, @Preset) WITH NOWAIT;
     RAISERROR(N'  @TieredThresholds        = %d', 10, 1, @TieredThresholds_int) WITH NOWAIT;
     RAISERROR(N'  @ThresholdLogic          = %s', 10, 1, @ThresholdLogic) WITH NOWAIT;
     IF @DaysStaleThreshold IS NOT NULL
@@ -2302,6 +2305,35 @@ BEGIN
         RAISERROR(N'  @LongRunningThreshold    = %d minutes', 10, 1, @LongRunningThresholdMinutes) WITH NOWAIT;
         RAISERROR(N'  @LongRunningSamplePct    = %d%%', 10, 1, @LongRunningSamplePercent) WITH NOWAIT;
     END;
+
+    /*
+    Query Store parameters (when enabled)
+    */
+    IF @QueryStorePriority = N'Y'
+    BEGIN
+        RAISERROR(N'  @QueryStorePriority      = %s', 10, 1, @QueryStorePriority) WITH NOWAIT;
+        RAISERROR(N'  @QueryStoreMetric        = %s', 10, 1, @QueryStoreMetric) WITH NOWAIT;
+        RAISERROR(N'  @QueryStoreMinExecutions = %I64d', 10, 1, @QueryStoreMinExecutions) WITH NOWAIT;
+        RAISERROR(N'  @QueryStoreRecentHours   = %d', 10, 1, @QueryStoreRecentHours) WITH NOWAIT;
+    END;
+
+    /*
+    Additional parameters (when non-default or relevant)
+    */
+    RAISERROR(N'  @GroupByJoinPattern      = %s', 10, 1, @GroupByJoinPattern) WITH NOWAIT;
+    IF @FilteredStatsMode <> N'INCLUDE'
+        RAISERROR(N'  @FilteredStatsMode       = %s', 10, 1, @FilteredStatsMode) WITH NOWAIT;
+    IF @MaxDOP IS NOT NULL
+        RAISERROR(N'  @MaxDOP                  = %d', 10, 1, @MaxDOP) WITH NOWAIT;
+    IF @DelayBetweenStats IS NOT NULL
+        RAISERROR(N'  @DelayBetweenStats       = %d seconds', 10, 1, @DelayBetweenStats) WITH NOWAIT;
+    RAISERROR(N'  @LogToTable              = %s', 10, 1, @LogToTable) WITH NOWAIT;
+    RAISERROR(N'  @CleanupOrphanedRuns     = %s', 10, 1, @CleanupOrphanedRuns) WITH NOWAIT;
+    RAISERROR(N'  @Debug                   = %d', 10, 1, @Debug_int) WITH NOWAIT;
+    IF @ExposeProgressToAllSessions = N'Y'
+        RAISERROR(N'  @ExposeProgressToAllSess = %s', 10, 1, @ExposeProgressToAllSessions) WITH NOWAIT;
+    IF @StatsInParallel = N'Y' AND @DeadWorkerTimeoutMinutes IS NOT NULL
+        RAISERROR(N'  @DeadWorkerTimeout       = %d minutes', 10, 1, @DeadWorkerTimeoutMinutes) WITH NOWAIT;
 
     /*
     Threshold Interaction Explanation (v1.9, debug mode only)
@@ -2337,6 +2369,16 @@ BEGIN
                 RAISERROR(N'  AND days since update >= %d', 10, 1, @DaysStaleThreshold) WITH NOWAIT;
         END;
     END;
+
+    /*
+    One-time note when @PersistSamplePercent=Y but no sample rate specified
+    (Moved from per-stat loop to reduce noise in debug output)
+    */
+    IF @Debug = 1 AND @PersistSamplePercent = N'Y' AND @StatisticsSample IS NULL
+    BEGIN
+        RAISERROR(N'Note: @PersistSamplePercent=Y ignored (no @StatisticsSample specified)', 10, 1) WITH NOWAIT;
+    END;
+
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     /*
@@ -5196,10 +5238,7 @@ BEGIN
         BEGIN
             RAISERROR(N'  Note: @PersistSamplePercent ignored - conflicts with RESAMPLE (Error 1052)', 10, 1) WITH NOWAIT;
         END;
-        ELSE IF @PersistSamplePercent = N'Y' AND @has_with_option = 0 AND @Debug = 1
-        BEGIN
-            RAISERROR(N'  Note: @PersistSamplePercent requires FULLSCAN or SAMPLE', 10, 1) WITH NOWAIT;
-        END;
+        /* Note: @has_with_option=0 case now handled once at startup to reduce debug noise */
 
         /*
         NORECOMPUTE: Preserve the flag on stats that have it set
