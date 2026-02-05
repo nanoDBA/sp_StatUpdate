@@ -1,4 +1,4 @@
-SET ANSI_NULLS ON;
+﻿SET ANSI_NULLS ON;
 GO
 SET QUOTED_IDENTIFIER ON;
 GO
@@ -67,11 +67,11 @@ History:    1.9.2026.0129 - Fix: Changed @long_running_stats table variable PK f
                           - P2 #4: @DeadWorkerTimeoutMinutes default reduced from 30 to 15 minutes.
                           - P2 #10: @WhatIfOutputTable validates schema when table exists.
                           - P2 #20: Query Store Phase 6 operations skipped when QS disabled on DB.
-            1.7.2026.0127 - BREAKING: @ModificationThreshold default 1000 → 5000 (less aggressive)
+            1.7.2026.0127 - BREAKING: @ModificationThreshold default 1000 â†’ 5000 (less aggressive)
             1.6.2026.0127 - RunLabel in individual stat ExtendedInfo for run correlation
             1.6.2026.0128 - Staged Discovery (Performance):
                             New @StagedDiscovery parameter (default Y). 6-phase discovery
-                            eliminates O(n²) DMV joins by: (1) collect basic candidates from
+                            eliminates O(nÂ²) DMV joins by: (1) collect basic candidates from
                             sys.stats, (2) batch enrich with sys.dm_db_stats_properties,
                             (3) pre-calculate tier thresholds (no inline SQRT), (4) apply
                             threshold filters, (5) add page counts for qualifying only,
@@ -5088,7 +5088,13 @@ BEGIN
                 FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id) AS isp
                 WHERE isp.modification_counter > 0';
 
-            BEGIN TRY
+            /*
+            Use STRING_AGG on SQL 2017+ (faster, cleaner)
+            Fall back to FOR XML PATH on SQL 2016
+            */
+            IF @sql_major_version >= 14
+            BEGIN
+                /* SQL 2017+: Use STRING_AGG */
                 EXEC sys.sp_executesql
                     @partition_sql,
                     N'@obj_id int, @stat_id int, @partitions_out nvarchar(max) OUTPUT, @count_out int OUTPUT, @total_out int OUTPUT',
@@ -5097,11 +5103,10 @@ BEGIN
                     @partitions_out = @incremental_partitions OUTPUT,
                     @count_out = @incremental_partition_count OUTPUT,
                     @total_out = @incremental_total_partitions OUTPUT;
-            END TRY
-            BEGIN CATCH
-                /*
-                If STRING_AGG fails (SQL 2016), fall back to FOR XML PATH
-                */
+            END
+            ELSE
+            BEGIN
+                /* SQL 2016: Use FOR XML PATH */
                 SELECT @partition_sql = N'
                     SELECT @partitions_out = STUFF((
                                SELECT N'', '' + CONVERT(nvarchar(10), isp.partition_number)
@@ -5122,8 +5127,7 @@ BEGIN
                     @partitions_out = @incremental_partitions OUTPUT,
                     @count_out = @incremental_partition_count OUTPUT,
                     @total_out = @incremental_total_partitions OUTPUT;
-            END CATCH;
-
+            END;
             /*
             Add ON PARTITIONS clause if we found specific stale partitions.
             If ALL partitions are stale, skip ON PARTITIONS (full RESAMPLE is more efficient).
