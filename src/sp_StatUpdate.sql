@@ -2041,6 +2041,26 @@ BEGIN
     END;
 
     /*
+    Validate @LockTimeout
+    -1 is valid (infinite wait), 0+ is valid (timeout in seconds)
+    Negative values other than -1 are invalid
+    */
+    IF  @LockTimeout IS NOT NULL
+    AND @LockTimeout < -1
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @LockTimeout must be -1 (infinite) or >= 0 seconds.',
+            error_severity = 16;
+    END;
+
+    /*
     Validate @LongRunningThresholdMinutes and @LongRunningSamplePercent
     */
     IF  @LongRunningThresholdMinutes IS NOT NULL
@@ -4877,13 +4897,18 @@ BEGIN
 
         /*
         Lock timeout
+        -1 = infinite wait (pass through as-is, don't multiply)
+        0+ = timeout in seconds (convert to milliseconds)
         */
         IF @LockTimeout IS NOT NULL
         BEGIN
             SELECT
                 @current_command =
                     N'SET LOCK_TIMEOUT ' +
-                    CONVERT(nvarchar(20), CONVERT(bigint, @LockTimeout) * 1000) +
+                    CASE
+                        WHEN @LockTimeout = -1 THEN N'-1'
+                        ELSE CONVERT(nvarchar(20), CONVERT(bigint, @LockTimeout) * 1000)
+                    END +
                     N'; ';
         END;
 
