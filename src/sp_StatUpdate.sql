@@ -4302,6 +4302,25 @@ BEGIN
             @StatsRemainingOut = 0,
             @DurationSecondsOut = DATEDIFF(second, @start_time, GETDATE());
 
+        /*
+        Return summary result set even on early exit (0 qualifying stats).
+        Without this, INSERT #Summary EXEC sp_StatUpdate gets no rows.
+        */
+        SELECT
+            Status = N'SUCCESS',
+            StatusMessage = N'No statistics qualify for update',
+            StatsFound = 0,
+            StatsProcessed = 0,
+            StatsSucceeded = 0,
+            StatsFailed = 0,
+            StatsSkipped = 0,
+            StatsRemaining = 0,
+            DatabasesProcessed = @database_count,
+            DurationSeconds = DATEDIFF(second, @start_time, GETDATE()),
+            StopReason = CONVERT(nvarchar(50), N'NO_QUALIFYING_STATS'),
+            RunLabel = @run_label,
+            Version = @procedure_version;
+
         RETURN 0;
     END;
 
@@ -5907,6 +5926,29 @@ BEGIN
     Enables automation scripts to capture and react to results.
     */
     SELECT
+        /*
+        Status: Enables easy Agent job alerting
+          ERROR   = At least one statistic failed to update
+          WARNING = Stats skipped or remaining (time/batch limit)
+          SUCCESS = All discovered stats updated without issues
+        */
+        Status = CASE
+            WHEN @stats_failed > 0 THEN N'ERROR'
+            WHEN @stats_skipped > 0 OR @remaining_stats > 0 THEN N'WARNING'
+            ELSE N'SUCCESS'
+        END,
+        StatusMessage = CASE
+            WHEN @stats_failed > 0 AND @remaining_stats > 0
+                THEN N'Failed: ' + CONVERT(nvarchar(10), @stats_failed) + N' stat(s), '
+                    + CONVERT(nvarchar(10), @remaining_stats) + N' remaining (' + ISNULL(@stop_reason, N'unknown') + N')'
+            WHEN @stats_failed > 0
+                THEN N'Failed: ' + CONVERT(nvarchar(10), @stats_failed) + N' stat(s)'
+            WHEN @remaining_stats > 0
+                THEN N'Incomplete: ' + CONVERT(nvarchar(10), @remaining_stats) + N' stat(s) remaining (' + ISNULL(@stop_reason, N'unknown') + N')'
+            WHEN @stats_skipped > 0
+                THEN N'Skipped: ' + CONVERT(nvarchar(10), @stats_skipped) + N' stat(s)'
+            ELSE N'All ' + CONVERT(nvarchar(10), @stats_succeeded) + N' stat(s) updated successfully'
+        END,
         StatsFound = @total_stats,
         StatsProcessed = @stats_processed,
         StatsSucceeded = @stats_succeeded,
