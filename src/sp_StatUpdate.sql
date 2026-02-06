@@ -40,7 +40,11 @@ Version:    1.9.2026.0206 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    1.9.2026.0206 - Perf: Phase 6 Query Store enrichment now uses batched CTE + JOIN
+History:    1.9.2026.0206 - Feat: Added Status and StatusMessage columns to summary result set
+                            for easy Agent job alerting (SUCCESS/WARNING/ERROR). Early-return
+                            path (0 qualifying stats) now also returns the result set.
+                            (Issue #2)
+                          - Perf: Phase 6 Query Store enrichment now uses batched CTE + JOIN
                             instead of CROSS APPLY per row. Changes O(n) separate QS queries
                             to O(1) batched query with GROUP BY. Significant improvement on
                             databases with many statistics and large Query Store catalogs.
@@ -422,8 +426,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '1.9.2026.0129',
-        @procedure_version_date datetime = '20260129',
+        @procedure_version varchar(20) = '1.9.2026.0206',
+        @procedure_version_date datetime = '20260206',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
