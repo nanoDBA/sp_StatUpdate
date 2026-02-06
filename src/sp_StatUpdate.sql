@@ -3477,9 +3477,10 @@ BEGIN
                         JOIN sys.query_store_runtime_stats AS qsrs ON qsrs.plan_id = qsp.plan_id
                         JOIN sys.query_store_runtime_stats_interval AS qsrsi
                             ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
-                        WHERE qsq.object_id IN (SELECT DISTINCT object_id FROM #stat_candidates WHERE object_id IS NOT NULL)
+                        WHERE qsq.object_id IN (SELECT DISTINCT object_id FROM #stat_candidates)
                         AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, GETDATE())
                         GROUP BY qsq.object_id
+                        HAVING SUM(qsrs.count_executions) > 0
                     )
                     UPDATE sc
                     SET
