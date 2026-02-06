@@ -36,11 +36,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.9.2026.0129 (Major.Minor.Year.MMDD)
+Version:    1.9.2026.0206 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    1.9.2026.0129 - Fix: Changed @long_running_stats table variable PK from CLUSTERED to
+History:    1.9.2026.0206 - Perf: Phase 6 Query Store enrichment now uses batched CTE + JOIN
+                            instead of CROSS APPLY per row. Changes O(n) separate QS queries
+                            to O(1) batched query with GROUP BY. Significant improvement on
+                            databases with many statistics and large Query Store catalogs.
+                            (Issue #4)
+            1.9.2026.0129 - Fix: Changed @long_running_stats table variable PK from CLUSTERED to
                             NONCLUSTERED to eliminate "maximum key length 900 bytes" warning.
                             (4 sysname columns = 1024 bytes exceeds clustered limit but is fine
                             for nonclustered indexes which support up to 1700 bytes in SQL 2016+)
@@ -3109,6 +3114,7 @@ BEGIN
               Phase 4: Apply threshold filters (early elimination)
               Phase 5: Add page counts (only for qualifying stats)
               Phase 6: Add Query Store data (only if enabled, only for qualifying)
+                       Uses batched CTE + JOIN instead of CROSS APPLY (O(1) vs O(n))
 
             This is significantly faster for large databases (10K+ stats) because:
               - Expensive DMV calls only run on candidates that might qualify
@@ -3447,8 +3453,35 @@ BEGIN
                             RAISERROR(N''    Warning: Query Store is READ_ONLY - priority data may be stale'', 10, 1) WITH NOWAIT;
                     END;
 
-                    /* Initialize qs_priority_boost to 0 for rows that won''t get QS data */
+                    /*
+                    PERF: Batch Query Store enrichment (Issue #4)
+                    Single query with GROUP BY instead of CROSS APPLY per row.
+                    Changes O(n) QS queries to O(1) batched query.
+                    */
+
+                    /* Initialize qs_priority_boost to 0 for all rows first */
                     UPDATE #stat_candidates SET qs_priority_boost = 0;
+
+                    /* Batch-fetch QS data for all relevant object_ids at once */
+                    ;WITH QSData AS (
+                        SELECT
+                            qsq.object_id,
+                            COUNT_BIG(DISTINCT qsp.plan_id) AS plan_count,
+                            SUM(qsrs.count_executions) AS total_executions,
+                            SUM(qsrs.avg_cpu_time * qsrs.count_executions) / 1000 AS total_cpu_ms,
+                            SUM(qsrs.avg_duration * qsrs.count_executions) / 1000 AS total_duration_ms,
+                            SUM(CONVERT(bigint, qsrs.avg_logical_io_reads * qsrs.count_executions)) AS total_logical_reads,
+                            MAX(qsrs.last_execution_time) AS last_execution
+                        FROM sys.query_store_query AS qsq
+                        JOIN sys.query_store_plan AS qsp ON qsp.query_id = qsq.query_id
+                        JOIN sys.query_store_runtime_stats AS qsrs ON qsrs.plan_id = qsp.plan_id
+                        JOIN sys.query_store_runtime_stats_interval AS qsrsi
+                            ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
+                        WHERE qsq.object_id IN (SELECT DISTINCT object_id FROM #stat_candidates)
+                        AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, GETDATE())
+                        GROUP BY qsq.object_id
+                        HAVING SUM(qsrs.count_executions) > 0
+                    )
                     UPDATE sc
                     SET
                         sc.qs_plan_count = qs.plan_count,
@@ -3470,22 +3503,7 @@ BEGIN
                                 ELSE 0
                             END
                     FROM #stat_candidates AS sc
-                    CROSS APPLY (
-                        SELECT
-                            COUNT_BIG(DISTINCT qsp.plan_id) AS plan_count,
-                            SUM(qsrs.count_executions) AS total_executions,
-                            SUM(qsrs.avg_cpu_time * qsrs.count_executions) / 1000 AS total_cpu_ms,
-                            SUM(qsrs.avg_duration * qsrs.count_executions) / 1000 AS total_duration_ms,
-                            SUM(CONVERT(bigint, qsrs.avg_logical_io_reads * qsrs.count_executions)) AS total_logical_reads,
-                            MAX(qsrs.last_execution_time) AS last_execution
-                        FROM sys.query_store_query AS qsq
-                        JOIN sys.query_store_plan AS qsp ON qsp.query_id = qsq.query_id
-                        JOIN sys.query_store_runtime_stats AS qsrs ON qsrs.plan_id = qsp.plan_id
-                        JOIN sys.query_store_runtime_stats_interval AS qsrsi
-                            ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
-                        WHERE qsq.object_id = sc.object_id
-                        AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, GETDATE())
-                    ) AS qs;
+                    INNER JOIN QSData AS qs ON qs.object_id = sc.object_id;
                 END;
 
                 /*
