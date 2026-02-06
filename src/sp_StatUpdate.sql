@@ -1,4 +1,4 @@
-﻿SET ANSI_NULLS ON;
+SET ANSI_NULLS ON;
 GO
 SET QUOTED_IDENTIFIER ON;
 GO
@@ -4302,6 +4302,25 @@ BEGIN
             @StatsRemainingOut = 0,
             @DurationSecondsOut = DATEDIFF(second, @start_time, GETDATE());
 
+        /*
+        Return summary result set even on early exit (0 qualifying stats).
+        Without this, INSERT #Summary EXEC sp_StatUpdate gets no rows.
+        */
+        SELECT
+            Status = N'SUCCESS',
+            StatusMessage = N'No statistics qualify for update',
+            StatsFound = 0,
+            StatsProcessed = 0,
+            StatsSucceeded = 0,
+            StatsFailed = 0,
+            StatsSkipped = 0,
+            StatsRemaining = 0,
+            DatabasesProcessed = @database_count,
+            DurationSeconds = DATEDIFF(second, @start_time, GETDATE()),
+            StopReason = CONVERT(nvarchar(50), N'NO_QUALIFYING_STATS'),
+            RunLabel = @run_label,
+            Version = @procedure_version;
+
         RETURN 0;
     END;
 
@@ -5919,6 +5938,9 @@ BEGIN
             ELSE N'SUCCESS'
         END,
         StatusMessage = CASE
+            WHEN @stats_failed > 0 AND @remaining_stats > 0
+                THEN N'Failed: ' + CONVERT(nvarchar(10), @stats_failed) + N' stat(s), '
+                    + CONVERT(nvarchar(10), @remaining_stats) + N' remaining (' + ISNULL(@stop_reason, N'unknown') + N')'
             WHEN @stats_failed > 0
                 THEN N'Failed: ' + CONVERT(nvarchar(10), @stats_failed) + N' stat(s)'
             WHEN @remaining_stats > 0
