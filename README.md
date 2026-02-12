@@ -235,7 +235,14 @@ ORDER BY SequenceNum;
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@Preset` | `NULL` | Common configurations: `NIGHTLY_MAINTENANCE`, `WEEKLY_FULL`, `OLTP_LIGHT`, `WAREHOUSE_AGGRESSIVE` |
-| `@GroupByJoinPattern` | `'Y'` | Update commonly-joined tables together (prevents optimization cliffs). Falls back silently if QS disabled. |
+
+### Join Pattern Grouping (v1.9+)
+
+Re-sorts processing order so commonly-joined tables (detected via Query Store) update consecutively. Without this, a time-limited run might update Table A but leave its join partner Table B stale — the optimizer sees mismatched cardinality estimates and picks bad join orders. Falls back silently if QS disabled. **Not compatible with `@StatsInParallel`.**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `@GroupByJoinPattern` | `'Y'` | Re-order stats so joined tables update together. `'N'` = priority only |
 | `@JoinPatternMinExecutions` | `100` | Minimum plan executions to detect join patterns |
 
 ### Execution Control
