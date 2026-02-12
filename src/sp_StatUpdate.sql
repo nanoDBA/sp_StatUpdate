@@ -36,11 +36,21 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.9.2026.0206 (Major.Minor.Year.MMDD)
+Version:    2.0.2026.0212 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    1.9.2026.0206 - Feat: Added Status and StatusMessage columns to summary result set
+History:    2.0.2026.0212 - Phase 1 Environment Intelligence (v2.0 roadmap):
+                          - CE Version/Compat Level: Shows per-database compatibility level and
+                            effective CE version (70, 120, 130+) in debug output.
+                          - Trace Flag Detection: Detects statistics-relevant trace flags (2371,
+                            2389, 2390, 4139, 9481) and shows warnings for obsolete/misconfigured
+                            flags. TF 2371 note for SQL 2016+ CL 130+, TF 9481 db-scoped config
+                            recommendation, TF 2389/2390 modernization note.
+                          - Database-Scoped Config: Detects LEGACY_CARDINALITY_ESTIMATION setting
+                            and notes when CE is forced to legacy mode.
+                          - SQL 2022 AUTO_DROP: Notes when AUTO_DROP feature is available.
+            1.9.2026.0206 - Feat: Added Status and StatusMessage columns to summary result set
                             for easy Agent job alerting (SUCCESS/WARNING/ERROR). Early-return
                             path (0 qualifying stats) now also returns the result set.
                             (Issue #2)
@@ -426,8 +436,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '1.9.2026.0206',
-        @procedure_version_date datetime = '20260206',
+        @procedure_version varchar(20) = '2.0.2026.0212',
+        @procedure_version_date datetime = '20260212',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -460,7 +470,9 @@ BEGIN
         SELECT
             N'' UNION ALL
         SELECT
-            N'version: ' + @procedure_version + N' (' + CONVERT(nvarchar(10), @procedure_version_date, 120) + N')';
+            N'version: ' + @procedure_version + N' (' + CONVERT(nvarchar(10), @procedure_version_date, 120) + N')' UNION ALL
+        SELECT
+            N'v2.0 Phase 1: Environment detection (CE version, trace flags, db-scoped configs)';
 
         /*
         Parameter documentation
@@ -898,7 +910,57 @@ BEGIN
         - MAXDOP in UPDATE STATISTICS: SQL 2016 SP2+ (build 5026+) or SQL 2017 CU3+ (build 3015+)
         */
         @supports_persist_sample bit = 0,
-        @supports_maxdop_stats bit = 0;
+        @supports_maxdop_stats bit = 0,
+        /* SQL 2022+ feature detection */
+        @supports_auto_drop bit = 0;
+
+    /* Set AUTO_DROP support flag (SQL 2022+) */
+    IF @sql_major_version >= 16
+        SET @supports_auto_drop = 1;
+
+    /*
+    Phase 1 Environment Detection (v2.0)
+    Trace flags affecting statistics behavior - detected once at startup.
+    */
+    DECLARE
+        @trace_flags table
+        (
+            TraceFlag int NOT NULL,
+            Status bit NOT NULL,
+            Global bit NOT NULL,
+            Session bit NOT NULL
+        );
+
+    DECLARE
+        @tf_2371_active bit = 0,    /* Dynamic thresholds (built-in for SQL 2016+ CL 130+) */
+        @tf_2389_active bit = 0,    /* Ascending key detection (legacy) */
+        @tf_2390_active bit = 0,    /* Descending key detection (legacy) */
+        @tf_4139_active bit = 0,    /* Universal histogram amendment (modern) */
+        @tf_9481_active bit = 0,    /* Force legacy CE */
+        @tf_warnings nvarchar(max) = N'';
+
+    /* Query active trace flags */
+    INSERT INTO @trace_flags (TraceFlag, Status, Global, Session)
+    EXEC (N'DBCC TRACESTATUS(-1) WITH NO_INFOMSGS');
+
+    /* Check for statistics-relevant trace flags */
+    SELECT
+        @tf_2371_active = MAX(CASE WHEN TraceFlag = 2371 AND Status = 1 THEN 1 ELSE 0 END),
+        @tf_2389_active = MAX(CASE WHEN TraceFlag = 2389 AND Status = 1 THEN 1 ELSE 0 END),
+        @tf_2390_active = MAX(CASE WHEN TraceFlag = 2390 AND Status = 1 THEN 1 ELSE 0 END),
+        @tf_4139_active = MAX(CASE WHEN TraceFlag = 4139 AND Status = 1 THEN 1 ELSE 0 END),
+        @tf_9481_active = MAX(CASE WHEN TraceFlag = 9481 AND Status = 1 THEN 1 ELSE 0 END)
+    FROM @trace_flags;
+
+    /* Build trace flag warnings for debug output */
+    IF @tf_2371_active = 1 AND @sql_major_version >= 13
+        SET @tf_warnings = @tf_warnings + N'TF 2371 unnecessary (built-in for SQL 2016+ CL 130+); ';
+    IF @tf_2389_active = 1 OR @tf_2390_active = 1
+        SET @tf_warnings = @tf_warnings + N'TF 2389/2390 are legacy ascending key flags - consider TF 4139 instead; ';
+    IF @tf_4139_active = 1
+        SET @tf_warnings = @tf_warnings + N'TF 4139 active (histogram amendment for ascending keys); ';
+    IF @tf_9481_active = 1
+        SET @tf_warnings = @tf_warnings + N'TF 9481 forces legacy CE 70 globally - consider db-scoped config instead; ';
 
     /*
     Error collection table (show all errors at once)
@@ -2268,6 +2330,29 @@ BEGIN
     RAISERROR(N'Server:      %s', 10, 1, @server_name) WITH NOWAIT;
     RAISERROR(N'Version:     %s', 10, 1, @product_version) WITH NOWAIT;
     RAISERROR(N'Edition:     %s', 10, 1, @edition) WITH NOWAIT;
+
+    /*
+    Trace flag status (Phase 1.3 - v2.0)
+    Show statistics-relevant trace flags if any are active.
+    */
+    IF @tf_2371_active = 1 OR @tf_2389_active = 1 OR @tf_2390_active = 1 OR @tf_4139_active = 1 OR @tf_9481_active = 1
+    BEGIN
+        DECLARE @tf_list nvarchar(100) = N'';
+        IF @tf_2371_active = 1 SET @tf_list = @tf_list + N'2371,';
+        IF @tf_2389_active = 1 SET @tf_list = @tf_list + N'2389,';
+        IF @tf_2390_active = 1 SET @tf_list = @tf_list + N'2390,';
+        IF @tf_4139_active = 1 SET @tf_list = @tf_list + N'4139,';
+        IF @tf_9481_active = 1 SET @tf_list = @tf_list + N'9481,';
+        SET @tf_list = LEFT(@tf_list, LEN(@tf_list) - 1); /* Remove trailing comma */
+        RAISERROR(N'TraceFlags:  %s (stats-relevant)', 10, 1, @tf_list) WITH NOWAIT;
+    END;
+
+    /*
+    SQL 2022 AUTO_DROP note (Phase 1.2 - v2.0)
+    */
+    IF @supports_auto_drop = 1
+        RAISERROR(N'AUTO_DROP:   Available (SQL 2022) - stats auto-drop on schema change by default', 10, 1) WITH NOWAIT;
+
     RAISERROR(N'Procedure:   %s', 10, 1, @procedure_version) WITH NOWAIT;
     RAISERROR(N'Start time:  %s', 10, 1, @start_time_display) WITH NOWAIT;
 
@@ -2396,6 +2481,24 @@ BEGIN
                 RAISERROR(N'  OR days since update >= %d', 10, 1, @DaysStaleThreshold) WITH NOWAIT;
             ELSE
                 RAISERROR(N'  AND days since update >= %d', 10, 1, @DaysStaleThreshold) WITH NOWAIT;
+        END;
+    END;
+
+    /*
+    Trace flag status in debug mode (Phase 1.3 - v2.0)
+    Show active statistics-relevant trace flags and recommendations.
+    */
+    IF @Debug = 1
+    BEGIN
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        IF LEN(@tf_warnings) > 0
+        BEGIN
+            RAISERROR(N'Statistics-Relevant Trace Flags: Active', 10, 1) WITH NOWAIT;
+            RAISERROR(N'  %s', 10, 1, @tf_warnings) WITH NOWAIT;
+        END
+        ELSE
+        BEGIN
+            RAISERROR(N'Statistics-Relevant Trace Flags: None active', 10, 1) WITH NOWAIT;
         END;
     END;
 
@@ -3106,6 +3209,60 @@ BEGIN
             ORDER BY ID;
 
             RAISERROR(N'  Scanning database: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
+
+            /*
+            ========================================================================
+            PER-DATABASE ENVIRONMENT INFO (Phase 1.1/1.4 - v2.0, debug mode only)
+            ========================================================================
+            Show compatibility level, effective CE version, and relevant db-scoped configs.
+            */
+            IF @Debug = 1
+            BEGIN
+                DECLARE
+                    @db_compat_level int,
+                    @db_ce_version int,
+                    @db_legacy_ce bit = 0,
+                    @db_env_sql nvarchar(max);
+
+                /* Get compatibility level */
+                SELECT @db_compat_level = compatibility_level
+                FROM sys.databases
+                WHERE name = @CurrentDatabaseName;
+
+                /* Calculate effective CE version */
+                SET @db_ce_version = CASE
+                    WHEN @db_compat_level <= 110 THEN 70
+                    WHEN @db_compat_level = 120 THEN 120
+                    ELSE @db_compat_level
+                END;
+
+                RAISERROR(N'    Compat Level: %d, CE Version: %d', 10, 1, @db_compat_level, @db_ce_version) WITH NOWAIT;
+
+                /* Check database-scoped configurations (SQL 2016+) */
+                IF @sql_major_version >= 13
+                BEGIN
+                    SET @db_env_sql = N'
+                        SELECT @legacy_ce_out = CASE WHEN value = 1 THEN 1 ELSE 0 END
+                        FROM ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.database_scoped_configurations
+                        WHERE name = N''LEGACY_CARDINALITY_ESTIMATION'';';
+
+                    BEGIN TRY
+                        EXEC sp_executesql @db_env_sql,
+                            N'@legacy_ce_out bit OUTPUT',
+                            @legacy_ce_out = @db_legacy_ce OUTPUT;
+                    END TRY
+                    BEGIN CATCH
+                        SET @db_legacy_ce = 0; /* Ignore errors - db might not support this */
+                    END CATCH;
+
+                    IF @db_legacy_ce = 1
+                        RAISERROR(N'    Note: LEGACY_CARDINALITY_ESTIMATION=ON (CE forced to 70)', 10, 1) WITH NOWAIT;
+                END;
+
+                /* Note if CE version differs from what compat level suggests due to trace flags */
+                IF @tf_9481_active = 1 AND @db_compat_level >= 120
+                    RAISERROR(N'    Note: TF 9481 forcing legacy CE despite compat level %d', 10, 1, @db_compat_level) WITH NOWAIT;
+            END;
 
             /*
             ========================================================================
