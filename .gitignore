@@ -1,8 +1,11 @@
 # sp_StatUpdate .gitignore
 # WHITELIST APPROACH: Ignore everything, then allow only specific files
 #
-# Files published to GitHub (3 files):
-#   - sp_StatUpdate.sql (main procedure)
+# Files published to GitHub (7 files, all at root):
+#   - sp_StatUpdate.sql          (main procedure)
+#   - sp_StatUpdate_Diag.sql     (diagnostic procedure)
+#   - sp_StatUpdate_XE_Session.sql (Extended Events troubleshooting)
+#   - Invoke-StatUpdateDiag.ps1  (multi-server diagnostic wrapper)
 #   - README.md
 #   - LICENSE
 
@@ -11,16 +14,9 @@
 
 # Allow repo files at root
 !sp_StatUpdate.sql
+!sp_StatUpdate_Diag.sql
+!sp_StatUpdate_XE_Session.sql
+!Invoke-StatUpdateDiag.ps1
 !README.md
 !LICENSE
 !.gitignore
-
-# Also allow from src/docs if using that structure
-!src/
-!src/sp_StatUpdate.sql
-!docs/
-!docs/README.md
-
-# Tools directory - supplementary scripts
-!tools/
-!tools/sp_StatUpdate_XE_Session.sql
