@@ -9,7 +9,6 @@
 
     Prerequisites:
     - PowerShell 7+
-    - SqlServer module (Install-Module SqlServer)
     - sp_StatUpdate_Diag procedure deployed on target servers
 
 .PARAMETER Servers
@@ -39,6 +38,10 @@
 .PARAMETER TopN
     Limit for detail result sets. Defaults to 20.
 
+.PARAMETER TrustServerCertificate
+    Trust the SQL Server certificate without validation. Defaults to $true.
+    Set to $false when connecting to servers with properly configured TLS certificates.
+
 .PARAMETER Credential
     Optional PSCredential for SQL authentication. If not provided, uses Windows auth.
 
@@ -56,7 +59,7 @@
     .\Invoke-StatUpdateDiag.ps1 -Servers (Get-Content servers.txt) -Credential $cred -CommandLogDatabase 'DBATools'
 
 .NOTES
-    Requires: PowerShell 7+, SqlServer module
+    Requires: PowerShell 7+ (uses ADO.NET directly, no SqlServer module needed)
     See also: sp_StatUpdate_Diag.sql (the T-SQL diagnostic procedure)
 #>
 
@@ -82,6 +85,8 @@ param(
 
     [int]$TopN = 20,
 
+    [bool]$TrustServerCertificate = $true,
+
     [PSCredential]$Credential
 )
 
@@ -94,12 +99,6 @@ $ErrorActionPreference = "Stop"
 if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw "This script requires PowerShell 7 or higher. Current version: $($PSVersionTable.PSVersion)"
 }
-
-if (-not (Get-Module -ListAvailable -Name SqlServer)) {
-    Write-Warning "SqlServer module not found. Installing..."
-    Install-Module SqlServer -Scope CurrentUser -Force
-}
-Import-Module SqlServer -ErrorAction Stop
 
 if (-not (Test-Path $OutputPath)) {
     New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
@@ -122,62 +121,6 @@ Write-Host ""
 # =============================================================================
 # Execute sp_StatUpdate_Diag on each server
 # =============================================================================
-
-function Invoke-DiagProc {
-    param(
-        [string]$Server,
-        [string]$Database,
-        [hashtable]$ProcParams,
-        [PSCredential]$Credential
-    )
-
-    $connStr = "Server=$Server;Database=$Database;TrustServerCertificate=True;Connection Timeout=30;"
-    if ($Credential) {
-        $connStr += "User ID=$($Credential.UserName);Password=$($Credential.GetNetworkCredential().Password);"
-    }
-    else {
-        $connStr += "Trusted_Connection=True;"
-    }
-
-    $conn = New-Object System.Data.SqlClient.SqlConnection($connStr)
-    $cmd = $conn.CreateCommand()
-    $cmd.CommandTimeout = 600  # 10 minutes
-
-    $paramList = @(
-        "@DaysBack = $($ProcParams.DaysBack)",
-        "@Obfuscate = $($ProcParams.Obfuscate)",
-        "@LongRunningMinutes = $($ProcParams.LongRunningMinutes)",
-        "@TopN = $($ProcParams.TopN)"
-    )
-    if ($ProcParams.CommandLogDatabase) {
-        $paramList += "@CommandLogDatabase = N'$($ProcParams.CommandLogDatabase)'"
-    }
-
-    $cmd.CommandText = "EXECUTE dbo.sp_StatUpdate_Diag $($paramList -join ', ');"
-
-    $adapter = New-Object System.Data.SqlClient.SqlDataAdapter($cmd)
-    $ds = New-Object System.Data.DataSet
-
-    try {
-        $conn.Open()
-        $adapter.Fill($ds) | Out-Null
-    }
-    finally {
-        $conn.Close()
-        $conn.Dispose()
-    }
-
-    return @{
-        Recommendations   = if ($ds.Tables.Count -gt 0) { $ds.Tables[0] } else { $null }
-        RunHealth         = if ($ds.Tables.Count -gt 1) { $ds.Tables[1] } else { $null }
-        RunDetail         = if ($ds.Tables.Count -gt 2) { $ds.Tables[2] } else { $null }
-        TopTables         = if ($ds.Tables.Count -gt 3) { $ds.Tables[3] } else { $null }
-        FailingStats      = if ($ds.Tables.Count -gt 4) { $ds.Tables[4] } else { $null }
-        LongRunning       = if ($ds.Tables.Count -gt 5) { $ds.Tables[5] } else { $null }
-        ParamHistory      = if ($ds.Tables.Count -gt 6) { $ds.Tables[6] } else { $null }
-        ObfuscationMap    = if ($ds.Tables.Count -gt 7) { $ds.Tables[7] } else { $null }
-    }
-}
 
 $procParams = @{
     DaysBack             = $DaysBack
@@ -203,15 +146,13 @@ $Servers | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
     $progressLocal = $using:progress
     $credLocal = $using:Credential
     $dbLocal = $using:CommandLogDatabase
+    $trustCert = $using:TrustServerCertificate
 
     $progressLocal[$server] = "Running"
 
     try {
-        # Import module in parallel runspace
-        Import-Module SqlServer -ErrorAction Stop
-
         # Build connection and execute
-        $connStr = "Server=$server;Database=$dbLocal;TrustServerCertificate=True;Connection Timeout=30;"
+        $connStr = "Server=$server;Database=$dbLocal;TrustServerCertificate=$trustCert;Connection Timeout=30;"
         if ($credLocal) {
             $connStr += "User ID=$($credLocal.UserName);Password=$($credLocal.GetNetworkCredential().Password);"
         }
@@ -289,6 +230,12 @@ if ($completed -eq 0) {
     exit 1
 }
 
+function Get-DisplayName {
+    param([string]$ServerName)
+    if ($Obfuscate) { "SRV_" + ($ServerName.GetHashCode().ToString("X8")).Substring(0, 4) }
+    else { $ServerName }
+}
+
 # =============================================================================
 # Cross-Server Analysis
 # =============================================================================
@@ -314,7 +261,7 @@ foreach ($server in $allResults.Keys) {
 
 $distinctVersions = $versions.Values | Sort-Object -Unique
 if ($distinctVersions.Count -gt 1) {
-    $versionDetail = ($versions.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)" }) -join ", "
+    $versionDetail = ($versions.GetEnumerator() | ForEach-Object { "$(Get-DisplayName $_.Key): $($_.Value)" }) -join ", "
     $crossServerFindings.Add([PSCustomObject]@{
         Severity       = "WARNING"
         Category       = "VERSION_SKEW"
@@ -338,7 +285,7 @@ foreach ($server in $allResults.Keys) {
 
 $distinctTimeLimits = $timeLimits.Values | Sort-Object -Unique
 if ($distinctTimeLimits.Count -gt 1) {
-    $tlDetail = ($timeLimits.GetEnumerator() | ForEach-Object { "$($_.Key): $($_.Value)s" }) -join ", "
+    $tlDetail = ($timeLimits.GetEnumerator() | ForEach-Object { "$(Get-DisplayName $_.Key): $($_.Value)s" }) -join ", "
     $crossServerFindings.Add([PSCustomObject]@{
         Severity       = "INFO"
         Category       = "PARAM_INCONSISTENCY"
@@ -364,7 +311,7 @@ foreach ($server in $allResults.Keys) {
     if ($data.Recommendations -and $data.Recommendations.Rows.Count -gt 0) {
         foreach ($row in $data.Recommendations.Rows) {
             $allRecommendations.Add([PSCustomObject]@{
-                Server         = $server
+                Server         = (Get-DisplayName $server)
                 Severity       = $row["Severity"].ToString()
                 Category       = $row["Category"].ToString()
                 Finding        = $row["Finding"].ToString()
@@ -490,13 +437,7 @@ foreach ($severity in @("CRITICAL", "WARNING", "INFO")) {
 foreach ($server in ($allResults.Keys | Sort-Object)) {
     $data = $allResults[$server]
 
-    $displayName = if ($Obfuscate) {
-        "SRV_" + ($server.GetHashCode().ToString("X8")).Substring(0, 4)
-    } else {
-        $server
-    }
-
-    [void]$report.AppendLine("### Server: $displayName")
+    [void]$report.AppendLine("### Server: $(Get-DisplayName $server)")
     [void]$report.AppendLine("")
 
     # Run Health
@@ -541,7 +482,7 @@ if ($allErrors.Count -gt 0) {
     [void]$report.AppendLine("## Connection Failures")
     [void]$report.AppendLine("")
     foreach ($err in $allErrors) {
-        $errServer = if ($Obfuscate) { "SRV_" + ($err.Server.GetHashCode().ToString("X8")).Substring(0, 4) } else { $err.Server }
+        $errServer = Get-DisplayName $err.Server
         [void]$report.AppendLine("- **$errServer**: $($err.Error)")
     }
     [void]$report.AppendLine("")
