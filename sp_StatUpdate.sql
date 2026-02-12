@@ -408,7 +408,7 @@ ALTER PROCEDURE
 
     Prerequisites:
       - dbo.Queue table (https://ola.hallengren.com/scripts/Queue.sql)
-      - dbo.QueueStatistic table (from QueueStatistic.sql)
+      - dbo.QueueStatistic table (auto-created on first parallel run)
     ============================================================================
     */
     @StatsInParallel nvarchar(1) = N'N', /*Y = use queue-based parallel processing*/
