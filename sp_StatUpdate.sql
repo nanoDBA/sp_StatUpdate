@@ -36,11 +36,34 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    1.9.2026.0206 (Major.Minor.Year.MMDD)
+Version:    2.0.2026.0212 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    1.9.2026.0206 - Feat: Added Status and StatusMessage columns to summary result set
+History:    2.0.2026.0212 - Phase 1 Environment Intelligence (v2.0 roadmap):
+                          - CE Version/Compat Level: Shows per-database compatibility level and
+                            effective CE version (70, 120, 130+) in debug output.
+                          - Trace Flag Detection: Detects statistics-relevant trace flags (2371,
+                            2389, 2390, 4139, 9481) and shows warnings for obsolete/misconfigured
+                            flags. TF 2371 note for SQL 2016+ CL 130+, TF 9481 db-scoped config
+                            recommendation, TF 2389/2390 modernization note.
+                          - Database-Scoped Config: Detects LEGACY_CARDINALITY_ESTIMATION setting
+                            and notes when CE is forced to legacy mode.
+                          - SQL 2022 AUTO_DROP: Notes when AUTO_DROP feature is available.
+                          - Fix: Phase validation now detects unexpected row loss between staged
+                            discovery phases and falls back to legacy single-query mode. Prevents
+                            processing incomplete data when DMV cross-applies fail silently.
+                            (#2 Erik Darling)
+                          - Fix: Truncated partitions no longer force full RESAMPLE. Stale
+                            partitions with data are updated via ON PARTITIONS(); empty/truncated
+                            partitions are skipped. (#4/26 Paul Randal / Michelle Ufford)
+                          - Fix: XE session script corrected - added sp_statement_starting and
+                            sql_statement_starting events for during-execution visibility, fixed
+                            invalid XE predicate syntax (IN() not supported, wait_type needs
+                            numeric map_key values), replaced query_canceled with attention event,
+                            added lock_escalation event, added start/complete correlation query.
+                            (#8 Grant Fritchey)
+            1.9.2026.0206 - Feat: Added Status and StatusMessage columns to summary result set
                             for easy Agent job alerting (SUCCESS/WARNING/ERROR). Early-return
                             path (0 qualifying stats) now also returns the result set.
                             (Issue #2)
@@ -385,7 +408,7 @@ ALTER PROCEDURE
 
     Prerequisites:
       - dbo.Queue table (https://ola.hallengren.com/scripts/Queue.sql)
-      - dbo.QueueStatistic table (from QueueStatistic.sql)
+      - dbo.QueueStatistic table (auto-created on first parallel run)
     ============================================================================
     */
     @StatsInParallel nvarchar(1) = N'N', /*Y = use queue-based parallel processing*/
@@ -426,8 +449,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '1.9.2026.0206',
-        @procedure_version_date datetime = '20260206',
+        @procedure_version varchar(20) = '2.0.2026.0212',
+        @procedure_version_date datetime = '20260212',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -460,7 +483,9 @@ BEGIN
         SELECT
             N'' UNION ALL
         SELECT
-            N'version: ' + @procedure_version + N' (' + CONVERT(nvarchar(10), @procedure_version_date, 120) + N')';
+            N'version: ' + @procedure_version + N' (' + CONVERT(nvarchar(10), @procedure_version_date, 120) + N')' UNION ALL
+        SELECT
+            N'v2.0 Phase 1: Environment detection (CE version, trace flags, db-scoped configs)';
 
         /*
         Parameter documentation
@@ -898,7 +923,57 @@ BEGIN
         - MAXDOP in UPDATE STATISTICS: SQL 2016 SP2+ (build 5026+) or SQL 2017 CU3+ (build 3015+)
         */
         @supports_persist_sample bit = 0,
-        @supports_maxdop_stats bit = 0;
+        @supports_maxdop_stats bit = 0,
+        /* SQL 2022+ feature detection */
+        @supports_auto_drop bit = 0;
+
+    /* Set AUTO_DROP support flag (SQL 2022+) */
+    IF @sql_major_version >= 16
+        SET @supports_auto_drop = 1;
+
+    /*
+    Phase 1 Environment Detection (v2.0)
+    Trace flags affecting statistics behavior - detected once at startup.
+    */
+    DECLARE
+        @trace_flags table
+        (
+            TraceFlag int NOT NULL,
+            Status bit NOT NULL,
+            Global bit NOT NULL,
+            Session bit NOT NULL
+        );
+
+    DECLARE
+        @tf_2371_active bit = 0,    /* Dynamic thresholds (built-in for SQL 2016+ CL 130+) */
+        @tf_2389_active bit = 0,    /* Ascending key detection (legacy) */
+        @tf_2390_active bit = 0,    /* Descending key detection (legacy) */
+        @tf_4139_active bit = 0,    /* Universal histogram amendment (modern) */
+        @tf_9481_active bit = 0,    /* Force legacy CE */
+        @tf_warnings nvarchar(max) = N'';
+
+    /* Query active trace flags */
+    INSERT INTO @trace_flags (TraceFlag, Status, Global, Session)
+    EXEC (N'DBCC TRACESTATUS(-1) WITH NO_INFOMSGS');
+
+    /* Check for statistics-relevant trace flags */
+    SELECT
+        @tf_2371_active = MAX(CASE WHEN TraceFlag = 2371 AND Status = 1 THEN 1 ELSE 0 END),
+        @tf_2389_active = MAX(CASE WHEN TraceFlag = 2389 AND Status = 1 THEN 1 ELSE 0 END),
+        @tf_2390_active = MAX(CASE WHEN TraceFlag = 2390 AND Status = 1 THEN 1 ELSE 0 END),
+        @tf_4139_active = MAX(CASE WHEN TraceFlag = 4139 AND Status = 1 THEN 1 ELSE 0 END),
+        @tf_9481_active = MAX(CASE WHEN TraceFlag = 9481 AND Status = 1 THEN 1 ELSE 0 END)
+    FROM @trace_flags;
+
+    /* Build trace flag warnings for debug output */
+    IF @tf_2371_active = 1 AND @sql_major_version >= 13
+        SET @tf_warnings = @tf_warnings + N'TF 2371 unnecessary (built-in for SQL 2016+ CL 130+); ';
+    IF @tf_2389_active = 1 OR @tf_2390_active = 1
+        SET @tf_warnings = @tf_warnings + N'TF 2389/2390 are legacy ascending key flags - consider TF 4139 instead; ';
+    IF @tf_4139_active = 1
+        SET @tf_warnings = @tf_warnings + N'TF 4139 active (histogram amendment for ascending keys); ';
+    IF @tf_9481_active = 1
+        SET @tf_warnings = @tf_warnings + N'TF 9481 forces legacy CE 70 globally - consider db-scoped config instead; ';
 
     /*
     Error collection table (show all errors at once)
@@ -2268,6 +2343,29 @@ BEGIN
     RAISERROR(N'Server:      %s', 10, 1, @server_name) WITH NOWAIT;
     RAISERROR(N'Version:     %s', 10, 1, @product_version) WITH NOWAIT;
     RAISERROR(N'Edition:     %s', 10, 1, @edition) WITH NOWAIT;
+
+    /*
+    Trace flag status (Phase 1.3 - v2.0)
+    Show statistics-relevant trace flags if any are active.
+    */
+    IF @tf_2371_active = 1 OR @tf_2389_active = 1 OR @tf_2390_active = 1 OR @tf_4139_active = 1 OR @tf_9481_active = 1
+    BEGIN
+        DECLARE @tf_list nvarchar(100) = N'';
+        IF @tf_2371_active = 1 SET @tf_list = @tf_list + N'2371,';
+        IF @tf_2389_active = 1 SET @tf_list = @tf_list + N'2389,';
+        IF @tf_2390_active = 1 SET @tf_list = @tf_list + N'2390,';
+        IF @tf_4139_active = 1 SET @tf_list = @tf_list + N'4139,';
+        IF @tf_9481_active = 1 SET @tf_list = @tf_list + N'9481,';
+        SET @tf_list = LEFT(@tf_list, LEN(@tf_list) - 1); /* Remove trailing comma */
+        RAISERROR(N'TraceFlags:  %s (stats-relevant)', 10, 1, @tf_list) WITH NOWAIT;
+    END;
+
+    /*
+    SQL 2022 AUTO_DROP note (Phase 1.2 - v2.0)
+    */
+    IF @supports_auto_drop = 1
+        RAISERROR(N'AUTO_DROP:   Available (SQL 2022) - stats auto-drop on schema change by default', 10, 1) WITH NOWAIT;
+
     RAISERROR(N'Procedure:   %s', 10, 1, @procedure_version) WITH NOWAIT;
     RAISERROR(N'Start time:  %s', 10, 1, @start_time_display) WITH NOWAIT;
 
@@ -2396,6 +2494,24 @@ BEGIN
                 RAISERROR(N'  OR days since update >= %d', 10, 1, @DaysStaleThreshold) WITH NOWAIT;
             ELSE
                 RAISERROR(N'  AND days since update >= %d', 10, 1, @DaysStaleThreshold) WITH NOWAIT;
+        END;
+    END;
+
+    /*
+    Trace flag status in debug mode (Phase 1.3 - v2.0)
+    Show active statistics-relevant trace flags and recommendations.
+    */
+    IF @Debug = 1
+    BEGIN
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        IF LEN(@tf_warnings) > 0
+        BEGIN
+            RAISERROR(N'Statistics-Relevant Trace Flags: Active', 10, 1) WITH NOWAIT;
+            RAISERROR(N'  %s', 10, 1, @tf_warnings) WITH NOWAIT;
+        END
+        ELSE
+        BEGIN
+            RAISERROR(N'Statistics-Relevant Trace Flags: None active', 10, 1) WITH NOWAIT;
         END;
     END;
 
@@ -3092,6 +3208,13 @@ BEGIN
         LOOP OVER SELECTED DATABASES
         ========================================================================
         */
+        /*
+        Signal table for staged discovery failure detection.
+        Created before the database loop so it persists across iterations.
+        Dynamic SQL can write to it to signal unexpected row loss.
+        */
+        CREATE TABLE #staged_discovery_failed (reason nvarchar(500));
+
         WHILE EXISTS (SELECT 1 FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
         BEGIN
             /*
@@ -3106,6 +3229,60 @@ BEGIN
             ORDER BY ID;
 
             RAISERROR(N'  Scanning database: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
+
+            /*
+            ========================================================================
+            PER-DATABASE ENVIRONMENT INFO (Phase 1.1/1.4 - v2.0, debug mode only)
+            ========================================================================
+            Show compatibility level, effective CE version, and relevant db-scoped configs.
+            */
+            IF @Debug = 1
+            BEGIN
+                DECLARE
+                    @db_compat_level int,
+                    @db_ce_version int,
+                    @db_legacy_ce bit = 0,
+                    @db_env_sql nvarchar(max);
+
+                /* Get compatibility level */
+                SELECT @db_compat_level = compatibility_level
+                FROM sys.databases
+                WHERE name = @CurrentDatabaseName;
+
+                /* Calculate effective CE version */
+                SET @db_ce_version = CASE
+                    WHEN @db_compat_level <= 110 THEN 70
+                    WHEN @db_compat_level = 120 THEN 120
+                    ELSE @db_compat_level
+                END;
+
+                RAISERROR(N'    Compat Level: %d, CE Version: %d', 10, 1, @db_compat_level, @db_ce_version) WITH NOWAIT;
+
+                /* Check database-scoped configurations (SQL 2016+) */
+                IF @sql_major_version >= 13
+                BEGIN
+                    SET @db_env_sql = N'
+                        SELECT @legacy_ce_out = CASE WHEN value = 1 THEN 1 ELSE 0 END
+                        FROM ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.database_scoped_configurations
+                        WHERE name = N''LEGACY_CARDINALITY_ESTIMATION'';';
+
+                    BEGIN TRY
+                        EXEC sp_executesql @db_env_sql,
+                            N'@legacy_ce_out bit OUTPUT',
+                            @legacy_ce_out = @db_legacy_ce OUTPUT;
+                    END TRY
+                    BEGIN CATCH
+                        SET @db_legacy_ce = 0; /* Ignore errors - db might not support this */
+                    END CATCH;
+
+                    IF @db_legacy_ce = 1
+                        RAISERROR(N'    Note: LEGACY_CARDINALITY_ESTIMATION=ON (CE forced to 70)', 10, 1) WITH NOWAIT;
+                END;
+
+                /* Note if CE version differs from what compat level suggests due to trace flags */
+                IF @tf_9481_active = 1 AND @db_compat_level >= 120
+                    RAISERROR(N'    Note: TF 9481 forcing legacy CE despite compat level %d', 10, 1, @db_compat_level) WITH NOWAIT;
+            END;
 
             /*
             ========================================================================
@@ -3262,11 +3439,53 @@ BEGIN
                 /*
                 VALIDATION: CROSS APPLY filters out stats with no properties.
                 This is expected for never-updated stats. Log if significant.
+                Unexpected total loss (0 enriched from 100+ candidates) triggers fallback.
                 */
+                IF @phase2_count = 0 AND @phase1_count > 100
+                BEGIN
+                    RAISERROR(N''    ERROR: Phase 2 enriched 0 of %d candidates - triggering legacy fallback'', 10, 1, @phase1_count) WITH NOWAIT;
+                    INSERT INTO #staged_discovery_failed (reason) VALUES (N''Phase 2 returned 0 rows from '' + CONVERT(nvarchar(20), @phase1_count) + N'' candidates'');
+
+                    /* Return empty result set to satisfy INSERT...EXEC schema */
+                    SELECT
+                        database_name = DB_NAME(),
+                        schema_name = CONVERT(sysname, NULL),
+                        table_name = CONVERT(sysname, NULL),
+                        stat_name = CONVERT(sysname, NULL),
+                        object_id = CONVERT(int, NULL),
+                        stats_id = CONVERT(int, NULL),
+                        no_recompute = CONVERT(bit, NULL),
+                        is_incremental = CONVERT(bit, NULL),
+                        is_memory_optimized = CONVERT(bit, NULL),
+                        is_heap = CONVERT(bit, NULL),
+                        auto_created = CONVERT(bit, NULL),
+                        modification_counter = CONVERT(bigint, NULL),
+                        row_count = CONVERT(bigint, NULL),
+                        days_stale = CONVERT(int, NULL),
+                        page_count = CONVERT(bigint, NULL),
+                        persisted_sample_percent = CONVERT(float, NULL),
+                        histogram_steps = CONVERT(int, NULL),
+                        has_filter = CONVERT(bit, NULL),
+                        filter_definition = CONVERT(nvarchar(max), NULL),
+                        unfiltered_rows = CONVERT(bigint, NULL),
+                        qs_plan_count = CONVERT(int, NULL),
+                        qs_total_executions = CONVERT(bigint, NULL),
+                        qs_total_cpu_ms = CONVERT(bigint, NULL),
+                        qs_total_duration_ms = CONVERT(bigint, NULL),
+                        qs_total_logical_reads = CONVERT(bigint, NULL),
+                        qs_last_execution = CONVERT(datetime2, NULL),
+                        qs_priority_boost = CONVERT(bigint, NULL),
+                        priority = CONVERT(bigint, NULL)
+                    WHERE 1 = 0;
+
+                    DROP TABLE #stat_candidates;
+                    RETURN;
+                END;
+
                 IF @phase2_count < @phase1_count AND @Debug_param = 1
                 BEGIN
                     DECLARE @missing_count int = @phase1_count - @phase2_count;
-                    RAISERROR(N''    Warning: %d stats have no properties (never updated)'', 10, 1, @missing_count) WITH NOWAIT;
+                    RAISERROR(N''    Note: %d stats have no properties (never updated)'', 10, 1, @missing_count) WITH NOWAIT;
                 END;
 
                 /*
@@ -3289,7 +3508,7 @@ BEGIN
                             WHEN rows <= 1000000 THEN (rows * 10) / 100 + 500
                             ELSE CONVERT(bigint, CONVERT(float, rows) * 5 / 100) + 500
                         END,
-                    sqrt_threshold = CONVERT(bigint, SQRT(CONVERT(float, ISNULL(rows, 1)) * 1000)),
+                    sqrt_threshold = CONVERT(bigint, SQRT(CONVERT(float, CASE WHEN ISNULL(rows, 0) < 1 THEN 1 ELSE rows END) * 1000)),
                     days_stale = ISNULL(DATEDIFF(DAY, last_updated, GETDATE()), 9999);
 
                 /*
@@ -3422,6 +3641,55 @@ BEGIN
 
                 IF @Debug_param = 1
                     RAISERROR(N''    Phase 5 (after MinPageCount): %d stats remain'', 10, 1, @phase5_remaining) WITH NOWAIT;
+
+                /*
+                VALIDATION: Suspicious row loss in Phase 5.
+                If MinPageCount is 0 (no filtering expected) and we lost >50% of rows,
+                the page count UPDATE may have failed silently.
+                */
+                IF  @MinPageCount_param = 0
+                AND @phase4_qualifying > 0
+                AND @phase5_remaining < (@phase4_qualifying / 2)
+                BEGIN
+                    RAISERROR(N''    ERROR: Phase 5 kept %d of %d rows with MinPageCount=0 - triggering legacy fallback'', 10, 1,
+                        @phase5_remaining, @phase4_qualifying) WITH NOWAIT;
+                    INSERT INTO #staged_discovery_failed (reason)
+                        VALUES (N''Phase 5 lost >50%% rows: '' + CONVERT(nvarchar(20), @phase5_remaining) + N'' of '' + CONVERT(nvarchar(20), @phase4_qualifying));
+
+                    SELECT
+                        database_name = DB_NAME(),
+                        schema_name = CONVERT(sysname, NULL),
+                        table_name = CONVERT(sysname, NULL),
+                        stat_name = CONVERT(sysname, NULL),
+                        object_id = CONVERT(int, NULL),
+                        stats_id = CONVERT(int, NULL),
+                        no_recompute = CONVERT(bit, NULL),
+                        is_incremental = CONVERT(bit, NULL),
+                        is_memory_optimized = CONVERT(bit, NULL),
+                        is_heap = CONVERT(bit, NULL),
+                        auto_created = CONVERT(bit, NULL),
+                        modification_counter = CONVERT(bigint, NULL),
+                        row_count = CONVERT(bigint, NULL),
+                        days_stale = CONVERT(int, NULL),
+                        page_count = CONVERT(bigint, NULL),
+                        persisted_sample_percent = CONVERT(float, NULL),
+                        histogram_steps = CONVERT(int, NULL),
+                        has_filter = CONVERT(bit, NULL),
+                        filter_definition = CONVERT(nvarchar(max), NULL),
+                        unfiltered_rows = CONVERT(bigint, NULL),
+                        qs_plan_count = CONVERT(int, NULL),
+                        qs_total_executions = CONVERT(bigint, NULL),
+                        qs_total_cpu_ms = CONVERT(bigint, NULL),
+                        qs_total_duration_ms = CONVERT(bigint, NULL),
+                        qs_total_logical_reads = CONVERT(bigint, NULL),
+                        qs_last_execution = CONVERT(datetime2, NULL),
+                        qs_priority_boost = CONVERT(bigint, NULL),
+                        priority = CONVERT(bigint, NULL)
+                    WHERE 1 = 0;
+
+                    DROP TABLE #stat_candidates;
+                    RETURN;
+                END;
 
                 /*
                 ================================================================
@@ -3618,8 +3886,36 @@ BEGIN
                     @QueryStoreMinExecutions_param = @QueryStoreMinExecutions,
                     @QueryStoreRecentHours_param = @QueryStoreRecentHours,
                     @Debug_param = @Debug;
-            END /* End of staged discovery */
-            ELSE
+            END; /* End of staged discovery */
+
+            /*
+            FALLBACK: If staged discovery signaled failure, switch to legacy mode.
+            The signal table #staged_discovery_failed is populated inside the dynamic SQL
+            when unexpected row loss is detected between phases.
+            Use @use_legacy_for_db as a per-database flag so @StagedDiscovery
+            retains its original value for subsequent database iterations.
+            */
+            DECLARE @use_legacy_for_db bit = 0;
+
+            IF  @StagedDiscovery = N'Y'
+            AND EXISTS (SELECT 1 FROM #staged_discovery_failed)
+            BEGIN
+                DECLARE @fallback_reason nvarchar(500);
+                SELECT TOP (1) @fallback_reason = reason FROM #staged_discovery_failed;
+
+                RAISERROR(N'    Staged discovery failed: %s', 10, 1, @fallback_reason) WITH NOWAIT;
+                RAISERROR(N'    Falling back to legacy single-query discovery...', 10, 1) WITH NOWAIT;
+
+                /* Clear any partial results from staged attempt */
+                DELETE FROM #stats_to_process WHERE database_name = @CurrentDatabaseName;
+
+                SET @use_legacy_for_db = 1;
+            END;
+
+            /* Clean up signal table for next database iteration */
+            DELETE FROM #staged_discovery_failed;
+
+            IF @StagedDiscovery = N'N' OR @use_legacy_for_db = 1
             BEGIN
             /*
             ========================================================================
@@ -4083,7 +4379,7 @@ BEGIN
                 @QueryStoreMinExecutions_param = @QueryStoreMinExecutions,
                 @QueryStoreRecentHours_param = @QueryStoreRecentHours;
 
-            END; /* End of legacy discovery ELSE */
+            END; /* End of legacy discovery (explicit or fallback) */
 
             /*
             Mark this database as completed (runs for both staged and legacy)
@@ -5118,7 +5414,8 @@ BEGIN
             @incremental_partitions nvarchar(max) = NULL,
             @incremental_partition_count int = 0,
             @incremental_total_partitions int = 0,
-            @physical_partition_count int = 0;
+            @physical_partition_count int = 0,
+            @on_partitions_clause nvarchar(max) = N'';
 
         IF  @UpdateIncremental = 1
         AND @current_is_incremental = 1
@@ -5197,48 +5494,54 @@ BEGIN
 
             /*
             Add ON PARTITIONS clause if we found specific stale partitions.
-            If ALL partitions are stale, skip ON PARTITIONS (full RESAMPLE is more efficient).
+            If ALL physical partitions are stale, skip ON PARTITIONS (full RESAMPLE is more efficient).
             If NO partitions are stale, we shouldn't be here (discovery should have filtered).
 
-            P1 #26: Check for missing partitions.
-            If DMV reports fewer partitions than sys.partitions, some are missing
-            (likely truncated/empty). Force full RESAMPLE in this case.
+            P1 #26 / v2.0 #4/26: Truncated partition handling.
+            When DMV reports fewer partitions than sys.partitions, some are missing
+            (truncated/empty). These have 0 rows so skip them — only update the
+            stale partitions that actually have data. Previously this forced a full
+            RESAMPLE which was wasteful (e.g., 24-partition table with 1 truncated
+            would update all 24 instead of just the 5 stale ones).
             */
-            DECLARE @partitions_missing bit = 0;
+            DECLARE @partitions_missing int = 0;
             IF @physical_partition_count > @incremental_total_partitions
             BEGIN
-                SELECT @partitions_missing = 1;
+                SELECT @partitions_missing = @physical_partition_count - @incremental_total_partitions;
                 IF @Debug = 1
                 BEGIN
-                    RAISERROR(N'  Note: DMV shows %d partitions but sys.partitions has %d - missing partitions detected', 10, 1,
-                        @incremental_total_partitions, @physical_partition_count) WITH NOWAIT;
+                    RAISERROR(N'  Note: %d of %d partitions missing from DMV (truncated/empty, skipping)', 10, 1,
+                        @partitions_missing, @physical_partition_count) WITH NOWAIT;
                 END;
             END;
 
-            IF  @partitions_missing = 0
-            AND @incremental_partitions IS NOT NULL
+            IF  @incremental_partitions IS NOT NULL
             AND @incremental_partition_count > 0
-            AND @incremental_partition_count < @incremental_total_partitions
+            AND @incremental_partition_count < @physical_partition_count
             BEGIN
+                /*
+                Partial update: only stale partitions with data.
+                Truncated partitions are naturally excluded (not in DMV).
+                */
                 SELECT
-                    @current_command += N' ON PARTITIONS(' + @incremental_partitions + N')';
+                    @on_partitions_clause = N' ON PARTITIONS(' + @incremental_partitions + N')';
 
                 IF @Debug = 1
                 BEGIN
-                    RAISERROR(N'  Note: Incremental statistics - updating %d of %d partitions', 10, 1,
-                        @incremental_partition_count, @incremental_total_partitions) WITH NOWAIT;
+                    IF @partitions_missing > 0
+                        RAISERROR(N'  Note: Incremental statistics - updating %d of %d partitions (skipping %d truncated)', 10, 1,
+                            @incremental_partition_count, @physical_partition_count, @partitions_missing) WITH NOWAIT;
+                    ELSE
+                        RAISERROR(N'  Note: Incremental statistics - updating %d of %d partitions', 10, 1,
+                            @incremental_partition_count, @physical_partition_count) WITH NOWAIT;
                 END;
-            END;
+            END
             ELSE IF @Debug = 1
             BEGIN
-                IF @partitions_missing = 1
-                BEGIN
-                    RAISERROR(N'  Note: Incremental statistics - full RESAMPLE (missing partitions)', 10, 1) WITH NOWAIT;
-                END;
-                ELSE IF @incremental_partition_count = @incremental_total_partitions
+                IF @incremental_partition_count >= @physical_partition_count
                 BEGIN
                     RAISERROR(N'  Note: Incremental statistics - all %d partitions stale, full RESAMPLE', 10, 1,
-                        @incremental_total_partitions) WITH NOWAIT;
+                        @physical_partition_count) WITH NOWAIT;
                 END;
                 ELSE
                 BEGIN
@@ -5337,6 +5640,16 @@ BEGIN
         BEGIN
             SELECT
                 @current_command += N' WITH ' + @with_clause;
+        END;
+
+        /*
+        ON PARTITIONS must come AFTER the WITH clause.
+        Syntax: UPDATE STATISTICS [t] ([s]) WITH RESAMPLE ON PARTITIONS(2, 3);
+        */
+        IF @on_partitions_clause <> N''
+        BEGIN
+            SELECT
+                @current_command += @on_partitions_clause;
         END;
 
         SELECT

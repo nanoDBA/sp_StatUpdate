@@ -366,12 +366,157 @@ ORDER BY StartTime DESC;
 --   FULLSCAN_MEMOPT = Memory-optimized table on SQL 2014
 ```
 
+## Diagnostic Tool (v1.0)
+
+**sp_StatUpdate_Diag** analyzes your CommandLog history and produces actionable recommendations — killed run detection, repeated failures, degrading throughput, suboptimal parameters, and more.
+
+### Single Server
+
+```sql
+-- Install: run sp_StatUpdate_Diag.sql on your maintenance database
+
+-- Basic diagnostic (last 30 days)
+EXEC dbo.sp_StatUpdate_Diag;
+
+-- Obfuscated for sharing with support (hashes server/database/table names)
+EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1;
+
+-- Debug mode with custom window
+EXEC dbo.sp_StatUpdate_Diag @DaysBack = 90, @Debug = 1;
+```
+
+Returns 8 result sets: Recommendations (severity-categorized), Run Health Summary, Run Detail, Top Tables by Maintenance Cost, Failing Statistics, Long-Running Statistics, Parameter Change History, and Obfuscation Map (when `@Obfuscate = 1`).
+
+### Multi-Server (PowerShell)
+
+```powershell
+# Requires: PowerShell 7+, SqlServer module
+# Install sp_StatUpdate_Diag on each server first
+
+.\Invoke-StatUpdateDiag.ps1 `
+    -Servers "Server1", "Server2,2500", "Server3" `
+    -CommandLogDatabase "Maintenance" `
+    -OutputPath ".\diag_output"
+
+# Obfuscated report for external sharing
+.\Invoke-StatUpdateDiag.ps1 `
+    -Servers "Server1", "Server2" `
+    -Obfuscate `
+    -OutputPath ".\diag_output"
+```
+
+Generates a Markdown report with executive summary, per-server findings, and cross-server analysis (version skew, parameter inconsistency).
+
+### Diagnostic Checks
+
+| Severity | Checks |
+|----------|--------|
+| CRITICAL | Killed runs, repeated stat failures, time limit exhaustion, degrading throughput |
+| WARNING | Suboptimal parameters, long-running stats, stale-stats backlog, overlapping runs, ineffective Query Store |
+| INFO | Run health trends, parameter history, top tables by cost, unused features, version history |
+
+### Diagnostic Scenarios
+
+#### "Our nightly job didn't finish — was it killed?"
+
+Killed runs leave orphaned START markers with no END. The diagnostic tool detects these automatically.
+
+```sql
+-- Look for killed runs in the last 7 days
+EXEC dbo.sp_StatUpdate_Diag @DaysBack = 7;
+-- Check CRITICAL findings for "Killed runs detected"
+-- Evidence shows which RunLabels have START without END
+```
+
+#### "The same stat keeps failing every night"
+
+Repeated failures on the same statistic often indicate corruption, permission issues, or persistent lock contention. The tool flags stats failing 3+ times as CRITICAL.
+
+```sql
+-- Lower the failure threshold to catch stats failing just twice
+EXEC dbo.sp_StatUpdate_Diag
+    @DaysBack = 14,
+    @FailureThreshold = 2;
+-- Result set 5 (Failing Statistics) groups by stat + error message
+```
+
+#### "Runs are getting slower every week"
+
+Throughput degradation can indicate table growth, I/O pressure, or plan regression. The tool compares recent throughput against a prior baseline window.
+
+```sql
+-- Compare last 7 days vs prior 7 days (default)
+EXEC dbo.sp_StatUpdate_Diag @DaysBack = 30;
+
+-- Use a wider comparison window for seasonal patterns
+EXEC dbo.sp_StatUpdate_Diag
+    @DaysBack = 90,
+    @ThroughputWindowDays = 14;
+-- CRITICAL finding if recent avg sec/stat is >50% worse
+```
+
+#### "Which tables eat the most maintenance time?"
+
+The "Top Tables by Maintenance Cost" result set ranks tables by cumulative UPDATE STATISTICS duration.
+
+```sql
+-- Show top 50 most expensive tables over 90 days
+EXEC dbo.sp_StatUpdate_Diag
+    @DaysBack = 90,
+    @TopN = 50;
+-- Result set 4: total duration, avg duration, update count per table
+```
+
+#### "Share diagnostics with Microsoft support (obfuscated)"
+
+Obfuscation mode hashes all server, database, schema, table, and statistic names with MD5. Safe to share externally — the obfuscation map (result set 8) stays on your server.
+
+```sql
+EXEC dbo.sp_StatUpdate_Diag
+    @DaysBack = 30,
+    @Obfuscate = 1;
+-- All result sets use hashed names (e.g., "DB_7F3A2B..." instead of "Production")
+-- Result set 8 shows the mapping (keep this private!)
+```
+
+#### "Compare diagnostics across 5 production servers"
+
+The PowerShell wrapper runs sp_StatUpdate_Diag in parallel across servers, merges results, and detects cross-server issues like version skew and parameter inconsistency.
+
+```powershell
+# Compare all production servers — parallel execution, merged report
+.\Invoke-StatUpdateDiag.ps1 `
+    -Servers "SQL-PROD1", "SQL-PROD2,2500", "SQL-PROD3" `
+    -CommandLogDatabase "DBAMaintenance" `
+    -DaysBack 30 `
+    -OutputFormat "Markdown" `
+    -OutputPath ".\diag_reports"
+
+# Obfuscated version for vendor support ticket
+.\Invoke-StatUpdateDiag.ps1 `
+    -Servers "SQL-PROD1", "SQL-PROD2,2500" `
+    -Obfuscate `
+    -OutputPath ".\diag_reports"
+```
+
 ## Troubleshooting
+
+### Diagnostic Report
+
+The fastest way to troubleshoot sp_StatUpdate issues is the diagnostic tool:
+
+```sql
+EXEC dbo.sp_StatUpdate_Diag @Debug = 1;
+```
+
+See [Diagnostic Tool](#diagnostic-tool-v10) above for details.
+
+### Extended Events Session
 
 An Extended Events session is included for runtime troubleshooting:
 
 ```sql
--- Create the XE session (see tools/sp_StatUpdate_XE_Session.sql)
+-- Create the XE session (see sp_StatUpdate_XE_Session.sql)
 -- Start monitoring before running sp_StatUpdate
 ALTER EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER STATE = START;
 
@@ -380,7 +525,7 @@ ALTER EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER STATE = START;
 -- View captured events (queries included in the XE script)
 ```
 
-The session captures UPDATE STATISTICS commands, errors, lock waits, and long-running statements.
+The session captures UPDATE STATISTICS commands (both starting and completed events for duration correlation), errors, lock waits, lock escalation, and long-running statements.
 
 ## When to Use This (vs IndexOptimize)
 
@@ -410,6 +555,9 @@ Based on patterns from [Ola Hallengren's SQL Server Maintenance Solution](https:
 
 ## Version History
 
+- **sp_StatUpdate_Diag 1.0** - Diagnostic & recommendation engine. T-SQL procedure (`sp_StatUpdate_Diag`) + PowerShell multi-server wrapper (`Invoke-StatUpdateDiag.ps1`). Analyzes CommandLog for killed runs, repeated failures, degrading throughput, overlapping runs, suboptimal parameters. Obfuscation mode for external sharing. 53-test automated suite.
+- **2.0.2026.0212** - Phase 1: Environment Intelligence (CE version/compat level, trace flag detection, DB-scoped config detection in debug output). Phase 2: Staged discovery auto-fallback to legacy mode on unexpected row loss (TRY/CATCH with signal table). Truncated partitions no longer force full RESAMPLE — only stale partitions updated via ON PARTITIONS(). XE session overhaul: added starting events for during-execution visibility, fixed wait_type predicates to use numeric map_key values, added lock_escalation and attention events, 8MB ring buffer.
+- **1.9.2026.0206** - Status and StatusMessage columns in summary result set (SUCCESS/WARNING/ERROR for Agent job alerting). Batch Query Store enrichment (O(n) to O(1) via CTE + GROUP BY). Early-return path now returns summary result set for INSERT...EXEC consumers.
 - **1.9.2026.0128** - New @Preset parameter (NIGHTLY_MAINTENANCE, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE_AGGRESSIVE), @GroupByJoinPattern (update joined tables together), ##sp_StatUpdate_Progress global temp table (opt-in via @ExposeProgressToAllSessions for security), @CleanupOrphanedRuns default Y, LOCK_TIMEOUT restores original value, XML entity decoding complete, READPAST hint for parallel mode, @WhatIfOutputTable data type validation, Query Store READ_ONLY warning, debug threshold explanation
 - **1.8.2026.0128** - Code review fixes (P1/P2): @LongRunningSamplePercent row cap, staged discovery phase validation, FOR XML entity decoding, LOCK_TIMEOUT reset, incremental partition cross-ref, @WhatIfOutputTable schema validation. Added XE troubleshooting session.
 - **1.7.2026.0127** - BREAKING: @ModificationThreshold default 1000 → 5000 (less aggressive)
