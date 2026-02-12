@@ -1,8 +1,9 @@
 /*
 sp_StatUpdate Extended Events Troubleshooting Session
 
-Purpose:    Monitor sp_StatUpdate execution for troubleshooting
-            Captures query execution, wait stats, errors, and statement completion
+Purpose:    Monitor sp_StatUpdate execution for troubleshooting.
+            Captures both statement START and COMPLETION events for before/after
+            correlation, plus wait stats, errors, and blocking.
 
 Usage:
     1. Run this script to create the XE session
@@ -15,6 +16,7 @@ To drop:    DROP EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER;
 To view:    See queries at bottom of this script
 
 Created: 2026-01-28 for sp_StatUpdate troubleshooting (#8 Grant Fritchey feedback)
+Updated: 2026-02-12 v2.0 - Added starting events for during-execution visibility
 */
 
 -- Drop existing session if present
@@ -27,7 +29,16 @@ GO
 -- Create the XE session
 CREATE EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER
 
--- Capture UPDATE STATISTICS commands
+-- Capture UPDATE STATISTICS command START (for during-execution visibility)
+ADD EVENT sqlserver.sp_statement_starting
+(
+    ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text)
+    WHERE (
+        sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N'%UPDATE STATISTICS%')
+    )
+),
+
+-- Capture UPDATE STATISTICS command COMPLETION (duration, CPU, reads)
 ADD EVENT sqlserver.sp_statement_completed
 (
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text, sqlserver.query_hash)
@@ -43,39 +54,58 @@ ADD EVENT sqlserver.error_reported
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text)
     WHERE (
         severity >= 11
-        OR error_number IN (1222, 1205, 3621, 8115) -- Lock timeout, deadlock, statement abort, overflow
+        OR error_number = 1222  -- Lock timeout
+        OR error_number = 1205  -- Deadlock victim
+        OR error_number = 3621  -- Statement aborted
+        OR error_number = 8115  -- Arithmetic overflow
     )
 ),
 
 -- Capture wait statistics for blocking/performance issues
+-- Note: XE predicates require numeric map_key values for wait_type
+-- Query sys.dm_xe_map_values WHERE name = 'wait_types' to find values
 ADD EVENT sqlos.wait_completed
 (
     ACTION (sqlserver.session_id, sqlserver.database_name)
     WHERE (
-        -- Focus on common stat maintenance waits
-        wait_type IN (
-            N'LCK_M_SCH_S',      -- Schema stability lock (stat reads)
-            N'LCK_M_SCH_M',      -- Schema modification lock (stat updates)
-            N'LCK_M_X',          -- Exclusive lock
-            N'LCK_M_U',          -- Update lock
-            N'PAGEIOLATCH_SH',   -- Shared page I/O latch
-            N'PAGEIOLATCH_EX',   -- Exclusive page I/O latch
-            N'CXPACKET',         -- Parallel query waits
-            N'ASYNC_NETWORK_IO'  -- Client waiting
+        duration > 1000000  -- > 1 second (in microseconds)
+        AND (
+               wait_type = 1    -- LCK_M_SCH_S (schema stability lock)
+            OR wait_type = 2    -- LCK_M_SCH_M (schema modification lock)
+            OR wait_type = 4    -- LCK_M_U (update lock)
+            OR wait_type = 5    -- LCK_M_X (exclusive lock)
+            OR wait_type = 66   -- PAGEIOLATCH_SH (shared page I/O latch)
+            OR wait_type = 68   -- PAGEIOLATCH_EX (exclusive page I/O latch)
+            OR wait_type = 281  -- CXPACKET (parallel query waits)
+            OR wait_type = 187  -- NETWORK_IO (client waiting)
         )
-        AND duration > 1000000  -- > 1 second (in microseconds)
     )
 ),
 
--- Capture long-running statements (> 10 seconds)
+-- Capture long-running statement START (> 0 filter = all, correlate with completed)
+ADD EVENT sqlserver.sql_statement_starting
+(
+    ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text)
+    WHERE (
+        sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N'%UPDATE STATISTICS%')
+    )
+),
+
+-- Capture long-running statement COMPLETION (> 10 seconds)
 ADD EVENT sqlserver.sql_statement_completed
 (
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text, sqlserver.plan_handle)
     WHERE duration > 10000000  -- > 10 seconds (in microseconds)
 ),
 
--- Capture query timeouts
-ADD EVENT sqlserver.query_canceled
+-- Capture lock escalation (common during large stat scans)
+ADD EVENT sqlserver.lock_escalation
+(
+    ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text)
+),
+
+-- Capture query timeouts and cancellations (attention = client cancel or timeout)
+ADD EVENT sqlserver.attention
 (
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text)
 ),
@@ -89,11 +119,11 @@ ADD EVENT sqlserver.xml_deadlock_report
 -- Output to ring buffer (in-memory, no file needed)
 ADD TARGET package0.ring_buffer
 (
-    SET max_memory = 4096  -- 4 MB ring buffer
+    SET max_memory = 8192  -- 8 MB ring buffer (increased for starting + completed events)
 )
 
 WITH (
-    MAX_MEMORY = 4096 KB,
+    MAX_MEMORY = 8192 KB,
     EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS,
     MAX_DISPATCH_LATENCY = 5 SECONDS,
     STARTUP_STATE = OFF  -- Don't auto-start on SQL Server restart
@@ -179,7 +209,41 @@ WHERE event_data.value('(event/@name)[1]', 'varchar(50)') = 'wait_completed'
 GROUP BY event_data.value('(event/data[@name="wait_type"]/text)[1]', 'varchar(50)')
 ORDER BY total_duration_ms DESC;
 
--- 5. Export to file (optional - creates file in SQL Server default backup dir)
+-- 5. Correlate starting/completed events (calculate in-progress duration)
+;WITH ring_buffer AS
+(
+    SELECT
+        CAST(target_data AS xml) AS event_data
+    FROM sys.dm_xe_session_targets AS xst
+    JOIN sys.dm_xe_sessions AS xs ON xs.address = xst.event_session_address
+    WHERE xs.name = N'sp_StatUpdate_Monitor'
+    AND   xst.target_name = N'ring_buffer'
+),
+events AS (
+    SELECT
+        event_data.value('(event/@name)[1]', 'varchar(50)') AS event_name,
+        event_data.value('(event/@timestamp)[1]', 'datetime2(3)') AS event_time,
+        event_data.value('(event/action[@name="session_id"]/value)[1]', 'int') AS session_id,
+        LEFT(event_data.value('(event/action[@name="sql_text"]/value)[1]', 'nvarchar(max)'), 200) AS sql_text
+    FROM ring_buffer
+    CROSS APPLY event_data.nodes('RingBufferTarget/event') AS n(event_data)
+    WHERE event_data.value('(event/@name)[1]', 'varchar(50)') IN ('sp_statement_starting', 'sp_statement_completed')
+)
+SELECT
+    s.event_time AS start_time,
+    c.event_time AS end_time,
+    DATEDIFF(MILLISECOND, s.event_time, c.event_time) AS duration_ms,
+    s.session_id,
+    s.sql_text
+FROM events AS s
+LEFT JOIN events AS c ON c.session_id = s.session_id
+    AND c.event_name = 'sp_statement_completed'
+    AND c.event_time >= s.event_time
+    AND c.sql_text = s.sql_text
+WHERE s.event_name = 'sp_statement_starting'
+ORDER BY s.event_time DESC;
+
+-- 6. Export to file (optional - creates file in SQL Server default backup dir)
 -- ALTER EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER
 -- ADD TARGET package0.event_file (SET filename = N'sp_StatUpdate_Monitor.xel', max_file_size = 50);
 
