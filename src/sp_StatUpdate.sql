@@ -3508,7 +3508,7 @@ BEGIN
                             WHEN rows <= 1000000 THEN (rows * 10) / 100 + 500
                             ELSE CONVERT(bigint, CONVERT(float, rows) * 5 / 100) + 500
                         END,
-                    sqrt_threshold = CONVERT(bigint, SQRT(CONVERT(float, ISNULL(rows, 1)) * 1000)),
+                    sqrt_threshold = CONVERT(bigint, SQRT(CONVERT(float, CASE WHEN ISNULL(rows, 0) < 1 THEN 1 ELSE rows END) * 1000)),
                     days_stale = ISNULL(DATEDIFF(DAY, last_updated, GETDATE()), 9999);
 
                 /*
@@ -5414,7 +5414,8 @@ BEGIN
             @incremental_partitions nvarchar(max) = NULL,
             @incremental_partition_count int = 0,
             @incremental_total_partitions int = 0,
-            @physical_partition_count int = 0;
+            @physical_partition_count int = 0,
+            @on_partitions_clause nvarchar(max) = N'';
 
         IF  @UpdateIncremental = 1
         AND @current_is_incremental = 1
@@ -5523,7 +5524,7 @@ BEGIN
                 Truncated partitions are naturally excluded (not in DMV).
                 */
                 SELECT
-                    @current_command += N' ON PARTITIONS(' + @incremental_partitions + N')';
+                    @on_partitions_clause = N' ON PARTITIONS(' + @incremental_partitions + N')';
 
                 IF @Debug = 1
                 BEGIN
@@ -5639,6 +5640,16 @@ BEGIN
         BEGIN
             SELECT
                 @current_command += N' WITH ' + @with_clause;
+        END;
+
+        /*
+        ON PARTITIONS must come AFTER the WITH clause.
+        Syntax: UPDATE STATISTICS [t] ([s]) WITH RESAMPLE ON PARTITIONS(2, 3);
+        */
+        IF @on_partitions_clause <> N''
+        BEGIN
+            SELECT
+                @current_command += @on_partitions_clause;
         END;
 
         SELECT
