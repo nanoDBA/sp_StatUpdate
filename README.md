@@ -428,11 +428,64 @@ ORDER BY
 | OrdersDB     | AuditLog     | 45230            | 180000   | 25.13         | 1200   | CRITICAL: Rebuild heap immediately   |
 | CustomerDB   | EventHistory | 12400            | 95000    | 13.05         | 450    | WARNING: Consider rebuild            |
 
-**Forwarding ratio thresholds:**
+#### Understanding Heap Forwarding Pointers
 
-- **>20%**: Critical fragmentation - rebuild immediately with `ALTER TABLE ... REBUILD`
-- **>10%**: Warning level - schedule rebuild during next maintenance window
-- **<10%**: Acceptable level - monitor only
+Forwarding pointers occur when variable-length columns (varchar, nvarchar) cause rows to grow beyond their original space. SQL Server moves the row to a new page but leaves a pointer at the old location. Every read then requires two page accesses instead of one—the original page to find the pointer, then the new page to read the actual data. This severely degrades table scan and clustered index scan performance.
+
+#### Remediation Options by Forwarding Ratio
+
+##### Critical (>20% forwarding ratio)
+
+The table is severely fragmented. Each option has trade-offs:
+
+1. **Rebuild the heap** - Quick fix but temporary:
+
+   ```sql
+   ALTER TABLE OrdersDB.dbo.AuditLog REBUILD;
+   ```
+
+   - **Pros**: Fast, simple, removes all forwarding pointers immediately
+   - **Cons**: Forwarding will return if updates continue to expand rows
+   - **When to use**: Temporary relief while you plan a permanent solution, or when the table has stabilized and won't grow further
+
+2. **Add a clustered index** - Permanent solution for most cases:
+
+   ```sql
+   CREATE CLUSTERED INDEX CIX_AuditLog_LogDate ON OrdersDB.dbo.AuditLog(LogDate);
+   ```
+
+   - **Pros**: Prevents future forwarding (clustered indexes use page splits, not forwarding), improves range query performance, statistics maintenance is more efficient
+   - **Cons**: Requires choosing a good clustering key (ideally ever-increasing like datetime/identity to minimize splits), adds 6-10% storage overhead for the index tree, can degrade point lookups if the clustering key isn't the primary access pattern
+   - **When to use**: When the table is frequently scanned/range-queried, has a natural ever-increasing key (datetime, identity), or will continue to experience updates that expand rows
+   - **Best practice**: Avoid wide clustering keys (>16 bytes)—they bloat nonclustered indexes since all NCIs include the clustering key
+
+3. **Increase fill factor and rebuild**:
+
+   ```sql
+   ALTER TABLE OrdersDB.dbo.AuditLog REBUILD WITH (FILLFACTOR = 70);
+   ```
+
+   - **Pros**: Leaves room for rows to expand in-place, reduces forwarding frequency
+   - **Cons**: Increases storage by 30-40%, slows scans due to additional page reads, requires periodic rebuilds as free space gets consumed
+   - **When to use**: When you can't add a clustered index (vendor table, app constraints) and updates frequently expand rows by predictable amounts
+
+##### Warning (10-20% forwarding ratio)
+
+Noticeable performance degradation. Schedule remediation during next maintenance window using one of the above approaches. Monitor modification patterns—if the table is write-heavy with frequent updates that expand rows, adding a clustered index is typically the best long-term solution. If updates are infrequent or the table is insert-only, a periodic rebuild may suffice.
+
+##### OK (<10% forwarding ratio)
+
+Acceptable level. Some forwarding is normal and doesn't justify the overhead of aggressive rebuilds. Continue monitoring. If the ratio is trending upward, investigate whether row expansion patterns have changed (new columns added, application behavior shift).
+
+#### When to Keep a Heap
+
+Heaps are optimal for:
+
+- **Insert-only tables** (logs, staging, archives) with no updates after insert
+- **Small tables** (<1000 rows) where forwarding overhead is negligible
+- **Full table scans every time** where clustering provides no seek benefit and you want to avoid index maintenance overhead
+
+If none of these apply and you're seeing forwarding pointers, adding a clustered index is usually the right answer.
 
 ## Diagnostic Tool (v1.0)
 
