@@ -373,6 +373,67 @@ ORDER BY StartTime DESC;
 --   FULLSCAN_MEMOPT = Memory-optimized table on SQL 2014
 ```
 
+### Heap Health Monitoring (v2.0+)
+
+When `@CollectHeapForwarding = 'Y'`, CommandLog captures forwarding pointer counts for heap tables. High forwarding ratios indicate fragmentation that degrades scan performance.
+
+```sql
+-- Heap Statistics Health Report - Find heaps with forwarding pointer problems
+-- Shows which heap statistics have the most forwarding pointers and may need rebuild
+SELECT TOP 20
+    DatabaseName,
+    SchemaName,
+    ObjectName,
+    StatisticsName,
+    StartTime,
+    -- Heap health metrics
+    ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') AS ForwardedRecords,
+    ExtendedInfo.value('(/ExtendedInfo/RowCount)[1]', 'bigint') AS [RowCount],
+    -- Calculate forwarding ratio (high % = fragmented heap)
+    CAST(
+        ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') * 100.0 /
+        NULLIF(ExtendedInfo.value('(/ExtendedInfo/RowCount)[1]', 'bigint'), 0)
+        AS decimal(5,2)
+    ) AS ForwardingPct,
+    ExtendedInfo.value('(/ExtendedInfo/SizeMB)[1]', 'int') AS SizeMB,
+    -- Modification activity
+    ExtendedInfo.value('(/ExtendedInfo/ModificationCounter)[1]', 'bigint') AS Modifications,
+    ExtendedInfo.value('(/ExtendedInfo/ModificationPct)[1]', 'decimal(18,2)') AS ModificationPct,
+    -- When last updated
+    DATEDIFF(day, StartTime, GETDATE()) AS DaysAgo,
+    -- Actionable recommendation
+    CASE
+        WHEN ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') * 100.0 /
+             NULLIF(ExtendedInfo.value('(/ExtendedInfo/RowCount)[1]', 'bigint'), 0) > 20
+        THEN 'CRITICAL: Rebuild heap immediately'
+        WHEN ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') * 100.0 /
+             NULLIF(ExtendedInfo.value('(/ExtendedInfo/RowCount)[1]', 'bigint'), 0) > 10
+        THEN 'WARNING: Consider rebuild'
+        ELSE 'OK'
+    END AS Recommendation
+FROM dbo.CommandLog
+WHERE CommandType = 'UPDATE_STATISTICS'
+AND ExtendedInfo.value('(/ExtendedInfo/IsHeap)[1]', 'bit') = 1
+AND ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') > 0
+ORDER BY
+    -- Sort by worst forwarding ratio first
+    ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') * 100.0 /
+    NULLIF(ExtendedInfo.value('(/ExtendedInfo/RowCount)[1]', 'bigint'), 0) DESC;
+```
+
+**Example output:**
+
+| DatabaseName | ObjectName   | ForwardedRecords | RowCount | ForwardingPct | SizeMB | Recommendation                       |
+|--------------|--------------|------------------|----------|---------------|--------|--------------------------------------|
+| OrdersDB     | AuditLog     | 45230            | 180000   | 25.13         | 1200   | CRITICAL: Rebuild heap immediately   |
+| CustomerDB   | EventHistory | 12400            | 95000    | 13.05         | 450    | WARNING: Consider rebuild            |
+
+**Forwarding ratio thresholds:**
+
+- **>20%**: Critical fragmentation - rebuild immediately with `ALTER TABLE ... REBUILD`
+- **>10%**: Warning level - schedule rebuild during next maintenance window
+- **<10%**: Acceptable level - monitor only
+
 ## Diagnostic Tool (v1.0)
 
 **sp_StatUpdate_Diag** analyzes your CommandLog history and produces actionable recommendations — killed run detection, repeated failures, degrading throughput, suboptimal parameters, and more.
