@@ -5761,7 +5761,7 @@ BEGIN
                                 @current_no_recompute AS HasNorecompute,
                                 @current_is_incremental AS IsIncremental,
                                 @current_is_heap AS IsHeap,
-                                @current_forwarded_records AS ForwardedRecords,
+                                ISNULL(@current_forwarded_records, 0) AS ForwardedRecords,
                                 @current_is_memory_optimized AS IsMemoryOptimized,
                                 @current_auto_created AS AutoCreated,
                                 @current_histogram_steps AS HistogramSteps,
