@@ -40,7 +40,26 @@ Version:    2.0.2026.0212 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.0.2026.0212 - Phase 1 Environment Intelligence (v2.0 roadmap):
+History:    2.1.2026.0219 - Phase 2 Extended Awareness:
+                          - SYSDATETIME() consistency: All date/time functions now use SYSDATETIME()
+                            instead of mixed GETDATE()/SYSDATETIME() for sub-second consistency.
+                          - Azure SQL detection: Added @is_azure_sql flag and DTU/vCore consumption
+                            warning for Azure SQL Database/MI/Edge environments.
+                          - Hardware context: Debug mode shows CPU cores, memory, NUMA nodes, uptime.
+                            Warns when uptime < 24h (QS/usage stats may be incomplete).
+                          - RCSI awareness: Detects per-database Read Committed Snapshot Isolation
+                            and snapshot isolation settings in debug output.
+                          - Replication/CDC/Temporal awareness: Discovery now captures is_published,
+                            is_tracked_by_cdc, and temporal_type. Progress output shows REPLICATED,
+                            CDC, TEMPORAL flags for affected tables.
+                          - Backup detection: Warns when backup operations are running (I/O competition).
+                          - @MaxConsecutiveFailures parameter: Stops execution after N consecutive
+                            failures to prevent cascading issues from shared resource problems.
+                          - @WarningsOut OUTPUT parameter: Collects warnings (LOW_UPTIME, BACKUP_RUNNING,
+                            AZURE_SQL) for programmatic access without parsing messages.
+                          - @StopReasonOut OUTPUT parameter: Returns why execution stopped (COMPLETED,
+                            TIME_LIMIT, BATCH_LIMIT, FAIL_FAST, CONSECUTIVE_FAILURES, etc.).
+            2.0.2026.0212 - Phase 1 Environment Intelligence (v2.0 roadmap):
                           - CE Version/Compat Level: Shows per-database compatibility level and
                             effective CE version (70, 120, 130+) in debug output.
                           - Trace Flag Detection: Detects statistics-relevant trace flags (2371,
@@ -351,6 +370,7 @@ ALTER PROCEDURE
     @BatchLimit integer = NULL, /*max stats to update per run*/
     @SortOrder nvarchar(50) = N'MODIFICATION_COUNTER', /*priority: MODIFICATION_COUNTER, DAYS_STALE, RANDOM, PAGE_COUNT, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED*/
     @DelayBetweenStats integer = NULL, /*seconds to wait between stats updates. Use during OLTP hours to reduce contention; NULL = no delay*/
+    @MaxConsecutiveFailures integer = NULL, /*stop after N consecutive failures (prevents cascading issues from shared resource problems). NULL = no limit*/
 
     /*
     ============================================================================
@@ -433,7 +453,9 @@ ALTER PROCEDURE
     @StatsSucceededOut integer = NULL OUTPUT, /*stats updated successfully*/
     @StatsFailedOut integer = NULL OUTPUT, /*stats that failed to update*/
     @StatsRemainingOut integer = NULL OUTPUT, /*stats not processed (time/batch limit)*/
-    @DurationSecondsOut integer = NULL OUTPUT /*total run duration in seconds*/
+    @DurationSecondsOut integer = NULL OUTPUT, /*total run duration in seconds*/
+    @WarningsOut nvarchar(max) = NULL OUTPUT, /*collected warnings for programmatic access*/
+    @StopReasonOut nvarchar(50) = NULL OUTPUT /*why execution stopped: COMPLETED, TIME_LIMIT, BATCH_LIMIT, FAIL_FAST, CONSECUTIVE_FAILURES, etc.*/
 )
 WITH RECOMPILE
 AS
@@ -449,8 +471,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.0.2026.0212',
-        @procedure_version_date datetime = '20260212',
+        @procedure_version varchar(20) = '2.1.2026.0219',
+        @procedure_version_date datetime = '20260219',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -619,6 +641,12 @@ BEGIN
                     THEN N'OUTPUT: stats not processed (time/batch limit)'
                     WHEN N'@DurationSecondsOut'
                     THEN N'OUTPUT: total run duration in seconds'
+                    WHEN N'@WarningsOut'
+                    THEN N'OUTPUT: collected warnings (LOW_UPTIME, BACKUP_RUNNING, AZURE_SQL, etc.)'
+                    WHEN N'@StopReasonOut'
+                    THEN N'OUTPUT: why execution stopped (COMPLETED, TIME_LIMIT, BATCH_LIMIT, FAIL_FAST, CONSECUTIVE_FAILURES)'
+                    WHEN N'@MaxConsecutiveFailures'
+                    THEN N'stop after N consecutive failures (prevents cascading issues from shared resource problems)'
                     ELSE N'undocumented parameter'
                 END,
             valid_inputs =
@@ -651,6 +679,8 @@ BEGIN
                     THEN N'Y, N'
                     WHEN N'@ExposeProgressToAllSessions'
                     THEN N'Y, N'
+                    WHEN N'@MaxConsecutiveFailures'
+                    THEN N'NULL, 1-N (e.g., 3, 5, 10)'
                     ELSE N''
                 END,
             defaults =
@@ -743,6 +773,12 @@ BEGIN
                     THEN N'15'
                     WHEN N'@Help'
                     THEN N'0'
+                    WHEN N'@MaxConsecutiveFailures'
+                    THEN N'NULL (no limit)'
+                    WHEN N'@WarningsOut'
+                    THEN N'NULL (OUTPUT)'
+                    WHEN N'@StopReasonOut'
+                    THEN N'NULL (OUTPUT)'
                     ELSE N''
                 END
         FROM sys.parameters AS ap
@@ -1040,6 +1076,10 @@ BEGIN
         @current_histogram_steps int = NULL,
         @current_partition_number integer = NULL,
         @current_forwarded_records bigint = NULL,
+        /* Replication and temporal table awareness */
+        @current_is_published bit = NULL,
+        @current_is_tracked_by_cdc bit = NULL,
+        @current_temporal_type tinyint = NULL,
         /* Filtered statistics metadata */
         @current_has_filter bit = NULL,
         @current_filter_definition nvarchar(max) = NULL,
@@ -1092,7 +1132,9 @@ BEGIN
         @stats_processed integer = 0,
         @stats_succeeded integer = 0,
         @stats_failed integer = 0,
-        @stats_skipped integer = 0;
+        @stats_skipped integer = 0,
+        @consecutive_failures integer = 0,
+        @warnings nvarchar(max) = N''; /* Collected warnings for @WarningsOut OUTPUT */
 
     /*
     Queue-based parallel processing variables
@@ -1157,6 +1199,10 @@ BEGIN
         is_memory_optimized bit NOT NULL DEFAULT 0,
         is_heap bit NOT NULL DEFAULT 0,
         auto_created bit NOT NULL DEFAULT 0,
+        /* Table metadata for replication/CDC/temporal awareness */
+        is_published bit NOT NULL DEFAULT 0, /*transactional replication*/
+        is_tracked_by_cdc bit NOT NULL DEFAULT 0, /*Change Data Capture*/
+        temporal_type tinyint NOT NULL DEFAULT 0, /*0=none, 1=history, 2=system-versioned*/
         modification_counter bigint NOT NULL DEFAULT 0,
         row_count bigint NOT NULL DEFAULT 0,
         days_stale integer NOT NULL DEFAULT 0,
@@ -2162,6 +2208,24 @@ BEGIN
             error_severity = 16;
     END;
 
+    /*
+    Validate @MaxConsecutiveFailures
+    */
+    IF  @MaxConsecutiveFailures IS NOT NULL
+    AND @MaxConsecutiveFailures < 1
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @MaxConsecutiveFailures must be >= 1.',
+            error_severity = 16;
+    END;
+
     IF  @LongRunningSamplePercent IS NOT NULL
     AND (
             @LongRunningSamplePercent < 1
@@ -2329,10 +2393,14 @@ BEGIN
         @server_name nvarchar(128) = CONVERT(nvarchar(128), SERVERPROPERTY(N'ServerName')),
         @product_version nvarchar(128) = CONVERT(nvarchar(128), SERVERPROPERTY(N'ProductVersion')),
         @edition nvarchar(128) = CONVERT(nvarchar(128), SERVERPROPERTY(N'Edition')),
+        @engine_edition int = CONVERT(int, SERVERPROPERTY(N'EngineEdition')),
+        /* EngineEdition: 3=Enterprise, 5=Azure SQL DB, 8=Azure SQL MI, 9=Azure SQL Edge */
+        @is_azure_sql bit = CASE WHEN CONVERT(int, SERVERPROPERTY(N'EngineEdition')) IN (5, 8, 9) THEN 1 ELSE 0 END,
         @Tables_display nvarchar(max) = ISNULL(@Tables, N'ALL'),
         @TimeLimit_display nvarchar(20) = ISNULL(CONVERT(nvarchar(20), @TimeLimit), N'None'),
         @BatchLimit_display nvarchar(20) = ISNULL(CONVERT(nvarchar(20), @BatchLimit), N'None'),
         @LockTimeout_display nvarchar(20) = ISNULL(CONVERT(nvarchar(20), @LockTimeout), N'None'),
+        @MaxConsecutiveFailures_display nvarchar(20) = ISNULL(CONVERT(nvarchar(20), @MaxConsecutiveFailures), N'None'),
         @start_time_display nvarchar(30) = CONVERT(nvarchar(30), @start_time, 121);
 
     RAISERROR(N'', 10, 1) WITH NOWAIT;
@@ -2343,6 +2411,18 @@ BEGIN
     RAISERROR(N'Server:      %s', 10, 1, @server_name) WITH NOWAIT;
     RAISERROR(N'Version:     %s', 10, 1, @product_version) WITH NOWAIT;
     RAISERROR(N'Edition:     %s', 10, 1, @edition) WITH NOWAIT;
+
+    /*
+    Azure SQL Platform Warning
+    DTU/vCore consumption warning for Azure SQL environments.
+    */
+    IF @is_azure_sql = 1
+    BEGIN
+        RAISERROR(N'Platform:    Azure SQL Database (EngineEdition=%d)', 10, 1, @engine_edition) WITH NOWAIT;
+        RAISERROR(N'  Note: Statistics updates consume DTU/vCore resources.', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  Consider running during off-peak hours or scaling up temporarily.', 10, 1) WITH NOWAIT;
+        SET @warnings += N'AZURE_SQL: Consider DTU/vCore impact; ';
+    END;
 
     /*
     Trace flag status (Phase 1.3 - v2.0)
@@ -2418,6 +2498,7 @@ BEGIN
     RAISERROR(N'  @UpdateIncremental       = %d', 10, 1, @UpdateIncremental_int) WITH NOWAIT;
     RAISERROR(N'  @TimeLimit               = %s seconds', 10, 1, @TimeLimit_display) WITH NOWAIT;
     RAISERROR(N'  @BatchLimit              = %s stats', 10, 1, @BatchLimit_display) WITH NOWAIT;
+    RAISERROR(N'  @MaxConsecutiveFailures  = %s', 10, 1, @MaxConsecutiveFailures_display) WITH NOWAIT;
     RAISERROR(N'  @LockTimeout             = %s seconds', 10, 1, @LockTimeout_display) WITH NOWAIT;
     RAISERROR(N'  @SortOrder               = %s', 10, 1, @SortOrder) WITH NOWAIT;
     RAISERROR(N'  @StatsInParallel         = %s', 10, 1, @StatsInParallel) WITH NOWAIT;
@@ -2512,6 +2593,49 @@ BEGIN
         ELSE
         BEGIN
             RAISERROR(N'Statistics-Relevant Trace Flags: None active', 10, 1) WITH NOWAIT;
+        END;
+
+        /*
+        Hardware context (Glenn Berry #43)
+        Display hardware summary to help diagnose performance expectations.
+        */
+        DECLARE
+            @hw_cpu_count int,
+            @hw_memory_mb bigint,
+            @hw_numa_nodes int,
+            @hw_uptime_hours int;
+
+        SELECT
+            @hw_cpu_count = cpu_count,
+            @hw_memory_mb = physical_memory_kb / 1024,
+            @hw_numa_nodes = numa_node_count,
+            @hw_uptime_hours = DATEDIFF(HOUR, sqlserver_start_time, SYSDATETIME())
+        FROM sys.dm_os_sys_info;
+
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(N'Environment (hardware context):', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  CPU cores: %d, Memory: %I64d MB, NUMA nodes: %d, Uptime: %d hours', 10, 1,
+            @hw_cpu_count, @hw_memory_mb, @hw_numa_nodes, @hw_uptime_hours) WITH NOWAIT;
+
+        IF @hw_uptime_hours < 24
+        BEGIN
+            RAISERROR(N'  Note: SQL Server restarted < 24h ago. Query Store/usage stats may be incomplete.', 10, 1) WITH NOWAIT;
+            SET @warnings += N'LOW_UPTIME: Server restarted < 24h ago; ';
+        END;
+
+        /*
+        Backup activity detection
+        Warn when backups are running as they compete for I/O resources.
+        */
+        DECLARE @active_backups int = 0;
+        SELECT @active_backups = COUNT(*)
+        FROM sys.dm_exec_requests AS r
+        WHERE r.command LIKE N'BACKUP%';
+
+        IF @active_backups > 0
+        BEGIN
+            RAISERROR(N'  Warning: %d backup operation(s) currently running. Statistics updates may compete for I/O.', 10, 1, @active_backups) WITH NOWAIT;
+            SET @warnings += N'BACKUP_RUNNING: ' + CONVERT(nvarchar(10), @active_backups) + N' backup(s) active; ';
         END;
     END;
 
@@ -2991,6 +3115,10 @@ BEGIN
             no_recompute = s.no_recompute,
             is_incremental = s.is_incremental,
             is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
+            /* Replication/CDC/Temporal metadata */
+            is_published = ISNULL(t.is_published, 0),
+            is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
+            temporal_type = ISNULL(t.temporal_type, 0),
             /*
             HEAP DETECTION: Check for index_id = 0 (heap) directly.
             Heaps have index_id = 0; clustered indexes have index_id = 1.
@@ -3011,7 +3139,7 @@ BEGIN
                 END,
             modification_counter = ISNULL(sp.modification_counter, 0),
             row_count = ISNULL(sp.rows, 0),
-            days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, GETDATE()), 9999),
+            days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
             page_count = ISNULL(pgs.total_pages, 0),
             persisted_sample_percent = sp.persisted_sample_percent, /*track existing persisted sample*/
             priority = ISNULL(src.priority, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)))
@@ -3132,7 +3260,7 @@ BEGIN
                 END,
             modification_counter = ISNULL(sp.modification_counter, 0),
             row_count = ISNULL(sp.rows, 0),
-            days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, GETDATE()), 9999),
+            days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
             page_count = ISNULL(pgs.total_pages, 0),
             persisted_sample_percent = sp.persisted_sample_percent,
             priority = ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
@@ -3282,6 +3410,25 @@ BEGIN
                 /* Note if CE version differs from what compat level suggests due to trace flags */
                 IF @tf_9481_active = 1 AND @db_compat_level >= 120
                     RAISERROR(N'    Note: TF 9481 forcing legacy CE despite compat level %d', 10, 1, @db_compat_level) WITH NOWAIT;
+
+                /*
+                RCSI / Snapshot Isolation detection (Fabiano Amorim #53)
+                Statistics updates under RCSI generate version store overhead in tempdb.
+                */
+                DECLARE
+                    @db_rcsi bit = 0,
+                    @db_snapshot bit = 0;
+
+                SELECT
+                    @db_rcsi = is_read_committed_snapshot_on,
+                    @db_snapshot = snapshot_isolation_state
+                FROM sys.databases
+                WHERE name = @CurrentDatabaseName;
+
+                IF @db_rcsi = 1
+                    RAISERROR(N'    Note: RCSI enabled - stats updates generate version store overhead', 10, 1) WITH NOWAIT;
+                IF @db_snapshot > 0
+                    RAISERROR(N'    Note: Snapshot Isolation active - version store impact expected', 10, 1) WITH NOWAIT;
             END;
 
             /*
@@ -3337,12 +3484,17 @@ BEGIN
                     filter_definition nvarchar(max) NULL,
                     is_memory_optimized bit NOT NULL DEFAULT 0,
                     auto_created bit NOT NULL DEFAULT 0,
+                    /* Replication/CDC/Temporal */
+                    is_published bit NOT NULL DEFAULT 0,
+                    is_tracked_by_cdc bit NOT NULL DEFAULT 0,
+                    temporal_type tinyint NOT NULL DEFAULT 0,
                     PRIMARY KEY CLUSTERED (object_id, stats_id)
                 );
 
                 INSERT INTO #stat_candidates
                     (object_id, stats_id, stat_name, schema_name, table_name,
-                     no_recompute, is_incremental, has_filter, filter_definition, is_memory_optimized, auto_created)
+                     no_recompute, is_incremental, has_filter, filter_definition, is_memory_optimized, auto_created,
+                     is_published, is_tracked_by_cdc, temporal_type)
                 SELECT
                     s.object_id,
                     s.stats_id,
@@ -3354,7 +3506,10 @@ BEGIN
                     s.has_filter,
                     s.filter_definition,
                     ISNULL(t.is_memory_optimized, 0),
-                    s.auto_created
+                    s.auto_created,
+                    ISNULL(t.is_published, 0),
+                    ISNULL(t.is_tracked_by_cdc, 0),
+                    ISNULL(t.temporal_type, 0)
                 FROM sys.stats AS s
                 JOIN sys.objects AS o ON o.object_id = s.object_id
                 LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
@@ -3509,7 +3664,7 @@ BEGIN
                             ELSE CONVERT(bigint, CONVERT(float, rows) * 5 / 100) + 500
                         END,
                     sqrt_threshold = CONVERT(bigint, SQRT(CONVERT(float, CASE WHEN ISNULL(rows, 0) < 1 THEN 1 ELSE rows END) * 1000)),
-                    days_stale = ISNULL(DATEDIFF(DAY, last_updated, GETDATE()), 9999);
+                    days_stale = ISNULL(DATEDIFF(DAY, last_updated, SYSDATETIME()), 9999);
 
                 /*
                 ================================================================
@@ -3750,7 +3905,7 @@ BEGIN
                         JOIN sys.query_store_runtime_stats_interval AS qsrsi
                             ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
                         WHERE qsq.object_id IN (SELECT DISTINCT object_id FROM #stat_candidates)
-                        AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, GETDATE())
+                        AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
                         GROUP BY qsq.object_id
                         HAVING SUM(qsrs.count_executions) > 0
                     )
@@ -3811,6 +3966,9 @@ BEGIN
                     qs_total_logical_reads,
                     qs_last_execution,
                     ISNULL(qs_priority_boost, 0) AS qs_priority_boost,
+                    is_published,
+                    is_tracked_by_cdc,
+                    temporal_type,
                     priority = ROW_NUMBER() OVER (
                         ORDER BY
                             ISNULL(qs_priority_boost, 0) +
@@ -3846,7 +4004,8 @@ BEGIN
                     modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                     has_filter, filter_definition, unfiltered_rows,
                     qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
-                    qs_total_logical_reads, qs_last_execution, qs_priority_boost, priority
+                    qs_total_logical_reads, qs_last_execution, qs_priority_boost,
+                    is_published, is_tracked_by_cdc, temporal_type, priority
                 )
                 EXECUTE sys.sp_executesql
                     @staged_sql,
@@ -3965,7 +4124,7 @@ BEGIN
             auto_created = s.auto_created,
             modification_counter = ISNULL(sp.modification_counter, 0),
             row_count = ISNULL(sp.rows, 0),
-            days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, GETDATE()), 9999),
+            days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
             page_count = ISNULL(pgs.total_pages, 0),
             persisted_sample_percent = sp.persisted_sample_percent,
             histogram_steps = sp.steps,
@@ -3997,6 +4156,10 @@ BEGIN
                          END
                     ELSE 0
                 END,
+            /* Replication and temporal table awareness */
+            is_published = ISNULL(t.is_published, 0),
+            is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
+            temporal_type = ISNULL(t.temporal_type, 0),
             priority =
                 ROW_NUMBER() OVER
                 (
@@ -4021,7 +4184,7 @@ BEGIN
                             WHEN N''MODIFICATION_COUNTER''
                             THEN ISNULL(sp.modification_counter, 0)
                             WHEN N''DAYS_STALE''
-                            THEN ISNULL(DATEDIFF(DAY, sp.last_updated, GETDATE()), 9999)
+                            THEN ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999)
                             WHEN N''PAGE_COUNT''
                             THEN ISNULL(pgs.total_pages, 0)
                             WHEN N''RANDOM''
@@ -4115,7 +4278,7 @@ BEGIN
               ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
             WHERE qsq.object_id = s.object_id  /* Early filter reduces join cardinality */
             AND   @QueryStorePriority_param = N''Y''
-            AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, GETDATE())
+            AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
             /*
             Check Query Store is enabled and readable before querying.
             actual_state: 0=OFF, 1=READ_ONLY, 2=READ_WRITE, 3=ERROR
@@ -4186,7 +4349,7 @@ BEGIN
                       /* Days stale threshold */
                       OR (
                           @DaysStaleThreshold_param IS NOT NULL
-                          AND DATEDIFF(DAY, sp.last_updated, GETDATE()) >= @DaysStaleThreshold_param
+                          AND DATEDIFF(DAY, sp.last_updated, SYSDATETIME()) >= @DaysStaleThreshold_param
                       )
                       /* If no thresholds specified, include all */
                       OR (
@@ -4220,7 +4383,7 @@ BEGIN
                   AND (
                       /* Days stale - must be met if specified */
                       @DaysStaleThreshold_param IS NULL
-                      OR DATEDIFF(DAY, sp.last_updated, GETDATE()) >= @DaysStaleThreshold_param
+                      OR DATEDIFF(DAY, sp.last_updated, SYSDATETIME()) >= @DaysStaleThreshold_param
                   )
               )
               ) /* End of threshold logic wrapper - ensures table/exclusion filters apply to both OR and AND modes */
@@ -4355,6 +4518,9 @@ BEGIN
             qs_total_logical_reads,
             qs_last_execution,
             qs_priority_boost,
+            is_published,
+            is_tracked_by_cdc,
+            temporal_type,
             priority
         )
             EXECUTE sys.sp_executesql
@@ -4618,7 +4784,9 @@ BEGIN
             @StatsSucceededOut = 0,
             @StatsFailedOut = 0,
             @StatsRemainingOut = 0,
-            @DurationSecondsOut = DATEDIFF(second, @start_time, GETDATE());
+            @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
+            @WarningsOut = NULLIF(@warnings, N''),
+            @StopReasonOut = N'NO_QUALIFYING_STATS';
 
         /*
         Return summary result set even on early exit (0 qualifying stats).
@@ -4634,7 +4802,7 @@ BEGIN
             StatsSkipped = 0,
             StatsRemaining = 0,
             DatabasesProcessed = @database_count,
-            DurationSeconds = DATEDIFF(second, @start_time, GETDATE()),
+            DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
             StopReason = CONVERT(nvarchar(50), N'NO_QUALIFYING_STATS'),
             RunLabel = @run_label,
             Version = @procedure_version;
@@ -5149,7 +5317,11 @@ BEGIN
             @current_qs_total_duration_ms = stp.qs_total_duration_ms,
             @current_qs_total_logical_reads = stp.qs_total_logical_reads,
             @current_qs_last_execution = stp.qs_last_execution,
-            @current_qs_priority_boost = stp.qs_priority_boost
+            @current_qs_priority_boost = stp.qs_priority_boost,
+            /* Replication and temporal table awareness */
+            @current_is_published = stp.is_published,
+            @current_is_tracked_by_cdc = stp.is_tracked_by_cdc,
+            @current_temporal_type = stp.temporal_type
         FROM #stats_to_process AS stp
         WHERE stp.processed = 0
         /*
@@ -5707,6 +5879,23 @@ BEGIN
                     THEN N', MEMORY'
                     ELSE N''
                 END +
+                CASE
+                    WHEN @current_is_published = 1
+                    THEN N', REPLICATED'
+                    ELSE N''
+                END +
+                CASE
+                    WHEN @current_is_tracked_by_cdc = 1
+                    THEN N', CDC'
+                    ELSE N''
+                END +
+                CASE
+                    WHEN @current_temporal_type = 2
+                    THEN N', TEMPORAL'
+                    WHEN @current_temporal_type = 1
+                    THEN N', TEMPORAL-HIST'
+                    ELSE N''
+                END +
                 N', NORECOMPUTE: ' + @norecompute_display + N')';
 
         RAISERROR(@progress_msg, 10, 1) WITH NOWAIT;
@@ -5725,6 +5914,7 @@ BEGIN
                 SELECT
                     @current_end_time = SYSDATETIME(),
                     @stats_succeeded += 1,
+                    @consecutive_failures = 0, /* Reset on success */
                     @claimed_table_stats_updated += CASE WHEN @StatsInParallel = N'Y' THEN 1 ELSE 0 END,
                     @duration_ms = DATEDIFF(MILLISECOND, @current_start_time, @current_end_time),
                     @progress_msg = N'  Complete (' + CONVERT(nvarchar(10), @duration_ms) + N' ms)';
@@ -5894,6 +6084,7 @@ BEGIN
                     @current_error_number = ERROR_NUMBER(),
                     @current_error_message = ERROR_MESSAGE(),
                     @stats_failed += 1,
+                    @consecutive_failures += 1,
                     @claimed_table_stats_failed += CASE WHEN @StatsInParallel = N'Y' THEN 1 ELSE 0 END;
 
                 RAISERROR(N'  X Error %d: %s', 16, 1, @current_error_number, @current_error_message) WITH NOWAIT;
@@ -5952,6 +6143,18 @@ BEGIN
                     RAISERROR(N'', 10, 1) WITH NOWAIT;
                     RAISERROR(N'FailFast enabled. Aborting due to error.', 16, 1) WITH NOWAIT;
                     SELECT @stop_reason = N'FAIL_FAST';
+                    BREAK;
+                END;
+
+                /*
+                MaxConsecutiveFailures: Abort after N consecutive failures
+                Prevents cascading issues from shared resource problems (disk, memory, locks).
+                */
+                IF @MaxConsecutiveFailures IS NOT NULL AND @consecutive_failures >= @MaxConsecutiveFailures
+                BEGIN
+                    RAISERROR(N'', 10, 1) WITH NOWAIT;
+                    RAISERROR(N'Aborting: %d consecutive failures reached (possible shared resource issue).', 16, 1, @consecutive_failures) WITH NOWAIT;
+                    SELECT @stop_reason = N'CONSECUTIVE_FAILURES';
                     BREAK;
                 END;
             END CATCH;
@@ -6251,7 +6454,9 @@ BEGIN
         @StatsSucceededOut = @stats_succeeded,
         @StatsFailedOut = @stats_failed,
         @StatsRemainingOut = @remaining_stats,
-        @DurationSecondsOut = @duration_seconds;
+        @DurationSecondsOut = @duration_seconds,
+        @WarningsOut = NULLIF(@warnings, N''),
+        @StopReasonOut = @stop_reason;
 
     /*
     ============================================================================

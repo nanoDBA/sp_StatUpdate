@@ -6,6 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![SQL Server 2016+](https://img.shields.io/badge/SQL%20Server-2016%2B-blue.svg)](https://www.microsoft.com/sql-server)
+[![Azure SQL](https://img.shields.io/badge/Azure%20SQL-Supported-0078D4.svg)](https://azure.microsoft.com/products/azure-sql)
 
 ## Why This Exists
 
@@ -17,6 +18,8 @@
 | NORECOMPUTE orphans | `@TargetNorecompute = 'Y'` - finds and refreshes them |
 | Large stats that never finish | `@LongRunningThresholdMinutes` - auto-reduce sample rate |
 | Query Store knows what's hot | `@QueryStorePriority = 'Y'` - prioritize by CPU/reads |
+| Cascading failures | `@MaxConsecutiveFailures` - stops after N failures |
+| Azure DTU/vCore concerns | Auto-detects Azure SQL, warns about resource impact |
 
 ## Quick Start
 
@@ -39,32 +42,16 @@ EXEC dbo.sp_StatUpdate
 
 **DROP-IN COMPATIBLE** with [Ola Hallengren's SQL Server Maintenance Solution](https://ola.hallengren.com).
 
-### SQL Server Version
+| Requirement | Details |
+|-------------|---------|
+| **SQL Server** | 2016+ (uses `STRING_SPLIT`). 2016 SP2+ recommended for MAXDOP support |
+| **Azure SQL** | Database, Managed Instance, and Edge supported (v2.1+) |
+| **dbo.CommandLog** | [CommandLog.sql](https://ola.hallengren.com/scripts/CommandLog.sql) or set `@LogToTable = 'N'` |
+| **dbo.Queue** | [Queue.sql](https://ola.hallengren.com/scripts/Queue.sql) - only for `@StatsInParallel = 'Y'` |
 
-- **Minimum**: SQL Server 2016 (uses `STRING_SPLIT`)
-- **Recommended**: SQL Server 2016 SP2+ (MAXDOP for UPDATE STATISTICS)
+**Note**: `dbo.QueueStatistic` is auto-created on first parallel run. `dbo.CommandExecute` is NOT required.
 
-### Required Dependencies
-
-| Object | URL | Notes |
-|--------|-----|-------|
-| `dbo.CommandLog` | [CommandLog.sql](https://ola.hallengren.com/scripts/CommandLog.sql) | Or set `@LogToTable = 'N'` |
-
-### Optional Dependencies (for `@StatsInParallel = 'Y'`)
-
-| Object | Source |
-|--------|--------|
-| `dbo.Queue` | [Queue.sql](https://ola.hallengren.com/scripts/Queue.sql) (Ola Hallengren) |
-
-**Note**: `dbo.QueueStatistic` is auto-created on first parallel run if `dbo.Queue` exists.
-
-**Note**: `dbo.CommandExecute` is NOT required. sp_StatUpdate handles its own command execution.
-
-## Real-World Scenarios
-
-### Quick Start with Presets (v1.9+)
-
-Don't want to figure out all the parameters? Use a preset:
+## Presets (Quick Configuration)
 
 ```sql
 -- Nightly maintenance (1hr, tiered thresholds, balanced)
@@ -80,9 +67,9 @@ EXEC dbo.sp_StatUpdate @Preset = 'OLTP_LIGHT', @Databases = 'MyOLTPDatabase';
 EXEC dbo.sp_StatUpdate @Preset = 'WAREHOUSE_AGGRESSIVE', @Databases = 'MyDW';
 ```
 
-### "Our maintenance job keeps getting killed at 5 AM"
+## Common Scenarios
 
-The job runs alphabetically, never reaches the important tables, and gets killed when the business day starts. You need worst-first ordering with a hard stop time.
+### Time-Limited Nightly Runs
 
 ```sql
 -- Nightly job: 11 PM - 4 AM window (5 hours)
@@ -90,34 +77,35 @@ EXEC dbo.sp_StatUpdate
     @Databases = N'USER_DATABASES, -DevDB, -ReportingDB',
     @TimeLimit = 18000,
     @SortOrder = N'MODIFICATION_COUNTER';  -- Worst stats first
-
--- Check next morning: did it finish or get killed?
-SELECT CommandType, StartTime,
-    ExtendedInfo.value('(/Summary/StopReason)[1]', 'nvarchar(50)') AS StopReason
-FROM dbo.CommandLog
-WHERE CommandType LIKE 'SP_STATUPDATE%'
-ORDER BY StartTime DESC;
 ```
 
-### "Someone set NORECOMPUTE in 2019 and forgot"
-
-NORECOMPUTE stats never auto-update. SQL Server ignores them. Meanwhile, the data has changed 500 million times.
+### Query Store-Driven Prioritization
 
 ```sql
--- Find and refresh the forgotten NORECOMPUTE stats
+-- Let Query Store tell you what matters
 EXEC dbo.sp_StatUpdate
     @Databases = N'Production',
-    @TargetNorecompute = N'Y',            -- Only NORECOMPUTE stats
+    @QueryStorePriority = N'Y',
+    @QueryStoreMetric = N'CPU',           -- Or DURATION, READS
+    @SortOrder = N'QUERY_STORE',
+    @TimeLimit = 3600;
+```
+
+### NORECOMPUTE Stats Refresh
+
+```sql
+-- Find and refresh forgotten NORECOMPUTE stats
+EXEC dbo.sp_StatUpdate
+    @Databases = N'Production',
+    @TargetNorecompute = N'Y',
     @ModificationThreshold = 50000,
     @TimeLimit = 1800;
 ```
 
-### "The Orders table gets 10M inserts/day"
-
-High-churn tables with ascending keys need attention, but UPDATE STATISTICS takes locks. Run during low-activity windows, not business hours.
+### High-Churn Tables
 
 ```sql
--- Midday lull or after-hours for high-churn tables
+-- Target specific tables with lock timeout
 EXEC dbo.sp_StatUpdate
     @Databases = N'Production',
     @Tables = N'Sales.Orders, Sales.OrderDetails',
@@ -126,24 +114,7 @@ EXEC dbo.sp_StatUpdate
     @TimeLimit = 600;
 ```
 
-### "Query Store shows one stat is causing 40% of our CPU"
-
-Use Query Store metrics to prioritize stats that are actually hurting performance.
-
-```sql
--- Let Query Store tell you what matters
-EXEC dbo.sp_StatUpdate
-    @Databases = N'Production',
-    @QueryStorePriority = N'Y',
-    @QueryStoreMetric = N'CPU',           -- Or DURATION, READS
-    @QueryStoreRecentHours = 24,          -- Last 24 hours
-    @SortOrder = N'QUERY_STORE',
-    @TimeLimit = 3600;
-```
-
-### "The 100% FULLSCAN stats never finish"
-
-Some stats were configured with 100% sample years ago. They take 6 hours each and blow your maintenance window. Use adaptive sampling to auto-reduce them.
+### Adaptive Sampling for Slow Stats
 
 ```sql
 -- Stats that historically took >2 hours get 5% sample
@@ -154,21 +125,7 @@ EXEC dbo.sp_StatUpdate
     @TimeLimit = 14400;
 ```
 
-### "Don't waste time on Archive tables"
-
-Skip tables you don't care about. Focus on what matters.
-
-```sql
-EXEC dbo.sp_StatUpdate
-    @Databases = N'Production',
-    @ExcludeTables = N'%Archive%, %History%',
-    @ExcludeStatistics = N'_WA_Sys%',
-    @TimeLimit = 7200;
-```
-
-### "Preview before committing"
-
-See exactly what commands would run without executing anything.
+### Dry Run Preview
 
 ```sql
 EXEC dbo.sp_StatUpdate
@@ -177,21 +134,20 @@ EXEC dbo.sp_StatUpdate
     @WhatIfOutputTable = N'#Preview',
     @Debug = 1;
 
--- Review the commands
-SELECT DatabaseName, SchemaName, TableName, StatName, Command
-FROM #Preview
-ORDER BY SequenceNum;
+SELECT * FROM #Preview ORDER BY SequenceNum;
 ```
 
 ## Parameter Reference
 
-### Database Selection
+Run `EXEC sp_StatUpdate @Help = 1` for complete documentation.
+
+### Database & Table Selection
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `@Databases` | Current DB | Keywords: `USER_DATABASES`, `SYSTEM_DATABASES`, `ALL_DATABASES`, `AVAILABILITY_GROUP_DATABASES`. Supports wildcards (`%Prod%`), exclusions (`-DevDB`), comma-separated lists |
+| `@Databases` | Current DB | `USER_DATABASES`, `SYSTEM_DATABASES`, `ALL_DATABASES`, `AVAILABILITY_GROUP_DATABASES`, wildcards (`%Prod%`), exclusions (`-DevDB`) |
 | `@Tables` | All | Table filter (comma-separated `Schema.Table`) |
-| `@ExcludeTables` | `NULL` | Exclude tables by pattern (`dbo.Archive%`) |
+| `@ExcludeTables` | `NULL` | Exclude tables by pattern (`%Archive%`) |
 | `@ExcludeStatistics` | `NULL` | Exclude stats by pattern (`_WA_Sys%`) |
 | `@IncludeSystemObjects` | `'N'` | Include stats on system objects |
 
@@ -201,49 +157,10 @@ ORDER BY SequenceNum;
 |-----------|---------|-------------|
 | `@TargetNorecompute` | `'BOTH'` | `'Y'`=NORECOMPUTE only, `'N'`=regular only, `'BOTH'`=all |
 | `@ModificationThreshold` | `5000` | Minimum modifications to qualify |
-| `@ModificationPercent` | `NULL` | SQRT-based threshold (scales with table size) |
 | `@TieredThresholds` | `1` | Use Tiger Toolbox 5-tier adaptive formula |
-| `@ThresholdLogic` | `'OR'` | `'OR'`=any threshold qualifies, `'AND'`=all must be met |
+| `@ThresholdLogic` | `'OR'` | `'OR'`=any threshold, `'AND'`=all must be met |
 | `@DaysStaleThreshold` | `NULL` | Minimum days since last update |
 | `@MinPageCount` | `0` | Minimum pages (125000 = ~1GB) |
-
-### Query Store Integration (v1.4+)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `@QueryStorePriority` | `'N'` | Prioritize stats used by Query Store plans |
-| `@QueryStoreMetric` | `'CPU'` | `CPU`, `DURATION`, `READS`, or `EXECUTIONS` |
-| `@QueryStoreMinExecutions` | `100` | Minimum plan executions to boost priority |
-| `@QueryStoreRecentHours` | `168` | Only consider plans from last N hours (default: 7 days) |
-
-### Filtered Stats (v1.4+)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `@FilteredStatsMode` | `'INCLUDE'` | `INCLUDE`, `EXCLUDE`, `ONLY`, or `PRIORITY` |
-| `@FilteredStatsStaleFactor` | `2.0` | Filtered stats stale when unfiltered_rows/rows > factor |
-
-### Adaptive Sampling (v1.6+)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `@LongRunningThresholdMinutes` | `NULL` | Stats that took longer get forced sample rate |
-| `@LongRunningSamplePercent` | `10` | Sample percent for long-running stats |
-
-### Presets (v1.9+)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `@Preset` | `NULL` | Common configurations: `NIGHTLY_MAINTENANCE`, `WEEKLY_FULL`, `OLTP_LIGHT`, `WAREHOUSE_AGGRESSIVE` |
-
-### Join Pattern Grouping (v1.9+)
-
-Re-sorts processing order so commonly-joined tables (detected via Query Store) update consecutively. Without this, a time-limited run might update Table A but leave its join partner Table B stale — the optimizer sees mismatched cardinality estimates and picks bad join orders. Falls back silently if QS disabled. **Not compatible with `@StatsInParallel`.**
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `@GroupByJoinPattern` | `'Y'` | Re-order stats so joined tables update together. `'N'` = priority only |
-| `@JoinPatternMinExecutions` | `100` | Minimum plan executions to detect join patterns |
 
 ### Execution Control
 
@@ -251,6 +168,7 @@ Re-sorts processing order so commonly-joined tables (detected via Query Store) u
 |-----------|---------|-------------|
 | `@TimeLimit` | `3600` | Max seconds (1 hour) |
 | `@BatchLimit` | `NULL` | Max stats per run |
+| `@MaxConsecutiveFailures` | `NULL` | Stop after N consecutive failures (v2.1+) |
 | `@LockTimeout` | `NULL` | Seconds to wait for locks per stat |
 | `@DelayBetweenStats` | `NULL` | Milliseconds to pause between stats |
 | `@SortOrder` | `'MODIFICATION_COUNTER'` | Priority order (see below) |
@@ -269,12 +187,23 @@ Re-sorts processing order so commonly-joined tables (detected via Query Store) u
 | `AUTO_CREATED` | User-created stats before auto-created |
 | `RANDOM` | Random order |
 
-### Sampling Options
+### Query Store Integration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `@QueryStorePriority` | `'N'` | Prioritize stats used by Query Store plans |
+| `@QueryStoreMetric` | `'CPU'` | `CPU`, `DURATION`, `READS`, or `EXECUTIONS` |
+| `@QueryStoreMinExecutions` | `100` | Minimum plan executions to boost |
+| `@QueryStoreRecentHours` | `168` | Only consider plans from last N hours |
+| `@GroupByJoinPattern` | `'Y'` | Update joined tables together (prevents optimization cliffs) |
+
+### Adaptive Sampling
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `@LongRunningThresholdMinutes` | `NULL` | Stats that took longer get forced sample rate |
+| `@LongRunningSamplePercent` | `10` | Sample percent for long-running stats |
 | `@StatisticsSample` | `NULL` | `NULL`=SQL Server decides, `100`=FULLSCAN |
-| `@UpdateIncremental` | `1` | Update incremental stats by partition |
 | `@PersistSamplePercent` | `'N'` | Add PERSIST_SAMPLE_PERCENT (SQL 2016 SP1 CU4+) |
 
 ### Logging & Output
@@ -282,50 +211,23 @@ Re-sorts processing order so commonly-joined tables (detected via Query Store) u
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@LogToTable` | `'Y'` | Log to dbo.CommandLog |
-| `@WhatIfOutputTable` | `NULL` | Table for dry-run commands |
-| `@ProgressLogInterval` | `NULL` | Log progress every N stats (secure - uses CommandLog) |
-| `@ExposeProgressToAllSessions` | `'N'` | `'Y'` = create ##sp_StatUpdate_Progress (**SECURITY:** visible to all sessions) |
+| `@ProgressLogInterval` | `NULL` | Log progress every N stats |
 | `@Debug` | `0` | `1` = verbose diagnostic output |
 
-### Parallel Mode
+### OUTPUT Parameters (v2.1+)
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `@StatsInParallel` | `'N'` | Use queue-based parallel processing |
-| `@DeadWorkerTimeoutMinutes` | `15` | Consider worker dead if no progress |
-
-### Maintenance
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `@CleanupOrphanedRuns` | `'Y'` | Mark killed runs (>24h old) with END markers |
-| `@Help` | `0` | `1` = show parameter documentation |
-
-Run `EXEC sp_StatUpdate @Help = 1` for complete parameter documentation.
+| Parameter | Description |
+|-----------|-------------|
+| `@StatsFoundOut` | Total qualifying stats discovered |
+| `@StatsProcessedOut` | Stats attempted (succeeded + failed) |
+| `@StatsSucceededOut` | Stats updated successfully |
+| `@StatsFailedOut` | Stats that failed to update |
+| `@StatsRemainingOut` | Stats not processed (time/batch limit) |
+| `@DurationSecondsOut` | Total run duration in seconds |
+| `@WarningsOut` | Collected warnings (LOW_UPTIME, BACKUP_RUNNING, AZURE_SQL) |
+| `@StopReasonOut` | Why execution stopped (COMPLETED, TIME_LIMIT, CONSECUTIVE_FAILURES, etc.) |
 
 ## Monitoring
-
-### Real-Time Progress (v1.9+)
-
-**Opt-in due to security:** Global temp tables are visible to ALL sessions on the server.
-
-```sql
--- Enable progress monitoring (exposes database/table names to all sessions)
-EXEC sp_StatUpdate
-    @Databases = 'USER_DATABASES',
-    @ExposeProgressToAllSessions = 'Y';
-
--- Query from another session while running:
-SELECT * FROM ##sp_StatUpdate_Progress;
--- Returns: RunLabel, StatsFound, StatsProcessed, StatsSucceeded, StatsFailed,
---          CurrentDatabase, CurrentTable, ElapsedSeconds, Status
-```
-
-**Secure alternative:** Use `@ProgressLogInterval` which writes to CommandLog (access-controlled):
-
-```sql
-EXEC sp_StatUpdate @Databases = 'USER_DATABASES', @ProgressLogInterval = 50;
-```
 
 ### Run History
 
@@ -346,307 +248,96 @@ WHERE s.CommandType = 'SP_STATUPDATE_START'
 ORDER BY s.StartTime DESC;
 ```
 
-### Why Did This Stat Use That Sample Rate?
-
-Three systems can influence sample rate: explicit `@StatisticsSample`, adaptive sampling (history-based), and SQL Server auto-sample. The `SampleSource` field in ExtendedInfo tells you exactly which one was used:
+### Programmatic Access (v2.1+)
 
 ```sql
--- Find sample rate decisions for a specific stat
-SELECT
-    StatisticsName,
-    StartTime,
-    ExtendedInfo.value('(/ExtendedInfo/RequestedSamplePct)[1]', 'int') AS RequestedPct,
-    ExtendedInfo.value('(/ExtendedInfo/EffectiveSamplePct)[1]', 'int') AS EffectivePct,
-    ExtendedInfo.value('(/ExtendedInfo/SampleSource)[1]', 'nvarchar(20)') AS SampleSource
-FROM dbo.CommandLog
-WHERE CommandType = 'UPDATE_STATISTICS'
-AND StatisticsName = 'YourStatName'
-ORDER BY StartTime DESC;
+DECLARE @Found int, @Processed int, @Failed int, @Remaining int,
+        @StopReason nvarchar(50), @Warnings nvarchar(max);
 
--- SampleSource values:
---   EXPLICIT        = User passed @StatisticsSample
---   ADAPTIVE        = History showed this stat was slow, overridden
---   ADAPTIVE_CAPPED = Adaptive but capped at ~10M rows
---   AUTO            = SQL Server decided (NULL passed)
---   RESAMPLE_PERSIST= Respecting PERSIST_SAMPLE_PERCENT setting
---   RESAMPLE_INCR   = Incremental stats require RESAMPLE
---   FULLSCAN_MEMOPT = Memory-optimized table on SQL 2014
+EXEC dbo.sp_StatUpdate
+    @Databases = N'Production',
+    @TimeLimit = 3600,
+    @StatsFoundOut = @Found OUTPUT,
+    @StatsProcessedOut = @Processed OUTPUT,
+    @StatsFailedOut = @Failed OUTPUT,
+    @StatsRemainingOut = @Remaining OUTPUT,
+    @StopReasonOut = @StopReason OUTPUT,
+    @WarningsOut = @Warnings OUTPUT;
+
+-- Use outputs for alerting, logging, or conditional logic
+IF @Failed > 0 OR @StopReason = 'CONSECUTIVE_FAILURES'
+    PRINT 'Alert: Statistics maintenance had failures';
+
+IF @Warnings LIKE '%BACKUP_RUNNING%'
+    PRINT 'Note: Backups were running during maintenance';
 ```
 
-### Heap Health Monitoring (v2.0+)
-
-When `@CollectHeapForwarding = 'Y'`, CommandLog captures forwarding pointer counts for heap tables. High forwarding ratios indicate fragmentation that degrades scan performance.
+### Real-Time Progress
 
 ```sql
--- Heap Statistics Health Report - Find heaps with forwarding pointer problems
--- Shows which heap statistics have the most forwarding pointers and may need rebuild
-SELECT TOP 20
-    DatabaseName,
-    SchemaName,
-    ObjectName,
-    StatisticsName,
-    StartTime,
-    -- Heap health metrics
-    ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') AS ForwardedRecords,
-    ExtendedInfo.value('(/ExtendedInfo/RowCount)[1]', 'bigint') AS [RowCount],
-    -- Calculate forwarding ratio (high % = fragmented heap)
-    CAST(
-        ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') * 100.0 /
-        NULLIF(ExtendedInfo.value('(/ExtendedInfo/RowCount)[1]', 'bigint'), 0)
-        AS decimal(5,2)
-    ) AS ForwardingPct,
-    ExtendedInfo.value('(/ExtendedInfo/SizeMB)[1]', 'int') AS SizeMB,
-    -- Modification activity
-    ExtendedInfo.value('(/ExtendedInfo/ModificationCounter)[1]', 'bigint') AS Modifications,
-    ExtendedInfo.value('(/ExtendedInfo/ModificationPct)[1]', 'decimal(18,2)') AS ModificationPct,
-    -- When last updated
-    DATEDIFF(day, StartTime, GETDATE()) AS DaysAgo,
-    -- Actionable recommendation
-    CASE
-        WHEN ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') * 100.0 /
-             NULLIF(ExtendedInfo.value('(/ExtendedInfo/RowCount)[1]', 'bigint'), 0) > 20
-        THEN 'CRITICAL: Rebuild heap immediately'
-        WHEN ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') * 100.0 /
-             NULLIF(ExtendedInfo.value('(/ExtendedInfo/RowCount)[1]', 'bigint'), 0) > 10
-        THEN 'WARNING: Consider rebuild'
-        ELSE 'OK'
-    END AS Recommendation
-FROM dbo.CommandLog
-WHERE CommandType = 'UPDATE_STATISTICS'
-AND ExtendedInfo.value('(/ExtendedInfo/IsHeap)[1]', 'bit') = 1
-AND ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') > 0
-ORDER BY
-    -- Sort by worst forwarding ratio first
-    ExtendedInfo.value('(/ExtendedInfo/ForwardedRecords)[1]', 'bigint') * 100.0 /
-    NULLIF(ExtendedInfo.value('(/ExtendedInfo/RowCount)[1]', 'bigint'), 0) DESC;
+-- Secure option: log to CommandLog every 50 stats
+EXEC sp_StatUpdate @Databases = 'USER_DATABASES', @ProgressLogInterval = 50;
+
+-- Opt-in global temp table (visible to all sessions - security consideration)
+EXEC sp_StatUpdate @Databases = 'USER_DATABASES', @ExposeProgressToAllSessions = 'Y';
+-- Query from another session: SELECT * FROM ##sp_StatUpdate_Progress;
 ```
 
-**Example output:**
+## Diagnostic Tool
 
-| DatabaseName | ObjectName   | ForwardedRecords | RowCount | ForwardingPct | SizeMB | Recommendation                       |
-|--------------|--------------|------------------|----------|---------------|--------|--------------------------------------|
-| OrdersDB     | AuditLog     | 45230            | 180000   | 25.13         | 1200   | CRITICAL: Rebuild heap immediately   |
-| CustomerDB   | EventHistory | 12400            | 95000    | 13.05         | 450    | WARNING: Consider rebuild            |
-
-#### Understanding Heap Forwarding Pointers
-
-Forwarding pointers occur when variable-length columns (varchar, nvarchar) cause rows to grow beyond their original space. SQL Server moves the row to a new page but leaves a pointer at the old location. Every read then requires two page accesses instead of one—the original page to find the pointer, then the new page to read the actual data. This severely degrades table scan and clustered index scan performance.
-
-#### Remediation Options by Forwarding Ratio
-
-##### Critical (>20% forwarding ratio)
-
-The table is severely fragmented. Each option has trade-offs:
-
-1. **Rebuild the heap** - Quick fix but temporary:
-
-   ```sql
-   ALTER TABLE OrdersDB.dbo.AuditLog REBUILD;
-   ```
-
-   - **Pros**: Fast, simple, removes all forwarding pointers immediately
-   - **Cons**: Forwarding will return if updates continue to expand rows
-   - **When to use**: Temporary relief while you plan a permanent solution, or when the table has stabilized and won't grow further
-
-2. **Add a clustered index** - Permanent solution for most cases:
-
-   ```sql
-   CREATE CLUSTERED INDEX CIX_AuditLog_LogDate ON OrdersDB.dbo.AuditLog(LogDate);
-   ```
-
-   - **Pros**: Prevents future forwarding (clustered indexes use page splits, not forwarding), improves range query performance, statistics maintenance is more efficient
-   - **Cons**: Requires choosing a good clustering key (ideally ever-increasing like datetime/identity to minimize splits), adds 6-10% storage overhead for the index tree, can degrade point lookups if the clustering key isn't the primary access pattern
-   - **When to use**: When the table is frequently scanned/range-queried, has a natural ever-increasing key (datetime, identity), or will continue to experience updates that expand rows
-   - **Best practice**: Avoid wide clustering keys (>16 bytes)—they bloat nonclustered indexes since all NCIs include the clustering key
-
-3. **Increase fill factor and rebuild**:
-
-   ```sql
-   ALTER TABLE OrdersDB.dbo.AuditLog REBUILD WITH (FILLFACTOR = 70);
-   ```
-
-   - **Pros**: Leaves room for rows to expand in-place, reduces forwarding frequency
-   - **Cons**: Increases storage by 30-40%, slows scans due to additional page reads, requires periodic rebuilds as free space gets consumed
-   - **When to use**: When you can't add a clustered index (vendor table, app constraints) and updates frequently expand rows by predictable amounts
-
-##### Warning (10-20% forwarding ratio)
-
-Noticeable performance degradation. Schedule remediation during next maintenance window using one of the above approaches. Monitor modification patterns—if the table is write-heavy with frequent updates that expand rows, adding a clustered index is typically the best long-term solution. If updates are infrequent or the table is insert-only, a periodic rebuild may suffice.
-
-##### OK (<10% forwarding ratio)
-
-Acceptable level. Some forwarding is normal and doesn't justify the overhead of aggressive rebuilds. Continue monitoring. If the ratio is trending upward, investigate whether row expansion patterns have changed (new columns added, application behavior shift).
-
-#### When to Keep a Heap
-
-Heaps are optimal for:
-
-- **Insert-only tables** (logs, staging, archives) with no updates after insert
-- **Small tables** (<1000 rows) where forwarding overhead is negligible
-- **Full table scans every time** where clustering provides no seek benefit and you want to avoid index maintenance overhead
-
-If none of these apply and you're seeing forwarding pointers, adding a clustered index is usually the right answer.
-
-## Diagnostic Tool (v1.0)
-
-**sp_StatUpdate_Diag** analyzes your CommandLog history and produces actionable recommendations — killed run detection, repeated failures, degrading throughput, suboptimal parameters, and more.
-
-### Single Server
+**sp_StatUpdate_Diag** analyzes CommandLog history and produces actionable recommendations.
 
 ```sql
--- Install: run sp_StatUpdate_Diag.sql on your maintenance database
-
 -- Basic diagnostic (last 30 days)
 EXEC dbo.sp_StatUpdate_Diag;
 
--- Obfuscated for sharing with support (hashes server/database/table names)
+-- Obfuscated for external sharing (hashes names)
 EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1;
-
--- Debug mode with custom window
-EXEC dbo.sp_StatUpdate_Diag @DaysBack = 90, @Debug = 1;
 ```
-
-Returns 8 result sets: Recommendations (severity-categorized), Run Health Summary, Run Detail, Top Tables by Maintenance Cost, Failing Statistics, Long-Running Statistics, Parameter Change History, and Obfuscation Map (when `@Obfuscate = 1`).
 
 ### Multi-Server (PowerShell)
 
 ```powershell
-# Requires: PowerShell 7+, SqlServer module
-# Install sp_StatUpdate_Diag on each server first
-
 .\Invoke-StatUpdateDiag.ps1 `
     -Servers "Server1", "Server2,2500", "Server3" `
     -CommandLogDatabase "Maintenance" `
     -OutputPath ".\diag_output"
-
-# Obfuscated report for external sharing
-.\Invoke-StatUpdateDiag.ps1 `
-    -Servers "Server1", "Server2" `
-    -Obfuscate `
-    -OutputPath ".\diag_output"
 ```
-
-Generates a Markdown report with executive summary, per-server findings, and cross-server analysis (version skew, parameter inconsistency).
 
 ### Diagnostic Checks
 
 | Severity | Checks |
 |----------|--------|
 | CRITICAL | Killed runs, repeated stat failures, time limit exhaustion, degrading throughput |
-| WARNING | Suboptimal parameters, long-running stats, stale-stats backlog, overlapping runs, ineffective Query Store |
-| INFO | Run health trends, parameter history, top tables by cost, unused features, version history |
+| WARNING | Suboptimal parameters, long-running stats, stale-stats backlog, overlapping runs |
+| INFO | Run health trends, parameter history, top tables by cost, version history |
 
-### Diagnostic Scenarios
+## Extended Events
 
-#### "Our nightly job didn't finish — was it killed?"
-
-Killed runs leave orphaned START markers with no END. The diagnostic tool detects these automatically.
+An XE session is included for runtime troubleshooting:
 
 ```sql
--- Look for killed runs in the last 7 days
-EXEC dbo.sp_StatUpdate_Diag @DaysBack = 7;
--- Check CRITICAL findings for "Killed runs detected"
--- Evidence shows which RunLabels have START without END
-```
-
-#### "The same stat keeps failing every night"
-
-Repeated failures on the same statistic often indicate corruption, permission issues, or persistent lock contention. The tool flags stats failing 3+ times as CRITICAL.
-
-```sql
--- Lower the failure threshold to catch stats failing just twice
-EXEC dbo.sp_StatUpdate_Diag
-    @DaysBack = 14,
-    @FailureThreshold = 2;
--- Result set 5 (Failing Statistics) groups by stat + error message
-```
-
-#### "Runs are getting slower every week"
-
-Throughput degradation can indicate table growth, I/O pressure, or plan regression. The tool compares recent throughput against a prior baseline window.
-
-```sql
--- Compare last 7 days vs prior 7 days (default)
-EXEC dbo.sp_StatUpdate_Diag @DaysBack = 30;
-
--- Use a wider comparison window for seasonal patterns
-EXEC dbo.sp_StatUpdate_Diag
-    @DaysBack = 90,
-    @ThroughputWindowDays = 14;
--- CRITICAL finding if recent avg sec/stat is >50% worse
-```
-
-#### "Which tables eat the most maintenance time?"
-
-The "Top Tables by Maintenance Cost" result set ranks tables by cumulative UPDATE STATISTICS duration.
-
-```sql
--- Show top 50 most expensive tables over 90 days
-EXEC dbo.sp_StatUpdate_Diag
-    @DaysBack = 90,
-    @TopN = 50;
--- Result set 4: total duration, avg duration, update count per table
-```
-
-#### "Share diagnostics with Microsoft support (obfuscated)"
-
-Obfuscation mode hashes all server, database, schema, table, and statistic names with MD5. Safe to share externally — the obfuscation map (result set 8) stays on your server.
-
-```sql
-EXEC dbo.sp_StatUpdate_Diag
-    @DaysBack = 30,
-    @Obfuscate = 1;
--- All result sets use hashed names (e.g., "DB_7F3A2B..." instead of "Production")
--- Result set 8 shows the mapping (keep this private!)
-```
-
-#### "Compare diagnostics across 5 production servers"
-
-The PowerShell wrapper runs sp_StatUpdate_Diag in parallel across servers, merges results, and detects cross-server issues like version skew and parameter inconsistency.
-
-```powershell
-# Compare all production servers — parallel execution, merged report
-.\Invoke-StatUpdateDiag.ps1 `
-    -Servers "SQL-PROD1", "SQL-PROD2,2500", "SQL-PROD3" `
-    -CommandLogDatabase "DBAMaintenance" `
-    -DaysBack 30 `
-    -OutputFormat "Markdown" `
-    -OutputPath ".\diag_reports"
-
-# Obfuscated version for vendor support ticket
-.\Invoke-StatUpdateDiag.ps1 `
-    -Servers "SQL-PROD1", "SQL-PROD2,2500" `
-    -Obfuscate `
-    -OutputPath ".\diag_reports"
-```
-
-## Troubleshooting
-
-### Diagnostic Report
-
-The fastest way to troubleshoot sp_StatUpdate issues is the diagnostic tool:
-
-```sql
-EXEC dbo.sp_StatUpdate_Diag @Debug = 1;
-```
-
-See [Diagnostic Tool](#diagnostic-tool-v10) above for details.
-
-### Extended Events Session
-
-An Extended Events session is included for runtime troubleshooting:
-
-```sql
--- Create the XE session (see sp_StatUpdate_XE_Session.sql)
--- Start monitoring before running sp_StatUpdate
+-- Create and start (see sp_StatUpdate_XE_Session.sql)
 ALTER EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER STATE = START;
-
--- Run sp_StatUpdate...
-
--- View captured events (queries included in the XE script)
 ```
 
-The session captures UPDATE STATISTICS commands (both starting and completed events for duration correlation), errors, lock waits, lock escalation, and long-running statements.
+Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and long-running statements.
+
+## Version History
+
+- **2.1.2026.0219** - Phase 2: Extended Awareness. Azure SQL detection with DTU/vCore warning. Hardware context (CPU/memory/NUMA/uptime). RCSI awareness. Replication/CDC/Temporal table detection (progress shows REPLICATED, CDC, TEMPORAL flags). Backup activity warning. New parameters: @MaxConsecutiveFailures, @WarningsOut OUTPUT, @StopReasonOut OUTPUT. SYSDATETIME() consistency throughout.
+- **2.0.2026.0212** - Phase 1: Environment Intelligence. CE version/compat level, trace flag detection, DB-scoped config detection. Staged discovery auto-fallback. Truncated partition handling. XE session overhaul.
+- **1.9.2026.0206** - Status/StatusMessage columns for Agent alerting. Batch Query Store enrichment (O(n) to O(1)).
+- **1.9.2026.0128** - @Preset parameter, @GroupByJoinPattern, ##sp_StatUpdate_Progress, @CleanupOrphanedRuns default Y.
+- **1.8.2026.0128** - Code review fixes, XE troubleshooting session.
+- **1.7.2026.0127** - BREAKING: @ModificationThreshold default 1000 → 5000.
+- **1.6.2026.0128** - Staged discovery, adaptive sampling, @ExcludeTables, @WhatIfOutputTable.
+- **1.5.2026.0120** - CRITICAL: Fixed @ExcludeStatistics filter, incremental partition targeting.
+- **1.4.2026.0119** - Query Store prioritization, filtered stats handling.
+- **1.3.2026.0119** - Multi-database support, OUTPUT parameters, return codes.
+- **1.2.2026.0117** - Tiger Toolbox tiered thresholds, AND/OR logic, PERSIST_SAMPLE_PERCENT.
+- **1.1.2026.0117** - Erik Darling style refactor, @Help, parallel mode.
+- **1.0.2026.0117** - Initial public release.
 
 ## When to Use This (vs IndexOptimize)
 
@@ -658,15 +349,7 @@ The session captures UPDATE STATISTICS commands (both starting and completed eve
 - NORECOMPUTE targeting
 - Query Store-driven prioritization
 - Adaptive sampling for problematic stats
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Test changes with `@Execute = 'N'` dry runs
-4. Submit a pull request
+- Programmatic access to results via OUTPUT parameters
 
 ## License
 
@@ -674,26 +357,10 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 Based on patterns from [Ola Hallengren's SQL Server Maintenance Solution](https://ola.hallengren.com) (MIT License).
 
-## Version History
-
-- **sp_StatUpdate_Diag 1.0** - Diagnostic & recommendation engine. T-SQL procedure (`sp_StatUpdate_Diag`) + PowerShell multi-server wrapper (`Invoke-StatUpdateDiag.ps1`). Analyzes CommandLog for killed runs, repeated failures, degrading throughput, overlapping runs, suboptimal parameters. Obfuscation mode for external sharing. 53-test automated suite.
-- **2.0.2026.0212** - Phase 1: Environment Intelligence (CE version/compat level, trace flag detection, DB-scoped config detection in debug output). Phase 2: Staged discovery auto-fallback to legacy mode on unexpected row loss (TRY/CATCH with signal table). Truncated partitions no longer force full RESAMPLE — only stale partitions updated via ON PARTITIONS(). XE session overhaul: added starting events for during-execution visibility, fixed wait_type predicates to use numeric map_key values, added lock_escalation and attention events, 8MB ring buffer.
-- **1.9.2026.0206** - Status and StatusMessage columns in summary result set (SUCCESS/WARNING/ERROR for Agent job alerting). Batch Query Store enrichment (O(n) to O(1) via CTE + GROUP BY). Early-return path now returns summary result set for INSERT...EXEC consumers.
-- **1.9.2026.0128** - New @Preset parameter (NIGHTLY_MAINTENANCE, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE_AGGRESSIVE), @GroupByJoinPattern (update joined tables together), ##sp_StatUpdate_Progress global temp table (opt-in via @ExposeProgressToAllSessions for security), @CleanupOrphanedRuns default Y, LOCK_TIMEOUT restores original value, XML entity decoding complete, READPAST hint for parallel mode, @WhatIfOutputTable data type validation, Query Store READ_ONLY warning, debug threshold explanation
-- **1.8.2026.0128** - Code review fixes (P1/P2): @LongRunningSamplePercent row cap, staged discovery phase validation, FOR XML entity decoding, LOCK_TIMEOUT reset, incremental partition cross-ref, @WhatIfOutputTable schema validation. Added XE troubleshooting session.
-- **1.7.2026.0127** - BREAKING: @ModificationThreshold default 1000 → 5000 (less aggressive)
-- **1.6.2026.0128** - Staged discovery (6-phase for 10K+ stats), adaptive sampling (@LongRunningThresholdMinutes), @ExcludeTables, @WhatIfOutputTable, @CleanupOrphanedRuns, @CollectHeapForwarding, AUTO_CREATED sort order
-- **1.5.2026.0120** - CRITICAL: Fixed @ExcludeStatistics filter, incremental partition targeting
-- **1.4.2026.0119** - Query Store prioritization (@QueryStorePriority, @QueryStoreMetric), filtered stats handling (@FilteredStatsMode), FILTERED_DRIFT sort order
-- **1.3.2026.0119** - Multi-database support (USER_DATABASES, wildcards, exclusions), @IncludeSystemObjects, AG secondary handling, OUTPUT parameters, return codes
-- **1.2.2026.0117** - Tiger Toolbox tiered thresholds, AND/OR threshold logic, PERSIST_SAMPLE_PERCENT, MAXDOP
-- **1.1.2026.0117** - Erik Darling style refactor, @Help, incremental stats, AG awareness, parallel mode
-- **1.0.2026.0117** - Initial public release
-
 ## Acknowledgments
 
 - [Ola Hallengren](https://ola.hallengren.com) - sp_StatUpdate wouldn't exist without his SQL Server Maintenance Solution. We use his CommandLog table, Queue patterns, and database selection syntax. If you're not already using his tools, start there.
 - [Brent Ozar](https://www.brentozar.com) - years of emphasizing stats over index rebuilds, First Responder Kit, and community education.
-- [Erik Darling](https://www.erikdarling.com) - T-SQL coding style and performance insights. sp_LogHunter and sp_QuickieStore are excellent.
+- [Erik Darling](https://www.erikdarling.com) - T-SQL coding style and performance insights. His diagnostic tools are excellent - I'm particularly fond of sp_LogHunter and sp_QuickieStore.
 - [Tiger Team's AdaptiveIndexDefrag](https://github.com/microsoft/tigertoolbox) - the 5-tier adaptive threshold formula
 - [Colleen Morrow](https://www.sqlservercentral.com/blogs/better-living-thru-powershell-update-statistics-in-parallel) - parallel statistics maintenance concept
