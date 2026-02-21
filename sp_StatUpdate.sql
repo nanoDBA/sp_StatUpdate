@@ -36,11 +36,34 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.0.2026.0212 (Major.Minor.Year.MMDD)
+Version:    2.2.2026.0220 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.1.2026.0219 - Phase 2 Extended Awareness:
+History:    2.2.2026.0220 - Adversarial Code Review (2 rounds):
+                          Round 1 - Critical bug fixes:
+                          - Fix: DIRECT_TABLE mode crash - INSERT column count mismatch for
+                            is_published, is_tracked_by_cdc, temporal_type columns.
+                          - Fix: DIRECT_STRING mode missing columns - added auto_created,
+                            histogram_steps, has_filter, filter_definition, unfiltered_rows,
+                            is_published, is_tracked_by_cdc, temporal_type to INSERT column list.
+                          - Fix: @WarningsOut OUTPUT not populated when @Debug=0.
+                          - Fix: Staged discovery fallback SELECTs missing 3 replication columns.
+                          - Add: Re-entrancy guard via sp_getapplock (sp_HeapDoctor pattern).
+                          - Add: TOCTOU check before UPDATE STATISTICS execution.
+                          Round 2 - Additional fixes:
+                          - Fix: Applock not released on 3 DIRECT_TABLE early-exit paths.
+                          - Fix: @stats_processed counted TOCTOU-skipped stats (batch limit drift).
+                          - Fix: Legacy discovery @DaysStaleThreshold missed never-updated stats
+                            (NULL last_updated). Wrapped in ISNULL(..., 9999) like staged path.
+                          - Fix: Incremental partition queries ran in wrong database context.
+                            Added USE QUOTENAME(@current_database) to partition DMV queries.
+                          - Fix: @WhatIfOutputTable SQL injection - added character blocklist.
+                          - Fix: Orphan cleanup infinite loop when RunLabel XML is NULL.
+                          - Fix: FORMAT() CLR dependency replaced with CONVERT-based formatting.
+                          - Fix: All @Preset overrides broken - non-NULL parameter defaults caused
+                            IS NULL checks to never fire. Changed to unconditional SET.
+            2.1.2026.0219 - Phase 2 Extended Awareness:
                           - SYSDATETIME() consistency: All date/time functions now use SYSDATETIME()
                             instead of mixed GETDATE()/SYSDATETIME() for sub-second consistency.
                           - Azure SQL detection: Added @is_azure_sql flag and DTU/vCore consumption
@@ -471,8 +494,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.1.2026.0219',
-        @procedure_version_date datetime = '20260219',
+        @procedure_version varchar(20) = '2.2.2026.0220',
+        @procedure_version_date datetime = '20260220',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -507,7 +530,9 @@ BEGIN
         SELECT
             N'version: ' + @procedure_version + N' (' + CONVERT(nvarchar(10), @procedure_version_date, 120) + N')' UNION ALL
         SELECT
-            N'v2.0 Phase 1: Environment detection (CE version, trace flags, db-scoped configs)';
+            N'v2.1 Phase 2: Extended Awareness (replication, CDC, temporal, consecutive failures)' UNION ALL
+        SELECT
+            N'v2.2: Adversarial review fixes (DIRECT mode crash, re-entrancy guard, TOCTOU check)';
 
         /*
         Parameter documentation
@@ -883,6 +908,30 @@ BEGIN
 
     /*
     ============================================================================
+    RE-ENTRANCY GUARD (sp_HeapDoctor pattern)
+    Prevents concurrent non-parallel runs from corrupting shared state
+    (orphan cleanup, progress tables, CommandLog bracketing).
+    Parallel mode workers skip this guard - they coordinate via queue tables.
+    ============================================================================
+    */
+    IF @StatsInParallel = N'N'
+    BEGIN
+        DECLARE @lock_result int;
+        EXEC @lock_result = sp_getapplock
+            @Resource = N'sp_StatUpdate',
+            @LockMode = N'Exclusive',
+            @LockTimeout = 0,
+            @LockOwner = N'Session';
+
+        IF @lock_result < 0
+        BEGIN
+            RAISERROR(N'Another instance of sp_StatUpdate is already running (non-parallel mode). Use @StatsInParallel=''Y'' for concurrent execution.', 16, 1);
+            RETURN;
+        END;
+    END;
+
+    /*
+    ============================================================================
     VARIABLE DECLARATIONS
     ============================================================================
     */
@@ -1093,6 +1142,13 @@ BEGIN
         @current_qs_total_logical_reads bigint = NULL,
         @current_qs_last_execution datetime2(3) = NULL,
         @current_qs_priority_boost bigint = NULL;
+
+    /*
+    TOCTOU check variables (verify stat still exists before execution)
+    */
+    DECLARE
+        @toctou_sql nvarchar(500) = N'',
+        @toctou_exists int = 0;
 
     /*
     Command building
@@ -1451,45 +1507,51 @@ BEGIN
             RAISERROR(N'Applying preset: %s', 10, 1, @Preset) WITH NOWAIT;
         END;
 
+        /*
+        Presets unconditionally SET their defining parameters because SQL Server
+        cannot distinguish "caller omitted this param" from "param got its default."
+        If @Preset is specified, its values take priority.
+        */
+
         /* NIGHTLY_MAINTENANCE: Balanced nightly job */
         IF @Preset = N'NIGHTLY_MAINTENANCE'
         BEGIN
-            IF @TimeLimit IS NULL SET @TimeLimit = 3600; /* 1 hour */
-            IF @TieredThresholds IS NULL SET @TieredThresholds = 1;
-            IF @ModificationThreshold IS NULL SET @ModificationThreshold = 5000;
-            IF @TargetNorecompute IS NULL SET @TargetNorecompute = N'BOTH';
-            IF @SortOrder IS NULL SET @SortOrder = N'MODIFICATION_COUNTER';
+            SET @TimeLimit = 3600; /* 1 hour */
+            SET @TieredThresholds = 1;
+            SET @ModificationThreshold = 5000;
+            SET @TargetNorecompute = N'BOTH';
+            SET @SortOrder = N'MODIFICATION_COUNTER';
         END;
 
         /* WEEKLY_FULL: Comprehensive weekly update */
         IF @Preset = N'WEEKLY_FULL'
         BEGIN
-            IF @TimeLimit IS NULL SET @TimeLimit = 14400; /* 4 hours */
-            IF @TieredThresholds IS NULL SET @TieredThresholds = 1;
-            IF @ModificationThreshold IS NULL SET @ModificationThreshold = 1000; /* Lower threshold */
-            IF @DaysStaleThreshold IS NULL SET @DaysStaleThreshold = 7;
-            IF @TargetNorecompute IS NULL SET @TargetNorecompute = N'BOTH';
+            SET @TimeLimit = 14400; /* 4 hours */
+            SET @TieredThresholds = 1;
+            SET @ModificationThreshold = 1000; /* Lower threshold */
+            IF @DaysStaleThreshold IS NULL SET @DaysStaleThreshold = 7; /* Only if not specified (NULL default) */
+            SET @TargetNorecompute = N'BOTH';
         END;
 
         /* OLTP_LIGHT: Minimal impact for OLTP systems */
         IF @Preset = N'OLTP_LIGHT'
         BEGIN
-            IF @TimeLimit IS NULL SET @TimeLimit = 1800; /* 30 minutes */
-            IF @ModificationThreshold IS NULL SET @ModificationThreshold = 50000; /* High threshold */
-            IF @TieredThresholds IS NULL SET @TieredThresholds = 1;
-            IF @DelayBetweenStats IS NULL SET @DelayBetweenStats = 2; /* 2 sec delay */
-            IF @LockTimeout IS NULL SET @LockTimeout = 10; /* 10 sec lock timeout */
-            IF @QueryStorePriority IS NULL SET @QueryStorePriority = N'Y'; /* Focus on hot queries */
+            SET @TimeLimit = 1800; /* 30 minutes */
+            SET @ModificationThreshold = 50000; /* High threshold */
+            SET @TieredThresholds = 1;
+            IF @DelayBetweenStats IS NULL SET @DelayBetweenStats = 2; /* Only if not specified (NULL default) */
+            IF @LockTimeout IS NULL SET @LockTimeout = 10; /* Only if not specified (NULL default) */
+            IF @QueryStorePriority IS NULL SET @QueryStorePriority = N'Y'; /* Only if not specified (NULL default) */
         END;
 
         /* WAREHOUSE_AGGRESSIVE: Data warehouse full refresh */
         IF @Preset = N'WAREHOUSE_AGGRESSIVE'
         BEGIN
-            IF @TimeLimit IS NULL SET @TimeLimit = NULL; /* No time limit */
-            IF @ModificationThreshold IS NULL SET @ModificationThreshold = 500; /* Low threshold */
-            IF @TieredThresholds IS NULL SET @TieredThresholds = 0; /* Use fixed threshold */
-            IF @StatisticsSample IS NULL SET @StatisticsSample = 100; /* FULLSCAN */
-            IF @TargetNorecompute IS NULL SET @TargetNorecompute = N'BOTH';
+            SET @TimeLimit = NULL; /* No time limit */
+            SET @ModificationThreshold = 500; /* Low threshold */
+            SET @TieredThresholds = 0; /* Use fixed threshold */
+            IF @StatisticsSample IS NULL SET @StatisticsSample = 100; /* FULLSCAN - only if not specified (NULL default) */
+            SET @TargetNorecompute = N'BOTH';
         END;
     END;
 
@@ -1786,6 +1848,32 @@ BEGIN
         SELECT
             error_message =
                 N'The value for @StatisticsFromTable contains invalid characters.',
+            error_severity = 16;
+    END;
+
+    /*
+    Validate @WhatIfOutputTable doesn't contain SQL injection characters
+    */
+    IF  @WhatIfOutputTable IS NOT NULL
+    AND (
+            @WhatIfOutputTable LIKE N'%;%'
+         OR @WhatIfOutputTable LIKE N'%--%'
+         OR @WhatIfOutputTable LIKE N'%/*%'
+         OR @WhatIfOutputTable LIKE N'%*/%'
+         OR @WhatIfOutputTable LIKE N'%''%'
+         OR @WhatIfOutputTable LIKE N'%xp_%'
+         OR @WhatIfOutputTable LIKE N'%sp_execute%'
+        )
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @WhatIfOutputTable contains invalid characters.',
             error_severity = 16;
     END;
 
@@ -2126,6 +2214,8 @@ BEGIN
     AND @ag_secondary_count > 0
     BEGIN
         RAISERROR(N'All selected databases are on AG secondary replicas. Statistics cannot be updated on readable secondaries.', 16, 1) WITH NOWAIT;
+        IF @StatsInParallel = N'N'
+            EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
         RETURN 1;
     END;
 
@@ -2372,6 +2462,8 @@ BEGIN
         RAISERROR(N'', 10, 1) WITH NOWAIT;
         RAISERROR(N'Documentation: https://ola.hallengren.com/sql-server-index-and-statistics-maintenance.html', 10, 1) WITH NOWAIT;
 
+        IF @StatsInParallel = N'N'
+            EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
         RETURN 50000;
     END;
 
@@ -2382,7 +2474,7 @@ BEGIN
         @run_label =
             CONVERT(nvarchar(50), SERVERPROPERTY(N'ServerName')) +
             N'_' +
-            FORMAT(@start_time, N'yyyyMMdd_HHmmss');
+            REPLACE(REPLACE(REPLACE(CONVERT(nvarchar(19), @start_time, 120), N'-', N''), N':', N''), N' ', N'_');
 
     /*
     ============================================================================
@@ -2579,7 +2671,35 @@ BEGIN
     END;
 
     /*
-    Trace flag status in debug mode (Phase 1.3 - v2.0)
+    Hardware context and warning collection (always runs for @WarningsOut)
+    RAISERROR output gated behind @Debug; warning collection always executes.
+    */
+    DECLARE
+        @hw_cpu_count int,
+        @hw_memory_mb bigint,
+        @hw_numa_nodes int,
+        @hw_uptime_hours int;
+
+    SELECT
+        @hw_cpu_count = cpu_count,
+        @hw_memory_mb = physical_memory_kb / 1024,
+        @hw_numa_nodes = numa_node_count,
+        @hw_uptime_hours = DATEDIFF(HOUR, sqlserver_start_time, SYSDATETIME())
+    FROM sys.dm_os_sys_info;
+
+    IF @hw_uptime_hours < 24
+        SET @warnings += N'LOW_UPTIME: Server restarted < 24h ago; ';
+
+    DECLARE @active_backups int = 0;
+    SELECT @active_backups = COUNT(*)
+    FROM sys.dm_exec_requests AS r
+    WHERE r.command LIKE N'BACKUP%';
+
+    IF @active_backups > 0
+        SET @warnings += N'BACKUP_RUNNING: ' + CONVERT(nvarchar(10), @active_backups) + N' backup(s) active; ';
+
+    /*
+    Trace flag status and hardware context in debug mode (Phase 1.3 - v2.0)
     Show active statistics-relevant trace flags and recommendations.
     */
     IF @Debug = 1
@@ -2595,48 +2715,16 @@ BEGIN
             RAISERROR(N'Statistics-Relevant Trace Flags: None active', 10, 1) WITH NOWAIT;
         END;
 
-        /*
-        Hardware context (Glenn Berry #43)
-        Display hardware summary to help diagnose performance expectations.
-        */
-        DECLARE
-            @hw_cpu_count int,
-            @hw_memory_mb bigint,
-            @hw_numa_nodes int,
-            @hw_uptime_hours int;
-
-        SELECT
-            @hw_cpu_count = cpu_count,
-            @hw_memory_mb = physical_memory_kb / 1024,
-            @hw_numa_nodes = numa_node_count,
-            @hw_uptime_hours = DATEDIFF(HOUR, sqlserver_start_time, SYSDATETIME())
-        FROM sys.dm_os_sys_info;
-
         RAISERROR(N'', 10, 1) WITH NOWAIT;
         RAISERROR(N'Environment (hardware context):', 10, 1) WITH NOWAIT;
         RAISERROR(N'  CPU cores: %d, Memory: %I64d MB, NUMA nodes: %d, Uptime: %d hours', 10, 1,
             @hw_cpu_count, @hw_memory_mb, @hw_numa_nodes, @hw_uptime_hours) WITH NOWAIT;
 
         IF @hw_uptime_hours < 24
-        BEGIN
             RAISERROR(N'  Note: SQL Server restarted < 24h ago. Query Store/usage stats may be incomplete.', 10, 1) WITH NOWAIT;
-            SET @warnings += N'LOW_UPTIME: Server restarted < 24h ago; ';
-        END;
-
-        /*
-        Backup activity detection
-        Warn when backups are running as they compete for I/O resources.
-        */
-        DECLARE @active_backups int = 0;
-        SELECT @active_backups = COUNT(*)
-        FROM sys.dm_exec_requests AS r
-        WHERE r.command LIKE N'BACKUP%';
 
         IF @active_backups > 0
-        BEGIN
             RAISERROR(N'  Warning: %d backup operation(s) currently running. Statistics updates may compete for I/O.', 10, 1, @active_backups) WITH NOWAIT;
-            SET @warnings += N'BACKUP_RUNNING: ' + CONVERT(nvarchar(10), @active_backups) + N' backup(s) active; ';
-        END;
     END;
 
     /*
@@ -2848,6 +2936,9 @@ BEGIN
         WHERE cl_start.CommandType = N'SP_STATUPDATE_START'
         /* Only clean orphans older than 24 hours (avoids concurrent run interference) */
         AND   cl_start.StartTime < DATEADD(HOUR, -24, SYSDATETIME())
+        /* Must have ExtendedInfo with RunLabel to avoid NULL=NULL matching */
+        AND   cl_start.ExtendedInfo IS NOT NULL
+        AND   cl_start.ExtendedInfo.exist('(/Parameters/RunLabel)[1]') = 1
         AND   NOT EXISTS
               (
                   SELECT 1
@@ -2984,6 +3075,8 @@ BEGIN
             IF OBJECT_ID(N'tempdb..' + @StatisticsFromTable) IS NULL
             BEGIN
                 RAISERROR(N'Temp table %s does not exist', 16, 1, @StatisticsFromTable);
+                IF @StatsInParallel = N'N'
+                    EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
                 RETURN 1;
             END;
         END;
@@ -2992,6 +3085,8 @@ BEGIN
             IF OBJECT_ID(@StatisticsFromTable) IS NULL
             BEGIN
                 RAISERROR(N'Table %s does not exist', 16, 1, @StatisticsFromTable);
+                IF @StatsInParallel = N'N'
+                    EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
                 RETURN 1;
             END;
         END;
@@ -3028,6 +3123,8 @@ BEGIN
         END TRY
         BEGIN CATCH
             RAISERROR(N'Table %s must have at least a StatName column', 16, 1, @StatisticsFromTable);
+            IF @StatsInParallel = N'N'
+                EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
             RETURN 1;
         END CATCH;
 
@@ -3097,6 +3194,9 @@ BEGIN
             no_recompute,
             is_incremental,
             is_memory_optimized,
+            is_published,
+            is_tracked_by_cdc,
+            temporal_type,
             is_heap,
             modification_counter,
             row_count,
@@ -3223,12 +3323,20 @@ BEGIN
             no_recompute,
             is_incremental,
             is_memory_optimized,
+            is_published,
+            is_tracked_by_cdc,
+            temporal_type,
             is_heap,
+            auto_created,
             modification_counter,
             row_count,
             days_stale,
             page_count,
             persisted_sample_percent,
+            histogram_steps,
+            has_filter,
+            filter_definition,
+            unfiltered_rows,
             priority
         )
         SELECT
@@ -3241,6 +3349,10 @@ BEGIN
             no_recompute = s.no_recompute,
             is_incremental = s.is_incremental,
             is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
+            /* Replication/CDC/Temporal metadata */
+            is_published = ISNULL(t.is_published, 0),
+            is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
+            temporal_type = ISNULL(t.temporal_type, 0),
             /*
             HEAP DETECTION: Check for index_id = 0 (heap) directly.
             Heaps have index_id = 0; clustered indexes have index_id = 1.
@@ -3258,11 +3370,16 @@ BEGIN
                     THEN 1
                     ELSE 0
                 END,
+            auto_created = s.auto_created,
             modification_counter = ISNULL(sp.modification_counter, 0),
             row_count = ISNULL(sp.rows, 0),
             days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
             page_count = ISNULL(pgs.total_pages, 0),
             persisted_sample_percent = sp.persisted_sample_percent,
+            histogram_steps = sp.steps,
+            has_filter = s.has_filter,
+            filter_definition = s.filter_definition,
+            unfiltered_rows = sp.unfiltered_rows,
             priority = ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
         FROM parsed_stats AS ps
         JOIN sys.stats AS s
@@ -3630,6 +3747,9 @@ BEGIN
                         qs_total_logical_reads = CONVERT(bigint, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
                         qs_priority_boost = CONVERT(bigint, NULL),
+                        is_published = CONVERT(bit, NULL),
+                        is_tracked_by_cdc = CONVERT(bit, NULL),
+                        temporal_type = CONVERT(tinyint, NULL),
                         priority = CONVERT(bigint, NULL)
                     WHERE 1 = 0;
 
@@ -3760,6 +3880,9 @@ BEGIN
                         qs_total_logical_reads = CONVERT(bigint, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
                         qs_priority_boost = CONVERT(bigint, NULL),
+                        is_published = CONVERT(bit, NULL),
+                        is_tracked_by_cdc = CONVERT(bit, NULL),
+                        temporal_type = CONVERT(tinyint, NULL),
                         priority = CONVERT(bigint, NULL)
                     WHERE 1 = 0;
 
@@ -3839,6 +3962,9 @@ BEGIN
                         qs_total_logical_reads = CONVERT(bigint, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
                         qs_priority_boost = CONVERT(bigint, NULL),
+                        is_published = CONVERT(bit, NULL),
+                        is_tracked_by_cdc = CONVERT(bit, NULL),
+                        temporal_type = CONVERT(tinyint, NULL),
                         priority = CONVERT(bigint, NULL)
                     WHERE 1 = 0;
 
@@ -4349,7 +4475,7 @@ BEGIN
                       /* Days stale threshold */
                       OR (
                           @DaysStaleThreshold_param IS NOT NULL
-                          AND DATEDIFF(DAY, sp.last_updated, SYSDATETIME()) >= @DaysStaleThreshold_param
+                          AND ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999) >= @DaysStaleThreshold_param
                       )
                       /* If no thresholds specified, include all */
                       OR (
@@ -4383,7 +4509,7 @@ BEGIN
                   AND (
                       /* Days stale - must be met if specified */
                       @DaysStaleThreshold_param IS NULL
-                      OR DATEDIFF(DAY, sp.last_updated, SYSDATETIME()) >= @DaysStaleThreshold_param
+                      OR ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999) >= @DaysStaleThreshold_param
                   )
               )
               ) /* End of threshold logic wrapper - ensures table/exclusion filters apply to both OR and AND modes */
@@ -4807,6 +4933,8 @@ BEGIN
             RunLabel = @run_label,
             Version = @procedure_version;
 
+        IF @StatsInParallel = N'N'
+            EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
         RETURN 0;
     END;
 
@@ -5598,6 +5726,7 @@ BEGIN
             Get physical partition count from sys.partitions as authoritative source.
             */
             DECLARE @physical_sql nvarchar(max) = N'
+                USE ' + QUOTENAME(@current_database) + N';
                 SELECT @count_out = COUNT(DISTINCT partition_number)
                 FROM sys.partitions
                 WHERE object_id = @obj_id
@@ -5616,6 +5745,7 @@ BEGIN
             partitions defeats the purpose of incremental stats.
             */
             DECLARE @partition_sql nvarchar(max) = N'
+                USE ' + QUOTENAME(@current_database) + N';
                 SELECT @partitions_out = STRING_AGG(CONVERT(nvarchar(10), isp.partition_number), N'', '')
                                          WITHIN GROUP (ORDER BY isp.partition_number),
                        @count_out = COUNT(*),
@@ -5643,6 +5773,7 @@ BEGIN
             BEGIN
                 /* SQL 2016: Use FOR XML PATH */
                 SELECT @partition_sql = N'
+                    USE ' + QUOTENAME(@current_database) + N';
                     SELECT @partitions_out = STUFF((
                                SELECT N'', '' + CONVERT(nvarchar(10), isp.partition_number)
                                FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id) AS isp
@@ -5907,6 +6038,44 @@ BEGIN
 
         IF @Execute = N'Y'
         BEGIN
+            /*
+            TOCTOU check (sp_HeapDoctor pattern): verify stat still exists.
+            Between discovery and execution, the statistic may have been dropped
+            (e.g., table dropped, stat auto-dropped on schema change, manual DROP).
+            */
+            SET @toctou_sql = N'SELECT @exists = COUNT(*) FROM '
+                + QUOTENAME(@current_database) + N'.sys.stats AS s '
+                + N'WHERE s.object_id = @obj_id AND s.stats_id = @stat_id';
+            SET @toctou_exists = 0;
+
+            BEGIN TRY
+                EXEC sys.sp_executesql @toctou_sql,
+                    N'@obj_id int, @stat_id int, @exists int OUTPUT',
+                    @obj_id = @current_object_id,
+                    @stat_id = @current_stats_id,
+                    @exists = @toctou_exists OUTPUT;
+            END TRY
+            BEGIN CATCH
+                SET @toctou_exists = 1; /* On error, proceed anyway (e.g., cross-DB permission issue) */
+            END CATCH;
+
+            IF @toctou_exists = 0
+            BEGIN
+                RAISERROR(N'  SKIPPED: statistic no longer exists (dropped between discovery and execution)', 10, 1) WITH NOWAIT;
+                SET @stats_skipped += 1;
+                SET @stats_processed -= 1; /* Undo increment - TOCTOU skip is not a real attempt */
+
+                UPDATE stp
+                SET stp.processed = 1
+                FROM #stats_to_process AS stp
+                WHERE stp.database_name = @current_database
+                AND   stp.schema_name = @current_schema_name
+                AND   stp.table_name = @current_table_name
+                AND   stp.stat_name = @current_stat_name;
+
+                CONTINUE;
+            END;
+
             BEGIN TRY
                 EXECUTE sys.sp_executesql
                     @current_command;
@@ -6507,6 +6676,16 @@ BEGIN
     IF @stats_failed > 0 AND @return_code = 0
     BEGIN
         SELECT @return_code = 1; /*Generic failure code for Agent jobs*/
+    END;
+
+    /*
+    Release re-entrancy guard (sp_HeapDoctor pattern)
+    */
+    IF @StatsInParallel = N'N'
+    BEGIN
+        EXEC sp_releaseapplock
+            @Resource = N'sp_StatUpdate',
+            @LockOwner = N'Session';
     END;
 
     RETURN @return_code;
