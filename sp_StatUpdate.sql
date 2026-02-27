@@ -36,11 +36,20 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.2.2026.0220 (Major.Minor.Year.MMDD)
+Version:    2.3.2026.0226 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.2.2026.0220 - Adversarial Code Review (2 rounds):
+History:    2.3.2026.0226 - v2.3 SME Persona Synthesis Implementation:
+                            Trivial: MAXRECURSION 1000, sub-second durations, dm_exec_sessions,
+                              ROWLOCK+READPAST, MAX_GRANT_PERCENT=25, TOCTOU message, hardware
+                              context extension, JSON summary in ExtendedInfo END.
+                            Low: @QueryStoreMetric AVG_CPU, @HoursStaleThreshold, @StopByTime,
+                              @SkipTablesWithColumnstore, phase loss logging, CommandLog schema
+                              check, @Help SAMPLING topic.
+                            Medium: Stat-level LastStatCompletedAt, parameter fingerprint,
+                              @CheckPermissionsOnly.
+            2.2.2026.0220 - Adversarial Code Review (2 rounds):
                           Round 1 - Critical bug fixes:
                           - Fix: DIRECT_TABLE mode crash - INSERT column count mismatch for
                             is_published, is_tracked_by_cdc, temporal_type columns.
@@ -346,9 +355,11 @@ ALTER PROCEDURE
     @ModificationPercent float = NULL, /*alternative: min mod % of rows (SQRT-based)*/
     @TieredThresholds bit = 1, /*1 = use Tiger Toolbox 5-tier adaptive thresholds based on table size (0-500: 500 mods, 501-10K: 20%, 10K-100K: 15%, 100K-1M: 10%, 1M+: 5%). 0 = use fixed @ModificationThreshold*/
     @ThresholdLogic nvarchar(3) = N'OR', /*OR = any threshold qualifies (default), AND = all thresholds must be met*/
-    @DaysStaleThreshold integer = NULL, /*minimum days since last update*/
+    @DaysStaleThreshold integer = NULL, /*minimum days since last update. Note: counts calendar day boundaries (midnight crossings), not 24-hour periods. Use @HoursStaleThreshold for precise time-based thresholds.*/
+    @HoursStaleThreshold int = NULL, /*alternative to @DaysStaleThreshold using hours (DATEDIFF(HOUR,...)). Provides precise time-based threshold. Cannot be specified simultaneously with @DaysStaleThreshold.*/
     @MinPageCount bigint = 0, /*minimum table page count to process. 0 = no filter, 125 = ~1MB, 125000 = ~1GB. Use to skip tiny tables*/
     @IncludeSystemObjects nvarchar(1) = N'N', /*Y = include system object statistics (sys.* tables/views)*/
+    @SkipTablesWithColumnstore nchar(1) = N'N', /*Y = skip tables that have a nonclustered columnstore index (type 5 or 6 in sys.indexes). Use when plan stability is paramount - updating rowstore stats on NCCI tables may change batch mode execution plans.*/
 
     /*
     ============================================================================
@@ -364,7 +375,7 @@ ALTER PROCEDURE
     ============================================================================
     */
     @QueryStorePriority nvarchar(1) = N'N', /*Y = boost priority for stats on tables actively used by Query Store plans. Identifies "hot" tables for query-driven maintenance (not necessarily bad plans). N = ignore QS data*/
-    @QueryStoreMetric nvarchar(20) = N'CPU', /*resource metric for priority: CPU (total CPU ms, default), DURATION (elapsed time), READS (logical I/O), EXECUTIONS (count)*/
+    @QueryStoreMetric nvarchar(20) = N'CPU', /*resource metric for priority: CPU (total CPU ms, default), DURATION (elapsed time), READS (logical I/O), EXECUTIONS (count), AVG_CPU (total_cpu_ms/execution_count - favors expensive single-execution queries over frequent cheap ones)*/
     @QueryStoreMinExecutions bigint = 100, /*minimum plan executions to boost priority*/
     @QueryStoreRecentHours integer = 168, /*plans executed in last N hours (default: 7 days). Intentionally short - recent query activity more relevant than 30-day history*/
 
@@ -390,6 +401,7 @@ ALTER PROCEDURE
     ============================================================================
     */
     @TimeLimit integer = 3600, /*seconds (default: 1 hour, NULL = unlimited)*/
+    @StopByTime nvarchar(8) = NULL, /*absolute wall-clock stop time (format: HH:MM or HH:MM:SS). Computes remaining seconds from now to specified time today. Overrides @TimeLimit when specified.*/
     @BatchLimit integer = NULL, /*max stats to update per run*/
     @SortOrder nvarchar(50) = N'MODIFICATION_COUNTER', /*priority: MODIFICATION_COUNTER, DAYS_STALE, RANDOM, PAGE_COUNT, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED*/
     @DelayBetweenStats integer = NULL, /*seconds to wait between stats updates. Use during OLTP hours to reduce contention; NULL = no delay*/
@@ -434,6 +446,7 @@ ALTER PROCEDURE
     @ProgressLogInterval int = NULL, /*log progress to CommandLog every N stats (for Agent job monitoring)*/
     @Execute nvarchar(1) = N'Y', /*Y = execute, N = print only (dry run)*/
     @WhatIfOutputTable nvarchar(500) = NULL, /*table to receive commands when @Execute = N (for automation)*/
+    @CheckPermissionsOnly nchar(1) = N'N', /*Y = check required permissions (VIEW ANY DATABASE, VIEW DATABASE STATE, ALTER on tables, INSERT on CommandLog) and report missing ones. Returns without executing any stats updates. Diagnostic mode only.*/
     @FailFast bit = 0, /*1 = abort on first error*/
     @Debug bit = 0, /*1 = verbose output*/
     @ExposeProgressToAllSessions nvarchar(1) = N'N', /*Y = create ##sp_StatUpdate_Progress global temp table (SECURITY NOTE: visible to ALL sessions on server). N = disabled (use @ProgressLogInterval for secure monitoring)*/
@@ -446,7 +459,7 @@ ALTER PROCEDURE
     When @StatsInParallel = 'Y':
       - First worker populates dbo.QueueStatistic with qualifying stats
       - All workers claim work via UPDATE ... WHERE StatStartTime IS NULL
-      - Dead workers detected via sys.dm_exec_requests
+      - Dead workers detected via sys.dm_exec_sessions (sleeping workers between stats appear in dm_exec_sessions but not dm_exec_requests)
       - Run same EXECUTE from multiple sessions/jobs for parallelism
 
     Prerequisites:
@@ -455,14 +468,14 @@ ALTER PROCEDURE
     ============================================================================
     */
     @StatsInParallel nvarchar(1) = N'N', /*Y = use queue-based parallel processing*/
-    @DeadWorkerTimeoutMinutes int = 15, /*consider worker dead if no progress for N minutes (NULL = only check dm_exec_requests). P2 #4: Reduced from 30 to 15 min.*/
+    @DeadWorkerTimeoutMinutes int = 15, /*consider worker dead if no progress for N minutes (NULL = only check dm_exec_sessions). P2 #4: Reduced from 30 to 15 min.*/
 
     /*
     ============================================================================
     HELP & VERSION OUTPUT
     ============================================================================
     */
-    @Help bit = 0, /*1 = show help in SSMS result set*/
+    @Help nvarchar(50) = N'0', /*1 = show help in SSMS result set. Named topics: 'SAMPLING' = sampling priority order documentation*/
     @Version varchar(20) = NULL OUTPUT, /*returns procedure version*/
     @VersionDate datetime = NULL OUTPUT, /*returns procedure version date*/
 
@@ -494,8 +507,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.2.2026.0220',
-        @procedure_version_date datetime = '20260220',
+        @procedure_version varchar(20) = '2.3.2026.0226',
+        @procedure_version_date datetime = '20260226',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -511,7 +524,7 @@ BEGIN
     HELP SECTION
     ============================================================================
     */
-    IF @Help = 1
+    IF @Help IN (N'1', N'Y')
     BEGIN
         /*
         Introduction
@@ -611,7 +624,7 @@ BEGIN
                     WHEN N'@QueryStorePriority'
                     THEN N'Y = prioritize stats used by Query Store plans, N = ignore'
                     WHEN N'@QueryStoreMetric'
-                    THEN N'CPU = total CPU time (default), DURATION = elapsed time, READS = logical I/O, EXECUTIONS = count'
+                    THEN N'CPU = total CPU time (default), DURATION = elapsed time, READS = logical I/O, EXECUTIONS = count, AVG_CPU = avg CPU per execution (total_cpu_ms/execution_count, favors expensive single-run queries)'
                     WHEN N'@QueryStoreMinExecutions'
                     THEN N'minimum plan executions to boost priority (default 100)'
                     WHEN N'@QueryStoreRecentHours'
@@ -644,12 +657,20 @@ BEGIN
                     THEN N'Y = create ##sp_StatUpdate_Progress (SECURITY: visible to ALL sessions). Use @ProgressLogInterval for secure monitoring.'
                     WHEN N'@CleanupOrphanedRuns'
                     THEN N'Y (default) = mark orphaned START entries >24h old (killed runs) with END marker'
+                    WHEN N'@HoursStaleThreshold'
+                    THEN N'alternative to @DaysStaleThreshold using precise hours (DATEDIFF HOUR). Note: @DaysStaleThreshold counts calendar midnight crossings, not 24-hour periods. Cannot be combined with @DaysStaleThreshold.'
+                    WHEN N'@StopByTime'
+                    THEN N'wall-clock stop time (HH:MM or HH:MM:SS). Computes remaining seconds from now to specified time today and uses as @TimeLimit. Overrides @TimeLimit when specified.'
+                    WHEN N'@SkipTablesWithColumnstore'
+                    THEN N'Y = skip tables with nonclustered/clustered columnstore indexes (type 5/6 in sys.indexes). Use when plan stability is critical — updating rowstore stats alongside NCCIs may change batch mode execution plans.'
+                    WHEN N'@CheckPermissionsOnly'
+                    THEN N'Y = check required permissions (VIEW ANY DATABASE, VIEW DATABASE STATE, INSERT on CommandLog) and report missing ones. No stats updates are executed. Diagnostic mode.'
                     WHEN N'@StatsInParallel'
                     THEN N'Y = use queue-based parallel processing (requires Queue tables)'
                     WHEN N'@DeadWorkerTimeoutMinutes'
-                    THEN N'parallel mode: consider worker dead if no progress for N minutes (default 15)'
+                    THEN N'parallel mode: consider worker dead if no progress for N minutes (default 15). v2.3: uses LastStatCompletedAt heartbeat column for accurate per-stat tracking.'
                     WHEN N'@Help'
-                    THEN N'1 = show this help information'
+                    THEN N'1 = show this help information. Named topics: SAMPLING = sampling priority order documentation.'
                     WHEN N'@Version'
                     THEN N'OUTPUT: returns procedure version string'
                     WHEN N'@VersionDate'
@@ -685,7 +706,7 @@ BEGIN
                     WHEN N'@QueryStorePriority'
                     THEN N'Y, N'
                     WHEN N'@QueryStoreMetric'
-                    THEN N'CPU, DURATION, READS, EXECUTIONS'
+                    THEN N'CPU, DURATION, READS, EXECUTIONS, AVG_CPU'
                     WHEN N'@StatisticsSample'
                     THEN N'NULL, 1-100 (100 = FULLSCAN)'
                     WHEN N'@LogToTable'
@@ -736,6 +757,14 @@ BEGIN
                     THEN N'OR'
                     WHEN N'@DaysStaleThreshold'
                     THEN N'NULL'
+                    WHEN N'@HoursStaleThreshold'
+                    THEN N'NULL'
+                    WHEN N'@StopByTime'
+                    THEN N'NULL'
+                    WHEN N'@SkipTablesWithColumnstore'
+                    THEN N'N'
+                    WHEN N'@CheckPermissionsOnly'
+                    THEN N'N'
                     WHEN N'@MinPageCount'
                     THEN N'0'
                     WHEN N'@StatisticsSample'
@@ -902,6 +931,44 @@ BEGIN
             mode_description,
             mode_when_to_use
         );
+
+        RETURN;
+    END;
+
+    /*
+    ============================================================================
+    @Help = 'SAMPLING' topic (v2.3)
+    ============================================================================
+    */
+    IF @Help = N'SAMPLING'
+    BEGIN
+        SELECT
+            priority =
+                p.priority_num,
+            name =
+                p.priority_name,
+            when_applied =
+                p.when_applied,
+            details =
+                p.details
+        FROM
+        (
+            VALUES
+                (1, N'@StatisticsSample (explicit)', N'When @StatisticsSample is not NULL',
+                 N'All statistics use this sample rate. Overrides all other sampling. Example: @StatisticsSample = 30 forces 30% on every stat.'),
+                (2, N'Adaptive sampling (history-based)', N'When @LongRunningThresholdMinutes IS NOT NULL AND CommandLog history exists',
+                 N'Stats that previously exceeded the threshold get a reduced sample rate. First run finds nothing — history is needed. Falls back to auto-sample if no history.'),
+                (3, N'@Preset WAREHOUSE_AGGRESSIVE', N'When @Preset = ''WAREHOUSE_AGGRESSIVE''',
+                 N'Forces FULLSCAN (100% sample) on all stats. Overrides adaptive sampling. Best for data warehouses where accuracy trumps speed.'),
+                (4, N'SQL Server auto-sample (default)', N'When none of the above apply',
+                 N'SQL Server selects the sample rate automatically based on table size. Small tables often get 100%; large tables may get 1-5%. This is standard UPDATE STATISTICS behavior.')
+        ) AS p (priority_num, priority_name, when_applied, details)
+        ORDER BY
+            priority;
+
+        SELECT
+            note = N'@PersistSamplePercent = Y persists the explicit sample rate in the stats header (SQL 2016+ / TF 2371). Future auto-updates use the persisted rate instead of SQL Server auto-sample.'
+        UNION ALL SELECT N'Available @Help topics: 1 (or Y) = full parameter help, SAMPLING = this topic.';
 
         RETURN;
     END;
@@ -1389,6 +1456,38 @@ BEGIN
     END;
 
     /*
+    v2.3: Check CommandLog schema compatibility when logging is enabled.
+    Non-blocking warning if expected columns are missing.
+    Required columns: CommandType, DatabaseName, SchemaName, ObjectName, StatisticName, ExtendedInfo.
+    */
+    IF  @LogToTable = N'Y'
+    AND @commandlog_exists = 1
+    BEGIN
+        DECLARE @commandlog_missing_cols nvarchar(max) = N'';
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.CommandLog') AND name = N'CommandType')
+            SET @commandlog_missing_cols += N'CommandType, ';
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.CommandLog') AND name = N'DatabaseName')
+            SET @commandlog_missing_cols += N'DatabaseName, ';
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.CommandLog') AND name = N'SchemaName')
+            SET @commandlog_missing_cols += N'SchemaName, ';
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.CommandLog') AND name = N'ObjectName')
+            SET @commandlog_missing_cols += N'ObjectName, ';
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.CommandLog') AND name = N'StatisticName')
+            SET @commandlog_missing_cols += N'StatisticName, ';
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.CommandLog') AND name = N'ExtendedInfo')
+            SET @commandlog_missing_cols += N'ExtendedInfo, ';
+
+        IF LEN(@commandlog_missing_cols) > 0
+        BEGIN
+            SET @commandlog_missing_cols = LEFT(@commandlog_missing_cols, LEN(@commandlog_missing_cols) - 2); /* trim trailing ", " */
+            DECLARE @commandlog_warn nvarchar(1000) =
+                N'WARNING: dbo.CommandLog schema may be incompatible. Expected columns missing: '
+                + @commandlog_missing_cols + N'. Logging may fail.';
+            RAISERROR(@commandlog_warn, 10, 1) WITH NOWAIT;
+        END;
+    END;
+
+    /*
     Check Queue tables exist if parallel processing enabled
     */
     IF  @StatsInParallel = N'Y'
@@ -1463,6 +1562,7 @@ BEGIN
             StatsUpdated integer NULL,
             StatsFailed integer NULL,
             StatsSkipped integer NULL,
+            LastStatCompletedAt datetime2(3) NULL, /* v2.3: timestamp of last individual stat completion per worker */
             CONSTRAINT PK_QueueStatistic
                 PRIMARY KEY CLUSTERED (QueueID, DatabaseName, SchemaName, ObjectName)
         );
@@ -1477,6 +1577,19 @@ BEGIN
             WHERE TableStartTime IS NULL;
 
         RAISERROR(N'Created dbo.QueueStatistic table and indexes.', 10, 1) WITH NOWAIT;
+    END;
+
+    /*
+    v2.3: Backward-compatible migration — add LastStatCompletedAt if it doesn't exist.
+    Existing installations may not have this column from older versions.
+    */
+    IF  @StatsInParallel = N'Y'
+    AND OBJECT_ID(N'dbo.QueueStatistic', N'U') IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic') AND name = N'LastStatCompletedAt')
+    BEGIN
+        ALTER TABLE dbo.QueueStatistic ADD LastStatCompletedAt datetime2(3) NULL;
+        IF @Debug = 1
+            RAISERROR(N'Added LastStatCompletedAt column to dbo.QueueStatistic (v2.3 migration).', 10, 1) WITH NOWAIT;
     END;
 
     /*
@@ -1553,6 +1666,36 @@ BEGIN
             IF @StatisticsSample IS NULL SET @StatisticsSample = 100; /* FULLSCAN - only if not specified (NULL default) */
             SET @TargetNorecompute = N'BOTH';
         END;
+    END;
+
+    /*
+    ============================================================================
+    @StopByTime PROCESSING (v2.3)
+    Convert absolute wall-clock stop time to a @TimeLimit (remaining seconds).
+    Must occur before validation so @TimeLimit can be validated normally.
+    ============================================================================
+    */
+    IF @StopByTime IS NOT NULL
+    BEGIN
+        BEGIN TRY
+            DECLARE
+                @stopby_time time(0) = CONVERT(time(0), @StopByTime),
+                @now_time time(0) = CONVERT(time(0), SYSDATETIME()),
+                @stopby_seconds_remaining int;
+
+            SET @stopby_seconds_remaining =
+                DATEDIFF(SECOND, @now_time, @stopby_time);
+
+            /* If the stop time has already passed today, set 0 seconds remaining */
+            IF @stopby_seconds_remaining < 0
+                SET @stopby_seconds_remaining = 0;
+
+            /* Override @TimeLimit with computed seconds remaining */
+            SET @TimeLimit = @stopby_seconds_remaining;
+        END TRY
+        BEGIN CATCH
+            /* Validation will catch invalid formats via the pre-check above */
+        END CATCH;
     END;
 
     /*
@@ -1914,7 +2057,7 @@ BEGIN
     /*
     Validate @QueryStoreMetric
     */
-    IF @QueryStoreMetric NOT IN (N'CPU', N'DURATION', N'READS', N'EXECUTIONS')
+    IF @QueryStoreMetric NOT IN (N'CPU', N'DURATION', N'READS', N'EXECUTIONS', N'AVG_CPU')
     BEGIN
         INSERT INTO
             @errors
@@ -1924,7 +2067,7 @@ BEGIN
         )
         SELECT
             error_message =
-                N'The value for @QueryStoreMetric is not supported. Use CPU, DURATION, READS, or EXECUTIONS.',
+                N'The value for @QueryStoreMetric is not supported. Use CPU, DURATION, READS, EXECUTIONS, or AVG_CPU.',
             error_severity = 16;
     END;
 
@@ -1942,6 +2085,79 @@ BEGIN
         SELECT
             error_message =
                 N'The value for @SortOrder is not supported. Use MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, or AUTO_CREATED.',
+            error_severity = 16;
+    END;
+
+    /*
+    Validate @HoursStaleThreshold / @DaysStaleThreshold mutual exclusion
+    */
+    IF @HoursStaleThreshold IS NOT NULL AND @DaysStaleThreshold IS NOT NULL
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'@HoursStaleThreshold and @DaysStaleThreshold cannot both be specified. Use one or the other. Note: @DaysStaleThreshold counts calendar day boundaries (midnight crossings); @HoursStaleThreshold uses precise elapsed hours.',
+            error_severity = 16;
+    END;
+
+    /*
+    Validate @StopByTime format (HH:MM or HH:MM:SS)
+    */
+    IF @StopByTime IS NOT NULL
+    BEGIN
+        BEGIN TRY
+            DECLARE @stopby_parsed time(0) = CONVERT(time(0), @StopByTime);
+        END TRY
+        BEGIN CATCH
+            INSERT INTO
+                @errors
+            (
+                error_message,
+                error_severity
+            )
+            SELECT
+                error_message =
+                    N'@StopByTime value ''' + @StopByTime + N''' is not a valid time format. Use HH:MM or HH:MM:SS (e.g., ''05:00'' or ''05:00:00'').',
+                error_severity = 16;
+        END CATCH;
+    END;
+
+    /*
+    Validate @CheckPermissionsOnly
+    */
+    IF @CheckPermissionsOnly NOT IN (N'Y', N'N')
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @CheckPermissionsOnly is not supported. Use Y or N.',
+            error_severity = 16;
+    END;
+
+    /*
+    Validate @SkipTablesWithColumnstore
+    */
+    IF @SkipTablesWithColumnstore NOT IN (N'Y', N'N')
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @SkipTablesWithColumnstore is not supported. Use Y or N.',
             error_severity = 16;
     END;
 
@@ -2067,7 +2283,7 @@ BEGIN
             StartPosition,
             Selected
         FROM Databases3
-        OPTION (MAXRECURSION 500); /* Support up to 500 comma-separated databases */
+        OPTION (MAXRECURSION 1000); /* Support up to 1000 comma-separated databases */
     END;
 
     /*
@@ -2468,6 +2684,80 @@ BEGIN
     END;
 
     /*
+    ============================================================================
+    @CheckPermissionsOnly mode (v2.3)
+    Check required permissions and report missing ones. No stats updates.
+    ============================================================================
+    */
+    IF @CheckPermissionsOnly = N'Y'
+    BEGIN
+        RAISERROR(N'sp_StatUpdate: @CheckPermissionsOnly mode - checking required permissions...', 10, 1) WITH NOWAIT;
+
+        /* Build permission result table */
+        DECLARE @perm_results TABLE
+        (
+            permission_name nvarchar(200),
+            scope nvarchar(200),
+            has_permission nvarchar(3),
+            notes nvarchar(500)
+        );
+
+        /* Check VIEW ANY DATABASE */
+        INSERT INTO @perm_results (permission_name, scope, has_permission, notes)
+        SELECT
+            N'VIEW ANY DATABASE',
+            N'Server',
+            CASE WHEN HAS_PERMS_BY_NAME(NULL, 'SERVER', 'VIEW ANY DATABASE') = 1 THEN N'YES' ELSE N'NO' END,
+            N'Required to enumerate databases for discovery';
+
+        /* Check VIEW DATABASE STATE (current database) */
+        INSERT INTO @perm_results (permission_name, scope, has_permission, notes)
+        SELECT
+            N'VIEW DATABASE STATE',
+            N'Database: ' + DB_NAME(),
+            CASE WHEN HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DATABASE STATE') = 1 THEN N'YES' ELSE N'NO' END,
+            N'Required for DMV access (dm_db_stats_properties, dm_exec_sessions)';
+
+        /* Check INSERT on dbo.CommandLog (if table exists) */
+        INSERT INTO @perm_results (permission_name, scope, has_permission, notes)
+        SELECT
+            N'INSERT',
+            N'dbo.CommandLog',
+            CASE
+                WHEN @commandlog_exists = 0 THEN N'N/A'
+                WHEN HAS_PERMS_BY_NAME(N'dbo.CommandLog', 'OBJECT', 'INSERT') = 1 THEN N'YES'
+                ELSE N'NO'
+            END,
+            CASE WHEN @commandlog_exists = 0 THEN N'CommandLog table does not exist' ELSE N'Required for @LogToTable = Y' END;
+
+        /* Return permission check results */
+        SELECT
+            permission_name,
+            scope,
+            has_permission,
+            notes,
+            status = CASE WHEN has_permission = N'NO' THEN N'MISSING' WHEN has_permission = N'N/A' THEN N'NOT APPLICABLE' ELSE N'OK' END
+        FROM @perm_results
+        ORDER BY
+            CASE WHEN has_permission = N'NO' THEN 0 ELSE 1 END,
+            permission_name;
+
+        /* Emit missing permission warnings */
+        IF EXISTS (SELECT 1 FROM @perm_results WHERE has_permission = N'NO')
+        BEGIN
+            RAISERROR(N'WARNING: Some required permissions are missing. See result set above.', 10, 1) WITH NOWAIT;
+        END
+        ELSE
+        BEGIN
+            RAISERROR(N'All checked permissions are present.', 10, 1) WITH NOWAIT;
+        END;
+
+        IF @StatsInParallel = N'N'
+            EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+        RETURN 0;
+    END;
+
+    /*
     Build human-readable run label
     */
     SELECT
@@ -2717,8 +3007,9 @@ BEGIN
 
         RAISERROR(N'', 10, 1) WITH NOWAIT;
         RAISERROR(N'Environment (hardware context):', 10, 1) WITH NOWAIT;
-        RAISERROR(N'  CPU cores: %d, Memory: %I64d MB, NUMA nodes: %d, Uptime: %d hours', 10, 1,
-            @hw_cpu_count, @hw_memory_mb, @hw_numa_nodes, @hw_uptime_hours) WITH NOWAIT;
+        DECLARE @hw_memory_gb bigint = @hw_memory_mb / 1024;
+        RAISERROR(N'  CPU cores: %d, Memory: %I64d MB (%I64d GB), NUMA nodes: %d, Uptime: %d hours', 10, 1,
+            @hw_cpu_count, @hw_memory_mb, @hw_memory_gb, @hw_numa_nodes, @hw_uptime_hours) WITH NOWAIT;
 
         IF @hw_uptime_hours < 24
             RAISERROR(N'  Note: SQL Server restarted < 24h ago. Query Store/usage stats may be incomplete.', 10, 1) WITH NOWAIT;
@@ -3672,6 +3963,19 @@ BEGIN
                        OR @FilteredStatsMode_param = N''PRIORITY''
                        OR (@FilteredStatsMode_param = N''EXCLUDE'' AND s.has_filter = 0)
                        OR (@FilteredStatsMode_param = N''ONLY'' AND s.has_filter = 1)
+                      )
+                /* v2.3: Skip tables with columnstore indexes when @SkipTablesWithColumnstore = Y */
+                /* Columnstore indexes (type 5=nonclustered columnstore, 6=clustered columnstore) */
+                /* may have plan stability concerns when rowstore stats are updated alongside NCCIs */
+                AND   (
+                          @SkipTablesWithColumnstore_param = N''N''
+                       OR NOT EXISTS
+                          (
+                              SELECT 1
+                              FROM sys.indexes AS ci
+                              WHERE ci.object_id = s.object_id
+                              AND   ci.type IN (5, 6) /* 5 = nonclustered columnstore, 6 = clustered columnstore */
+                          )
                       );
 
                 SELECT @phase1_count = @@ROWCOUNT;
@@ -3761,6 +4065,22 @@ BEGIN
                 BEGIN
                     DECLARE @missing_count int = @phase1_count - @phase2_count;
                     RAISERROR(N''    Note: %d stats have no properties (never updated)'', 10, 1, @missing_count) WITH NOWAIT;
+                    /* v2.3: Log specific Phase 1→2 losses (stats with no dm_db_stats_properties data) */
+                    DECLARE @phase_loss_msg nvarchar(4000);
+                    DECLARE phase_loss_cursor CURSOR LOCAL FAST_FORWARD FOR
+                        SELECT N''  Phase 1→2 loss: '' + QUOTENAME(schema_name) + N''.'' + QUOTENAME(table_name) + N''.'' + QUOTENAME(stat_name)
+                        FROM #stat_candidates
+                        WHERE modification_counter IS NULL
+                        ORDER BY schema_name, table_name, stat_name;
+                    OPEN phase_loss_cursor;
+                    FETCH NEXT FROM phase_loss_cursor INTO @phase_loss_msg;
+                    WHILE @@FETCH_STATUS = 0
+                    BEGIN
+                        RAISERROR(@phase_loss_msg, 10, 1) WITH NOWAIT;
+                        FETCH NEXT FROM phase_loss_cursor INTO @phase_loss_msg;
+                    END;
+                    CLOSE phase_loss_cursor;
+                    DEALLOCATE phase_loss_cursor;
                 END;
 
                 /*
@@ -3771,7 +4091,8 @@ BEGIN
                 ALTER TABLE #stat_candidates ADD
                     tier_threshold bigint NULL,
                     sqrt_threshold bigint NULL,
-                    days_stale int NULL;
+                    days_stale int NULL,
+                    hours_stale int NULL; /* v2.3: for @HoursStaleThreshold */
 
                 UPDATE #stat_candidates
                 SET
@@ -3784,7 +4105,8 @@ BEGIN
                             ELSE CONVERT(bigint, CONVERT(float, rows) * 5 / 100) + 500
                         END,
                     sqrt_threshold = CONVERT(bigint, SQRT(CONVERT(float, CASE WHEN ISNULL(rows, 0) < 1 THEN 1 ELSE rows END) * 1000)),
-                    days_stale = ISNULL(DATEDIFF(DAY, last_updated, SYSDATETIME()), 9999);
+                    days_stale = ISNULL(DATEDIFF(DAY, last_updated, SYSDATETIME()), 9999),
+                    hours_stale = ISNULL(DATEDIFF(HOUR, last_updated, SYSDATETIME()), 999999); /* v2.3 */
 
                 /*
                 ================================================================
@@ -3808,9 +4130,12 @@ BEGIN
                         OR (@TieredThresholds_param = 1 AND (modification_counter >= tier_threshold OR modification_counter >= sqrt_threshold))
                         /* Days stale */
                         OR (@DaysStaleThreshold_param IS NOT NULL AND days_stale >= @DaysStaleThreshold_param)
+                        /* Hours stale (v2.3 - precise time-based threshold, alternative to @DaysStaleThreshold) */
+                        OR (@HoursStaleThreshold_param IS NOT NULL AND hours_stale >= @HoursStaleThreshold_param)
                         /* No thresholds = include all */
                         OR (@ModificationThreshold_param IS NULL AND @ModificationPercent_param IS NULL
-                            AND @TieredThresholds_param = 0 AND @DaysStaleThreshold_param IS NULL)
+                            AND @TieredThresholds_param = 0 AND @DaysStaleThreshold_param IS NULL
+                            AND @HoursStaleThreshold_param IS NULL)
                     );
                 END
                 ELSE /* AND logic */
@@ -3827,6 +4152,10 @@ BEGIN
                     )
                     AND (
                         @DaysStaleThreshold_param IS NULL OR days_stale >= @DaysStaleThreshold_param
+                    )
+                    AND (
+                        /* v2.3: hours stale threshold */
+                        @HoursStaleThreshold_param IS NULL OR hours_stale >= @HoursStaleThreshold_param
                     );
                 END;
 
@@ -4051,6 +4380,7 @@ BEGIN
                                          WHEN N''DURATION'' THEN ISNULL(qs.total_duration_ms, 0)
                                          WHEN N''READS'' THEN ISNULL(qs.total_logical_reads, 0) / 1000
                                          WHEN N''EXECUTIONS'' THEN ISNULL(qs.total_executions, 0)
+                                         WHEN N''AVG_CPU'' THEN ISNULL(qs.total_cpu_ms, 0) / NULLIF(qs.total_executions, 0) /* avg CPU per execution */
                                          ELSE ISNULL(qs.total_cpu_ms, 0)
                                      END
                                 ELSE 0
@@ -4115,7 +4445,8 @@ BEGIN
                                 ELSE modification_counter
                             END DESC
                     )
-                FROM #stat_candidates;
+                FROM #stat_candidates
+                OPTION (MAX_GRANT_PERCENT = 25); /* Cap memory grant: prevents monopolizing server memory during maintenance */
 
                 DROP TABLE #stat_candidates;
                 ';
@@ -4142,6 +4473,7 @@ BEGIN
                       @TieredThresholds_param bit,
                       @ThresholdLogic_param nvarchar(3),
                       @DaysStaleThreshold_param integer,
+                      @HoursStaleThreshold_param integer,
                       @MinPageCount_param bigint,
                       @IncludeSystemObjects_param nvarchar(1),
                       @Tables_param nvarchar(max),
@@ -4152,6 +4484,7 @@ BEGIN
                       @QueryStoreMetric_param nvarchar(20),
                       @QueryStoreMinExecutions_param bigint,
                       @QueryStoreRecentHours_param integer,
+                      @SkipTablesWithColumnstore_param nchar(1),
                       @Debug_param bit',
                     @SortOrder_param = @SortOrder,
                     @TargetNorecompute_param = @TargetNorecompute,
@@ -4160,6 +4493,7 @@ BEGIN
                     @TieredThresholds_param = @TieredThresholds,
                     @ThresholdLogic_param = @ThresholdLogic,
                     @DaysStaleThreshold_param = @DaysStaleThreshold,
+                    @HoursStaleThreshold_param = @HoursStaleThreshold,
                     @MinPageCount_param = @MinPageCount,
                     @IncludeSystemObjects_param = @IncludeSystemObjects,
                     @Tables_param = @Tables,
@@ -4170,6 +4504,7 @@ BEGIN
                     @QueryStoreMetric_param = @QueryStoreMetric,
                     @QueryStoreMinExecutions_param = @QueryStoreMinExecutions,
                     @QueryStoreRecentHours_param = @QueryStoreRecentHours,
+                    @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore,
                     @Debug_param = @Debug;
             END; /* End of staged discovery */
 
@@ -4278,6 +4613,7 @@ BEGIN
                              WHEN N''DURATION'' THEN ISNULL(qs_stats.total_duration_ms, 0)
                              WHEN N''READS'' THEN ISNULL(qs_stats.total_logical_reads, 0) / 1000 /* scale down */
                              WHEN N''EXECUTIONS'' THEN ISNULL(qs_stats.total_executions, 0)
+                             WHEN N''AVG_CPU'' THEN ISNULL(qs_stats.total_cpu_ms, 0) / NULLIF(qs_stats.total_executions, 0) /* avg CPU per execution */
                              ELSE ISNULL(qs_stats.total_cpu_ms, 0) /* default to CPU */
                          END
                     ELSE 0
@@ -4302,6 +4638,7 @@ BEGIN
                                      WHEN N''DURATION'' THEN ISNULL(qs_stats.total_duration_ms, 0)
                                      WHEN N''READS'' THEN ISNULL(qs_stats.total_logical_reads, 0) / 1000
                                      WHEN N''EXECUTIONS'' THEN ISNULL(qs_stats.total_executions, 0)
+                                     WHEN N''AVG_CPU'' THEN ISNULL(qs_stats.total_cpu_ms, 0) / NULLIF(qs_stats.total_executions, 0)
                                      ELSE ISNULL(qs_stats.total_cpu_ms, 0)
                                  END
                             ELSE 0
@@ -4321,6 +4658,7 @@ BEGIN
                                      WHEN N''DURATION'' THEN ISNULL(qs_stats.total_duration_ms, 0)
                                      WHEN N''READS'' THEN ISNULL(qs_stats.total_logical_reads, 0) / 1000
                                      WHEN N''EXECUTIONS'' THEN ISNULL(qs_stats.total_executions, 0)
+                                     WHEN N''AVG_CPU'' THEN ISNULL(qs_stats.total_cpu_ms, 0) / NULLIF(qs_stats.total_executions, 0)
                                      ELSE ISNULL(qs_stats.total_cpu_ms, 0)
                                  END
                             WHEN N''FILTERED_DRIFT''
@@ -4477,12 +4815,18 @@ BEGIN
                           @DaysStaleThreshold_param IS NOT NULL
                           AND ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999) >= @DaysStaleThreshold_param
                       )
+                      /* Hours stale threshold (v2.3 - precise time-based, alternative to @DaysStaleThreshold) */
+                      OR (
+                          @HoursStaleThreshold_param IS NOT NULL
+                          AND ISNULL(DATEDIFF(HOUR, sp.last_updated, SYSDATETIME()), 999999) >= @HoursStaleThreshold_param
+                      )
                       /* If no thresholds specified, include all */
                       OR (
                           @ModificationThreshold_param IS NULL
                           AND @ModificationPercent_param IS NULL
                           AND @TieredThresholds_param = 0
                           AND @DaysStaleThreshold_param IS NULL
+                          AND @HoursStaleThreshold_param IS NULL
                       )
                   )
               )
@@ -4510,6 +4854,11 @@ BEGIN
                       /* Days stale - must be met if specified */
                       @DaysStaleThreshold_param IS NULL
                       OR ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999) >= @DaysStaleThreshold_param
+                  )
+                  AND (
+                      /* Hours stale (v2.3) - must be met if specified */
+                      @HoursStaleThreshold_param IS NULL
+                      OR ISNULL(DATEDIFF(HOUR, sp.last_updated, SYSDATETIME()), 999999) >= @HoursStaleThreshold_param
                   )
               )
               ) /* End of threshold logic wrapper - ensures table/exclusion filters apply to both OR and AND modes */
@@ -4586,6 +4935,17 @@ BEGIN
                /* Or if it meets the normal threshold anyway */
                OR ISNULL(sp.modification_counter, 0) >= @ModificationThreshold_param
               )
+        /* v2.3: Skip tables with columnstore indexes when @SkipTablesWithColumnstore = Y */
+        AND   (
+                  @SkipTablesWithColumnstore_param = N''N''
+               OR NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM sys.indexes AS ci
+                      WHERE ci.object_id = s.object_id
+                      AND   ci.type IN (5, 6) /* 5 = nonclustered columnstore, 6 = clustered columnstore */
+                  )
+              )
         ORDER BY
             priority
         OPTION (RECOMPILE);'; /*Prevents plan caching issues with varying parameters*/
@@ -4599,6 +4959,7 @@ BEGIN
                 @TieredThresholds_param bit,
                 @ThresholdLogic_param nvarchar(3),
                 @DaysStaleThreshold_param integer,
+                @HoursStaleThreshold_param integer,
                 @MinPageCount_param bigint,
                 @IncludeSystemObjects_param nvarchar(1),
                 @Tables_param nvarchar(max),
@@ -4609,7 +4970,8 @@ BEGIN
                 @QueryStorePriority_param nvarchar(1),
                 @QueryStoreMetric_param nvarchar(20),
                 @QueryStoreMinExecutions_param bigint,
-                @QueryStoreRecentHours_param integer';
+                @QueryStoreRecentHours_param integer,
+                @SkipTablesWithColumnstore_param nchar(1)';
 
         /*
         Execute discovery in target database
@@ -4659,6 +5021,7 @@ BEGIN
                 @TieredThresholds_param = @TieredThresholds,
                 @ThresholdLogic_param = @ThresholdLogic,
                 @DaysStaleThreshold_param = @DaysStaleThreshold,
+                @HoursStaleThreshold_param = @HoursStaleThreshold,
                 @MinPageCount_param = @MinPageCount,
                 @IncludeSystemObjects_param = @IncludeSystemObjects,
                 @Tables_param = @Tables,
@@ -4669,7 +5032,8 @@ BEGIN
                 @QueryStorePriority_param = @QueryStorePriority,
                 @QueryStoreMetric_param = @QueryStoreMetric,
                 @QueryStoreMinExecutions_param = @QueryStoreMinExecutions,
-                @QueryStoreRecentHours_param = @QueryStoreRecentHours;
+                @QueryStoreRecentHours_param = @QueryStoreRecentHours,
+                @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore;
 
             END; /* End of legacy discovery (explicit or fallback) */
 
@@ -4947,7 +5311,7 @@ BEGIN
     - First worker creates/claims Queue row and populates QueueStatistic
     - QueueStatistic stores ONE ROW PER TABLE (not per stat)
     - This ensures no two workers update stats on the same table concurrently
-    - Dead workers detected via sys.dm_exec_requests
+    - Dead workers detected via sys.dm_exec_sessions (sleeping workers between stats appear in dm_exec_sessions but not dm_exec_requests)
 
     Queue claim uses UPDLOCK, HOLDLOCK pattern from Ola Hallengren.
     */
@@ -4955,6 +5319,41 @@ BEGIN
     BEGIN
         RAISERROR(N'', 10, 1) WITH NOWAIT;
         RAISERROR(N'Parallel mode: Initializing work queue...', 10, 1) WITH NOWAIT;
+
+        /*
+        v2.3: Backward-compatible migration — add ParameterFingerprint to dbo.Queue if missing.
+        Allows detecting conflicting parameter sets when multiple workers join the same queue.
+        */
+        IF  OBJECT_ID(N'dbo.Queue', N'U') IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.Queue') AND name = N'ParameterFingerprint')
+        BEGIN
+            BEGIN TRY
+                ALTER TABLE dbo.Queue ADD ParameterFingerprint int NULL;
+                IF @Debug = 1
+                    RAISERROR(N'  Added ParameterFingerprint column to dbo.Queue (v2.3 migration).', 10, 1) WITH NOWAIT;
+            END TRY
+            BEGIN CATCH
+                /* Non-blocking: if ALTER fails (e.g., permissions), proceed without fingerprint */
+                IF @Debug = 1
+                BEGIN
+                    DECLARE @fp_alter_err nvarchar(500) = ERROR_MESSAGE();
+                    RAISERROR(N'  Warning: Could not add ParameterFingerprint to dbo.Queue: %s', 10, 1, @fp_alter_err) WITH NOWAIT;
+                END;
+            END CATCH;
+        END;
+
+        /*
+        v2.3: Compute parameter fingerprint for conflict detection.
+        CHECKSUM of key threshold parameters that define what qualifies for update.
+        If two workers compute different fingerprints, they have incompatible criteria.
+        */
+        DECLARE @parameter_fingerprint int = CHECKSUM(
+            ISNULL(CONVERT(nvarchar(10), @TieredThresholds), N'NULL'),
+            ISNULL(CONVERT(nvarchar(20), @ModificationThreshold), N'NULL'),
+            ISNULL(CONVERT(nvarchar(20), @ModificationPercent), N'NULL'),
+            ISNULL(CONVERT(nvarchar(20), @DaysStaleThreshold), N'NULL'),
+            ISNULL(@QueryStoreMetric, N'NULL')
+        );
 
         /*
         Build parameters string to identify this run.
@@ -5017,9 +5416,47 @@ BEGIN
                     SET @queue_id = SCOPE_IDENTITY();
 
                     RAISERROR(N'  Created new queue (QueueID = %d)', 10, 1, @queue_id) WITH NOWAIT;
-                END;
+
+                    /* v2.3: Store parameter fingerprint for conflict detection */
+                    BEGIN TRY
+                        IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.Queue') AND name = N'ParameterFingerprint')
+                        BEGIN
+                            UPDATE dbo.Queue
+                            SET ParameterFingerprint = @parameter_fingerprint
+                            WHERE QueueID = @queue_id;
+                        END;
+                    END TRY
+                    BEGIN CATCH
+                        /* Non-blocking: fingerprint is diagnostic, not critical */
+                    END CATCH;
+                END
 
                 COMMIT TRANSACTION;
+
+                /* v2.3: After transaction, check parameter fingerprint for conflict detection */
+                /* (Done outside transaction to avoid leaving open txn on conflict RETURN) */
+                BEGIN TRY
+                    IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.Queue') AND name = N'ParameterFingerprint')
+                    BEGIN
+                        DECLARE @stored_fingerprint int;
+                        SELECT @stored_fingerprint = ParameterFingerprint
+                        FROM dbo.Queue
+                        WHERE QueueID = @queue_id;
+
+                        IF  @stored_fingerprint IS NOT NULL
+                        AND @stored_fingerprint <> @parameter_fingerprint
+                        BEGIN
+                            RAISERROR(N'Conflicting sp_StatUpdate parameters detected. Worker cannot join existing queue initialized with different threshold parameters. (Stored fingerprint: %d, This worker: %d)', 16, 1,
+                                @stored_fingerprint, @parameter_fingerprint);
+                            IF @StatsInParallel = N'N'
+                                EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+                            RETURN 50001;
+                        END;
+                    END;
+                END TRY
+                BEGIN CATCH
+                    /* Non-blocking: if fingerprint check fails, proceed to join the queue */
+                END CATCH;
             END;
 
             /*
@@ -5050,29 +5487,26 @@ BEGIN
             FROM dbo.Queue AS q
             WHERE q.QueueID = @queue_id
             /*
-            Only claim if previous leader is dead (not in dm_exec_requests)
+            Only claim if previous leader is dead (not in dm_exec_sessions).
+            Using dm_exec_sessions: a sleeping leader appears in dm_exec_sessions but not dm_exec_requests.
             */
             AND   NOT EXISTS
                   (
                       SELECT
                           1
-                      FROM sys.dm_exec_requests AS r
-                      WHERE r.session_id = q.SessionID
-                      AND   r.request_id = q.RequestID
-                      AND   r.start_time = q.RequestStartTime
+                      FROM sys.dm_exec_sessions AS s
+                      WHERE s.session_id = q.SessionID
                   )
             /*
-            And no active workers in QueueStatistic
+            And no active workers in QueueStatistic (sessions still alive in dm_exec_sessions)
             */
             AND   NOT EXISTS
                   (
                       SELECT
                           1
                       FROM dbo.QueueStatistic AS qs
-                      JOIN sys.dm_exec_requests AS r
-                        ON r.session_id = qs.SessionID
-                       AND r.request_id = qs.RequestID
-                       AND r.start_time = qs.RequestStartTime
+                      JOIN sys.dm_exec_sessions AS s
+                        ON s.session_id = qs.SessionID
                       WHERE qs.QueueID = @queue_id
                   );
 
@@ -5269,7 +5703,9 @@ BEGIN
             BEGIN
                 /*
                 First, release any tables claimed by dead workers.
-                A worker is dead if its session/request is no longer in dm_exec_requests.
+                A worker is dead if its session is no longer in dm_exec_sessions.
+                Using dm_exec_sessions (not dm_exec_requests) because workers sleeping
+                between stat claims are not in dm_exec_requests but ARE in dm_exec_sessions.
                 */
                 UPDATE
                     qs
@@ -5277,27 +5713,31 @@ BEGIN
                     qs.TableStartTime = NULL,
                     qs.SessionID = NULL,
                     qs.RequestID = NULL,
-                    qs.RequestStartTime = NULL
+                    qs.RequestStartTime = NULL,
+                    qs.LastStatCompletedAt = NULL /* v2.3: reset heartbeat when releasing dead worker row */
                 FROM dbo.QueueStatistic AS qs
                 WHERE qs.QueueID = @queue_id
                 AND   qs.TableStartTime IS NOT NULL
                 AND   qs.TableEndTime IS NULL
                 AND   (
-                          /* Original check: worker not in dm_exec_requests (session ended) */
+                          /* Primary check: worker session no longer exists in dm_exec_sessions */
                           NOT EXISTS
                           (
                               SELECT
                                   1
-                              FROM sys.dm_exec_requests AS r
-                              WHERE r.session_id = qs.SessionID
-                              AND   r.request_id = qs.RequestID
-                              AND   r.start_time = qs.RequestStartTime
+                              FROM sys.dm_exec_sessions AS s
+                              WHERE s.session_id = qs.SessionID
                           )
                           OR
-                          /* Timeout check: worker stuck for too long (might be blocked or hung) */
+                          /* Timeout check: worker stuck for too long (might be blocked or hung).
+                             v2.3: Use LastStatCompletedAt (per-stat heartbeat) when available;
+                             fall back to TableStartTime for backward compatibility.
+                             "Dead" = no stat completed in N minutes AND session no longer exists. */
                           (
                               @DeadWorkerTimeoutMinutes IS NOT NULL
-                              AND DATEDIFF(MINUTE, qs.TableStartTime, SYSDATETIME()) > @DeadWorkerTimeoutMinutes
+                              AND DATEDIFF(MINUTE,
+                                  COALESCE(qs.LastStatCompletedAt, qs.TableStartTime),
+                                  SYSDATETIME()) > @DeadWorkerTimeoutMinutes
                           )
                       );
 
@@ -5332,9 +5772,10 @@ BEGIN
                 DELETE FROM @claimed_tables;
 
                 /*
-                READPAST hint (v1.9 #25): Skip locked rows instead of waiting.
-                When multiple workers claim tables concurrently, READPAST prevents
-                one worker from blocking while another commits its claim update.
+                ROWLOCK+READPAST hints (v1.9 #25 + v2.3): Skip locked rows instead of waiting.
+                ROWLOCK ensures row-level lock granularity (prevents escalation to table locks
+                on large queue tables). READPAST skips rows locked by other concurrent workers.
+                When multiple workers claim tables concurrently, this prevents blocking.
                 */
                 UPDATE
                     qs
@@ -5361,7 +5802,7 @@ BEGIN
                     inserted.ObjectName,
                     inserted.ObjectID
                 INTO @claimed_tables
-                FROM dbo.QueueStatistic AS qs WITH (READPAST)
+                FROM dbo.QueueStatistic AS qs WITH (ROWLOCK, READPAST)
                 WHERE qs.QueueID = @queue_id
                 AND   qs.TableStartTime IS NULL
                 AND   qs.TablePriority =
@@ -6061,7 +6502,17 @@ BEGIN
 
             IF @toctou_exists = 0
             BEGIN
-                RAISERROR(N'  SKIPPED: statistic no longer exists (dropped between discovery and execution)', 10, 1) WITH NOWAIT;
+                IF @Debug = 1
+                BEGIN
+                    DECLARE @toctou_msg nvarchar(2000) =
+                        N'  Skipping ' + QUOTENAME(@current_schema_name) + N'.' + QUOTENAME(@current_table_name) + N'.' + QUOTENAME(@current_stat_name)
+                        + N': object no longer exists (dropped or renamed between discovery and execution)';
+                    RAISERROR(@toctou_msg, 10, 1) WITH NOWAIT;
+                END
+                ELSE
+                BEGIN
+                    RAISERROR(N'  SKIPPED: statistic no longer exists (dropped between discovery and execution)', 10, 1) WITH NOWAIT;
+                END;
                 SET @stats_skipped += 1;
                 SET @stats_processed -= 1; /* Undo increment - TOCTOU skip is not a real attempt */
 
@@ -6087,6 +6538,20 @@ BEGIN
                     @claimed_table_stats_updated += CASE WHEN @StatsInParallel = N'Y' THEN 1 ELSE 0 END,
                     @duration_ms = DATEDIFF(MILLISECOND, @current_start_time, @current_end_time),
                     @progress_msg = N'  Complete (' + CONVERT(nvarchar(10), @duration_ms) + N' ms)';
+
+                /* v2.3: Update LastStatCompletedAt to track per-stat heartbeat for dead worker detection */
+                IF  @StatsInParallel = N'Y'
+                AND @claimed_table_database IS NOT NULL
+                AND OBJECT_ID(N'dbo.QueueStatistic', N'U') IS NOT NULL
+                AND EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic') AND name = N'LastStatCompletedAt')
+                BEGIN
+                    UPDATE dbo.QueueStatistic
+                    SET LastStatCompletedAt = SYSDATETIME()
+                    WHERE QueueID = @queue_id
+                    AND   DatabaseName = @claimed_table_database
+                    AND   SchemaName = @claimed_table_schema
+                    AND   ObjectName = @claimed_table_name;
+                END;
 
                 RAISERROR(@progress_msg, 10, 1) WITH NOWAIT;
 
@@ -6484,6 +6949,7 @@ BEGIN
     DECLARE
         @end_time datetime2(7) = SYSDATETIME(),
         @duration_seconds integer = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
+        @duration_ms_total bigint = DATEDIFF(MILLISECOND, @start_time, SYSDATETIME()),
         @remaining_stats integer =
         (
             SELECT
@@ -6532,7 +6998,11 @@ BEGIN
     RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
     RAISERROR(N'End time:        %s', 10, 1, @end_time_display) WITH NOWAIT;
-    RAISERROR(N'Duration:        %d seconds', 10, 1, @duration_seconds) WITH NOWAIT;
+    /* Sub-second duration display: show decimal seconds (e.g., 0.9s not 0s) */
+    DECLARE @duration_display nvarchar(30) =
+        CONVERT(nvarchar(20), @duration_ms_total / 1000) + N'.' +
+        CONVERT(nvarchar(3), (@duration_ms_total % 1000) / 100) + N's';
+    RAISERROR(N'Duration:        %s', 10, 1, @duration_display) WITH NOWAIT;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
     RAISERROR(N'Stats processed: %d / %d', 10, 1, @stats_processed, @total_stats) WITH NOWAIT;
     RAISERROR(N'  Succeeded:     %d', 10, 1, @stats_succeeded) WITH NOWAIT;
@@ -6557,6 +7027,19 @@ BEGIN
     AND @Execute = N'Y'
     AND @commandlog_exists = 1
     BEGIN
+        /* Build JSON summary for monitoring integration (v2.3) */
+        DECLARE @json_status nvarchar(10) =
+            CASE
+                WHEN @stats_failed > 0 THEN N'ERROR'
+                WHEN @remaining_stats > 0 THEN N'WARNING'
+                ELSE N'OK'
+            END;
+        DECLARE @json_summary_str nvarchar(500) =
+            N'{"succeeded":' + CONVERT(nvarchar(20), @stats_succeeded)
+            + N',"failed":' + CONVERT(nvarchar(20), @stats_failed)
+            + N',"duration_seconds":' + CONVERT(nvarchar(20), @duration_seconds)
+            + N',"status":"' + @json_status + N'"}';
+
         DECLARE
             @summary_xml xml =
             (
@@ -6570,7 +7053,8 @@ BEGIN
                     @stats_failed AS StatsFailed,
                     @remaining_stats AS StatsRemaining,
                     @duration_seconds AS DurationSeconds,
-                    @stop_reason AS StopReason
+                    @stop_reason AS StopReason,
+                    @json_summary_str AS JsonSummary
                 FOR
                     XML RAW(N'Summary'),
                     ELEMENTS
