@@ -36,11 +36,23 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.4.2026.0302 (Major.Minor.Year.MMDD)
+Version:    2.5.2026.0302 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.4.2026.0302 - v2.4 Code quality and LLM navigability:
+History:    2.5.2026.0302 - v2.5 Operational intelligence:
+                          - Add: CommandLog index advisory (#31). Warns when dbo.CommandLog
+                            lacks a nonclustered index on CommandType. Provides exact CREATE
+                            INDEX DDL. Suppressed when a suitable index already exists.
+                          - Add: Resource Governor detection (#35). Detects current session
+                            workload group and MAX_DOP cap. Warns (always, not just debug)
+                            when @MaxDOP > RG MAX_DOP — a silent production footgun.
+                          - Doc: @LockTimeout semantics clarified (#51). @Help now documents
+                            NULL vs -1 vs 0 vs positive values with recommendations.
+                          - Fix: Version history dates corrected (v2.3 entries had wrong date).
+                          - Closed: #53 (ALL_DATABASES already excludes system DBs), #41
+                            (NORECOMPUTE already preserved), #14 (misfiled — diag tool param).
+            2.4.2026.0302 - v2.4 Code quality and LLM navigability:
                           - Add: 19 region markers for LLM-friendly section navigation.
                             Enables surgical edits without full-file reprocessing.
                           - Fix: Collation-aware string comparisons (#48). All user-param-to-DMV-column
@@ -50,7 +62,7 @@ History:    2.4.2026.0302 - v2.4 Code quality and LLM navigability:
                           - Add: Per-phase timing in staged discovery (#40). Debug mode now reports
                             elapsed milliseconds for each of 6 discovery phases. Enables identification
                             of slow phases on databases with large catalogs (100K+ stats).
-            2.4.2026.0302 - Bug fix batch (Issues #27, #33, #47, #50, #52, #66):
+            2.3.2026.0227 - Bug fix batch (Issues #27, #33, #47, #50, #52, #66):
                           - Fix: sp_releaseapplock missing on queue CATCH RETURN path
                             (connection pool poison when queue init fails). (#27)
                           - Fix: @@TRANCOUNT check now returns immediately instead of
@@ -470,7 +482,7 @@ ALTER PROCEDURE
     LOGGING & OUTPUT (both modes)
     ============================================================================
     */
-    @LockTimeout integer = NULL, /*seconds to wait for schema locks before failing (NULL = no limit). Recommended for parallel mode to prevent blocking chains*/
+    @LockTimeout integer = NULL, /*seconds to wait for schema locks. NULL = session default (typically infinite), -1 = infinite, 0 = fail immediately on any contention, positive = seconds. Recommended: 30-300 for parallel mode*/
     @LogToTable nvarchar(1) = N'Y', /*Y = log to dbo.CommandLog (requires table), N = no logging*/
     @ProgressLogInterval int = NULL, /*log progress to CommandLog every N stats (for Agent job monitoring)*/
     @Execute nvarchar(1) = N'Y', /*Y = execute, N = print only (dry run)*/
@@ -537,7 +549,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.4.2026.0302',
+        @procedure_version varchar(20) = '2.5.2026.0302',
         @procedure_version_date datetime = '20260302',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -581,7 +593,9 @@ BEGIN
         SELECT
             N'v2.3: Bug fixes (#27 applock leak, #47 open tran halt, #50 SET validation, #52 DB access, #66 MAXRECURSION)' UNION ALL
         SELECT
-            N'v2.4: Region markers, collation-aware comparisons (#48), discovery phase timing (#40)';
+            N'v2.4: Region markers, collation-aware comparisons (#48), discovery phase timing (#40)' UNION ALL
+        SELECT
+            N'v2.5: CommandLog index advisory (#31), Resource Governor detection (#35), @LockTimeout docs (#51)';
 
         /*
         Parameter documentation
@@ -676,7 +690,7 @@ BEGIN
                     WHEN N'@CollectHeapForwarding'
                     THEN N'Y = collect heap forwarding pointer counts (slow), N = skip for performance'
                     WHEN N'@LockTimeout'
-                    THEN N'seconds to wait for locks (NULL = no limit)'
+                    THEN N'seconds to wait for schema locks. NULL = session default, -1 = infinite wait, 0 = fail immediately on any contention, positive = seconds before timeout. Recommended: 30-300 for parallel mode.'
                     WHEN N'@LogToTable'
                     THEN N'Y = log to dbo.CommandLog table'
                     WHEN N'@ProgressLogInterval'
@@ -763,6 +777,8 @@ BEGIN
                     THEN N'Y, N'
                     WHEN N'@MaxConsecutiveFailures'
                     THEN N'NULL, 1-N (e.g., 3, 5, 10)'
+                    WHEN N'@LockTimeout'
+                    THEN N'NULL (session default), -1 (infinite), 0 (fail immediately), 1-N seconds'
                     ELSE N''
                 END,
             defaults =
@@ -840,7 +856,7 @@ BEGIN
                     WHEN N'@CollectHeapForwarding'
                     THEN N'N'
                     WHEN N'@LockTimeout'
-                    THEN N'NULL'
+                    THEN N'NULL (session default)'
                     WHEN N'@LogToTable'
                     THEN N'Y'
                     WHEN N'@ProgressLogInterval'
@@ -1540,6 +1556,28 @@ BEGIN
                 N'WARNING: dbo.CommandLog schema may be incompatible. Expected columns missing: '
                 + @commandlog_missing_cols + N'. Logging may fail.';
             RAISERROR(@commandlog_warn, 10, 1) WITH NOWAIT;
+        END;
+
+        /*
+        v2.5: CommandLog index advisory (#31).
+        Large CommandLog tables (5M+ rows, common on busy instances running multiple maintenance
+        jobs) cause full scans on @CleanupOrphanedRuns, @LongRunningThresholdMinutes, and progress
+        queries. A nonclustered index leading on CommandType eliminates these scans.
+        */
+        IF NOT EXISTS
+           (
+               SELECT 1
+               FROM sys.indexes AS i
+               JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+               JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+               WHERE i.object_id = OBJECT_ID(N'dbo.CommandLog')
+               AND   i.type IN (1, 2) /* clustered or nonclustered */
+               AND   c.name = N'CommandType'
+               AND   ic.key_ordinal = 1
+           )
+        BEGIN
+            RAISERROR(N'ADVISORY: dbo.CommandLog has no index leading on CommandType. On large tables this causes full scans during orphan cleanup and adaptive sampling. Consider:', 10, 1) WITH NOWAIT;
+            RAISERROR(N'  CREATE NONCLUSTERED INDEX IX_CommandLog_CommandType_StartTime ON dbo.CommandLog (CommandType, StartTime) INCLUDE (DatabaseName, SchemaName, ObjectName, StatisticsName, ExtendedInfo, EndTime, ErrorNumber);', 10, 1) WITH NOWAIT;
         END;
     END;
 
@@ -3098,6 +3136,55 @@ BEGIN
 
         IF @active_backups > 0
             RAISERROR(N'  Warning: %d backup operation(s) currently running. Statistics updates may compete for I/O.', 10, 1, @active_backups) WITH NOWAIT;
+    END;
+
+    /*
+    v2.5: Resource Governor detection (#35).
+    Query runs always (not just debug) so @MaxDOP conflict warning works.
+    Display is debug-only; warning is always shown.
+    */
+    DECLARE
+        @rg_workload_group sysname,
+        @rg_max_dop int;
+
+    SELECT
+        @rg_workload_group = wg.name,
+        @rg_max_dop = wg.max_dop
+    FROM sys.dm_exec_sessions AS s
+    JOIN sys.dm_resource_governor_workload_groups AS wg
+      ON wg.group_id = s.group_id
+    WHERE s.session_id = @@SPID;
+
+    IF @Debug = 1 AND @rg_workload_group IS NOT NULL
+    BEGIN
+        IF @rg_max_dop > 0 /* 0 = no RG cap */
+            RAISERROR(N'  Resource Governor: workload group [%s], MAX_DOP=%d', 10, 1,
+                @rg_workload_group, @rg_max_dop) WITH NOWAIT;
+        ELSE
+            RAISERROR(N'  Resource Governor: workload group [%s] (no DOP cap)', 10, 1,
+                @rg_workload_group) WITH NOWAIT;
+    END;
+
+    /*
+    v2.5: Resource Governor @MaxDOP conflict warning (#35).
+    Always shown (not just debug) when @MaxDOP > RG MAX_DOP — a real production footgun.
+    */
+    IF  @MaxDOP IS NOT NULL
+    AND @rg_max_dop IS NOT NULL
+    AND @rg_max_dop > 0
+    AND @MaxDOP > @rg_max_dop
+    BEGIN
+        DECLARE @rg_warn nvarchar(500) =
+            N'WARNING: @MaxDOP=' + CONVERT(nvarchar(10), @MaxDOP) +
+            N' but Resource Governor workload group [' + @rg_workload_group +
+            N'] caps MAX_DOP=' + CONVERT(nvarchar(10), @rg_max_dop) +
+            N'. @MaxDOP hint will be silently capped by SQL Server.';
+        RAISERROR(@rg_warn, 10, 1) WITH NOWAIT;
+
+        /* Add to warnings output for programmatic consumers */
+        SET @WarningsOut = ISNULL(@WarningsOut, N'') +
+            N'RG_MAXDOP_CAP: RG caps @MaxDOP from ' + CONVERT(nvarchar(10), @MaxDOP) +
+            N' to ' + CONVERT(nvarchar(10), @rg_max_dop) + N'; ';
     END;
 
     /*
