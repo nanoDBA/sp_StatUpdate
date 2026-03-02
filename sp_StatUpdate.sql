@@ -36,11 +36,30 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.3.2026.0226 (Major.Minor.Year.MMDD)
+Version:    2.3.2026.0227 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.3.2026.0226 - v2.3 SME Persona Synthesis Implementation:
+History:    2.3.2026.0227 - Bug fix batch (Issues #27, #33, #47, #50, #52, #66):
+                          - Fix: sp_releaseapplock missing on queue CATCH RETURN path
+                            (connection pool poison when queue init fails). (#27)
+                          - Fix: @@TRANCOUNT check now returns immediately instead of
+                            deferring to validation block. UPDATE STATISTICS acquires
+                            Sch-M locks that escalate unpredictably inside caller
+                            transactions. (#47)
+                          - Fix: SET options enforcement added — proactively sets
+                            ANSI_WARNINGS and ARITHABORT ON at startup (auto-reverts on
+                            proc return). Prevents error 1934 from JDBC/linked server
+                            connections. ANSI_NULLS captured at CREATE time. (#50)
+                          - Fix: @Databases CTE MAXRECURSION raised from 500 to 0
+                            (unlimited). Supports instances with 1000+ databases. (#66)
+                          - Fix: ALL_DATABASES now filters with HAS_DBACCESS() to skip
+                            SINGLE_USER databases held by other sessions. Per-database
+                            TRY/CATCH prevents inaccessible databases from aborting the
+                            entire run. (#52)
+                          - Doc: @ExcludeStatistics/@ExcludeTables @Help text now documents
+                            LIKE wildcard semantics (_ = single-char, [_] for literal). (#33)
+            2.3.2026.0226 - v2.3 SME Persona Synthesis Implementation:
                             Trivial: MAXRECURSION 1000, sub-second durations, dm_exec_sessions,
                               ROWLOCK+READPAST, MAX_GRANT_PERCENT=25, TOCTOU message, hardware
                               context extension, JSON summary in ExtendedInfo END.
@@ -269,7 +288,7 @@ History:    2.3.2026.0226 - v2.3 SME Persona Synthesis Implementation:
                             OUTPUT parameters for automation, TRY/CATCH around CommandLog,
                             OPTION (RECOMPILE) on discovery queries, @commandlog_exists
                             caching, non-zero return code on failures for Agent jobs,
-                            severity 16 on time/batch limits, MAXRECURSION 500.
+                            severity 16 on time/batch limits, MAXRECURSION 0 (unlimited).
             1.2.2026.0117 - Tiger Toolbox 5-tier adaptive thresholds (@TieredThresholds),
                             AND/OR threshold logic (@ThresholdLogic),
                             version-aware PERSIST_SAMPLE_PERCENT and MAXDOP.
@@ -507,8 +526,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.3.2026.0226',
-        @procedure_version_date datetime = '20260226',
+        @procedure_version varchar(20) = '2.3.2026.0227',
+        @procedure_version_date datetime = '20260227',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -545,7 +564,9 @@ BEGIN
         SELECT
             N'v2.1 Phase 2: Extended Awareness (replication, CDC, temporal, consecutive failures)' UNION ALL
         SELECT
-            N'v2.2: Adversarial review fixes (DIRECT mode crash, re-entrancy guard, TOCTOU check)';
+            N'v2.2: Adversarial review fixes (DIRECT mode crash, re-entrancy guard, TOCTOU check)' UNION ALL
+        SELECT
+            N'v2.3: Bug fixes (#27 applock leak, #47 open tran halt, #50 SET validation, #52 DB access, #66 MAXRECURSION)';
 
         /*
         Parameter documentation
@@ -580,9 +601,9 @@ BEGIN
                     WHEN N'@Tables'
                     THEN N'DISCOVERY MODE: table filter (NULL = all, comma-separated Schema.Table)'
                     WHEN N'@ExcludeTables'
-                    THEN N'DISCOVERY MODE: exclude tables by name pattern (supports % wildcard)'
+                    THEN N'DISCOVERY MODE: exclude tables by LIKE pattern (% = multi-char, _ = single-char wildcard, [_] for literal underscore)'
                     WHEN N'@ExcludeStatistics'
-                    THEN N'DISCOVERY MODE: exclude stats by name pattern (supports % wildcard)'
+                    THEN N'DISCOVERY MODE: exclude stats by LIKE pattern (% = multi-char, _ = single-char wildcard, [_] for literal underscore)'
                     WHEN N'@IncludeSystemObjects'
                     THEN N'Y = include system object statistics (sys.* tables/views), N = user objects only'
                     WHEN N'@TargetNorecompute'
@@ -1411,20 +1432,34 @@ BEGIN
             END;
 
     /*
-    Check transaction count
+    Check transaction count - RETURN immediately (UPDATE STATISTICS acquires Sch-M locks
+    that escalate unpredictably inside caller's transaction; connection pool poison risk)
     */
     IF @@TRANCOUNT <> 0
     BEGIN
-        INSERT INTO
-            @errors
-        (
-            error_message,
-            error_severity
-        )
-        SELECT
-            error_message =
-                N'The transaction count is not 0. sp_StatUpdate should not be called within an open transaction.',
-            error_severity = 16;
+        RAISERROR(N'The transaction count is not 0. sp_StatUpdate must not be called within an open transaction.', 16, 1) WITH NOWAIT;
+        IF @StatsInParallel = N'N'
+            EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+        RETURN 1;
+    END;
+
+    /*
+    Enforce SET options required by UPDATE STATISTICS on indexed views / computed columns.
+    Error 1934 fires when these are off (common via JDBC, linked servers, legacy ODBC).
+    Proactively SET them here — values revert automatically when the proc returns.
+    ANSI_NULLS is captured at proc CREATE time (preamble), so only ANSI_WARNINGS
+    and ARITHABORT need runtime enforcement.
+    */
+    IF SESSIONPROPERTY(N'ANSI_WARNINGS') <> 1
+    BEGIN
+        SET ANSI_WARNINGS ON;
+        RAISERROR(N'Note: SET ANSI_WARNINGS ON (was OFF, required for UPDATE STATISTICS)', 10, 1) WITH NOWAIT;
+    END;
+
+    IF SESSIONPROPERTY(N'ARITHABORT') <> 1
+    BEGIN
+        SET ARITHABORT ON;
+        RAISERROR(N'Note: SET ARITHABORT ON (was OFF, required for UPDATE STATISTICS)', 10, 1) WITH NOWAIT;
     END;
 
     /*
@@ -2283,7 +2318,7 @@ BEGIN
             StartPosition,
             Selected
         FROM Databases3
-        OPTION (MAXRECURSION 1000); /* Support up to 1000 comma-separated databases */
+        OPTION (MAXRECURSION 0); /* Unlimited - supports instances with 1000+ databases */
     END;
 
     /*
@@ -2317,7 +2352,8 @@ BEGIN
     FROM sys.databases AS d
     WHERE d.name <> N'tempdb'
     AND   d.source_database_id IS NULL  /* Exclude database snapshots */
-    AND   d.state = 0;                  /* ONLINE only */
+    AND   d.state = 0                   /* ONLINE only */
+    AND   HAS_DBACCESS(d.name) = 1;     /* Skip SINGLE_USER held by other sessions */
 
     /*
     Apply selections (inclusion pass first)
@@ -3767,6 +3803,13 @@ BEGIN
             RAISERROR(N'  Scanning database: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
 
             /*
+            Per-database TRY/CATCH: Skip databases that become inaccessible during the run
+            (SINGLE_USER acquired by another session, taken offline, etc.) instead of
+            aborting the entire run or counting toward @MaxConsecutiveFailures.
+            */
+            BEGIN TRY
+
+            /*
             ========================================================================
             PER-DATABASE ENVIRONMENT INFO (Phase 1.1/1.4 - v2.0, debug mode only)
             ========================================================================
@@ -5037,6 +5080,14 @@ BEGIN
 
             END; /* End of legacy discovery (explicit or fallback) */
 
+            END TRY
+            BEGIN CATCH
+                DECLARE @db_skip_msg nvarchar(4000) =
+                    N'  WARNING: Skipping database ' + QUOTENAME(@CurrentDatabaseName) +
+                    N' - ' + ERROR_MESSAGE();
+                RAISERROR(@db_skip_msg, 10, 1) WITH NOWAIT;
+            END CATCH;
+
             /*
             Mark this database as completed (runs for both staged and legacy)
             */
@@ -5594,6 +5645,8 @@ BEGIN
                 @queue_error_message nvarchar(4000) = ERROR_MESSAGE();
 
             RAISERROR(N'ERROR: Queue initialization failed: %s', 16, 1, @queue_error_message) WITH NOWAIT;
+            IF @StatsInParallel = N'N'
+                EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
             RETURN -1;
         END CATCH;
 
