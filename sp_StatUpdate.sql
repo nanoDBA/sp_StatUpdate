@@ -36,11 +36,21 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.3.2026.0227 (Major.Minor.Year.MMDD)
+Version:    2.4.2026.0302 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.3.2026.0227 - Bug fix batch (Issues #27, #33, #47, #50, #52, #66):
+History:    2.4.2026.0302 - v2.4 Code quality and LLM navigability:
+                          - Add: 19 region markers for LLM-friendly section navigation.
+                            Enables surgical edits without full-file reprocessing.
+                          - Fix: Collation-aware string comparisons (#48). All user-param-to-DMV-column
+                            comparisons now include COLLATE DATABASE_DEFAULT. Affects @Databases LIKE,
+                            @Tables IN, @ExcludeTables LIKE, @ExcludeStatistics LIKE, @Statistics joins,
+                            @StatisticsFromTable joins. Prevents silent match failures on CS instances.
+                          - Add: Per-phase timing in staged discovery (#40). Debug mode now reports
+                            elapsed milliseconds for each of 6 discovery phases. Enables identification
+                            of slow phases on databases with large catalogs (100K+ stats).
+            2.4.2026.0302 - Bug fix batch (Issues #27, #33, #47, #50, #52, #66):
                           - Fix: sp_releaseapplock missing on queue CATCH RETURN path
                             (connection pool poison when queue init fails). (#27)
                           - Fix: @@TRANCOUNT check now returns immediately instead of
@@ -515,6 +525,7 @@ ALTER PROCEDURE
 WITH RECOMPILE
 AS
 BEGIN
+    /*#region 02-INIT: SET options, version constants */
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
     SET ARITHABORT ON;
@@ -526,8 +537,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.3.2026.0227',
-        @procedure_version_date datetime = '20260227',
+        @procedure_version varchar(20) = '2.4.2026.0302',
+        @procedure_version_date datetime = '20260302',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -537,7 +548,9 @@ BEGIN
     SELECT
         @Version = @procedure_version,
         @VersionDate = @procedure_version_date;
+    /*#endregion 02-INIT */
 
+    /*#region 03-HELP: @Help parameter output */
     /*
     ============================================================================
     HELP SECTION
@@ -566,7 +579,9 @@ BEGIN
         SELECT
             N'v2.2: Adversarial review fixes (DIRECT mode crash, re-entrancy guard, TOCTOU check)' UNION ALL
         SELECT
-            N'v2.3: Bug fixes (#27 applock leak, #47 open tran halt, #50 SET validation, #52 DB access, #66 MAXRECURSION)';
+            N'v2.3: Bug fixes (#27 applock leak, #47 open tran halt, #50 SET validation, #52 DB access, #66 MAXRECURSION)' UNION ALL
+        SELECT
+            N'v2.4: Region markers, collation-aware comparisons (#48), discovery phase timing (#40)';
 
         /*
         Parameter documentation
@@ -993,7 +1008,9 @@ BEGIN
 
         RETURN;
     END;
+    /*#endregion 03-HELP */
 
+    /*#region 04-REENTRANCE: Re-entrancy guard (sp_getapplock) */
     /*
     ============================================================================
     RE-ENTRANCY GUARD (sp_HeapDoctor pattern)
@@ -1017,7 +1034,9 @@ BEGIN
             RETURN;
         END;
     END;
+    /*#endregion 04-REENTRANCE */
 
+    /*#region 05-VARIABLES: Declarations, env detection, temp tables */
     /*
     ============================================================================
     VARIABLE DECLARATIONS
@@ -1387,7 +1406,9 @@ BEGIN
         (processed, priority)
     INCLUDE
         (database_name, schema_name, table_name, stat_name);
+    /*#endregion 05-VARIABLES */
 
+    /*#region 06-GUARDS: Core checks, @@TRANCOUNT, SET enforcement */
     /*
     ============================================================================
     CORE REQUIREMENTS CHECKS
@@ -1626,7 +1647,9 @@ BEGIN
         IF @Debug = 1
             RAISERROR(N'Added LastStatCompletedAt column to dbo.QueueStatistic (v2.3 migration).', 10, 1) WITH NOWAIT;
     END;
+    /*#endregion 06-GUARDS */
 
+    /*#region 07-PRESETS: Preset application, @StopByTime */
     /*
     ============================================================================
     PRESET APPLICATION (v1.9)
@@ -1732,7 +1755,9 @@ BEGIN
             /* Validation will catch invalid formats via the pre-check above */
         END CATCH;
     END;
+    /*#endregion 07-PRESETS */
 
+    /*#region 08-VALIDATION: Parameter validation (pre-database) */
     /*
     ============================================================================
     PARAMETER VALIDATION
@@ -2195,7 +2220,9 @@ BEGIN
                 N'The value for @SkipTablesWithColumnstore is not supported. Use Y or N.',
             error_severity = 16;
     END;
+    /*#endregion 08-VALIDATION */
 
+    /*#region 09-DB-PARSE: @Databases parsing, AG secondary check */
     /*
     ============================================================================
     PARSE @Databases - Ola Hallengren pattern
@@ -2362,7 +2389,7 @@ BEGIN
     SET td.Selected = sd.Selected
     FROM @tmpDatabases AS td
     INNER JOIN @SelectedDatabases AS sd
-        ON td.DatabaseName LIKE REPLACE(sd.DatabaseItem, N'_', N'[_]')
+        ON td.DatabaseName LIKE REPLACE(sd.DatabaseItem, N'_', N'[_]') COLLATE DATABASE_DEFAULT
         AND (td.DatabaseType = sd.DatabaseType OR sd.DatabaseType IS NULL)
         AND (td.AvailabilityGroup = sd.AvailabilityGroup OR sd.AvailabilityGroup IS NULL)
     WHERE sd.Selected = 1;
@@ -2374,7 +2401,7 @@ BEGIN
     SET td.Selected = sd.Selected
     FROM @tmpDatabases AS td
     INNER JOIN @SelectedDatabases AS sd
-        ON td.DatabaseName LIKE REPLACE(sd.DatabaseItem, N'_', N'[_]')
+        ON td.DatabaseName LIKE REPLACE(sd.DatabaseItem, N'_', N'[_]') COLLATE DATABASE_DEFAULT
         AND (td.DatabaseType = sd.DatabaseType OR sd.DatabaseType IS NULL)
         AND (td.AvailabilityGroup = sd.AvailabilityGroup OR sd.AvailabilityGroup IS NULL)
     WHERE sd.Selected = 0;
@@ -2470,7 +2497,9 @@ BEGIN
             EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
         RETURN 1;
     END;
+    /*#endregion 09-DB-PARSE */
 
+    /*#region 10-VALIDATION-REPORT: Validation reporting, error aggregation */
     /*
     ============================================================================
     PARAMETER VALIDATION
@@ -2718,7 +2747,9 @@ BEGIN
             EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
         RETURN 50000;
     END;
+    /*#endregion 10-VALIDATION-REPORT */
 
+    /*#region 11-PERMISSIONS: @CheckPermissionsOnly mode */
     /*
     ============================================================================
     @CheckPermissionsOnly mode (v2.3)
@@ -2814,7 +2845,9 @@ BEGIN
             CONVERT(nvarchar(50), SERVERPROPERTY(N'ServerName')) +
             N'_' +
             REPLACE(REPLACE(REPLACE(CONVERT(nvarchar(19), @start_time, 120), N'-', N''), N':', N''), N' ', N'_');
+    /*#endregion 11-PERMISSIONS */
 
+    /*#region 12-HEADER: Header output (server info, params, debug) */
     /*
     ============================================================================
     HEADER OUTPUT
@@ -3077,7 +3110,9 @@ BEGIN
     END;
 
     RAISERROR(N'', 10, 1) WITH NOWAIT;
+    /*#endregion 12-HEADER */
 
+    /*#region 13-RUN-INIT: CommandLog START, progress table, orphan cleanup */
     /*
     ============================================================================
     LOG RUN_HEADER TO COMMANDLOG
@@ -3296,7 +3331,9 @@ BEGIN
             RAISERROR(N'', 10, 1) WITH NOWAIT;
         END;
     END;
+    /*#endregion 13-RUN-INIT */
 
+    /*#region 14-PRE-DISCOVERY: Adaptive sampling cache, mode selection */
     /*
     ============================================================================
     QUERY COMMANDLOG FOR LONG-RUNNING STATS (adaptive sampling)
@@ -3394,7 +3431,9 @@ BEGIN
 
     RAISERROR(N'Mode: %s', 10, 1, @mode) WITH NOWAIT;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
+    /*#endregion 14-PRE-DISCOVERY */
 
+    /*#region 15-DIRECT-MODE: Mode 1: DIRECT_TABLE and DIRECT_STRING */
     /*
     ============================================================================
     MODE 1A: DIRECT_TABLE - Read from temp/permanent table
@@ -3585,14 +3624,14 @@ BEGIN
             priority = ISNULL(src.priority, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)))
         FROM #input_stats AS src
         JOIN sys.stats AS s
-          ON s.name = src.stat_name
+          ON s.name COLLATE DATABASE_DEFAULT = src.stat_name COLLATE DATABASE_DEFAULT
          AND (
                  src.table_name IS NULL
-              OR OBJECT_NAME(s.object_id) = src.table_name
+              OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT = src.table_name COLLATE DATABASE_DEFAULT
              )
          AND (
                  src.schema_name IS NULL
-              OR OBJECT_SCHEMA_NAME(s.object_id) = src.schema_name
+              OR OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT = src.schema_name COLLATE DATABASE_DEFAULT
              )
         LEFT JOIN sys.tables AS t
           ON t.object_id = s.object_id
@@ -3723,14 +3762,14 @@ BEGIN
             priority = ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
         FROM parsed_stats AS ps
         JOIN sys.stats AS s
-          ON s.name = ps.parsed_stat
+          ON s.name COLLATE DATABASE_DEFAULT = ps.parsed_stat COLLATE DATABASE_DEFAULT
          AND (
                  ps.parsed_table IS NULL
-              OR OBJECT_NAME(s.object_id) = ps.parsed_table
+              OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT = ps.parsed_table COLLATE DATABASE_DEFAULT
              )
          AND (
                  ps.parsed_schema IS NULL
-              OR OBJECT_SCHEMA_NAME(s.object_id) = ps.parsed_schema
+              OR OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT = ps.parsed_schema COLLATE DATABASE_DEFAULT
              )
         LEFT JOIN sys.tables AS t
           ON t.object_id = s.object_id
@@ -3774,7 +3813,9 @@ BEGIN
             RAISERROR(N'Warning: Only %d of %d requested statistics found', 10, 1, @found_count, @requested_count) WITH NOWAIT;
         END;
     END;
+    /*#endregion 15-DIRECT-MODE */
 
+    /*#region 16-DISCOVERY: Mode 2: Staged and legacy discovery */
     /*
     ============================================================================
     MODE 2: DISCOVERY - DMV-based candidate selection
@@ -3928,7 +3969,9 @@ BEGIN
                     @phase1_count int = 0,
                     @phase2_count int = 0,
                     @phase4_qualifying int = 0,
-                    @phase5_remaining int = 0;
+                    @phase5_remaining int = 0,
+                    @phase_timer datetime2(7) = SYSDATETIME(),
+                    @phase_ms int = 0;
 
                 /*
                 ================================================================
@@ -4000,10 +4043,10 @@ BEGIN
                 /* Table filter */
                 AND   (
                           @Tables_param IS NULL
-                       OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) IN
-                          (SELECT LTRIM(RTRIM(ss.value)) FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
-                       OR OBJECT_NAME(s.object_id) IN
-                          (SELECT LTRIM(RTRIM(ss.value)) FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                       OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                       OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
                       )
                 /* Table exclusion filter */
                 AND   (
@@ -4012,7 +4055,7 @@ BEGIN
                           (
                               SELECT 1
                               FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
-                              WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) LIKE LTRIM(RTRIM(ex.value))
+                              WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                           )
                       )
                 /* Statistics exclusion filter */
@@ -4022,7 +4065,7 @@ BEGIN
                           (
                               SELECT 1
                               FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
-                              WHERE s.name LIKE LTRIM(RTRIM(ex.value))
+                              WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                           )
                       )
                 /* Filtered stats mode filter */
@@ -4046,10 +4089,13 @@ BEGIN
                           )
                       );
 
-                SELECT @phase1_count = @@ROWCOUNT;
+                SELECT @phase1_count = @@ROWCOUNT,
+                       @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
 
                 IF @Debug_param = 1
-                    RAISERROR(N''    Phase 1 (candidates): %d stats'', 10, 1, @phase1_count) WITH NOWAIT;
+                    RAISERROR(N''    Phase 1 (candidates): %d stats (%d ms)'', 10, 1, @phase1_count, @phase_ms) WITH NOWAIT;
+
+                SET @phase_timer = SYSDATETIME();
 
                 /*
                 ================================================================
@@ -4075,10 +4121,11 @@ BEGIN
                 FROM #stat_candidates AS sc
                 CROSS APPLY sys.dm_db_stats_properties(sc.object_id, sc.stats_id) AS sp;
 
-                SELECT @phase2_count = @@ROWCOUNT;
+                SELECT @phase2_count = @@ROWCOUNT,
+                       @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
 
                 IF @Debug_param = 1
-                    RAISERROR(N''    Phase 2 (enriched): %d stats'', 10, 1, @phase2_count) WITH NOWAIT;
+                    RAISERROR(N''    Phase 2 (enriched): %d stats (%d ms)'', 10, 1, @phase2_count, @phase_ms) WITH NOWAIT;
 
                 /*
                 VALIDATION: CROSS APPLY filters out stats with no properties.
@@ -4176,6 +4223,11 @@ BEGIN
                     days_stale = ISNULL(DATEDIFF(DAY, last_updated, SYSDATETIME()), 9999),
                     hours_stale = ISNULL(DATEDIFF(HOUR, last_updated, SYSDATETIME()), 999999); /* v2.3 */
 
+                SET @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
+                IF @Debug_param = 1
+                    RAISERROR(N''    Phase 3 (tier thresholds): calculated (%d ms)'', 10, 1, @phase_ms) WITH NOWAIT;
+                SET @phase_timer = SYSDATETIME();
+
                 /*
                 ================================================================
                 PHASE 4: Apply threshold filters (early elimination)
@@ -4230,10 +4282,12 @@ BEGIN
                 /* Delete non-qualifying stats early */
                 DELETE FROM #stat_candidates WHERE qualifies = 0;
 
-                SELECT @phase4_qualifying = (SELECT COUNT(*) FROM #stat_candidates);
+                SELECT @phase4_qualifying = (SELECT COUNT(*) FROM #stat_candidates),
+                       @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
 
                 IF @Debug_param = 1
-                    RAISERROR(N''    Phase 4 (after thresholds): %d stats qualify'', 10, 1, @phase4_qualifying) WITH NOWAIT;
+                    RAISERROR(N''    Phase 4 (after thresholds): %d stats qualify (%d ms)'', 10, 1, @phase4_qualifying, @phase_ms) WITH NOWAIT;
+                SET @phase_timer = SYSDATETIME();
 
                 /*
                 VALIDATION: If 0 stats qualify after threshold filtering, we can exit early.
@@ -4312,10 +4366,12 @@ BEGIN
                 /* Apply MinPageCount filter */
                 DELETE FROM #stat_candidates WHERE ISNULL(page_count, 0) < @MinPageCount_param;
 
-                SELECT @phase5_remaining = (SELECT COUNT(*) FROM #stat_candidates);
+                SELECT @phase5_remaining = (SELECT COUNT(*) FROM #stat_candidates),
+                       @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
 
                 IF @Debug_param = 1
-                    RAISERROR(N''    Phase 5 (after MinPageCount): %d stats remain'', 10, 1, @phase5_remaining) WITH NOWAIT;
+                    RAISERROR(N''    Phase 5 (after MinPageCount): %d stats remain (%d ms)'', 10, 1, @phase5_remaining, @phase_ms) WITH NOWAIT;
+                SET @phase_timer = SYSDATETIME();
 
                 /*
                 VALIDATION: Suspicious row loss in Phase 5.
@@ -4456,6 +4512,10 @@ BEGIN
                     FROM #stat_candidates AS sc
                     INNER JOIN QSData AS qs ON qs.object_id = sc.object_id;
                 END;
+
+                SET @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
+                IF @Debug_param = 1
+                    RAISERROR(N''    Phase 6 (Query Store): enriched (%d ms)'', 10, 1, @phase_ms) WITH NOWAIT;
 
                 /*
                 ================================================================
@@ -4945,16 +5005,16 @@ BEGIN
         /* Table filter */
         AND   (
                   @Tables_param IS NULL
-               OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) IN
+               OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
                   (
                       SELECT
-                          LTRIM(RTRIM(ss.value))
+                          LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT
                       FROM STRING_SPLIT(@Tables_param, N'','') AS ss
                   )
-               OR OBJECT_NAME(s.object_id) IN
+               OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
                   (
                       SELECT
-                          LTRIM(RTRIM(ss.value))
+                          LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT
                       FROM STRING_SPLIT(@Tables_param, N'','') AS ss
                   )
               )
@@ -4965,7 +5025,7 @@ BEGIN
                   (
                       SELECT 1
                       FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
-                      WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) LIKE LTRIM(RTRIM(ex.value))
+                      WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                   )
               )
         /* Statistics exclusion filter (pattern-based) */
@@ -4975,7 +5035,7 @@ BEGIN
                   (
                       SELECT 1
                       FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
-                      WHERE s.name LIKE LTRIM(RTRIM(ex.value))
+                      WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                   )
               )
         /*
@@ -5134,7 +5194,9 @@ BEGIN
 
         END; /* End of WHILE database loop */
     END; /* End of IF @mode = N'DISCOVERY' */
+    /*#endregion 16-DISCOVERY */
 
+    /*#region 17-POST-DISCOVERY: Join patterns, stats report, early return */
     /*
     ============================================================================
     JOIN PATTERN GROUPING (v1.9 - optimization cliff prevention)
@@ -5389,7 +5451,9 @@ BEGIN
             EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
         RETURN 0;
     END;
+    /*#endregion 17-POST-DISCOVERY */
 
+    /*#region 18-PARALLEL-QUEUE: Queue initialization, candidate display */
     /*
     ============================================================================
     PARALLEL MODE: QUEUE INITIALIZATION
@@ -5731,7 +5795,9 @@ BEGIN
         ORDER BY
             stp.priority;
     END;
+    /*#endregion 18-PARALLEL-QUEUE */
 
+    /*#region 19-PROCESS-LOOP: Main processing loop (WHILE 1=1) */
     /*
     ============================================================================
     PROCESS STATISTICS
@@ -7032,7 +7098,9 @@ BEGIN
             END;
         END;
     END;
+    /*#endregion 19-PROCESS-LOOP */
 
+    /*#region 20-FINALIZE: Summary, CommandLog footer, output params, result set */
     /*
     ============================================================================
     SUMMARY
@@ -7265,6 +7333,7 @@ BEGIN
     END;
 
     RETURN @return_code;
+    /*#endregion 20-FINALIZE */
 END;
 GO
 
