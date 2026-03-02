@@ -36,11 +36,22 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.5.2026.0302 (Major.Minor.Year.MMDD)
+Version:    2.6.2026.0302 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.5.2026.0302 - v2.5 Operational intelligence:
+History:    2.6.2026.0302 - v2.6 Multi-database direct mode:
+                          - Fix: @Statistics and @StatisticsFromTable now respect @Databases
+                            parameter (#44). Previously, DIRECT modes queried sys.stats in the
+                            current database context only, silently ignoring @Databases. Now both
+                            modes iterate all selected databases via dynamic SQL with USE, matching
+                            the DISCOVERY mode pattern. Backwards compatible: when @Databases is
+                            NULL, behavior is identical (loops once over current DB).
+                          - Fix: DIRECT_TABLE column gap. Mode 1A was missing 5 columns that
+                            DIRECT_STRING included: auto_created, histogram_steps, has_filter,
+                            filter_definition, unfiltered_rows. Both modes now INSERT identical
+                            column sets.
+            2.5.2026.0302 - v2.5 Operational intelligence:
                           - Add: CommandLog index advisory (#31). Warns when dbo.CommandLog
                             lacks a nonclustered index on CommandType. Provides exact CREATE
                             INDEX DDL. Suppressed when a suitable index already exists.
@@ -549,7 +560,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.5.2026.0302',
+        @procedure_version varchar(20) = '2.6.2026.0302',
         @procedure_version_date datetime = '20260302',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -3646,102 +3657,137 @@ BEGIN
         END CATCH;
 
         /*
-        Join with sys.stats to get full metadata
+        Join with sys.stats to get full metadata — loop over selected databases.
+        #input_stats is visible to dynamic SQL (temp tables in caller scope).
         */
-        INSERT INTO
-            #stats_to_process
-        (
-            database_name,
-            schema_name,
-            table_name,
-            stat_name,
-            object_id,
-            stats_id,
-            no_recompute,
-            is_incremental,
-            is_memory_optimized,
-            is_published,
-            is_tracked_by_cdc,
-            temporal_type,
-            is_heap,
-            modification_counter,
-            row_count,
-            days_stale,
-            page_count,
-            persisted_sample_percent,
-            priority
-        )
-        SELECT
-            database_name = DB_NAME(),
-            schema_name = ISNULL(src.schema_name, OBJECT_SCHEMA_NAME(s.object_id)),
-            table_name = ISNULL(src.table_name, OBJECT_NAME(s.object_id)),
-            stat_name = s.name,
-            object_id = s.object_id,
-            stats_id = s.stats_id,
-            no_recompute = s.no_recompute,
-            is_incremental = s.is_incremental,
-            is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
-            /* Replication/CDC/Temporal metadata */
-            is_published = ISNULL(t.is_published, 0),
-            is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
-            temporal_type = ISNULL(t.temporal_type, 0),
-            /*
-            HEAP DETECTION: Check for index_id = 0 (heap) directly.
-            Heaps have index_id = 0; clustered indexes have index_id = 1.
-            Every user table has exactly one of these, never both.
-            */
-            is_heap =
-                CASE
-                    WHEN EXISTS
-                         (
-                             SELECT
-                                 1
-                             FROM sys.indexes AS i
-                             WHERE i.object_id = s.object_id
-                             AND   i.index_id = 0
-                         )
-                    THEN 1
-                    ELSE 0
-                END,
-            modification_counter = ISNULL(sp.modification_counter, 0),
-            row_count = ISNULL(sp.rows, 0),
-            days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
-            page_count = ISNULL(pgs.total_pages, 0),
-            persisted_sample_percent = sp.persisted_sample_percent, /*track existing persisted sample*/
-            priority = ISNULL(src.priority, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)))
-        FROM #input_stats AS src
-        JOIN sys.stats AS s
-          ON s.name COLLATE DATABASE_DEFAULT = src.stat_name COLLATE DATABASE_DEFAULT
-         AND (
-                 src.table_name IS NULL
-              OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT = src.table_name COLLATE DATABASE_DEFAULT
-             )
-         AND (
-                 src.schema_name IS NULL
-              OR OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT = src.schema_name COLLATE DATABASE_DEFAULT
-             )
-        LEFT JOIN sys.tables AS t
-          ON t.object_id = s.object_id
-        CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
-        OUTER APPLY
-        (
-            /*
-            PAGE COUNT: Get total table pages from base table structure.
-            - index_id = 0 for heaps (tables without clustered index)
-            - index_id = 1 for clustered indexes
-            Note: We don't match stats_id to index_id because column statistics
-            have unique stats_id values that don't correspond to any index.
-            */
-            SELECT
-                total_pages = SUM(p.used_page_count)
-            FROM sys.dm_db_partition_stats AS p
-            WHERE p.object_id = s.object_id
-            AND   p.index_id IN (0, 1)
-        ) AS pgs
-        WHERE (OBJECTPROPERTY(s.object_id, N'IsUserTable') = 1 OR @IncludeSystemObjects = N'Y')
-        ORDER BY
-            ISNULL(src.priority, 0)
-        OPTION (RECOMPILE); /*Prevents plan caching issues with DMV joins*/
+        DECLARE
+            @direct_table_sql nvarchar(max),
+            @dt_skip_msg nvarchar(4000);
+
+        WHILE EXISTS (SELECT 1 FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
+        BEGIN
+            SELECT TOP (1)
+                @CurrentDatabaseID = ID,
+                @CurrentDatabaseName = DatabaseName
+            FROM @tmpDatabases
+            WHERE Selected = 1
+            AND   Completed = 0
+            ORDER BY ID;
+
+            RAISERROR(N'  Scanning database: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
+
+            BEGIN TRY
+                SET @direct_table_sql = N'
+USE ' + QUOTENAME(@CurrentDatabaseName) + N';
+
+INSERT INTO
+    #stats_to_process
+(
+    database_name,
+    schema_name,
+    table_name,
+    stat_name,
+    object_id,
+    stats_id,
+    no_recompute,
+    is_incremental,
+    is_memory_optimized,
+    is_published,
+    is_tracked_by_cdc,
+    temporal_type,
+    is_heap,
+    auto_created,
+    modification_counter,
+    row_count,
+    days_stale,
+    page_count,
+    persisted_sample_percent,
+    histogram_steps,
+    has_filter,
+    filter_definition,
+    unfiltered_rows,
+    priority
+)
+SELECT
+    database_name = DB_NAME(),
+    schema_name = ISNULL(src.schema_name, OBJECT_SCHEMA_NAME(s.object_id)),
+    table_name = ISNULL(src.table_name, OBJECT_NAME(s.object_id)),
+    stat_name = s.name,
+    object_id = s.object_id,
+    stats_id = s.stats_id,
+    no_recompute = s.no_recompute,
+    is_incremental = s.is_incremental,
+    is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
+    is_published = ISNULL(t.is_published, 0),
+    is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
+    temporal_type = ISNULL(t.temporal_type, 0),
+    is_heap =
+        CASE
+            WHEN EXISTS
+                 (
+                     SELECT
+                         1
+                     FROM sys.indexes AS i
+                     WHERE i.object_id = s.object_id
+                     AND   i.index_id = 0
+                 )
+            THEN 1
+            ELSE 0
+        END,
+    auto_created = s.auto_created,
+    modification_counter = ISNULL(sp.modification_counter, 0),
+    row_count = ISNULL(sp.rows, 0),
+    days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
+    page_count = ISNULL(pgs.total_pages, 0),
+    persisted_sample_percent = sp.persisted_sample_percent,
+    histogram_steps = sp.steps,
+    has_filter = s.has_filter,
+    filter_definition = s.filter_definition,
+    unfiltered_rows = sp.unfiltered_rows,
+    priority = ISNULL(src.priority, ROW_NUMBER() OVER (ORDER BY (SELECT NULL)))
+FROM #input_stats AS src
+JOIN sys.stats AS s
+  ON s.name COLLATE DATABASE_DEFAULT = src.stat_name COLLATE DATABASE_DEFAULT
+ AND (
+         src.table_name IS NULL
+      OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT = src.table_name COLLATE DATABASE_DEFAULT
+     )
+ AND (
+         src.schema_name IS NULL
+      OR OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT = src.schema_name COLLATE DATABASE_DEFAULT
+     )
+LEFT JOIN sys.tables AS t
+  ON t.object_id = s.object_id
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+OUTER APPLY
+(
+    SELECT
+        total_pages = SUM(p.used_page_count)
+    FROM sys.dm_db_partition_stats AS p
+    WHERE p.object_id = s.object_id
+    AND   p.index_id IN (0, 1)
+) AS pgs
+WHERE (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @IncludeSystemObjects_param = N''Y'')
+OPTION (RECOMPILE);';
+
+                EXECUTE sys.sp_executesql
+                    @direct_table_sql,
+                    N'@IncludeSystemObjects_param nvarchar(1)',
+                    @IncludeSystemObjects_param = @IncludeSystemObjects;
+
+            END TRY
+            BEGIN CATCH
+                SET @dt_skip_msg =
+                    N'  WARNING: Skipping database ' + QUOTENAME(@CurrentDatabaseName) +
+                    N' - ' + ERROR_MESSAGE();
+                RAISERROR(@dt_skip_msg, 10, 1) WITH NOWAIT;
+            END CATCH;
+
+            UPDATE @tmpDatabases
+            SET Completed = 1
+            WHERE ID = @CurrentDatabaseID;
+
+        END; /* End of WHILE database loop for DIRECT_TABLE */
 
         DROP TABLE #input_stats;
 
@@ -3753,7 +3799,7 @@ BEGIN
                 FROM #stats_to_process
             );
 
-        RAISERROR(N'Loaded %d statistics from table', 10, 1, @table_row_count) WITH NOWAIT;
+        RAISERROR(N'Loaded %d statistics from table across %d database(s)', 10, 1, @table_row_count, @database_count) WITH NOWAIT;
     END;
 
     /*
@@ -3765,129 +3811,179 @@ BEGIN
     BEGIN
         RAISERROR(N'Parsing explicit statistics list...', 10, 1) WITH NOWAIT;
 
-        ;WITH
-            parsed_stats
-        AS
+        /*
+        Materialize parsed stats into temp table so dynamic SQL can see it.
+        PARSENAME positions: 3=schema, 2=table, 1=stat
+        */
+        CREATE TABLE
+            #parsed_stats
         (
-            SELECT
-                raw_value = LTRIM(RTRIM(ss.value)),
-                parsed_schema = PARSENAME(LTRIM(RTRIM(ss.value)), 3),
-                parsed_table = PARSENAME(LTRIM(RTRIM(ss.value)), 2),
-                parsed_stat = PARSENAME(LTRIM(RTRIM(ss.value)), 1)
-            FROM STRING_SPLIT(@Statistics, N',') AS ss
-            WHERE LTRIM(RTRIM(ss.value)) <> N''
-        )
+            parsed_schema sysname NULL,
+            parsed_table sysname NULL,
+            parsed_stat sysname NOT NULL
+        );
+
         INSERT INTO
-            #stats_to_process
+            #parsed_stats
         (
-            database_name,
-            schema_name,
-            table_name,
-            stat_name,
-            object_id,
-            stats_id,
-            no_recompute,
-            is_incremental,
-            is_memory_optimized,
-            is_published,
-            is_tracked_by_cdc,
-            temporal_type,
-            is_heap,
-            auto_created,
-            modification_counter,
-            row_count,
-            days_stale,
-            page_count,
-            persisted_sample_percent,
-            histogram_steps,
-            has_filter,
-            filter_definition,
-            unfiltered_rows,
-            priority
+            parsed_schema,
+            parsed_table,
+            parsed_stat
         )
         SELECT
-            database_name = DB_NAME(),
-            schema_name = ISNULL(ps.parsed_schema, OBJECT_SCHEMA_NAME(s.object_id)),
-            table_name = ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)),
-            stat_name = s.name,
-            object_id = s.object_id,
-            stats_id = s.stats_id,
-            no_recompute = s.no_recompute,
-            is_incremental = s.is_incremental,
-            is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
-            /* Replication/CDC/Temporal metadata */
-            is_published = ISNULL(t.is_published, 0),
-            is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
-            temporal_type = ISNULL(t.temporal_type, 0),
-            /*
-            HEAP DETECTION: Check for index_id = 0 (heap) directly.
-            Heaps have index_id = 0; clustered indexes have index_id = 1.
-            */
-            is_heap =
-                CASE
-                    WHEN EXISTS
-                         (
-                             SELECT
-                                 1
-                             FROM sys.indexes AS i
-                             WHERE i.object_id = s.object_id
-                             AND   i.index_id = 0
-                         )
-                    THEN 1
-                    ELSE 0
-                END,
-            auto_created = s.auto_created,
-            modification_counter = ISNULL(sp.modification_counter, 0),
-            row_count = ISNULL(sp.rows, 0),
-            days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
-            page_count = ISNULL(pgs.total_pages, 0),
-            persisted_sample_percent = sp.persisted_sample_percent,
-            histogram_steps = sp.steps,
-            has_filter = s.has_filter,
-            filter_definition = s.filter_definition,
-            unfiltered_rows = sp.unfiltered_rows,
-            priority = ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
-        FROM parsed_stats AS ps
-        JOIN sys.stats AS s
-          ON s.name COLLATE DATABASE_DEFAULT = ps.parsed_stat COLLATE DATABASE_DEFAULT
-         AND (
-                 ps.parsed_table IS NULL
-              OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT = ps.parsed_table COLLATE DATABASE_DEFAULT
-             )
-         AND (
-                 ps.parsed_schema IS NULL
-              OR OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT = ps.parsed_schema COLLATE DATABASE_DEFAULT
-             )
-        LEFT JOIN sys.tables AS t
-          ON t.object_id = s.object_id
-        CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
-        OUTER APPLY
-        (
-            /*
-            PAGE COUNT: Get total table pages from base table structure.
-            - index_id = 0 for heaps, index_id = 1 for clustered indexes
-            - Column statistics have stats_id values that don't match any index_id
-            */
-            SELECT
-                total_pages = SUM(p.used_page_count)
-            FROM sys.dm_db_partition_stats AS p
-            WHERE p.object_id = s.object_id
-            AND   p.index_id IN (0, 1)
-        ) AS pgs
-        WHERE (OBJECTPROPERTY(s.object_id, N'IsUserTable') = 1 OR @IncludeSystemObjects = N'Y')
-        OPTION (RECOMPILE); /*Prevents plan caching issues with DMV joins*/
+            parsed_schema = PARSENAME(LTRIM(RTRIM(ss.value)), 3),
+            parsed_table = PARSENAME(LTRIM(RTRIM(ss.value)), 2),
+            parsed_stat = PARSENAME(LTRIM(RTRIM(ss.value)), 1)
+        FROM STRING_SPLIT(@Statistics, N',') AS ss
+        WHERE LTRIM(RTRIM(ss.value)) <> N''
+        AND   PARSENAME(LTRIM(RTRIM(ss.value)), 1) IS NOT NULL;
 
-        /*
-        Warn about any stats not found
-        */
         DECLARE
             @requested_count integer =
             (
                 SELECT
                     COUNT_BIG(*)
-                FROM STRING_SPLIT(@Statistics, N',') AS ss
-                WHERE LTRIM(RTRIM(ss.value)) <> N''
-            ),
+                FROM #parsed_stats
+            );
+
+        /*
+        Loop over selected databases — #parsed_stats visible to dynamic SQL.
+        */
+        DECLARE
+            @direct_string_sql nvarchar(max),
+            @ds_skip_msg nvarchar(4000);
+
+        WHILE EXISTS (SELECT 1 FROM @tmpDatabases WHERE Selected = 1 AND Completed = 0)
+        BEGIN
+            SELECT TOP (1)
+                @CurrentDatabaseID = ID,
+                @CurrentDatabaseName = DatabaseName
+            FROM @tmpDatabases
+            WHERE Selected = 1
+            AND   Completed = 0
+            ORDER BY ID;
+
+            RAISERROR(N'  Scanning database: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
+
+            BEGIN TRY
+                SET @direct_string_sql = N'
+USE ' + QUOTENAME(@CurrentDatabaseName) + N';
+
+INSERT INTO
+    #stats_to_process
+(
+    database_name,
+    schema_name,
+    table_name,
+    stat_name,
+    object_id,
+    stats_id,
+    no_recompute,
+    is_incremental,
+    is_memory_optimized,
+    is_published,
+    is_tracked_by_cdc,
+    temporal_type,
+    is_heap,
+    auto_created,
+    modification_counter,
+    row_count,
+    days_stale,
+    page_count,
+    persisted_sample_percent,
+    histogram_steps,
+    has_filter,
+    filter_definition,
+    unfiltered_rows,
+    priority
+)
+SELECT
+    database_name = DB_NAME(),
+    schema_name = ISNULL(ps.parsed_schema, OBJECT_SCHEMA_NAME(s.object_id)),
+    table_name = ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)),
+    stat_name = s.name,
+    object_id = s.object_id,
+    stats_id = s.stats_id,
+    no_recompute = s.no_recompute,
+    is_incremental = s.is_incremental,
+    is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
+    is_published = ISNULL(t.is_published, 0),
+    is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
+    temporal_type = ISNULL(t.temporal_type, 0),
+    is_heap =
+        CASE
+            WHEN EXISTS
+                 (
+                     SELECT
+                         1
+                     FROM sys.indexes AS i
+                     WHERE i.object_id = s.object_id
+                     AND   i.index_id = 0
+                 )
+            THEN 1
+            ELSE 0
+        END,
+    auto_created = s.auto_created,
+    modification_counter = ISNULL(sp.modification_counter, 0),
+    row_count = ISNULL(sp.rows, 0),
+    days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
+    page_count = ISNULL(pgs.total_pages, 0),
+    persisted_sample_percent = sp.persisted_sample_percent,
+    histogram_steps = sp.steps,
+    has_filter = s.has_filter,
+    filter_definition = s.filter_definition,
+    unfiltered_rows = sp.unfiltered_rows,
+    priority = ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+FROM #parsed_stats AS ps
+JOIN sys.stats AS s
+  ON s.name COLLATE DATABASE_DEFAULT = ps.parsed_stat COLLATE DATABASE_DEFAULT
+ AND (
+         ps.parsed_table IS NULL
+      OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT = ps.parsed_table COLLATE DATABASE_DEFAULT
+     )
+ AND (
+         ps.parsed_schema IS NULL
+      OR OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT = ps.parsed_schema COLLATE DATABASE_DEFAULT
+     )
+LEFT JOIN sys.tables AS t
+  ON t.object_id = s.object_id
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+OUTER APPLY
+(
+    SELECT
+        total_pages = SUM(p.used_page_count)
+    FROM sys.dm_db_partition_stats AS p
+    WHERE p.object_id = s.object_id
+    AND   p.index_id IN (0, 1)
+) AS pgs
+WHERE (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @IncludeSystemObjects_param = N''Y'')
+OPTION (RECOMPILE);';
+
+                EXECUTE sys.sp_executesql
+                    @direct_string_sql,
+                    N'@IncludeSystemObjects_param nvarchar(1)',
+                    @IncludeSystemObjects_param = @IncludeSystemObjects;
+
+            END TRY
+            BEGIN CATCH
+                SET @ds_skip_msg =
+                    N'  WARNING: Skipping database ' + QUOTENAME(@CurrentDatabaseName) +
+                    N' - ' + ERROR_MESSAGE();
+                RAISERROR(@ds_skip_msg, 10, 1) WITH NOWAIT;
+            END CATCH;
+
+            UPDATE @tmpDatabases
+            SET Completed = 1
+            WHERE ID = @CurrentDatabaseID;
+
+        END; /* End of WHILE database loop for DIRECT_STRING */
+
+        DROP TABLE #parsed_stats;
+
+        /*
+        Warn about any stats not found
+        */
+        DECLARE
             @found_count integer =
             (
                 SELECT
@@ -3897,7 +3993,7 @@ BEGIN
 
         IF @found_count < @requested_count
         BEGIN
-            RAISERROR(N'Warning: Only %d of %d requested statistics found', 10, 1, @found_count, @requested_count) WITH NOWAIT;
+            RAISERROR(N'Warning: Only %d of %d requested statistics found across %d database(s)', 10, 1, @found_count, @requested_count, @database_count) WITH NOWAIT;
         END;
     END;
     /*#endregion 15-DIRECT-MODE */
