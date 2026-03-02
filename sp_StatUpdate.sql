@@ -3979,6 +3979,18 @@ BEGIN
                 LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
                 WHERE (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
                 AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @IncludeSystemObjects_param = N''Y'')
+                AND   o.type <> N''ET'' /* Exclude PolyBase/Synapse external tables (#54) */
+                /* Skip tables on READ_ONLY filegroups (#65) */
+                AND   NOT EXISTS
+                      (
+                          SELECT 1
+                          FROM sys.indexes AS ri
+                          JOIN sys.data_spaces AS rds ON rds.data_space_id = ri.data_space_id
+                          JOIN sys.filegroups AS rfg ON rfg.data_space_id = rds.data_space_id
+                          WHERE ri.object_id = s.object_id
+                          AND   ri.index_id IN (0, 1) /* heap or clustered — the base storage */
+                          AND   rfg.is_read_only = 1
+                      )
                 /* NORECOMPUTE filter */
                 AND   (
                           (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
@@ -4813,6 +4825,18 @@ BEGIN
         ) AS qs_stats
         WHERE (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
         AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @IncludeSystemObjects_param = N''Y'')
+        AND   o.type <> N''ET'' /* Exclude PolyBase/Synapse external tables (#54) */
+        /* Skip tables on READ_ONLY filegroups (#65) */
+        AND   NOT EXISTS
+              (
+                  SELECT 1
+                  FROM sys.indexes AS ri
+                  JOIN sys.data_spaces AS rds ON rds.data_space_id = ri.data_space_id
+                  JOIN sys.filegroups AS rfg ON rfg.data_space_id = rds.data_space_id
+                  WHERE ri.object_id = s.object_id
+                  AND   ri.index_id IN (0, 1) /* heap or clustered — the base storage */
+                  AND   rfg.is_read_only = 1
+              )
         /* NORECOMPUTE filter */
         AND   (
                   (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
@@ -6698,7 +6722,8 @@ BEGIN
                                 @effective_sample_percent AS EffectiveSamplePct,
                                 @sample_source AS SampleSource,
                                 @mode AS Mode,
-                                @run_label AS RunLabel
+                                @run_label AS RunLabel,
+                                @procedure_version AS Version
                             FOR
                                 XML RAW(N'ExtendedInfo'),
                                 ELEMENTS
