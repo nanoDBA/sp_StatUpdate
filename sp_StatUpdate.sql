@@ -1507,8 +1507,8 @@ BEGIN
             SET @commandlog_missing_cols += N'SchemaName, ';
         IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.CommandLog') AND name = N'ObjectName')
             SET @commandlog_missing_cols += N'ObjectName, ';
-        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.CommandLog') AND name = N'StatisticName')
-            SET @commandlog_missing_cols += N'StatisticName, ';
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.CommandLog') AND name = N'StatisticsName')
+            SET @commandlog_missing_cols += N'StatisticsName, ';
         IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.CommandLog') AND name = N'ExtendedInfo')
             SET @commandlog_missing_cols += N'ExtendedInfo, ';
 
@@ -1721,9 +1721,9 @@ BEGIN
             SET @stopby_seconds_remaining =
                 DATEDIFF(SECOND, @now_time, @stopby_time);
 
-            /* If the stop time has already passed today, set 0 seconds remaining */
+            /* If the stop time has already passed today, wrap to tomorrow */
             IF @stopby_seconds_remaining < 0
-                SET @stopby_seconds_remaining = 0;
+                SET @stopby_seconds_remaining = @stopby_seconds_remaining + 86400;
 
             /* Override @TimeLimit with computed seconds remaining */
             SET @TimeLimit = @stopby_seconds_remaining;
@@ -2753,6 +2753,19 @@ BEGIN
             N'Database: ' + DB_NAME(),
             CASE WHEN HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'VIEW DATABASE STATE') = 1 THEN N'YES' ELSE N'NO' END,
             N'Required for DMV access (dm_db_stats_properties, dm_exec_sessions)';
+
+        /* Check ALTER on schema (required for UPDATE STATISTICS) */
+        INSERT INTO @perm_results (permission_name, scope, has_permission, notes)
+        SELECT
+            N'ALTER',
+            N'Database: ' + DB_NAME(),
+            CASE WHEN HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'ALTER ANY SCHEMA') = 1
+                   OR IS_SRVROLEMEMBER(N'sysadmin') = 1
+                   OR IS_MEMBER(N'db_owner') = 1
+                   OR IS_MEMBER(N'db_ddladmin') = 1
+                 THEN N'YES' ELSE N'NO'
+            END,
+            N'Required for UPDATE STATISTICS (via ALTER on tables, db_owner, db_ddladmin, or sysadmin)';
 
         /* Check INSERT on dbo.CommandLog (if table exists) */
         INSERT INTO @perm_results (permission_name, scope, has_permission, notes)
@@ -5403,6 +5416,7 @@ BEGIN
             ISNULL(CONVERT(nvarchar(20), @ModificationThreshold), N'NULL'),
             ISNULL(CONVERT(nvarchar(20), @ModificationPercent), N'NULL'),
             ISNULL(CONVERT(nvarchar(20), @DaysStaleThreshold), N'NULL'),
+            ISNULL(CONVERT(nvarchar(20), @HoursStaleThreshold), N'NULL'),
             ISNULL(@QueryStoreMetric, N'NULL')
         );
 
