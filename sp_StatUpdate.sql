@@ -40,7 +40,16 @@ Version:    2.8.2026.0303 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.8.2026.0302 - v2.8 Comprehensive issue sweep (31 issues resolved):
+History:    2.8.2026.0303 - v2.8 Bug fixes for deploy, @Tables, CommandLog:
+                          - Fix: Deploy fails on pre-v2.3 servers. SQL Server validates column
+                            names at compile time; wrapped ParameterFingerprint and
+                            LastStatCompletedAt references in sp_executesql (5 locations).
+                          - Fix: @Tables='ALL' silently matched zero tables. Now normalized
+                            to NULL (case-insensitive, whitespace-trimmed).
+                          - Fix: CommandLog SP_STATUPDATE_START Command field showed '...'
+                            truncation. Now shows @Databases, @Tables, @TimeLimit, @SortOrder,
+                            and QS params (conditional).
+            2.8.2026.0302 - v2.8 Comprehensive issue sweep (31 issues resolved):
                           - Feat: Query Store forced plan invalidation warning (#32, p1-critical).
                             After stats updates, automatically checks sys.query_store_plan for
                             forced plans on updated tables. Warns via @WarningsOut if found.
