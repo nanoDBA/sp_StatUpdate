@@ -36,7 +36,7 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.8.2026.0302 (Major.Minor.Year.MMDD)
+Version:    2.8.2026.0303 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
@@ -610,8 +610,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.8.2026.0302',
-        @procedure_version_date datetime = '20260302',
+        @procedure_version varchar(20) = '2.8.2026.0303',
+        @procedure_version_date datetime = '20260303',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
