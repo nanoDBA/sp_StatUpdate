@@ -36,11 +36,22 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.6.2026.0302 (Major.Minor.Year.MMDD)
+Version:    2.7.2026.0302 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.6.2026.0302 - v2.6 Multi-database direct mode:
+History:    2.7.2026.0302 - v2.7 AG redo queue pause and tempdb pressure check:
+                          - Feat: @MaxAGRedoQueueMB / @MaxAGWaitMinutes (#18). On AG primaries,
+                            pauses stats when secondary redo queue exceeds threshold. Wait loop
+                            with 30s recheck interval respects both @MaxAGWaitMinutes and @TimeLimit.
+                            Non-AG instances skip check. Stop reason: AG_REDO_QUEUE.
+                          - Feat: @MinTempdbFreeMB (#34). Per-stat tempdb free space check.
+                            When breached: @FailFast=1 aborts with TEMPDB_PRESSURE, else warns
+                            and continues. Important for FULLSCAN and Azure SQL.
+                          - Debug banner now shows AG primary status, redo queue depth, and tempdb
+                            free space. Warnings added for elevated redo queue (>100 MB) and low
+                            tempdb (<100 MB) at startup.
+            2.6.2026.0302 - v2.6 Multi-database direct mode:
                           - Fix: @Statistics and @StatisticsFromTable now respect @Databases
                             parameter (#44). Previously, DIRECT modes queried sys.stats in the
                             current database context only, silently ignoring @Databases. Now both
@@ -458,6 +469,8 @@ ALTER PROCEDURE
     @SortOrder nvarchar(50) = N'MODIFICATION_COUNTER', /*priority: MODIFICATION_COUNTER, DAYS_STALE, RANDOM, PAGE_COUNT, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED*/
     @DelayBetweenStats integer = NULL, /*seconds to wait between stats updates. Use during OLTP hours to reduce contention; NULL = no delay*/
     @MaxConsecutiveFailures integer = NULL, /*stop after N consecutive failures (prevents cascading issues from shared resource problems). NULL = no limit*/
+    @MaxAGRedoQueueMB integer = NULL, /*AG primary only: pause stats when any secondary redo queue exceeds this MB. NULL = disabled. Checks dm_hadr_database_replica_states before each stat update.*/
+    @MaxAGWaitMinutes integer = 10, /*max minutes to wait for AG redo queue to drain before stopping (stop reason: AG_REDO_QUEUE). Only used when @MaxAGRedoQueueMB is set.*/
 
     /*
     ============================================================================
@@ -487,6 +500,7 @@ ALTER PROCEDURE
     */
     @StagedDiscovery nvarchar(1) = N'Y', /*Y = use 6-phase staged discovery (faster for large DBs), N = legacy single-query discovery*/
     @CollectHeapForwarding nvarchar(1) = N'N', /*Y = query dm_db_index_physical_stats for heap forwarding counts (slow), N = skip*/
+    @MinTempdbFreeMB bigint = NULL, /*minimum tempdb free space (MB) before each stat update. NULL = disabled. When breached: @FailFast=1 aborts, else warns and continues. Especially important for FULLSCAN and Azure SQL.*/
 
     /*
     ============================================================================
@@ -560,7 +574,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.6.2026.0302',
+        @procedure_version varchar(20) = '2.7.2026.0302',
         @procedure_version_date datetime = '20260302',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -606,7 +620,11 @@ BEGIN
         SELECT
             N'v2.4: Region markers, collation-aware comparisons (#48), discovery phase timing (#40)' UNION ALL
         SELECT
-            N'v2.5: CommandLog index advisory (#31), Resource Governor detection (#35), @LockTimeout docs (#51)';
+            N'v2.5: CommandLog index advisory (#31), Resource Governor detection (#35), @LockTimeout docs (#51)' UNION ALL
+        SELECT
+            N'v2.6: Multi-database direct mode -- @Statistics and @StatisticsFromTable respect @Databases (#44)' UNION ALL
+        SELECT
+            N'v2.7: AG redo queue pause (#18), tempdb pressure check (#34)';
 
         /*
         Parameter documentation
@@ -751,9 +769,15 @@ BEGIN
                     WHEN N'@WarningsOut'
                     THEN N'OUTPUT: collected warnings (LOW_UPTIME, BACKUP_RUNNING, AZURE_SQL, etc.)'
                     WHEN N'@StopReasonOut'
-                    THEN N'OUTPUT: why execution stopped (COMPLETED, TIME_LIMIT, BATCH_LIMIT, FAIL_FAST, CONSECUTIVE_FAILURES)'
+                    THEN N'OUTPUT: why execution stopped (COMPLETED, TIME_LIMIT, BATCH_LIMIT, FAIL_FAST, CONSECUTIVE_FAILURES, AG_REDO_QUEUE, TEMPDB_PRESSURE)'
                     WHEN N'@MaxConsecutiveFailures'
                     THEN N'stop after N consecutive failures (prevents cascading issues from shared resource problems)'
+                    WHEN N'@MaxAGRedoQueueMB'
+                    THEN N'AG primary only: pause stats when any secondary redo queue exceeds threshold MB. Checks dm_hadr_database_replica_states before each stat. Non-AG instances skip check. NULL = disabled.'
+                    WHEN N'@MaxAGWaitMinutes'
+                    THEN N'max minutes to wait for AG redo queue to drain before stopping with AG_REDO_QUEUE. Interacts with @TimeLimit (whichever is reached first wins). Default 10.'
+                    WHEN N'@MinTempdbFreeMB'
+                    THEN N'minimum tempdb free space (MB) before each stat update. When breached: @FailFast=1 aborts with TEMPDB_PRESSURE, else warns and continues. Important for FULLSCAN and Azure SQL. NULL = disabled.'
                     ELSE N'undocumented parameter'
                 END,
             valid_inputs =
@@ -790,6 +814,12 @@ BEGIN
                     THEN N'NULL, 1-N (e.g., 3, 5, 10)'
                     WHEN N'@LockTimeout'
                     THEN N'NULL (session default), -1 (infinite), 0 (fail immediately), 1-N seconds'
+                    WHEN N'@MaxAGRedoQueueMB'
+                    THEN N'NULL (disabled), 0-N MB (e.g., 500, 1000, 5000)'
+                    WHEN N'@MaxAGWaitMinutes'
+                    THEN N'1-N minutes (default 10)'
+                    WHEN N'@MinTempdbFreeMB'
+                    THEN N'NULL (disabled), 0-N MB (e.g., 100, 500, 1024)'
                     ELSE N''
                 END,
             defaults =
@@ -896,6 +926,12 @@ BEGIN
                     THEN N'NULL (OUTPUT)'
                     WHEN N'@StopReasonOut'
                     THEN N'NULL (OUTPUT)'
+                    WHEN N'@MaxAGRedoQueueMB'
+                    THEN N'NULL (disabled)'
+                    WHEN N'@MaxAGWaitMinutes'
+                    THEN N'10'
+                    WHEN N'@MinTempdbFreeMB'
+                    THEN N'NULL (disabled)'
                     ELSE N''
                 END
         FROM sys.parameters AS ap
@@ -1352,6 +1388,24 @@ BEGIN
     DECLARE
         @is_ag_secondary bit = 0,
         @ag_role_desc nvarchar(60) = NULL;
+
+    /*
+    AG redo queue monitoring variables (v2.7, #18)
+    */
+    DECLARE
+        @ag_redo_queue_mb bigint = NULL,
+        @ag_wait_start datetime2(7) = NULL,
+        @ag_is_primary bit = 0,
+        @ag_redo_initial_mb bigint = NULL,
+        @ag_wait_msg nvarchar(500) = N'',
+        @ag_recovered_msg nvarchar(500) = N'';
+
+    /*
+    Tempdb pressure monitoring variables (v2.7, #34)
+    */
+    DECLARE
+        @tempdb_free_mb bigint = NULL,
+        @tempdb_msg nvarchar(500) = N'';
 
     /*
     Long-running stats table (for adaptive sampling)
@@ -2269,6 +2323,57 @@ BEGIN
                 N'The value for @SkipTablesWithColumnstore is not supported. Use Y or N.',
             error_severity = 16;
     END;
+
+    /*
+    Validate @MaxAGRedoQueueMB (v2.7, #18)
+    */
+    IF @MaxAGRedoQueueMB IS NOT NULL AND @MaxAGRedoQueueMB < 0
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'@MaxAGRedoQueueMB must be >= 0 when specified. Supplied: ' + CONVERT(nvarchar(20), @MaxAGRedoQueueMB),
+            error_severity = 16;
+    END;
+
+    /*
+    Validate @MaxAGWaitMinutes (v2.7, #18)
+    */
+    IF @MaxAGWaitMinutes IS NOT NULL AND @MaxAGWaitMinutes < 1
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'@MaxAGWaitMinutes must be >= 1 when specified. Supplied: ' + CONVERT(nvarchar(20), @MaxAGWaitMinutes),
+            error_severity = 16;
+    END;
+
+    /*
+    Validate @MinTempdbFreeMB (v2.7, #34)
+    */
+    IF @MinTempdbFreeMB IS NOT NULL AND @MinTempdbFreeMB < 0
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'@MinTempdbFreeMB must be >= 0 when specified. Supplied: ' + CONVERT(nvarchar(20), @MinTempdbFreeMB),
+            error_severity = 16;
+    END;
     /*#endregion 08-VALIDATION */
 
     /*#region 09-DB-PARSE: @Databases parsing, AG secondary check */
@@ -3012,6 +3117,16 @@ BEGIN
     RAISERROR(N'  @TimeLimit               = %s seconds', 10, 1, @TimeLimit_display) WITH NOWAIT;
     RAISERROR(N'  @BatchLimit              = %s stats', 10, 1, @BatchLimit_display) WITH NOWAIT;
     RAISERROR(N'  @MaxConsecutiveFailures  = %s', 10, 1, @MaxConsecutiveFailures_display) WITH NOWAIT;
+    IF @MaxAGRedoQueueMB IS NOT NULL
+    BEGIN
+        RAISERROR(N'  @MaxAGRedoQueueMB        = %d MB', 10, 1, @MaxAGRedoQueueMB) WITH NOWAIT;
+        RAISERROR(N'  @MaxAGWaitMinutes        = %d', 10, 1, @MaxAGWaitMinutes) WITH NOWAIT;
+    END;
+    IF @MinTempdbFreeMB IS NOT NULL
+    BEGIN
+        DECLARE @MinTempdbFreeMB_display nvarchar(20) = CONVERT(nvarchar(20), @MinTempdbFreeMB);
+        RAISERROR(N'  @MinTempdbFreeMB         = %s MB', 10, 1, @MinTempdbFreeMB_display) WITH NOWAIT;
+    END;
     RAISERROR(N'  @LockTimeout             = %s seconds', 10, 1, @LockTimeout_display) WITH NOWAIT;
     RAISERROR(N'  @SortOrder               = %s', 10, 1, @SortOrder) WITH NOWAIT;
     RAISERROR(N'  @StatsInParallel         = %s', 10, 1, @StatsInParallel) WITH NOWAIT;
@@ -3150,6 +3265,43 @@ BEGIN
     END;
 
     /*
+    v2.7: AG primary detection (#18).
+    Query runs always (not just debug) so @MaxAGRedoQueueMB loop check works.
+    Also captures initial redo queue for debug banner.
+    */
+    IF EXISTS
+    (
+        SELECT 1
+        FROM sys.dm_hadr_availability_replica_states AS ars
+        WHERE ars.is_local = 1
+        AND   ars.role_desc = N'PRIMARY'
+    )
+    BEGIN
+        SET @ag_is_primary = 1;
+
+        SELECT @ag_redo_initial_mb = MAX(drs.redo_queue_size) / 1024
+        FROM sys.dm_hadr_database_replica_states AS drs
+        WHERE drs.is_local = 0
+        AND   drs.is_primary_replica = 0;
+
+        IF @ag_redo_initial_mb IS NOT NULL AND @ag_redo_initial_mb > 100
+            SET @WarningsOut = ISNULL(@WarningsOut, N'') +
+                N'AG_REDO_ELEVATED: Redo queue ' + CONVERT(nvarchar(20), @ag_redo_initial_mb) + N' MB at startup; ';
+    END;
+
+    /*
+    v2.7: Tempdb free space detection (#34).
+    Query runs always for warnings and debug banner.
+    */
+    SELECT @tempdb_free_mb =
+        SUM(unallocated_extent_page_count) * 8 / 1024
+    FROM tempdb.sys.dm_db_file_space_usage;
+
+    IF @tempdb_free_mb IS NOT NULL AND @tempdb_free_mb < 100
+        SET @WarningsOut = ISNULL(@WarningsOut, N'') +
+            N'TEMPDB_LOW: Only ' + CONVERT(nvarchar(20), @tempdb_free_mb) + N' MB free at startup; ';
+
+    /*
     v2.5: Resource Governor detection (#35).
     Query runs always (not just debug) so @MaxDOP conflict warning works.
     Display is debug-only; warning is always shown.
@@ -3174,6 +3326,20 @@ BEGIN
         ELSE
             RAISERROR(N'  Resource Governor: workload group [%s] (no DOP cap)', 10, 1,
                 @rg_workload_group) WITH NOWAIT;
+    END;
+
+    /* v2.7: AG redo queue and tempdb in debug banner */
+    IF @Debug = 1
+    BEGIN
+        IF @ag_is_primary = 1
+        BEGIN
+            IF @ag_redo_initial_mb IS NOT NULL
+                RAISERROR(N'  AG redo queue:   %I64d MB (max across secondaries at startup)', 10, 1, @ag_redo_initial_mb) WITH NOWAIT;
+            ELSE
+                RAISERROR(N'  AG primary:      Yes (secondaries offline or no redo data)', 10, 1) WITH NOWAIT;
+        END;
+        IF @tempdb_free_mb IS NOT NULL
+            RAISERROR(N'  Tempdb free:     %I64d MB', 10, 1, @tempdb_free_mb) WITH NOWAIT;
     END;
 
     /*
@@ -3248,7 +3414,10 @@ BEGIN
                     @StatsInParallel AS StatsInParallel,
                     @FailFast AS FailFast,
                     @LongRunningThresholdMinutes AS LongRunningThresholdMinutes,
-                    @LongRunningSamplePercent AS LongRunningSamplePercent
+                    @LongRunningSamplePercent AS LongRunningSamplePercent,
+                    @MaxAGRedoQueueMB AS MaxAGRedoQueueMB,
+                    @MaxAGWaitMinutes AS MaxAGWaitMinutes,
+                    @MinTempdbFreeMB AS MinTempdbFreeMB
                 FOR
                     XML RAW(N'Parameters'),
                     ELEMENTS
@@ -6025,6 +6194,135 @@ OPTION (RECOMPILE);';
             SELECT
                 @stop_reason = N'BATCH_LIMIT';
             BREAK;
+        END;
+
+        /*
+        ====================================================================
+        AG REDO QUEUE CHECK (v2.7, #18)
+        ====================================================================
+        Before each stat update, check if AG secondary redo queue exceeds
+        threshold. If over threshold, enter a wait loop. If wait exceeds
+        @MaxAGWaitMinutes or @TimeLimit is reached during wait, stop the run.
+        */
+        IF  @MaxAGRedoQueueMB IS NOT NULL
+        AND @ag_is_primary = 1
+        AND @Execute = N'Y'
+        BEGIN
+            SELECT @ag_redo_queue_mb = MAX(drs.redo_queue_size) / 1024
+            FROM sys.dm_hadr_database_replica_states AS drs
+            WHERE drs.is_local = 0
+            AND   drs.is_primary_replica = 0
+            AND   drs.redo_queue_size IS NOT NULL;
+
+            IF @ag_redo_queue_mb IS NOT NULL AND @ag_redo_queue_mb > @MaxAGRedoQueueMB
+            BEGIN
+                SET @ag_wait_start = SYSDATETIME();
+
+                WHILE @ag_redo_queue_mb > @MaxAGRedoQueueMB
+                BEGIN
+                    /* Check AG wait timeout */
+                    IF DATEDIFF(MINUTE, @ag_wait_start, SYSDATETIME()) >= @MaxAGWaitMinutes
+                    BEGIN
+                        SELECT @stop_reason = N'AG_REDO_QUEUE';
+                        RAISERROR(N'', 10, 1) WITH NOWAIT;
+                        RAISERROR(N'AG redo queue exceeded %d MB for %d minutes. Stopping to protect secondaries.', 10, 1,
+                            @MaxAGRedoQueueMB, @MaxAGWaitMinutes) WITH NOWAIT;
+                        SET @WarningsOut = ISNULL(@WarningsOut, N'') +
+                            N'AG_REDO_QUEUE: Stopped after waiting ' +
+                            CONVERT(nvarchar(10), @MaxAGWaitMinutes) + N' min; ';
+                        BREAK;
+                    END;
+
+                    /* Check time limit during wait */
+                    IF  @TimeLimit IS NOT NULL
+                    AND DATEDIFF(SECOND, @start_time, SYSDATETIME()) >= @TimeLimit
+                    BEGIN
+                        SELECT @stop_reason = N'TIME_LIMIT';
+                        RAISERROR(N'', 10, 1) WITH NOWAIT;
+                        RAISERROR(N'Time limit reached while waiting for AG redo queue to drain.', 10, 1) WITH NOWAIT;
+                        BREAK;
+                    END;
+
+                    SET @ag_wait_msg =
+                        N'  AG redo queue: ' + CONVERT(nvarchar(20), @ag_redo_queue_mb) +
+                        N' MB (threshold: ' + CONVERT(nvarchar(20), @MaxAGRedoQueueMB) +
+                        N' MB) -- waiting 30s...';
+                    RAISERROR(@ag_wait_msg, 10, 1) WITH NOWAIT;
+
+                    WAITFOR DELAY '00:00:30';
+
+                    /* Re-check redo queue */
+                    SELECT @ag_redo_queue_mb = MAX(drs.redo_queue_size) / 1024
+                    FROM sys.dm_hadr_database_replica_states AS drs
+                    WHERE drs.is_local = 0
+                    AND   drs.is_primary_replica = 0
+                    AND   drs.redo_queue_size IS NOT NULL;
+
+                    /* If secondaries went offline during wait, break out */
+                    IF @ag_redo_queue_mb IS NULL
+                    BEGIN
+                        RAISERROR(N'  AG secondaries went offline during wait. Resuming.', 10, 1) WITH NOWAIT;
+                        BREAK;
+                    END;
+                END;
+
+                /* If stop_reason was set inside the wait loop, exit main loop */
+                IF @stop_reason IS NOT NULL
+                    BREAK;
+
+                /* Redo queue drained -- log recovery */
+                IF @ag_redo_queue_mb IS NOT NULL AND @ag_redo_queue_mb <= @MaxAGRedoQueueMB
+                BEGIN
+                    SET @ag_recovered_msg =
+                        N'  AG redo queue drained to ' + CONVERT(nvarchar(20), @ag_redo_queue_mb) +
+                        N' MB (threshold: ' + CONVERT(nvarchar(20), @MaxAGRedoQueueMB) +
+                        N' MB). Resuming.';
+                    RAISERROR(@ag_recovered_msg, 10, 1) WITH NOWAIT;
+                END;
+            END;
+        END;
+
+        /*
+        ====================================================================
+        TEMPDB PRESSURE CHECK (v2.7, #34)
+        ====================================================================
+        Before each stat update, check tempdb free space. Particularly
+        important for FULLSCAN operations and Azure SQL.
+        */
+        IF  @MinTempdbFreeMB IS NOT NULL
+        AND @Execute = N'Y'
+        BEGIN
+            SELECT @tempdb_free_mb =
+                SUM(unallocated_extent_page_count) * 8 / 1024
+            FROM tempdb.sys.dm_db_file_space_usage;
+
+            IF @tempdb_free_mb < @MinTempdbFreeMB
+            BEGIN
+                SET @tempdb_msg =
+                    N'  Tempdb free space: ' + CONVERT(nvarchar(20), @tempdb_free_mb) +
+                    N' MB (threshold: ' + CONVERT(nvarchar(20), @MinTempdbFreeMB) +
+                    N' MB)';
+
+                IF @FailFast = 1
+                BEGIN
+                    RAISERROR(N'', 10, 1) WITH NOWAIT;
+                    RAISERROR(@tempdb_msg, 10, 1) WITH NOWAIT;
+                    RAISERROR(N'Tempdb pressure detected with @FailFast=1. Stopping.', 10, 1) WITH NOWAIT;
+                    SELECT @stop_reason = N'TEMPDB_PRESSURE';
+                    SET @WarningsOut = ISNULL(@WarningsOut, N'') +
+                        N'TEMPDB_PRESSURE: Stopped, only ' +
+                        CONVERT(nvarchar(20), @tempdb_free_mb) + N' MB free; ';
+                    BREAK;
+                END;
+                ELSE
+                BEGIN
+                    RAISERROR(@tempdb_msg, 10, 1) WITH NOWAIT;
+                    RAISERROR(N'  WARNING: Tempdb below threshold. Continuing (use @FailFast=1 to abort).', 10, 1) WITH NOWAIT;
+                    SET @WarningsOut = ISNULL(@WarningsOut, N'') +
+                        N'TEMPDB_LOW: ' + CONVERT(nvarchar(20), @tempdb_free_mb) +
+                        N' MB free (threshold: ' + CONVERT(nvarchar(20), @MinTempdbFreeMB) + N' MB); ';
+                END;
+            END;
         END;
 
         /*
