@@ -15,7 +15,7 @@ To stop:    ALTER EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER STATE = STOP;
 To drop:    DROP EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER;
 To view:    See queries at bottom of this script
 
-Created: 2026-01-28 for sp_StatUpdate troubleshooting (#8 Grant Fritchey feedback)
+Created: 2026-01-28 for sp_StatUpdate troubleshooting (#8)
 Updated: 2026-02-12 v2.0 - Added starting events for during-execution visibility
 */
 
