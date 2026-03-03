@@ -1961,6 +1961,11 @@ BEGIN
     ============================================================================
     */
 
+    /* Normalize @Tables = 'ALL' to NULL (all tables). The display variable already
+       shows 'ALL' for NULL, so users naturally expect 'ALL' to work as a keyword. */
+    IF UPPER(LTRIM(RTRIM(@Tables))) = N'ALL'
+        SET @Tables = NULL;
+
     IF @TargetNorecompute NOT IN (N'Y', N'N', N'BOTH')
     BEGIN
         INSERT INTO
@@ -3586,7 +3591,13 @@ BEGIN
             N'dbo',
             N'sp_StatUpdate',
             N'P',
-            N'EXECUTE dbo.sp_StatUpdate @Databases = N''' + ISNULL(@Databases, DB_NAME()) + N'''...',
+            N'EXECUTE dbo.sp_StatUpdate @Databases = N''' + ISNULL(@Databases, DB_NAME()) + N''''
+                + CASE WHEN @Tables IS NOT NULL THEN N', @Tables = N''' + @Tables + N'''' ELSE N'' END
+                + CASE WHEN @Statistics IS NOT NULL THEN N', @Statistics = N''' + @Statistics + N'''' ELSE N'' END
+                + N', @TimeLimit = ' + CONVERT(nvarchar(10), @TimeLimit)
+                + N', @SortOrder = N''' + @SortOrder + N''''
+                + CASE WHEN @QueryStorePriority = N'Y' THEN N', @QueryStorePriority = N''Y'', @QueryStoreMetric = N''' + @QueryStoreMetric + N'''' ELSE N'' END
+                + N';',
             N'SP_STATUPDATE_START',
             @start_time,
             @parameters_xml
