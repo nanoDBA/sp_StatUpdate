@@ -144,7 +144,7 @@ History:    2.8.2026.0303 - v2.8 Bug fixes for deploy, @Tables, CommandLog:
                             entire run. (#52)
                           - Doc: @ExcludeStatistics/@ExcludeTables @Help text now documents
                             LIKE wildcard semantics (_ = single-char, [_] for literal). (#33)
-            2.3.2026.0226 - v2.3 SME Persona Synthesis Implementation:
+            2.3.2026.0226 - v2.3 Code Review Implementation:
                             Trivial: MAXRECURSION 1000, sub-second durations, dm_exec_sessions,
                               ROWLOCK+READPAST, MAX_GRANT_PERCENT=25, TOCTOU message, hardware
                               context extension, JSON summary in ExtendedInfo END.
@@ -217,7 +217,7 @@ History:    2.8.2026.0303 - v2.8 Bug fixes for deploy, @Tables, CommandLog:
                             invalid XE predicate syntax (IN() not supported, wait_type needs
                             numeric map_key values), replaced query_canceled with attention event,
                             added lock_escalation event, added start/complete correlation query.
-                            (#8 Grant Fritchey)
+                            (#8)
             1.9.2026.0206 - Feat: Added Status and StatusMessage columns to summary result set
                             for easy Agent job alerting (SUCCESS/WARNING/ERROR). Early-return
                             path (0 qualifying stats) now also returns the result set.
@@ -231,7 +231,7 @@ History:    2.8.2026.0303 - v2.8 Bug fixes for deploy, @Tables, CommandLog:
                             NONCLUSTERED to eliminate "maximum key length 900 bytes" warning.
                             (4 sysname columns = 1024 bytes exceeds clustered limit but is fine
                             for nonclustered indexes which support up to 1700 bytes in SQL 2016+)
-            1.9.2026.0128 - Additional Code Review Fixes (addressing remaining SME concerns):
+            1.9.2026.0128 - Additional Code Review Fixes:
                           - New @Preset parameter: NIGHTLY_MAINTENANCE, WEEKLY_FULL, OLTP_LIGHT,
                             WAREHOUSE_AGGRESSIVE for common configuration patterns
                           - @GroupByJoinPattern parameter (default Y): Updates commonly-joined tables together
@@ -4430,7 +4430,7 @@ OPTION (RECOMPILE);';
                     RAISERROR(N'    Note: TF 9481 forcing legacy CE despite compat level %d', 10, 1, @db_compat_level) WITH NOWAIT;
 
                 /*
-                RCSI / Snapshot Isolation detection (Fabiano Amorim #53)
+                RCSI / Snapshot Isolation detection (#53)
                 Statistics updates under RCSI generate version store overhead in tempdb.
                 */
                 DECLARE
