@@ -199,10 +199,10 @@ History:    2.8.2026.0302 - v2.8 Comprehensive issue sweep (31 issues resolved):
                           - Fix: Phase validation now detects unexpected row loss between staged
                             discovery phases and falls back to legacy single-query mode. Prevents
                             processing incomplete data when DMV cross-applies fail silently.
-                            (#2 Erik Darling)
+                            (#2)
                           - Fix: Truncated partitions no longer force full RESAMPLE. Stale
                             partitions with data are updated via ON PARTITIONS(); empty/truncated
-                            partitions are skipped. (#4/26 Paul Randal / Michelle Ufford)
+                            partitions are skipped. (#4/26)
                           - Fix: XE session script corrected - added sp_statement_starting and
                             sql_statement_starting events for during-execution visibility, fixed
                             invalid XE predicate syntax (IN() not supported, wait_type needs
@@ -368,7 +368,7 @@ History:    2.8.2026.0302 - v2.8 Comprehensive issue sweep (31 issues resolved):
             1.2.2026.0117 - Tiger Toolbox 5-tier adaptive thresholds (@TieredThresholds),
                             AND/OR threshold logic (@ThresholdLogic),
                             version-aware PERSIST_SAMPLE_PERCENT and MAXDOP.
-                            Erik Darling style refactor, @Help parameter,
+                            Style refactor, @Help parameter,
                             incremental stats (@UpdateIncremental),
                             AG awareness, heap handling (index_id=0, PageCount),
                             memory-optimized tables, saner defaults.

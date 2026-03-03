@@ -336,7 +336,7 @@ Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and lo
 - **1.4.2026.0119** - Query Store prioritization, filtered stats handling.
 - **1.3.2026.0119** - Multi-database support, OUTPUT parameters, return codes.
 - **1.2.2026.0117** - Tiger Toolbox tiered thresholds, AND/OR logic, PERSIST_SAMPLE_PERCENT.
-- **1.1.2026.0117** - Erik Darling style refactor, @Help, parallel mode.
+- **1.1.2026.0117** - Style refactor, @Help, parallel mode.
 - **1.0.2026.0117** - Initial public release.
 
 ## When to Use This (vs IndexOptimize)
