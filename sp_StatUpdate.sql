@@ -6239,12 +6239,15 @@ OPTION (RECOMPILE);';
                     RAISERROR(N'  Created new queue (QueueID = %d)', 10, 1, @queue_id) WITH NOWAIT;
 
                     /* v2.3: Store parameter fingerprint for conflict detection */
+                    /* Uses dynamic SQL to avoid compile-time column validation when column doesn't exist yet */
                     BEGIN TRY
                         IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.Queue') AND name = N'ParameterFingerprint')
                         BEGIN
-                            UPDATE dbo.Queue
-                            SET ParameterFingerprint = @parameter_fingerprint
-                            WHERE QueueID = @queue_id;
+                            EXEC sp_executesql
+                                N'UPDATE dbo.Queue SET ParameterFingerprint = @fp WHERE QueueID = @qid;',
+                                N'@fp int, @qid int',
+                                @fp = @parameter_fingerprint,
+                                @qid = @queue_id;
                         END;
                     END TRY
                     BEGIN CATCH
@@ -6256,13 +6259,16 @@ OPTION (RECOMPILE);';
 
                 /* v2.3: After transaction, check parameter fingerprint for conflict detection */
                 /* (Done outside transaction to avoid leaving open txn on conflict RETURN) */
+                /* Uses dynamic SQL to avoid compile-time column validation when column doesn't exist yet */
                 BEGIN TRY
                     IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.Queue') AND name = N'ParameterFingerprint')
                     BEGIN
                         DECLARE @stored_fingerprint int;
-                        SELECT @stored_fingerprint = ParameterFingerprint
-                        FROM dbo.Queue
-                        WHERE QueueID = @queue_id;
+                        EXEC sp_executesql
+                            N'SELECT @fp = ParameterFingerprint FROM dbo.Queue WHERE QueueID = @qid;',
+                            N'@fp int OUTPUT, @qid int',
+                            @fp = @stored_fingerprint OUTPUT,
+                            @qid = @queue_id;
 
                         IF  @stored_fingerprint IS NOT NULL
                         AND @stored_fingerprint <> @parameter_fingerprint
@@ -6705,39 +6711,50 @@ OPTION (RECOMPILE);';
                 Using dm_exec_sessions (not dm_exec_requests) because workers sleeping
                 between stat claims are not in dm_exec_requests but ARE in dm_exec_sessions.
                 */
-                UPDATE
-                    qs
-                SET
-                    qs.TableStartTime = NULL,
-                    qs.SessionID = NULL,
-                    qs.RequestID = NULL,
-                    qs.RequestStartTime = NULL,
-                    qs.LastStatCompletedAt = NULL /* v2.3: reset heartbeat when releasing dead worker row */
+                /* v2.3: LastStatCompletedAt column may not exist on pre-v2.3 installations.
+                   Use dynamic SQL to avoid compile-time column validation failure. */
+                DECLARE @dead_worker_sql nvarchar(max);
+                DECLARE @has_heartbeat_col bit = CASE
+                    WHEN EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic') AND name = N'LastStatCompletedAt')
+                    THEN 1 ELSE 0 END;
+
+                SET @dead_worker_sql = N'
+                UPDATE qs
+                SET    qs.TableStartTime = NULL,
+                       qs.SessionID = NULL,
+                       qs.RequestID = NULL,
+                       qs.RequestStartTime = NULL'
+                    + CASE WHEN @has_heartbeat_col = 1
+                           THEN N',
+                       qs.LastStatCompletedAt = NULL'
+                           ELSE N'' END + N'
                 FROM dbo.QueueStatistic AS qs
                 WHERE qs.QueueID = @queue_id
                 AND   qs.TableStartTime IS NOT NULL
                 AND   qs.TableEndTime IS NULL
                 AND   (
-                          /* Primary check: worker session no longer exists in dm_exec_sessions */
                           NOT EXISTS
                           (
-                              SELECT
-                                  1
+                              SELECT 1
                               FROM sys.dm_exec_sessions AS s
                               WHERE s.session_id = qs.SessionID
                           )
                           OR
-                          /* Timeout check: worker stuck for too long (might be blocked or hung).
-                             v2.3: Use LastStatCompletedAt (per-stat heartbeat) when available;
-                             fall back to TableStartTime for backward compatibility.
-                             "Dead" = no stat completed in N minutes AND session no longer exists. */
                           (
                               @DeadWorkerTimeoutMinutes IS NOT NULL
-                              AND DATEDIFF(MINUTE,
-                                  COALESCE(qs.LastStatCompletedAt, qs.TableStartTime),
+                              AND DATEDIFF(MINUTE, '
+                    + CASE WHEN @has_heartbeat_col = 1
+                           THEN N'COALESCE(qs.LastStatCompletedAt, qs.TableStartTime)'
+                           ELSE N'qs.TableStartTime' END + N',
                                   SYSDATETIME()) > @DeadWorkerTimeoutMinutes
                           )
-                      );
+                      );';
+
+                EXEC sp_executesql
+                    @dead_worker_sql,
+                    N'@queue_id int, @DeadWorkerTimeoutMinutes int',
+                    @queue_id = @queue_id,
+                    @DeadWorkerTimeoutMinutes = @DeadWorkerTimeoutMinutes;
 
                 DECLARE
                     @released_count integer = ROWCOUNT_BIG();
@@ -7564,17 +7581,19 @@ OPTION (RECOMPILE);';
                     @progress_msg = N'  Complete (' + CONVERT(nvarchar(10), @duration_ms) + N' ms)';
 
                 /* v2.3: Update LastStatCompletedAt to track per-stat heartbeat for dead worker detection */
+                /* Uses dynamic SQL to avoid compile-time column validation when column doesn't exist yet */
                 IF  @StatsInParallel = N'Y'
                 AND @claimed_table_database IS NOT NULL
                 AND OBJECT_ID(N'dbo.QueueStatistic', N'U') IS NOT NULL
                 AND EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic') AND name = N'LastStatCompletedAt')
                 BEGIN
-                    UPDATE dbo.QueueStatistic
-                    SET LastStatCompletedAt = SYSDATETIME()
-                    WHERE QueueID = @queue_id
-                    AND   DatabaseName = @claimed_table_database
-                    AND   SchemaName = @claimed_table_schema
-                    AND   ObjectName = @claimed_table_name;
+                    EXEC sp_executesql
+                        N'UPDATE dbo.QueueStatistic SET LastStatCompletedAt = SYSDATETIME() WHERE QueueID = @qid AND DatabaseName = @db AND SchemaName = @sch AND ObjectName = @obj;',
+                        N'@qid int, @db sysname, @sch sysname, @obj sysname',
+                        @qid = @queue_id,
+                        @db = @claimed_table_database,
+                        @sch = @claimed_table_schema,
+                        @obj = @claimed_table_name;
                 END;
 
                 RAISERROR(@progress_msg, 10, 1) WITH NOWAIT;
