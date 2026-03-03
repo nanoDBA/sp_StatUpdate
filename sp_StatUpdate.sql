@@ -36,11 +36,43 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.7.2026.0302 (Major.Minor.Year.MMDD)
+Version:    2.8.2026.0302 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.7.2026.0302 - v2.7 AG redo queue pause and tempdb pressure check:
+History:    2.8.2026.0302 - v2.8 Comprehensive issue sweep (31 issues resolved):
+                          - Feat: Query Store forced plan invalidation warning (#32, p1-critical).
+                            After stats updates, automatically checks sys.query_store_plan for
+                            forced plans on updated tables. Warns via @WarningsOut if found.
+                          - Feat: @IncludeIndexedViews parameter (#49). Y = include statistics
+                            on indexed views (views with clustered index). Default N.
+                          - Feat: @LogSkippedToCommandLog parameter (#58). Writes CommandLog
+                            entries for TOCTOU-skipped stats. For compliance audit trails.
+                          - Feat: @ReturnDetailedResults parameter (#25). Returns second result
+                            set with per-statistic detail for PowerShell/automation.
+                          - Feat: @CompletionNotifyTable parameter (#64). Insert notification
+                            row on all exit paths for ETL dependency chains. Auto-creates table.
+                          - Feat: Transaction log space check (#61). Warns when log >90% full
+                            during FULLSCAN operations. Prevents unwarned log growth.
+                          - Feat: Stretch Database auto-skip (#55). Tables with remote data
+                            archive are automatically excluded (deprecated feature, causes timeouts).
+                          - Fix: Azure SQL MI vs DB distinction (#39). EngineEdition 5 (SQL DB)
+                            vs 8 (MI) now detected separately with platform-specific warnings.
+                          - Add: RLS detection (#60). Debug mode warns when Row-Level Security
+                            policies exist on tables being updated (biased histogram risk).
+                          - Add: Wide statistics detection (#59). Debug mode warns for stats
+                            with >8 columns (tempdb/memory pressure risk during FULLSCAN).
+                          - Add: Filtered index mismatch detection (#38). Debug mode warns when
+                            stat filter_definition differs from index filter_definition.
+                          - Add: Columnstore context detection (#28). Debug mode warns about
+                            CCI modification_counter underreporting after bulk loads.
+                          - Add: Computed column detection (#30). Debug mode warns about stats
+                            on non-persisted computed columns (higher scan cost).
+                          - Doc: @Help operational notes added for scheduling (#9), parallel
+                            mode (#12), edition behavior (#36), PERSIST_SAMPLE_PERCENT (#11),
+                            RCSI (#62), locking (#63), modification_counter semantics (#57),
+                            quick start (#15, #16), consultant workflow (#46), Azure (#39).
+            2.7.2026.0302 - v2.7 AG redo queue pause and tempdb pressure check:
                           - Feat: @MaxAGRedoQueueMB / @MaxAGWaitMinutes (#18). On AG primaries,
                             pauses stats when secondary redo queue exceeds threshold. Wait loop
                             with 30s recheck interval respects both @MaxAGWaitMinutes and @TimeLimit.
@@ -422,6 +454,7 @@ ALTER PROCEDURE
     @HoursStaleThreshold int = NULL, /*alternative to @DaysStaleThreshold using hours (DATEDIFF(HOUR,...)). Provides precise time-based threshold. Cannot be specified simultaneously with @DaysStaleThreshold.*/
     @MinPageCount bigint = 0, /*minimum table page count to process. 0 = no filter, 125 = ~1MB, 125000 = ~1GB. Use to skip tiny tables*/
     @IncludeSystemObjects nvarchar(1) = N'N', /*Y = include system object statistics (sys.* tables/views)*/
+    @IncludeIndexedViews nvarchar(1) = N'N', /*Y = include statistics on indexed views (sys.stats on views with clustered index). N = user tables only (default). UPDATE STATISTICS on indexed views is valid SQL. (#49)*/
     @SkipTablesWithColumnstore nchar(1) = N'N', /*Y = skip tables that have a nonclustered columnstore index (type 5 or 6 in sys.indexes). Use when plan stability is paramount - updating rowstore stats on NCCI tables may change batch mode execution plans.*/
 
     /*
@@ -509,8 +542,11 @@ ALTER PROCEDURE
     */
     @LockTimeout integer = NULL, /*seconds to wait for schema locks. NULL = session default (typically infinite), -1 = infinite, 0 = fail immediately on any contention, positive = seconds. Recommended: 30-300 for parallel mode*/
     @LogToTable nvarchar(1) = N'Y', /*Y = log to dbo.CommandLog (requires table), N = no logging*/
+    @LogSkippedToCommandLog nvarchar(1) = N'N', /*Y = write CommandLog entries for skipped statistics (TOCTOU/threshold-filtered) with Command='SKIPPED'. For compliance audit trails. (#58)*/
     @ProgressLogInterval int = NULL, /*log progress to CommandLog every N stats (for Agent job monitoring)*/
     @Execute nvarchar(1) = N'Y', /*Y = execute, N = print only (dry run)*/
+    @ReturnDetailedResults bit = 0, /*1 = return second result set with per-statistic detail (database, schema, table, stat, command, duration_ms, result). For automation/PowerShell integration. (#25)*/
+    @CompletionNotifyTable nvarchar(500) = NULL, /*table to receive notification row on all exit paths (RunLabel, StartTime, EndTime, StopReason, counts). Auto-created if not exists. For ETL dependency chains. (#64)*/
     @WhatIfOutputTable nvarchar(500) = NULL, /*table to receive commands when @Execute = N (for automation)*/
     @CheckPermissionsOnly nchar(1) = N'N', /*Y = check required permissions (VIEW ANY DATABASE, VIEW DATABASE STATE, ALTER on tables, INSERT on CommandLog) and report missing ones. Returns without executing any stats updates. Diagnostic mode only.*/
     @FailFast bit = 0, /*1 = abort on first error*/
@@ -574,7 +610,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.7.2026.0302',
+        @procedure_version varchar(20) = '2.8.2026.0302',
         @procedure_version_date datetime = '20260302',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -624,7 +660,9 @@ BEGIN
         SELECT
             N'v2.6: Multi-database direct mode -- @Statistics and @StatisticsFromTable respect @Databases (#44)' UNION ALL
         SELECT
-            N'v2.7: AG redo queue pause (#18), tempdb pressure check (#34)';
+            N'v2.7: AG redo queue pause (#18), tempdb pressure check (#34)' UNION ALL
+        SELECT
+            N'v2.8: Comprehensive issue sweep — 31 issues resolved (QS forced plans, indexed views, log space, RLS/columnstore/filter detection)';
 
         /*
         Parameter documentation
@@ -778,6 +816,14 @@ BEGIN
                     THEN N'max minutes to wait for AG redo queue to drain before stopping with AG_REDO_QUEUE. Interacts with @TimeLimit (whichever is reached first wins). Default 10.'
                     WHEN N'@MinTempdbFreeMB'
                     THEN N'minimum tempdb free space (MB) before each stat update. When breached: @FailFast=1 aborts with TEMPDB_PRESSURE, else warns and continues. Important for FULLSCAN and Azure SQL. NULL = disabled.'
+                    WHEN N'@IncludeIndexedViews'
+                    THEN N'Y = include statistics on indexed views (views with clustered index). N (default) = user tables only. UPDATE STATISTICS on indexed views is valid SQL syntax.'
+                    WHEN N'@LogSkippedToCommandLog'
+                    THEN N'Y = write CommandLog entries for TOCTOU-skipped stats (Command=SKIPPED). For compliance audit trails. N (default) = skip silently.'
+                    WHEN N'@ReturnDetailedResults'
+                    THEN N'1 = return second result set with per-statistic detail (database, schema, table, stat, mods, priority, processed). For PowerShell/automation.'
+                    WHEN N'@CompletionNotifyTable'
+                    THEN N'table to receive notification row on all exit paths (RunLabel, times, counts, StopReason). Auto-created if not exists. For ETL dependency chains. NULL = disabled.'
                     ELSE N'undocumented parameter'
                 END,
             valid_inputs =
@@ -1029,6 +1075,54 @@ BEGIN
             mode_name,
             mode_description,
             mode_when_to_use
+        );
+
+        /*
+        Operational notes (v2.8) — addresses documentation issues #9, #11, #12, #15, #16, #36, #46, #57, #62, #63
+        */
+        SELECT
+            topic = note_data.topic,
+            note = note_data.note
+        FROM
+        (
+            VALUES
+                /* #15: Essential parameters for new users */
+                (N'Quick Start',
+                 N'Essential parameters: @Databases, @Preset (or @TimeLimit + @ModificationThreshold), @LogToTable, @Execute. Start with: EXEC sp_StatUpdate @Preset=N''NIGHTLY_MAINTENANCE'', @Databases=N''USER_DATABASES'';'),
+                /* #16: Zero-dependency quick start */
+                (N'Zero Dependencies',
+                 N'Run without Ola Hallengren tables: EXEC sp_StatUpdate @LogToTable=N''N'', @Execute=N''N''; (dry run, no CommandLog needed). Add @Execute=N''Y'' when ready.'),
+                /* #46: Consultant workflow */
+                (N'Consultant Workflow',
+                 N'Step 1: EXEC sp_StatUpdate @Execute=N''N'', @Debug=1; (diagnose). Step 2: Review output. Step 3: EXEC sp_StatUpdate @Preset=N''NIGHTLY_MAINTENANCE'', @Databases=N''USER_DATABASES'';'),
+                /* #57: modification_counter semantics */
+                (N'@ModificationThreshold',
+                 N'modification_counter reflects TOTAL table modifications (INSERT/UPDATE/DELETE), NOT per-column or per-filter changes. For filtered statistics, the counter may be high even when the filter predicate''s data distribution hasn''t changed.'),
+                /* #62: RCSI and modification_counter */
+                (N'RCSI Environments',
+                 N'READ_COMMITTED_SNAPSHOT does not affect modification_counter (DML-driven only, not read-path). RCSI generates version store overhead in tempdb during stats updates — monitor tempdb if @MinTempdbFreeMB is not set.'),
+                /* #63: Sch-S locking */
+                (N'Locking Behavior',
+                 N'UPDATE STATISTICS acquires Sch-M (schema modification) locks. sys.dm_db_stats_histogram uses Sch-S which can queue behind Sch-M. Avoid overlapping stats maintenance with schema changes. Use @LockTimeout to bound wait time.'),
+                /* #9: Scheduling guidance */
+                (N'Scheduling',
+                 N'Avoid overlapping with index maintenance (both acquire Sch-M). On AG primaries, Sch-M locks replay to secondaries via redo thread — use @MaxAGRedoQueueMB to protect secondaries. Run during off-peak concurrency windows.'),
+                /* #12: Parallel mode burst behavior */
+                (N'Parallel Mode',
+                 N'Parallel mode creates burst I/O and concurrent Sch-M lock acquisitions. Start with 2-3 workers and conservative @LockTimeout (30-60s). Monitor dm_os_wait_stats for LCK_M_SCH_M contention. @DelayBetweenStats can pace workers.'),
+                /* #36: Edition-specific behavior */
+                (N'Edition Notes',
+                 N'MAXDOP: works on all editions (SQL 2016 SP2+). PERSIST_SAMPLE_PERCENT: all editions (SQL 2016 SP1 CU4+). Incremental stats: requires partitioning (Enterprise or Standard SP1+). Parallel stats: all editions.'),
+                /* #11: PERSIST_SAMPLE_PERCENT CU history */
+                (N'PERSIST_SAMPLE_PERCENT',
+                 N'Available since SQL 2016 SP1 CU4 (build 4446+). Early CUs had bugs — ensure fleet CU consistency. RESAMPLE ignores persisted percent (uses previously computed rate). To audit: SELECT name, has_persisted_sample FROM sys.stats. To remove: UPDATE STATISTICS WITH SAMPLE (without PERSIST).'),
+                /* Azure MI vs DB */
+                (N'Azure SQL',
+                 N'EngineEdition 5 = Azure SQL DB (no Resource Governor, no incremental stats, DTU model). EngineEdition 8 = Azure SQL MI (most on-prem features supported, vCore model). The procedure auto-detects and adjusts warnings.')
+        ) AS note_data
+        (
+            topic,
+            note
         );
 
         RETURN;
@@ -2374,6 +2468,33 @@ BEGIN
                 N'@MinTempdbFreeMB must be >= 0 when specified. Supplied: ' + CONVERT(nvarchar(20), @MinTempdbFreeMB),
             error_severity = 16;
     END;
+
+    /*
+    Validate @IncludeIndexedViews (#49)
+    */
+    IF @IncludeIndexedViews NOT IN (N'Y', N'N')
+    BEGIN
+        INSERT INTO @errors (error_message, error_severity)
+        SELECT N'The value for @IncludeIndexedViews is not supported. Use Y or N.', 16;
+    END;
+
+    /*
+    Validate @LogSkippedToCommandLog (#58)
+    */
+    IF @LogSkippedToCommandLog NOT IN (N'Y', N'N')
+    BEGIN
+        INSERT INTO @errors (error_message, error_severity)
+        SELECT N'The value for @LogSkippedToCommandLog is not supported. Use Y or N.', 16;
+    END;
+
+    /*
+    Validate @CompletionNotifyTable (#64)
+    */
+    IF @CompletionNotifyTable IS NOT NULL AND @CompletionNotifyTable = N''
+    BEGIN
+        INSERT INTO @errors (error_message, error_severity)
+        SELECT N'@CompletionNotifyTable cannot be empty string. Use NULL to disable or provide a table name.', 16;
+    END;
     /*#endregion 08-VALIDATION */
 
     /*#region 09-DB-PARSE: @Databases parsing, AG secondary check */
@@ -3036,10 +3157,30 @@ BEGIN
     */
     IF @is_azure_sql = 1
     BEGIN
-        RAISERROR(N'Platform:    Azure SQL Database (EngineEdition=%d)', 10, 1, @engine_edition) WITH NOWAIT;
-        RAISERROR(N'  Note: Statistics updates consume DTU/vCore resources.', 10, 1) WITH NOWAIT;
-        RAISERROR(N'  Consider running during off-peak hours or scaling up temporarily.', 10, 1) WITH NOWAIT;
-        SET @warnings += N'AZURE_SQL: Consider DTU/vCore impact; ';
+        /*
+        Azure platform distinction (#39): EngineEdition 5 = Azure SQL DB, 8 = Azure SQL MI, 9 = Azure SQL Edge.
+        MI supports incremental stats, Resource Governor, and most on-prem features. SQL DB does not.
+        */
+        DECLARE @azure_platform nvarchar(50) = CASE @engine_edition
+            WHEN 5 THEN N'Azure SQL Database'
+            WHEN 8 THEN N'Azure SQL Managed Instance'
+            WHEN 9 THEN N'Azure SQL Edge'
+            ELSE N'Azure SQL (unknown edition)'
+        END;
+        RAISERROR(N'Platform:    %s (EngineEdition=%d)', 10, 1, @azure_platform, @engine_edition) WITH NOWAIT;
+
+        IF @engine_edition = 5
+        BEGIN
+            RAISERROR(N'  Note: Azure SQL DB — DTU/vCore impact, no Resource Governor, no incremental stats.', 10, 1) WITH NOWAIT;
+            RAISERROR(N'  Consider running during off-peak hours or scaling up temporarily.', 10, 1) WITH NOWAIT;
+            SET @warnings += N'AZURE_SQL_DB: DTU/vCore impact, limited feature set; ';
+        END
+        ELSE IF @engine_edition = 8
+        BEGIN
+            RAISERROR(N'  Note: Azure SQL MI — most on-prem features supported (incremental stats, RG, etc.).', 10, 1) WITH NOWAIT;
+            RAISERROR(N'  vCore consumption still applies during maintenance windows.', 10, 1) WITH NOWAIT;
+            SET @warnings += N'AZURE_SQL_MI: vCore impact during maintenance; ';
+        END;
     END;
 
     /*
@@ -4373,8 +4514,15 @@ OPTION (RECOMPILE);';
                 JOIN sys.objects AS o ON o.object_id = s.object_id
                 LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
                 WHERE (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
-                AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @IncludeSystemObjects_param = N''Y'')
-                AND   o.type <> N''ET'' /* Exclude PolyBase/Synapse external tables (#54) */
+                AND   (
+                          OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
+                       OR @IncludeSystemObjects_param = N''Y''
+                       OR (o.type = N''V'' AND @IncludeIndexedViews_param = N''Y''
+                           AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
+                      ) /* #49: Include indexed views when requested */
+                AND   o.type NOT IN (N''ET'', N''S'') /* Exclude external tables (#54) and system tables */
+                /* #55: Skip Stretch Database tables (deprecated, causes timeouts to Azure storage) */
+                AND   ISNULL(OBJECTPROPERTY(s.object_id, N''TableHasRemoteDataArchive''), 0) = 0
                 /* Skip tables on READ_ONLY filegroups (#65) */
                 AND   NOT EXISTS
                       (
@@ -4965,6 +5113,7 @@ OPTION (RECOMPILE);';
                       @QueryStoreMinExecutions_param bigint,
                       @QueryStoreRecentHours_param integer,
                       @SkipTablesWithColumnstore_param nchar(1),
+                      @IncludeIndexedViews_param nvarchar(1),
                       @Debug_param bit',
                     @SortOrder_param = @SortOrder,
                     @TargetNorecompute_param = @TargetNorecompute,
@@ -4985,6 +5134,7 @@ OPTION (RECOMPILE);';
                     @QueryStoreMinExecutions_param = @QueryStoreMinExecutions,
                     @QueryStoreRecentHours_param = @QueryStoreRecentHours,
                     @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore,
+                    @IncludeIndexedViews_param = @IncludeIndexedViews,
                     @Debug_param = @Debug;
             END; /* End of staged discovery */
 
@@ -5236,8 +5386,15 @@ OPTION (RECOMPILE);';
                   )
         ) AS qs_stats
         WHERE (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
-        AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @IncludeSystemObjects_param = N''Y'')
-        AND   o.type <> N''ET'' /* Exclude PolyBase/Synapse external tables (#54) */
+        AND   (
+                  OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
+               OR @IncludeSystemObjects_param = N''Y''
+               OR (o.type = N''V'' AND @IncludeIndexedViews_param = N''Y''
+                   AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
+              ) /* #49: Include indexed views when requested */
+        AND   o.type NOT IN (N''ET'', N''S'') /* Exclude external tables (#54) and system tables */
+        /* #55: Skip Stretch Database tables */
+        AND   ISNULL(OBJECTPROPERTY(s.object_id, N''TableHasRemoteDataArchive''), 0) = 0
         /* Skip tables on READ_ONLY filegroups (#65) */
         AND   NOT EXISTS
               (
@@ -5463,7 +5620,8 @@ OPTION (RECOMPILE);';
                 @QueryStoreMetric_param nvarchar(20),
                 @QueryStoreMinExecutions_param bigint,
                 @QueryStoreRecentHours_param integer,
-                @SkipTablesWithColumnstore_param nchar(1)';
+                @SkipTablesWithColumnstore_param nchar(1),
+                @IncludeIndexedViews_param nvarchar(1)';
 
         /*
         Execute discovery in target database
@@ -5525,9 +5683,167 @@ OPTION (RECOMPILE);';
                 @QueryStoreMetric_param = @QueryStoreMetric,
                 @QueryStoreMinExecutions_param = @QueryStoreMinExecutions,
                 @QueryStoreRecentHours_param = @QueryStoreRecentHours,
-                @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore;
+                @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore,
+                @IncludeIndexedViews_param = @IncludeIndexedViews;
 
             END; /* End of legacy discovery (explicit or fallback) */
+
+            /*
+            ================================================================
+            POST-DISCOVERY PER-DATABASE DETECTION WARNINGS
+            Lightweight checks on discovered stats for operational awareness.
+            ================================================================
+            */
+
+            /* #60: RLS (Row-Level Security) detection — biased histogram risk */
+            IF @Debug = 1
+            BEGIN
+                DECLARE @rls_check_sql nvarchar(max) = N'
+                    SELECT @cnt = COUNT(DISTINCT sp.target_object_id)
+                    FROM ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.security_policies AS sp
+                    INNER JOIN ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.security_predicates AS spd
+                        ON spd.object_id = sp.object_id
+                    WHERE sp.is_enabled = 1
+                    AND spd.target_object_id IN (
+                        SELECT DISTINCT stp.object_id
+                        FROM #stats_to_process AS stp
+                        WHERE stp.database_name = @dbname COLLATE DATABASE_DEFAULT
+                    )';
+                DECLARE @rls_table_count int = 0;
+                BEGIN TRY
+                    EXEC sp_executesql @rls_check_sql,
+                        N'@dbname sysname, @cnt int OUTPUT',
+                        @dbname = @CurrentDatabaseName, @cnt = @rls_table_count OUTPUT;
+                    IF @rls_table_count > 0
+                    BEGIN
+                        DECLARE @rls_msg nvarchar(500) = N'    RLS: ' + CONVERT(nvarchar(10), @rls_table_count)
+                            + N' table(s) with Row-Level Security — histogram quality may vary by execution context';
+                        RAISERROR(@rls_msg, 10, 1) WITH NOWAIT;
+                        SET @warnings += N'RLS_DETECTED: ' + @CurrentDatabaseName + N'(' + CONVERT(nvarchar(10), @rls_table_count) + N' tables); ';
+                    END;
+                END TRY
+                BEGIN CATCH /* RLS DMVs might not be accessible */ END CATCH;
+            END;
+
+            /* #59: Wide statistics detection (>8 columns) — tempdb/memory pressure risk */
+            IF @Debug = 1
+            BEGIN
+                DECLARE @wide_check_sql nvarchar(max) = N'
+                    SELECT @cnt = COUNT(*)
+                    FROM (
+                        SELECT sc2.object_id, sc2.stats_id, col_count = COUNT(*)
+                        FROM ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.stats_columns AS sc2
+                        WHERE EXISTS (
+                            SELECT 1 FROM #stats_to_process AS stp
+                            WHERE stp.database_name = @dbname COLLATE DATABASE_DEFAULT
+                            AND stp.object_id = sc2.object_id
+                            AND stp.stats_id = sc2.stats_id
+                        )
+                        GROUP BY sc2.object_id, sc2.stats_id
+                        HAVING COUNT(*) > 8
+                    ) AS wide';
+                DECLARE @wide_stat_count int = 0;
+                BEGIN TRY
+                    EXEC sp_executesql @wide_check_sql,
+                        N'@dbname sysname, @cnt int OUTPUT',
+                        @dbname = @CurrentDatabaseName, @cnt = @wide_stat_count OUTPUT;
+                    IF @wide_stat_count > 0
+                    BEGIN
+                        DECLARE @wide_msg nvarchar(500) = N'    Wide Stats: ' + CONVERT(nvarchar(10), @wide_stat_count)
+                            + N' statistic(s) with >8 columns — FULLSCAN may use significant tempdb/memory';
+                        RAISERROR(@wide_msg, 10, 1) WITH NOWAIT;
+                    END;
+                END TRY
+                BEGIN CATCH END CATCH;
+            END;
+
+            /* #38: Filtered index statistics — detect filter_definition mismatch */
+            IF @Debug = 1
+            BEGIN
+                DECLARE @filter_check_sql nvarchar(max) = N'
+                    SELECT @cnt = COUNT(*)
+                    FROM ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.stats AS st
+                    INNER JOIN ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.indexes AS ix
+                        ON ix.object_id = st.object_id AND ix.name = st.name
+                    WHERE st.has_filter = 1
+                    AND ix.has_filter = 1
+                    AND st.filter_definition <> ix.filter_definition
+                    AND EXISTS (
+                        SELECT 1 FROM #stats_to_process AS stp
+                        WHERE stp.database_name = @dbname COLLATE DATABASE_DEFAULT
+                        AND stp.object_id = st.object_id
+                        AND stp.stats_id = st.stats_id
+                    )';
+                DECLARE @filter_mismatch_count int = 0;
+                BEGIN TRY
+                    EXEC sp_executesql @filter_check_sql,
+                        N'@dbname sysname, @cnt int OUTPUT',
+                        @dbname = @CurrentDatabaseName, @cnt = @filter_mismatch_count OUTPUT;
+                    IF @filter_mismatch_count > 0
+                    BEGIN
+                        DECLARE @filter_msg nvarchar(500) = N'    Filter Mismatch: ' + CONVERT(nvarchar(10), @filter_mismatch_count)
+                            + N' stat(s) with stale filter_definition (differs from index filter)';
+                        RAISERROR(@filter_msg, 10, 1) WITH NOWAIT;
+                        SET @warnings += N'FILTER_MISMATCH: ' + @CurrentDatabaseName + N'(' + CONVERT(nvarchar(10), @filter_mismatch_count) + N'); ';
+                    END;
+                END TRY
+                BEGIN CATCH END CATCH;
+            END;
+
+            /* #28: Columnstore context detection — CCI modification_counter can be misleadingly low after bulk loads */
+            IF @Debug = 1
+            BEGIN
+                DECLARE @cs_check_sql nvarchar(max) = N'
+                    SELECT @cnt = COUNT(DISTINCT stp.object_id)
+                    FROM #stats_to_process AS stp
+                    WHERE stp.database_name = @dbname COLLATE DATABASE_DEFAULT
+                    AND EXISTS (
+                        SELECT 1
+                        FROM ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.indexes AS csi
+                        WHERE csi.object_id = stp.object_id
+                        AND csi.type IN (5, 6) /* 5=NCCI, 6=CCI */
+                    )';
+                DECLARE @cs_table_count int = 0;
+                BEGIN TRY
+                    EXEC sp_executesql @cs_check_sql,
+                        N'@dbname sysname, @cnt int OUTPUT',
+                        @dbname = @CurrentDatabaseName, @cnt = @cs_table_count OUTPUT;
+                    IF @cs_table_count > 0
+                    BEGIN
+                        DECLARE @cs_msg nvarchar(500) = N'    Columnstore: ' + CONVERT(nvarchar(10), @cs_table_count)
+                            + N' table(s) with columnstore indexes — modification_counter may underreport after bulk loads';
+                        RAISERROR(@cs_msg, 10, 1) WITH NOWAIT;
+                    END;
+                END TRY
+                BEGIN CATCH END CATCH;
+            END;
+
+            /* #30: Computed column statistics — non-persisted computed columns have higher update cost */
+            IF @Debug = 1
+            BEGIN
+                DECLARE @cc_check_sql nvarchar(max) = N'
+                    SELECT @cnt = COUNT(*)
+                    FROM #stats_to_process AS stp
+                    INNER JOIN ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.stats_columns AS sc
+                        ON sc.object_id = stp.object_id AND sc.stats_id = stp.stats_id AND sc.stats_column_id = 1
+                    INNER JOIN ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.computed_columns AS cc
+                        ON cc.object_id = sc.object_id AND cc.column_id = sc.column_id
+                    WHERE stp.database_name = @dbname COLLATE DATABASE_DEFAULT
+                    AND cc.is_persisted = 0';
+                DECLARE @cc_count int = 0;
+                BEGIN TRY
+                    EXEC sp_executesql @cc_check_sql,
+                        N'@dbname sysname, @cnt int OUTPUT',
+                        @dbname = @CurrentDatabaseName, @cnt = @cc_count OUTPUT;
+                    IF @cc_count > 0
+                    BEGIN
+                        DECLARE @cc_msg nvarchar(500) = N'    Computed Cols: ' + CONVERT(nvarchar(10), @cc_count)
+                            + N' stat(s) on non-persisted computed columns — higher scan cost';
+                        RAISERROR(@cc_msg, 10, 1) WITH NOWAIT;
+                    END;
+                END TRY
+                BEGIN CATCH END CATCH;
+            END;
 
             END TRY
             BEGIN CATCH
@@ -6322,6 +6638,50 @@ OPTION (RECOMPILE);';
                         N'TEMPDB_LOW: ' + CONVERT(nvarchar(20), @tempdb_free_mb) +
                         N' MB free (threshold: ' + CONVERT(nvarchar(20), @MinTempdbFreeMB) + N' MB); ';
                 END;
+            END;
+        END;
+
+        /*
+        ====================================================================
+        TRANSACTION LOG SPACE CHECK (#61)
+        ====================================================================
+        For FULLSCAN operations on FULL recovery model databases, UPDATE
+        STATISTICS can generate significant transaction log growth. Check
+        per-database log usage before each stat update when using FULLSCAN.
+        Only checks once per iteration; uses the current stat's database.
+        */
+        IF  @Execute = N'Y'
+        AND @StatisticsSample = 100
+        BEGIN
+            DECLARE @log_check_db sysname;
+            DECLARE @log_used_pct float = 0;
+
+            /* Get the next stat's database */
+            SELECT TOP (1) @log_check_db = stp.database_name
+            FROM #stats_to_process AS stp
+            WHERE stp.processed = 0
+            ORDER BY stp.priority;
+
+            IF @log_check_db IS NOT NULL
+            BEGIN
+                DECLARE @log_sql nvarchar(500) = N'
+                    SELECT @pct = used_log_space_in_percent
+                    FROM ' + QUOTENAME(@log_check_db) + N'.sys.dm_db_log_space_usage';
+                BEGIN TRY
+                    EXEC sp_executesql @log_sql,
+                        N'@pct float OUTPUT', @pct = @log_used_pct OUTPUT;
+
+                    IF @log_used_pct > 90.0
+                    BEGIN
+                        DECLARE @log_msg nvarchar(500) = N'  WARNING: Transaction log ' + @log_check_db
+                            + N' is ' + CONVERT(nvarchar(10), CONVERT(int, @log_used_pct))
+                            + N'% full. FULLSCAN may cause log growth.';
+                        RAISERROR(@log_msg, 10, 1) WITH NOWAIT;
+                        SET @warnings += N'LOG_SPACE_HIGH: ' + @log_check_db + N'('
+                            + CONVERT(nvarchar(10), CONVERT(int, @log_used_pct)) + N'%); ';
+                    END;
+                END TRY
+                BEGIN CATCH /* Ignore - db may not be accessible */ END CATCH;
             END;
         END;
 
@@ -7154,6 +7514,32 @@ OPTION (RECOMPILE);';
                 SET @stats_skipped += 1;
                 SET @stats_processed -= 1; /* Undo increment - TOCTOU skip is not a real attempt */
 
+                /* #58: Log skipped stats to CommandLog for audit compliance */
+                IF  @LogSkippedToCommandLog = N'Y'
+                AND @LogToTable = N'Y'
+                AND @commandlog_exists = 1
+                AND @Execute = N'Y'
+                BEGIN
+                    BEGIN TRY
+                        INSERT INTO dbo.CommandLog
+                            (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType, StartTime, EndTime, ExtendedInfo)
+                        VALUES
+                        (
+                            @current_database,
+                            @current_schema_name,
+                            @current_table_name,
+                            N'U',
+                            N'SKIPPED: ' + @current_stat_name + N' (object no longer exists)',
+                            N'UPDATE_STATISTICS',
+                            SYSDATETIME(),
+                            SYSDATETIME(),
+                            (SELECT N'TOCTOU_SKIP' AS SkipReason, @run_label AS RunLabel, @procedure_version AS [Version]
+                             FOR XML RAW(N'ExtendedInfo'), ELEMENTS)
+                        );
+                    END TRY
+                    BEGIN CATCH /* Non-critical - ignore */ END CATCH;
+                END;
+
                 UPDATE stp
                 SET stp.processed = 1
                 FROM #stats_to_process AS stp
@@ -7661,6 +8047,88 @@ OPTION (RECOMPILE);';
 
     /*
     ============================================================================
+    QUERY STORE FORCED PLAN CHECK (#32)
+    After stats updates, warn if forced plans exist on updated tables.
+    Statistics changes may invalidate forced plan choices.
+    ============================================================================
+    */
+    IF  @Execute = N'Y'
+    AND @stats_succeeded > 0
+    BEGIN
+        DECLARE
+            @qs_check_db sysname = NULL,
+            @qs_check_sql nvarchar(max),
+            @qs_forced_count int = 0,
+            @qs_forced_total int = 0,
+            @qs_forced_details nvarchar(max) = N'',
+            @qs_db_idx int = 0;
+
+        DECLARE @qs_databases TABLE
+        (
+            idx int IDENTITY(1,1) PRIMARY KEY,
+            database_name sysname NOT NULL
+        );
+
+        INSERT INTO @qs_databases (database_name)
+        SELECT DISTINCT stp.database_name
+        FROM #stats_to_process AS stp
+        WHERE stp.processed = 1;
+
+        SELECT @qs_db_idx = MIN(idx) FROM @qs_databases;
+
+        WHILE @qs_db_idx IS NOT NULL
+        BEGIN
+            SELECT @qs_check_db = database_name
+            FROM @qs_databases
+            WHERE idx = @qs_db_idx;
+
+            BEGIN TRY
+                SET @qs_check_sql = N'
+                    SELECT @cnt = COUNT(DISTINCT qsp.plan_id)
+                    FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan AS qsp
+                    INNER JOIN ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_query AS qsq
+                        ON qsq.query_id = qsp.query_id
+                    WHERE qsp.is_forced_plan = 1
+                    AND qsq.object_id IN (
+                        SELECT DISTINCT stp.object_id
+                        FROM #stats_to_process AS stp
+                        WHERE stp.database_name = @dbname COLLATE DATABASE_DEFAULT
+                        AND stp.processed = 1
+                    )';
+
+                EXEC sp_executesql @qs_check_sql,
+                    N'@dbname sysname, @cnt int OUTPUT',
+                    @dbname = @qs_check_db,
+                    @cnt = @qs_forced_count OUTPUT;
+
+                IF ISNULL(@qs_forced_count, 0) > 0
+                BEGIN
+                    SET @qs_forced_total = @qs_forced_total + @qs_forced_count;
+                    SET @qs_forced_details = @qs_forced_details
+                        + @qs_check_db + N'(' + CONVERT(nvarchar(10), @qs_forced_count) + N') ';
+                END;
+            END TRY
+            BEGIN CATCH
+                /* Query Store not enabled or not accessible on this database — skip */
+            END CATCH;
+
+            SELECT @qs_db_idx = MIN(idx) FROM @qs_databases WHERE idx > @qs_db_idx;
+        END;
+
+        IF @qs_forced_total > 0
+        BEGIN
+            SET @warnings = @warnings + N'QS_FORCED_PLANS: '
+                + CONVERT(nvarchar(10), @qs_forced_total)
+                + N' forced plan(s) on updated tables — verify plan quality: '
+                + RTRIM(@qs_forced_details) + N'; ';
+            RAISERROR(N'', 10, 1) WITH NOWAIT;
+            RAISERROR(N'WARNING: %d Query Store forced plan(s) on tables with updated statistics: %s', 10, 1, @qs_forced_total, @qs_forced_details) WITH NOWAIT;
+            RAISERROR(N'         Stats changes may affect forced plan quality. Review with sys.query_store_plan.', 10, 1) WITH NOWAIT;
+        END;
+    END;
+
+    /*
+    ============================================================================
     LOG RUN_FOOTER TO COMMANDLOG
     ============================================================================
     */
@@ -7754,6 +8222,54 @@ OPTION (RECOMPILE);';
 
     /*
     ============================================================================
+    COMPLETION NOTIFY TABLE (#64)
+    Insert notification row for ETL pipeline dependency chains.
+    Auto-creates the table if it doesn't exist.
+    ============================================================================
+    */
+    IF @CompletionNotifyTable IS NOT NULL
+    BEGIN
+        BEGIN TRY
+            DECLARE @notify_sql nvarchar(max);
+
+            /* Auto-create table if it doesn't exist */
+            SET @notify_sql = N'
+                IF OBJECT_ID(' + QUOTENAME(@CompletionNotifyTable, '''') + N', N''U'') IS NULL
+                BEGIN
+                    CREATE TABLE ' + @CompletionNotifyTable + N' (
+                        ID int IDENTITY(1,1) PRIMARY KEY,
+                        RunLabel nvarchar(100) NOT NULL,
+                        StartTime datetime2(7) NOT NULL,
+                        EndTime datetime2(7) NOT NULL,
+                        StopReason nvarchar(50) NULL,
+                        StatsFound int NOT NULL,
+                        StatsSucceeded int NOT NULL,
+                        StatsFailed int NOT NULL,
+                        StatsRemaining int NOT NULL,
+                        DurationSeconds int NOT NULL,
+                        Warnings nvarchar(max) NULL
+                    );
+                END;
+                INSERT INTO ' + @CompletionNotifyTable + N'
+                    (RunLabel, StartTime, EndTime, StopReason, StatsFound, StatsSucceeded, StatsFailed, StatsRemaining, DurationSeconds, Warnings)
+                VALUES
+                    (@rl, @st, @et, @sr, @sf, @ss, @sfl, @rem, @dur, @wrn);';
+
+            EXEC sp_executesql @notify_sql,
+                N'@rl nvarchar(100), @st datetime2(7), @et datetime2(7), @sr nvarchar(50),
+                  @sf int, @ss int, @sfl int, @rem int, @dur int, @wrn nvarchar(max)',
+                @rl = @run_label, @st = @start_time, @et = @end_time, @sr = @stop_reason,
+                @sf = @total_stats, @ss = @stats_succeeded, @sfl = @stats_failed,
+                @rem = @remaining_stats, @dur = @duration_seconds, @wrn = @warnings;
+        END TRY
+        BEGIN CATCH
+            DECLARE @notify_err nvarchar(500) = N'WARNING: Failed to write to @CompletionNotifyTable: ' + LEFT(ERROR_MESSAGE(), 400);
+            RAISERROR(@notify_err, 10, 1) WITH NOWAIT;
+        END CATCH;
+    END;
+
+    /*
+    ============================================================================
     RETURN SUMMARY RESULT SET
     ============================================================================
     Provides programmatic access to run statistics.
@@ -7794,6 +8310,35 @@ OPTION (RECOMPILE);';
         StopReason = @stop_reason,
         RunLabel = @run_label,
         Version = @procedure_version;
+
+    /*
+    ============================================================================
+    DETAILED RESULTS (#25)
+    Per-statistic result set for PowerShell/automation integration.
+    ============================================================================
+    */
+    IF @ReturnDetailedResults = 1
+    BEGIN
+        SELECT
+            DatabaseName = stp.database_name,
+            SchemaName = stp.schema_name,
+            TableName = stp.table_name,
+            StatisticName = stp.stat_name,
+            Modifications = stp.modification_counter,
+            DaysStale = stp.days_stale,
+            PageCount = stp.page_count,
+            RowCount_ = stp.row_count,
+            Priority = stp.priority,
+            Processed = stp.processed,
+            IsHeap = stp.is_heap,
+            AutoCreated = stp.auto_created,
+            NoRecompute = stp.no_recompute,
+            IsIncremental = stp.is_incremental,
+            HasFilter = stp.has_filter,
+            QSPriorityBoost = stp.qs_priority_boost
+        FROM #stats_to_process AS stp
+        ORDER BY stp.priority;
+    END;
 
     /*
     Ensure non-zero return code when failures occurred (Agent job detection)
