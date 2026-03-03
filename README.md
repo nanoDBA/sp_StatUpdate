@@ -19,7 +19,11 @@
 | Large stats that never finish | `@LongRunningThresholdMinutes` - auto-reduce sample rate |
 | Query Store knows what's hot | `@QueryStorePriority = 'Y'` - prioritize by CPU/reads |
 | Cascading failures | `@MaxConsecutiveFailures` - stops after N failures |
-| Azure DTU/vCore concerns | Auto-detects Azure SQL, warns about resource impact |
+| AG secondary falls behind | `@MaxAGRedoQueueMB` - pauses when redo queue is deep |
+| tempdb pressure during FULLSCAN | `@MinTempdbFreeMB` - checks before each stat update |
+| Azure DTU/vCore concerns | Auto-detects Azure SQL DB vs MI, platform-specific warnings |
+| Indexed view stats ignored | `@IncludeIndexedViews = 'Y'` - discovers view statistics |
+| No audit trail for skipped stats | `@LogSkippedToCommandLog = 'Y'` - TOCTOU skip logging |
 
 ## Quick Start
 
@@ -45,7 +49,7 @@ EXEC dbo.sp_StatUpdate
 | Requirement | Details |
 |-------------|---------|
 | **SQL Server** | 2016+ (uses `STRING_SPLIT`). 2016 SP2+ recommended for MAXDOP support |
-| **Azure SQL** | Database, Managed Instance, and Edge supported (v2.1+) |
+| **Azure SQL** | Database (EngineEdition 5), Managed Instance (8), and Edge (9) supported |
 | **dbo.CommandLog** | [CommandLog.sql](https://ola.hallengren.com/scripts/CommandLog.sql) or set `@LogToTable = 'N'` |
 | **dbo.Queue** | [Queue.sql](https://ola.hallengren.com/scripts/Queue.sql) - only for `@StatsInParallel = 'Y'` |
 
@@ -102,16 +106,15 @@ EXEC dbo.sp_StatUpdate
     @TimeLimit = 1800;
 ```
 
-### High-Churn Tables
+### AG-Safe Maintenance
 
 ```sql
--- Target specific tables with lock timeout
+-- Pause if any secondary falls behind by 500 MB redo
 EXEC dbo.sp_StatUpdate
-    @Databases = N'Production',
-    @Tables = N'Sales.Orders, Sales.OrderDetails',
-    @ModificationThreshold = 100000,
-    @LockTimeout = 5,                     -- Skip if blocked after 5 sec
-    @TimeLimit = 600;
+    @Databases = N'USER_DATABASES',
+    @MaxAGRedoQueueMB = 500,
+    @MaxAGWaitMinutes = 10,               -- Wait up to 10 min for drain
+    @TimeLimit = 3600;
 ```
 
 ### Adaptive Sampling for Slow Stats
@@ -137,9 +140,21 @@ EXEC dbo.sp_StatUpdate
 SELECT * FROM #Preview ORDER BY SequenceNum;
 ```
 
+### ETL Completion Notification
+
+```sql
+-- Downstream ETL waits for this table to have a row
+EXEC dbo.sp_StatUpdate
+    @Databases = N'Production',
+    @TimeLimit = 3600,
+    @CompletionNotifyTable = N'dbo.StatUpdateNotify';
+
+-- ETL checks: SELECT * FROM dbo.StatUpdateNotify WHERE RunLabel = ...
+```
+
 ## Parameter Reference
 
-Run `EXEC sp_StatUpdate @Help = 1` for complete documentation.
+Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operational notes.
 
 ### Database & Table Selection
 
@@ -147,9 +162,12 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete documentation.
 |-----------|---------|-------------|
 | `@Databases` | Current DB | `USER_DATABASES`, `SYSTEM_DATABASES`, `ALL_DATABASES`, `AVAILABILITY_GROUP_DATABASES`, wildcards (`%Prod%`), exclusions (`-DevDB`) |
 | `@Tables` | All | Table filter (comma-separated `Schema.Table`) |
-| `@ExcludeTables` | `NULL` | Exclude tables by pattern (`%Archive%`) |
-| `@ExcludeStatistics` | `NULL` | Exclude stats by pattern (`_WA_Sys%`) |
+| `@ExcludeTables` | `NULL` | Exclude tables by LIKE pattern (`%Archive%`) |
+| `@ExcludeStatistics` | `NULL` | Exclude stats by LIKE pattern (`_WA_Sys%`) |
+| `@Statistics` | `NULL` | Direct stat references (`Schema.Table.Stat`, comma-separated) |
+| `@StatisticsFromTable` | `NULL` | Table containing stat references (`#MyStats`, `dbo.StatsQueue`) |
 | `@IncludeSystemObjects` | `'N'` | Include stats on system objects |
+| `@IncludeIndexedViews` | `'N'` | Include statistics on indexed views (v2.8+) |
 
 ### Threshold Configuration
 
@@ -157,20 +175,23 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete documentation.
 |-----------|---------|-------------|
 | `@TargetNorecompute` | `'BOTH'` | `'Y'`=NORECOMPUTE only, `'N'`=regular only, `'BOTH'`=all |
 | `@ModificationThreshold` | `5000` | Minimum modifications to qualify |
+| `@ModificationPercent` | `NULL` | Alternative: min mod % of rows (SQRT-based) |
 | `@TieredThresholds` | `1` | Use Tiger Toolbox 5-tier adaptive formula |
 | `@ThresholdLogic` | `'OR'` | `'OR'`=any threshold, `'AND'`=all must be met |
 | `@DaysStaleThreshold` | `NULL` | Minimum days since last update |
-| `@MinPageCount` | `0` | Minimum pages (125000 = ~1GB) |
+| `@HoursStaleThreshold` | `NULL` | Alternative: minimum hours since last update |
+| `@MinPageCount` | `0` | Minimum pages (125 = ~1MB, 125000 = ~1GB) |
 
 ### Execution Control
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `@TimeLimit` | `3600` | Max seconds (1 hour) |
+| `@TimeLimit` | `3600` | Max seconds (1 hour). `NULL` = unlimited |
+| `@StopByTime` | `NULL` | Absolute wall-clock stop time (`'04:00'` = 4 AM) |
 | `@BatchLimit` | `NULL` | Max stats per run |
-| `@MaxConsecutiveFailures` | `NULL` | Stop after N consecutive failures (v2.1+) |
-| `@LockTimeout` | `NULL` | Seconds to wait for locks per stat |
-| `@DelayBetweenStats` | `NULL` | Milliseconds to pause between stats |
+| `@MaxConsecutiveFailures` | `NULL` | Stop after N consecutive failures |
+| `@LockTimeout` | `NULL` | Seconds to wait for schema locks per stat |
+| `@DelayBetweenStats` | `NULL` | Seconds to pause between stats |
 | `@SortOrder` | `'MODIFICATION_COUNTER'` | Priority order (see below) |
 | `@Execute` | `'Y'` | `'N'` for dry run |
 | `@FailFast` | `0` | `1` = abort on first error |
@@ -187,12 +208,20 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete documentation.
 | `AUTO_CREATED` | User-created stats before auto-created |
 | `RANDOM` | Random order |
 
+### Safety Checks (v2.7+)
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `@MaxAGRedoQueueMB` | `NULL` | Pause when AG secondary redo queue exceeds this MB |
+| `@MaxAGWaitMinutes` | `10` | Max minutes to wait for redo queue to drain |
+| `@MinTempdbFreeMB` | `NULL` | Min tempdb free space (MB). `@FailFast=1` aborts, else warns |
+
 ### Query Store Integration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@QueryStorePriority` | `'N'` | Prioritize stats used by Query Store plans |
-| `@QueryStoreMetric` | `'CPU'` | `CPU`, `DURATION`, `READS`, or `EXECUTIONS` |
+| `@QueryStoreMetric` | `'CPU'` | `CPU`, `DURATION`, `READS`, `EXECUTIONS`, or `AVG_CPU` |
 | `@QueryStoreMinExecutions` | `100` | Minimum plan executions to boost |
 | `@QueryStoreRecentHours` | `168` | Only consider plans from last N hours |
 | `@GroupByJoinPattern` | `'Y'` | Update joined tables together (prevents optimization cliffs) |
@@ -204,30 +233,84 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete documentation.
 | `@LongRunningThresholdMinutes` | `NULL` | Stats that took longer get forced sample rate |
 | `@LongRunningSamplePercent` | `10` | Sample percent for long-running stats |
 | `@StatisticsSample` | `NULL` | `NULL`=SQL Server decides, `100`=FULLSCAN |
-| `@PersistSamplePercent` | `'N'` | Add PERSIST_SAMPLE_PERCENT (SQL 2016 SP1 CU4+) |
+| `@PersistSamplePercent` | `'Y'` | PERSIST_SAMPLE_PERCENT (SQL 2016 SP1 CU4+) |
+| `@MaxDOP` | `NULL` | MAXDOP for UPDATE STATISTICS (SQL 2016 SP2+) |
 
 ### Logging & Output
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@LogToTable` | `'Y'` | Log to dbo.CommandLog |
+| `@LogSkippedToCommandLog` | `'N'` | Log TOCTOU-skipped stats for audit trail (v2.8+) |
 | `@ProgressLogInterval` | `NULL` | Log progress every N stats |
+| `@ReturnDetailedResults` | `0` | `1` = return per-statistic detail result set (v2.8+) |
+| `@CompletionNotifyTable` | `NULL` | Table for completion notification row (v2.8+) |
+| `@WhatIfOutputTable` | `NULL` | Table for dry-run commands (`@Execute = 'N'` required) |
 | `@Debug` | `0` | `1` = verbose diagnostic output |
 
-### OUTPUT Parameters (v2.1+)
+### OUTPUT Parameters
 
 | Parameter | Description |
 |-----------|-------------|
+| `@Version` | Procedure version string |
+| `@VersionDate` | Procedure version date |
 | `@StatsFoundOut` | Total qualifying stats discovered |
 | `@StatsProcessedOut` | Stats attempted (succeeded + failed) |
 | `@StatsSucceededOut` | Stats updated successfully |
 | `@StatsFailedOut` | Stats that failed to update |
 | `@StatsRemainingOut` | Stats not processed (time/batch limit) |
 | `@DurationSecondsOut` | Total run duration in seconds |
-| `@WarningsOut` | Collected warnings (LOW_UPTIME, BACKUP_RUNNING, AZURE_SQL) |
-| `@StopReasonOut` | Why execution stopped (COMPLETED, TIME_LIMIT, CONSECUTIVE_FAILURES, etc.) |
+| `@WarningsOut` | Collected warnings (see below) |
+| `@StopReasonOut` | Why execution stopped (see below) |
+
+### StopReason Values
+
+`COMPLETED`, `TIME_LIMIT`, `BATCH_LIMIT`, `FAIL_FAST`, `CONSECUTIVE_FAILURES`, `AG_REDO_QUEUE`, `TEMPDB_PRESSURE`, `NO_QUALIFYING_STATS`, `KILLED`
+
+### Warning Values
+
+`LOW_UPTIME`, `BACKUP_RUNNING`, `AZURE_SQL`, `AZURE_MI`, `RESOURCE_GOVERNOR`, `AG_REDO_ELEVATED`, `TEMPDB_LOW`, `RLS_DETECTED`, `COLUMNSTORE_CONTEXT`, `QS_FORCED_PLANS`, `LOG_SPACE_HIGH`, `WIDE_STATS`, `FILTER_MISMATCH`
+
+## Environment Detection (v2.0+)
+
+Debug mode (`@Debug = 1`) automatically reports:
+
+- **SQL Server version** and build number
+- **Cardinality Estimator** version per database (Legacy CE 70 vs New CE 120+)
+- **Trace flags** affecting statistics (2371, 9481, 2389/2390, 4139)
+- **DB-scoped configs** (LEGACY_CARDINALITY_ESTIMATION)
+- **Hardware context** (CPU count, memory, NUMA nodes, uptime)
+- **Azure platform** (SQL DB vs Managed Instance vs Edge, with platform-specific guidance)
+- **AG primary status** and redo queue depth (v2.7+)
+- **tempdb free space** (v2.7+)
+- **Resource Governor** active resource pools (v2.5+)
+
+### Per-Database Detection (v2.8+)
+
+When `@Debug = 1`, after discovery the proc checks each database for:
+
+- **Row-Level Security** policies that may bias histograms
+- **Wide statistics** (>8 columns) that increase tempdb/memory pressure
+- **Filtered index mismatches** where stat filter differs from index filter
+- **Columnstore indexes** where `modification_counter` underreports
+- **Non-persisted computed columns** with evaluation cost during stat updates
+- **Stretch Database** tables (auto-skipped, deprecated feature)
+- **Query Store forced plans** on updated tables (post-update check, automatic)
+- **Transaction log space** >90% full during FULLSCAN operations
 
 ## Monitoring
+
+### Summary Result Set
+
+Every run returns a summary row:
+
+```text
+Status         StatusMessage                                      StatsFound  ...
+-------------- -------------------------------------------------- ----------  ---
+SUCCESS        All 142 stat(s) updated successfully                142         ...
+WARNING        Incomplete: 47 stat(s) remaining (TIME_LIMIT)       189        ...
+ERROR          Failed: 3 stat(s), 47 remaining (FAIL_FAST)         150        ...
+```
 
 ### Run History
 
@@ -248,7 +331,7 @@ WHERE s.CommandType = 'SP_STATUPDATE_START'
 ORDER BY s.StartTime DESC;
 ```
 
-### Programmatic Access (v2.1+)
+### Programmatic Access
 
 ```sql
 DECLARE @Found int, @Processed int, @Failed int, @Remaining int,
@@ -266,10 +349,10 @@ EXEC dbo.sp_StatUpdate
 
 -- Use outputs for alerting, logging, or conditional logic
 IF @Failed > 0 OR @StopReason = 'CONSECUTIVE_FAILURES'
-    PRINT 'Alert: Statistics maintenance had failures';
+    RAISERROR(N'Alert: Statistics maintenance had failures', 10, 1) WITH NOWAIT;
 
-IF @Warnings LIKE '%BACKUP_RUNNING%'
-    PRINT 'Note: Backups were running during maintenance';
+IF @Warnings LIKE '%AG_REDO_ELEVATED%'
+    RAISERROR(N'Note: AG redo queue was elevated during maintenance', 10, 1) WITH NOWAIT;
 ```
 
 ### Real-Time Progress
@@ -325,12 +408,18 @@ Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and lo
 
 ## Version History
 
-- **2.1.2026.0219** - Phase 2: Extended Awareness. Azure SQL detection with DTU/vCore warning. Hardware context (CPU/memory/NUMA/uptime). RCSI awareness. Replication/CDC/Temporal table detection (progress shows REPLICATED, CDC, TEMPORAL flags). Backup activity warning. New parameters: @MaxConsecutiveFailures, @WarningsOut OUTPUT, @StopReasonOut OUTPUT. SYSDATETIME() consistency throughout.
-- **2.0.2026.0212** - Phase 1: Environment Intelligence. CE version/compat level, trace flag detection, DB-scoped config detection. Staged discovery auto-fallback. Truncated partition handling. XE session overhaul.
-- **1.9.2026.0206** - Status/StatusMessage columns for Agent alerting. Batch Query Store enrichment (O(n) to O(1)).
+- **2.8.2026.0302** - Comprehensive issue sweep (31 issues resolved). New params: @IncludeIndexedViews, @LogSkippedToCommandLog, @ReturnDetailedResults, @CompletionNotifyTable. Detection: QS forced plan warning, RLS, wide stats, columnstore context, filtered index mismatch, computed columns, Stretch DB skip, log space check. Azure MI vs DB distinction. 12-topic @Help operational notes.
+- **2.7.2026.0302** - AG redo queue pause (@MaxAGRedoQueueMB, @MaxAGWaitMinutes). tempdb pressure check (@MinTempdbFreeMB). New StopReasons: AG_REDO_QUEUE, TEMPDB_PRESSURE.
+- **2.6.2026.0302** - Multi-database direct mode: @Statistics and @StatisticsFromTable respect @Databases.
+- **2.5.2026.0302** - CommandLog index advisory, Resource Governor detection, @LockTimeout docs.
+- **2.4.2026.0302** - Region markers for LLM navigation. Collation-aware comparisons (COLLATE DATABASE_DEFAULT). Per-phase timing in debug mode.
+- **2.3.2026.0302** - Bug fixes: applock release on CATCH, @@TRANCOUNT check, SET ANSI_WARNINGS/ARITHABORT, HAS_DBACCESS() filter, MAXRECURSION unlimited, midnight @StopByTime crossing, @CheckPermissionsOnly, CommandLog schema check.
+- **2.1.2026.0219** - Extended Awareness. Azure SQL detection, hardware context, RCSI awareness, Replication/CDC/Temporal detection. New: @MaxConsecutiveFailures, @WarningsOut, @StopReasonOut.
+- **2.0.2026.0212** - Environment Intelligence. CE version/trace flag/DB-scoped config detection. Staged discovery auto-fallback. Truncated partition handling. XE session overhaul. Diagnostic tool (sp_StatUpdate_Diag).
+- **1.9.2026.0206** - Status/StatusMessage columns for Agent alerting. Batch QS enrichment (O(n) to O(1)).
 - **1.9.2026.0128** - @Preset parameter, @GroupByJoinPattern, ##sp_StatUpdate_Progress, @CleanupOrphanedRuns default Y.
 - **1.8.2026.0128** - Code review fixes, XE troubleshooting session.
-- **1.7.2026.0127** - BREAKING: @ModificationThreshold default 1000 → 5000.
+- **1.7.2026.0127** - BREAKING: @ModificationThreshold default 1000 to 5000.
 - **1.6.2026.0128** - Staged discovery, adaptive sampling, @ExcludeTables, @WhatIfOutputTable.
 - **1.5.2026.0120** - CRITICAL: Fixed @ExcludeStatistics filter, incremental partition targeting.
 - **1.4.2026.0119** - Query Store prioritization, filtered stats handling.
@@ -349,6 +438,7 @@ Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and lo
 - NORECOMPUTE targeting
 - Query Store-driven prioritization
 - Adaptive sampling for problematic stats
+- AG-safe maintenance with redo queue awareness
 - Programmatic access to results via OUTPUT parameters
 
 ## License
