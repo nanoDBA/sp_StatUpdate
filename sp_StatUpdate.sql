@@ -8181,12 +8181,23 @@ OPTION (RECOMPILE);';
         END;
 
         /*
-        Delay between stats if specified
+        Delay between stats if specified.
+        P2 fix (#210): Check @TimeLimit BEFORE sleeping. Previously the WAITFOR executed
+        unconditionally, causing overshoot equal to the full delay duration even after
+        the time budget was exhausted. Now we skip the sleep (and break) when time is up.
         */
         IF  @DelayBetweenStats IS NOT NULL
         AND @DelayBetweenStats > 0
         AND @Execute = N'Y'
         BEGIN
+            /* Skip the sleep and exit the loop if we are already at or past the time limit */
+            IF @TimeLimit IS NOT NULL AND DATEDIFF(SECOND, @start_time, SYSDATETIME()) >= @TimeLimit
+            BEGIN
+                RAISERROR(N'Time limit (%d seconds) reached (pre-delay check). Stopping gracefully.', 10, 1, @TimeLimit) WITH NOWAIT;
+                SELECT @stop_reason = N'TIME_LIMIT';
+                BREAK;
+            END;
+
             DECLARE
                 @delay_time datetime = DATEADD(SECOND, @DelayBetweenStats, '00:00:00');
 
