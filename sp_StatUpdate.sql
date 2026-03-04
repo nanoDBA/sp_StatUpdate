@@ -7931,9 +7931,54 @@ OPTION (RECOMPILE);';
                 CONTINUE;
             END;
 
+            /* #163 (P2): Deadlock retry — up to 3 total attempts with exponential backoff on error 1205.
+               ROWLOCK+READPAST skips locked rows but cannot prevent Sch-M conflicts when multiple
+               workers update the same stat simultaneously. Retry loop handles that residual race. */
+            DECLARE
+                @exec_retry      int    = 0,
+                @exec_retry_delay char(8),
+                @exec_done       bit    = 0;
+
             BEGIN TRY
-                EXECUTE sys.sp_executesql
-                    @current_command;
+                WHILE @exec_done = 0
+                BEGIN
+                    BEGIN TRY
+                        EXECUTE sys.sp_executesql
+                            @current_command;
+                        SET @exec_done = 1; /* Success — exit retry loop */
+                    END TRY
+                    BEGIN CATCH
+                        IF ERROR_NUMBER() = 1205 AND @exec_retry < 2
+                        BEGIN
+                            /* Deadlock — back off and retry */
+                            SET @exec_retry_delay =
+                                CASE @exec_retry WHEN 0 THEN '00:00:01' WHEN 1 THEN '00:00:02' ELSE '00:00:04' END;
+                            SET @exec_retry += 1;
+                            RAISERROR(N'  ~ Deadlock on stat update (retry %d/2) — waiting %s before retry (#163)',
+                                10, 1, @exec_retry, @exec_retry_delay) WITH NOWAIT;
+                            WAITFOR DELAY @exec_retry_delay;
+                        END
+                        ELSE
+                        BEGIN
+                            /* Non-deadlock error, or all retries exhausted — re-raise to outer CATCH */
+                            IF @exec_retry > 0
+                                SET @warnings = @warnings
+                                    + N'DEADLOCK_RETRY_FAIL: [' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name + N'] '
+                                    + N'deadlocked, failed after ' + CONVERT(nvarchar(5), @exec_retry + 1) + N' attempt(s); ';
+                            SET @exec_done = 1; /* Force loop exit before re-raise */
+                            ;THROW; /* Propagates to outer BEGIN CATCH */
+                        END;
+                    END CATCH;
+                END; /* WHILE @exec_done = 0 */
+
+                /* Emit note if stat update succeeded after one or more deadlock retries */
+                IF @exec_retry > 0
+                BEGIN
+                    RAISERROR(N'  ~ Stat update succeeded after %d deadlock retry(s) (#163)', 10, 1, @exec_retry) WITH NOWAIT;
+                    SET @warnings = @warnings
+                        + N'DEADLOCK_RETRY_OK: [' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name + N'] '
+                        + N'succeeded after ' + CONVERT(nvarchar(5), @exec_retry) + N' retry(s); ';
+                END;
 
                 SELECT
                     @current_end_time = SYSDATETIME(),
