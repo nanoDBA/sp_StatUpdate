@@ -8211,6 +8211,44 @@ OPTION (RECOMPILE);';
                     SET @log_error_msg = LEFT(ERROR_MESSAGE(), 3900);
                     RAISERROR(N'  WARNING: Failed to log success to CommandLog (%s). Stat update succeeded.', 10, 1, @log_error_msg) WITH NOWAIT;
                 END CATCH;
+
+                /*
+                #168 (P2): After stat update, warn if this table has ANY forced plans in Query Store.
+                Statistics changes can shift cardinality estimates causing forced plans to become
+                suboptimal. This gives the DBA immediate per-stat visibility — the end-of-run
+                summary (#32) still provides the aggregate count for monitoring automation.
+                Wrapped in TRY/CATCH: silently skipped when QS is disabled on the database.
+                */
+                BEGIN TRY
+                    DECLARE @qs168_count int = 0, @qs168_sql nvarchar(max), @qs168_msg nvarchar(1000);
+                    SET @qs168_sql =
+                        N'SELECT @cnt = COUNT(DISTINCT qsp.plan_id)
+                          FROM ' + QUOTENAME(@current_database) + N'.sys.query_store_plan AS qsp
+                          INNER JOIN ' + QUOTENAME(@current_database) + N'.sys.query_store_query AS qsq
+                              ON qsq.query_id = qsp.query_id
+                          INNER JOIN ' + QUOTENAME(@current_database) + N'.sys.query_store_query_text AS qsqt
+                              ON qsqt.query_text_id = qsq.query_text_id
+                          WHERE qsp.is_forced_plan = 1
+                          AND CHARINDEX(@tbl COLLATE DATABASE_DEFAULT,
+                                        qsqt.query_sql_text COLLATE DATABASE_DEFAULT) > 0';
+                    EXEC sp_executesql @qs168_sql,
+                        N'@tbl sysname, @cnt int OUTPUT',
+                        @tbl = @current_table_name,
+                        @cnt = @qs168_count OUTPUT;
+                    IF ISNULL(@qs168_count, 0) > 0
+                    BEGIN
+                        SET @qs168_msg =
+                            N'WARNING: Stat update on [' + @current_schema_name + N'].[' + @current_table_name
+                            + N'] — ' + CONVERT(nvarchar(10), @qs168_count)
+                            + N' forced plan(s) exist in Query Store. Verify query plans remain optimal after statistics change. (#168)';
+                        RAISERROR(N'%s', 10, 1, @qs168_msg) WITH NOWAIT;
+                        SET @warnings = @warnings
+                            + N'QS_FORCED_PLANS_STAT: [' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name + N'] '
+                            + CONVERT(nvarchar(10), @qs168_count) + N' forced plan(s); ';
+                    END;
+                END TRY
+                BEGIN CATCH /* QS not enabled or not accessible on this database — skip */ END CATCH;
+
             END TRY
             BEGIN CATCH
                 SELECT
