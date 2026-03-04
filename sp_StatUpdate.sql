@@ -7838,7 +7838,8 @@ OPTION (RECOMPILE);';
                     END TRY
                     BEGIN CATCH
                         /* Heartbeat failure is non-fatal — the stat update succeeded. Log warning only. */
-                        RAISERROR(N'[sp_StatUpdate] WARNING: Heartbeat write failed (%s). Stat update was successful.', 0, 1, ERROR_MESSAGE()) WITH NOWAIT;
+                        DECLARE @heartbeat_err nvarchar(500) = LEFT(ERROR_MESSAGE(), 500);
+                        RAISERROR(N'[sp_StatUpdate] WARNING: Heartbeat write failed (%s). Stat update was successful.', 0, 1, @heartbeat_err) WITH NOWAIT;
                     END CATCH;
                 END;
 
