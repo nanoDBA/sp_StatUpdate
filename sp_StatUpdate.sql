@@ -40,7 +40,9 @@ Version:    2.12.2026.03.04 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.12.2026.03.04 - P2 fixes: PERSIST_SAMPLE_PERCENT silent override warning (#183),
+History:    2.13.2026.03.04 - P3 fixes: @Databases='ALL' normalized to 'ALL_DATABASES' (#159),
+                            empty string parameters normalized to NULL with warning (#198)
+            2.12.2026.03.04 - P2 fixes: PERSIST_SAMPLE_PERCENT silent override warning (#183),
                             ROWLOCK+READPAST deadlock retry loop with exponential backoff (#163),
                             Query Store forced plans per-stat warning after stat update (#168)
             2.11.2026.03.04 - P1/P2 fixes: container memory warning always-on (#208),
@@ -503,7 +505,7 @@ ALTER PROCEDURE
     @PersistSamplePercent nvarchar(1) = N'Y', /*Y = add PERSIST_SAMPLE_PERCENT = ON (SQL 2016 SP1 CU4+) to remember sample rate*/
     @PersistSampleMinRows bigint = 1000000, /*Minimum sampled rows for RESAMPLE_PERSIST to fire. If computed sampled rows (row_count × persisted_pct%) fall below this, RESAMPLE is skipped to avoid low-quality histograms. NULL = no floor check.*/
     @MaxDOP integer = NULL, /*MAXDOP for UPDATE STATISTICS (SQL 2016 SP2+ / SQL 2017 CU3+). NULL = server default*/
-    @MaxGrantPercent int = 10, /*Memory grant cap percent (1-100) for the candidate discovery SELECT. Applied as OPTION(MAX_GRANT_PERCENT) on the internal ranking query. NULL = no hint. Default 10 limits memory monopolization during candidate enumeration.*/
+    @MaxGrantPercent int = 10, /*Memory grant cap percent (1-100) for the candidate discovery SELECT ONLY. NOTE: Does NOT cap UPDATE STATISTICS memory (hint not valid on that statement). For stats memory control, use Resource Governor or reduce @StatisticsSample. Applied as OPTION(MAX_GRANT_PERCENT) on the internal ranking query. NULL = no hint. Default 10 limits memory monopolization during candidate enumeration.*/
 
     /*
     ============================================================================
@@ -632,7 +634,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.12.2026.03.04',
+        @procedure_version varchar(20) = '2.13.2026.03.04',
         @procedure_version_date datetime = '20260304',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -762,6 +764,8 @@ BEGIN
                     THEN N'Y = add PERSIST_SAMPLE_PERCENT = ON to preserve sample rate'
                     WHEN N'@MaxDOP'
                     THEN N'MAXDOP for FULLSCAN operations (SQL Server 2016 SP2+)'
+                    WHEN N'@MaxGrantPercent'
+                    THEN N'Memory grant cap (1-100%) for candidate discovery query ONLY. Does NOT cap UPDATE STATISTICS memory (not valid syntax). To cap stats memory, use Resource Governor or reduce @StatisticsSample.'
                     WHEN N'@UpdateIncremental'
                     THEN N'1 = use ON PARTITIONS() for incremental stats on partitioned tables'
                     WHEN N'@TimeLimit'
@@ -2019,6 +2023,45 @@ BEGIN
        shows 'ALL' for NULL, so users naturally expect 'ALL' to work as a keyword. */
     IF UPPER(LTRIM(RTRIM(@Tables))) = N'ALL'
         SET @Tables = NULL;
+
+    /* P3 fix #159: Normalize @Databases='ALL' to 'ALL_DATABASES' with informational message.
+       Users commonly try 'ALL' expecting it to work like other maintenance tools. */
+    IF UPPER(LTRIM(RTRIM(@Databases))) = N'ALL'
+    BEGIN
+        SET @Databases = N'ALL_DATABASES';
+        IF @Debug = 1
+            RAISERROR(N'Note: @Databases=''ALL'' normalized to ''ALL_DATABASES'' (excludes system DBs).', 10, 1) WITH NOWAIT;
+    END;
+
+    /* P3 fix #198: Normalize empty string parameters to NULL with warning.
+       Empty strings from parameterized jobs can cause unexpected behavior. */
+    IF @Statistics IS NOT NULL AND LEN(LTRIM(RTRIM(@Statistics))) = 0
+    BEGIN
+        SET @Statistics = NULL;
+        SET @WarningsOut = ISNULL(@WarningsOut, N'') + N'EMPTY_STRING_PARAM: @Statistics='''' treated as NULL (no filter); ';
+        IF @Debug = 1
+            RAISERROR(N'Note: @Statistics was empty string — treated as NULL (no filter).', 10, 1) WITH NOWAIT;
+    END;
+
+    IF @Tables IS NOT NULL AND LEN(LTRIM(RTRIM(@Tables))) = 0
+    BEGIN
+        SET @Tables = NULL;
+        SET @WarningsOut = ISNULL(@WarningsOut, N'') + N'EMPTY_STRING_PARAM: @Tables='''' treated as NULL (all tables); ';
+        IF @Debug = 1
+            RAISERROR(N'Note: @Tables was empty string — treated as NULL (all tables).', 10, 1) WITH NOWAIT;
+    END;
+
+    IF @ExcludeStatistics IS NOT NULL AND LEN(LTRIM(RTRIM(@ExcludeStatistics))) = 0
+    BEGIN
+        SET @ExcludeStatistics = NULL;
+        SET @WarningsOut = ISNULL(@WarningsOut, N'') + N'EMPTY_STRING_PARAM: @ExcludeStatistics='''' treated as NULL (no exclusions); ';
+    END;
+
+    IF @ExcludeTables IS NOT NULL AND LEN(LTRIM(RTRIM(@ExcludeTables))) = 0
+    BEGIN
+        SET @ExcludeTables = NULL;
+        SET @WarningsOut = ISNULL(@WarningsOut, N'') + N'EMPTY_STRING_PARAM: @ExcludeTables='''' treated as NULL (no exclusions); ';
+    END;
 
     IF @TargetNorecompute NOT IN (N'Y', N'N', N'BOTH')
     BEGIN
