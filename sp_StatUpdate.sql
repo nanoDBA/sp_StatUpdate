@@ -36,7 +36,7 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.12.2026.03.04 (Major.Minor.YYYY.MM.DD)
+Version:    2.14.2026.03.04 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
@@ -576,7 +576,8 @@ ALTER PROCEDURE
     @FailFast bit = 0, /*1 = abort on first error*/
     @Debug bit = 0, /*1 = verbose output*/
     @ExposeProgressToAllSessions nvarchar(1) = N'N', /*Y = create ##sp_StatUpdate_Progress global temp table (SECURITY NOTE: visible to ALL sessions on server). N = disabled (use @ProgressLogInterval for secure monitoring)*/
-    @CleanupOrphanedRuns nvarchar(1) = N'Y', /*Y = mark orphaned SP_STATUPDATE_START entries (>24h old, no END) as KILLED. v1.9: Default changed from N to Y*/
+    @CleanupOrphanedRuns nvarchar(1) = N'Y', /*Y = mark orphaned SP_STATUPDATE_START entries (no END) as KILLED. v1.9: Default changed from N to Y*/
+    @OrphanedRunThresholdHours int = 48, /*#148: Hours before a START entry with no END is considered orphaned. Default 48h to accommodate multi-day maintenance runs.*/
 
     /*
     ============================================================================
@@ -634,7 +635,9 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.13.2026.03.04',
+        /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
+           Also update the header comment "Version:" line at the top of the file. */
+        @procedure_version varchar(20) = '2.14.2026.03.04',
         @procedure_version_date datetime = '20260304',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -805,7 +808,7 @@ BEGIN
                     WHEN N'@LogToTable'
                     THEN N'Y = log to dbo.CommandLog table'
                     WHEN N'@ProgressLogInterval'
-                    THEN N'log SP_STATUPDATE_PROGRESS to CommandLog every N stats (Agent job monitoring)'
+                    THEN N'log SP_STATUPDATE_PROGRESS to CommandLog every N stats (Agent job monitoring). Requires @LogToTable=Y. Progress entries include StatsProcessed, StatsSucceeded, StatsFailed, StatsTotal, ElapsedSeconds in ExtendedInfo XML.'
                     WHEN N'@Execute'
                     THEN N'Y = execute commands, N = print only (dry run)'
                     WHEN N'@WhatIfOutputTable'
@@ -820,6 +823,10 @@ BEGIN
                     THEN N'Y (default) = mark orphaned START entries >24h old (killed runs) with END marker'
                     WHEN N'@HoursStaleThreshold'
                     THEN N'alternative to @DaysStaleThreshold using precise hours (DATEDIFF HOUR). Note: @DaysStaleThreshold counts calendar midnight crossings, not 24-hour periods. Cannot be combined with @DaysStaleThreshold.'
+                    WHEN N'@MaxSecondsPerStat'
+                    THEN N'ADVISORY per-stat scheduling gate (NOT a hard timeout). Skips a stat when its estimated duration (from CommandLog history) exceeds BOTH this cap AND remaining window time. A stat with no CommandLog history always runs. Does not kill running UPDATE STATISTICS. NULL = disabled.'
+                    WHEN N'@PersistSampleMinRows'
+                    THEN N'minimum absolute sampled rows before RESAMPLE_PERSIST fires. If row_count * persisted_pct% < this value, RESAMPLE is skipped to avoid low-quality histograms. NULL = no floor check. Default 1000000.'
                     WHEN N'@StopByTime'
                     THEN N'wall-clock stop time (HH:MM or HH:MM:SS). Computes remaining seconds from now to specified time today and uses as @TimeLimit. Overrides @TimeLimit when specified.'
                     WHEN N'@SkipTablesWithColumnstore'
@@ -829,7 +836,7 @@ BEGIN
                     WHEN N'@StatsInParallel'
                     THEN N'Y = use queue-based parallel processing (requires Queue tables)'
                     WHEN N'@DeadWorkerTimeoutMinutes'
-                    THEN N'parallel mode: consider worker dead if no progress for N minutes (default 15). v2.3: uses LastStatCompletedAt heartbeat column for accurate per-stat tracking.'
+                    THEN N'parallel mode: consider worker dead if no progress for N minutes (default 15). Uses LastStatCompletedAt heartbeat column for accurate per-stat tracking. Units: minutes (same as @MaxAGWaitMinutes). Only applies when @StatsInParallel=Y.'
                     WHEN N'@Help'
                     THEN N'1 = show this help information. Named topics: SAMPLING = sampling priority order documentation.'
                     WHEN N'@Version'
@@ -863,7 +870,7 @@ BEGIN
                     WHEN N'@IncludeIndexedViews'
                     THEN N'Y = include statistics on indexed views (views with clustered index). N (default) = user tables only. UPDATE STATISTICS on indexed views is valid SQL syntax.'
                     WHEN N'@LogSkippedToCommandLog'
-                    THEN N'Y = write CommandLog entries for TOCTOU-skipped stats (Command=SKIPPED). For compliance audit trails. N (default) = skip silently.'
+                    THEN N'Y = write CommandLog entries for TOCTOU-skipped stats (Command=SKIPPED) and @MaxSecondsPerStat-skipped stats. For compliance audit trails. Requires @LogToTable=Y. Skipped stats also appear in @ReturnDetailedResults if enabled. N (default) = skip silently.'
                     WHEN N'@ReturnDetailedResults'
                     THEN N'1 = return second result set with per-statistic detail (database, schema, table, stat, mods, priority, processed). For PowerShell/automation.'
                     WHEN N'@CompletionNotifyTable'
@@ -910,6 +917,10 @@ BEGIN
                     THEN N'1-N minutes (default 10)'
                     WHEN N'@MinTempdbFreeMB'
                     THEN N'NULL (disabled), 0-N MB (e.g., 100, 500, 1024)'
+                    WHEN N'@MaxSecondsPerStat'
+                    THEN N'NULL (disabled), 1-N seconds (e.g., 60, 120, 300)'
+                    WHEN N'@PersistSampleMinRows'
+                    THEN N'NULL (no floor), 1-N rows (default 1000000)'
                     ELSE N''
                 END,
             defaults =
@@ -1022,6 +1033,10 @@ BEGIN
                     THEN N'10'
                     WHEN N'@MinTempdbFreeMB'
                     THEN N'NULL (disabled)'
+                    WHEN N'@MaxSecondsPerStat'
+                    THEN N'NULL (disabled)'
+                    WHEN N'@PersistSampleMinRows'
+                    THEN N'1000000'
                     ELSE N''
                 END
         FROM sys.parameters AS ap
@@ -1162,7 +1177,25 @@ BEGIN
                  N'Available since SQL 2016 SP1 CU4 (build 4446+). Early CUs had bugs — ensure fleet CU consistency. RESAMPLE ignores persisted percent (uses previously computed rate). To audit: SELECT name, has_persisted_sample FROM sys.stats. To remove: UPDATE STATISTICS WITH SAMPLE (without PERSIST).'),
                 /* Azure MI vs DB */
                 (N'Azure SQL',
-                 N'EngineEdition 5 = Azure SQL DB (no Resource Governor, no incremental stats, DTU model). EngineEdition 8 = Azure SQL MI (most on-prem features supported, vCore model). The procedure auto-detects and adjusts warnings.')
+                 N'EngineEdition 5 = Azure SQL DB (no Resource Governor, no incremental stats, DTU model). EngineEdition 8 = Azure SQL MI (most on-prem features supported, vCore model). The procedure auto-detects and adjusts warnings.'),
+                /* #158: Cross-database boundary */
+                (N'Multi-Database Mode',
+                 N'UPDATE STATISTICS runs in each database''s own context (USE [db]). It cannot cross database boundaries. Multi-database mode (@Databases) updates each database''s own statistics independently. Cross-database queries use statistics from each referenced database.'),
+                /* #160: @Databases=NULL vs ALL_DATABASES */
+                (N'@Databases=NULL',
+                 N'@Databases=NULL targets the current database context only (equivalent to DB_NAME()). Use @Databases=N''ALL_DATABASES'' for all user+system databases, or @Databases=N''USER_DATABASES'' for user databases only. @Databases=N''ALL'' is not valid — use ALL_DATABASES.'),
+                /* #172: @IncludeIndexedViews + @TargetNorecompute interaction */
+                (N'Indexed View Stats',
+                 N'@IncludeIndexedViews=Y with @TargetNorecompute=N skips indexed view statistics that have NORECOMPUTE set — often the most maintenance-critical ones (set NORECOMPUTE to prevent auto-update interference). Use @TargetNorecompute=BOTH to include all indexed view stats.'),
+                /* #177: @MinPageCount clarification */
+                (N'@MinPageCount Scope',
+                 N'@MinPageCount uses used_page_count from sys.dm_db_partition_stats, which includes data pages, LOB pages, and row-overflow pages. Tables with large LOB/XML columns may have higher page counts than their row data alone suggests. 125000 pages ≈ 1 GB for standard 8KB pages.'),
+                /* #180: Indexed views and NOEXPAND */
+                (N'Indexed Views + NOEXPAND',
+                 N'On Standard Edition, indexed view statistics are only used by the optimizer when the view is referenced with the NOEXPAND hint. UPDATE STATISTICS on the view is valid, but the optimizer may ignore the stats without NOEXPAND. Enterprise Edition uses indexed view stats automatically.'),
+                /* #193: @ReturnDetailedResults vs CommandLog */
+                (N'Output Channels',
+                 N'@ReturnDetailedResults and CommandLog are independent output channels. Skipped stats (TOCTOU, @MaxSecondsPerStat) appear in @ReturnDetailedResults but not CommandLog unless @LogSkippedToCommandLog=Y. CommandLog requires @LogToTable=Y. Both channels report the same succeeded/failed stats.')
         ) AS note_data
         (
             topic,
@@ -1692,6 +1725,7 @@ BEGIN
     IF @@TRANCOUNT <> 0
     BEGIN
         RAISERROR(N'The transaction count is not 0. sp_StatUpdate must not be called within an open transaction.', 16, 1) WITH NOWAIT;
+        SET @StopReasonOut = N'PARAMETER_ERROR';
         IF @StatsInParallel = N'N'
             EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
         RETURN 1;
@@ -1793,8 +1827,27 @@ BEGIN
                AND   ic.key_ordinal = 1
            )
         BEGIN
+            /* #150: Build advisory DDL dynamically based on columns that actually exist in this schema */
+            DECLARE
+                @cmdlog_object_id int = OBJECT_ID(N'dbo.CommandLog'),
+                @advisory_include nvarchar(500) = N'';
+
+            SELECT @advisory_include = @advisory_include +
+                CASE WHEN @advisory_include = N'' THEN N'' ELSE N', ' END + c.name
+            FROM (VALUES
+                (N'DatabaseName'), (N'SchemaName'), (N'ObjectName'),
+                (N'StatisticsName'), (N'EndTime'), (N'ErrorNumber')
+            ) AS cols(name)
+            JOIN sys.columns AS c
+              ON c.object_id = @cmdlog_object_id
+             AND c.name = cols.name COLLATE DATABASE_DEFAULT;
+
             RAISERROR(N'ADVISORY: dbo.CommandLog has no index leading on CommandType. On large tables this causes full scans during orphan cleanup and adaptive sampling. Consider:', 10, 1) WITH NOWAIT;
-            RAISERROR(N'  CREATE NONCLUSTERED INDEX IX_CommandLog_CommandType_StartTime ON dbo.CommandLog (CommandType, StartTime) INCLUDE (DatabaseName, SchemaName, ObjectName, StatisticsName, EndTime, ErrorNumber);', 10, 1) WITH NOWAIT;
+
+            IF @advisory_include <> N''
+                RAISERROR(N'  CREATE NONCLUSTERED INDEX IX_CommandLog_CommandType_StartTime ON dbo.CommandLog (CommandType, StartTime) INCLUDE (%s);', 10, 1, @advisory_include) WITH NOWAIT;
+            ELSE
+                RAISERROR(N'  CREATE NONCLUSTERED INDEX IX_CommandLog_CommandType_StartTime ON dbo.CommandLog (CommandType, StartTime);', 10, 1) WITH NOWAIT;
         END;
     END;
 
@@ -1887,6 +1940,9 @@ BEGIN
             INCLUDE (DatabaseName, SchemaName, ObjectName, ObjectID, TableStartTime, TableEndTime)
             WHERE TableStartTime IS NULL;
 
+        /* #174: Disable lock escalation to prevent READPAST hint from losing effectiveness */
+        ALTER TABLE dbo.QueueStatistic SET (LOCK_ESCALATION = DISABLE);
+
         RAISERROR(N'Created dbo.QueueStatistic table and indexes.', 10, 1) WITH NOWAIT;
     END;
 
@@ -1901,6 +1957,76 @@ BEGIN
         ALTER TABLE dbo.QueueStatistic ADD LastStatCompletedAt datetime2(3) NULL;
         IF @Debug = 1
             RAISERROR(N'Added LastStatCompletedAt column to dbo.QueueStatistic (v2.3 migration).', 10, 1) WITH NOWAIT;
+    END;
+    /*
+    #142: Server-level AG readable secondary detection.
+    If this server is an AG secondary for ALL databases, UPDATE STATISTICS will fail for everything.
+    Check sys.dm_hadr_availability_replica_states early to prevent an error storm.
+    */
+    DECLARE @is_ag_secondary_server bit = 0;
+    IF EXISTS (SELECT 1 FROM sys.all_objects WHERE name = N'dm_hadr_availability_replica_states' AND schema_id = SCHEMA_ID(N'sys'))
+    BEGIN
+        DECLARE @local_primary_count int = 0, @local_secondary_count int = 0;
+        SELECT
+            @local_primary_count = SUM(CASE WHEN ars.role_desc = N'PRIMARY' THEN 1 ELSE 0 END),
+            @local_secondary_count = SUM(CASE WHEN ars.role_desc = N'SECONDARY' THEN 1 ELSE 0 END)
+        FROM sys.dm_hadr_availability_replica_states AS ars
+        WHERE ars.is_local = 1;
+
+        IF @local_secondary_count > 0 AND @local_primary_count = 0
+        BEGIN
+            SET @is_ag_secondary_server = 1;
+            RAISERROR(N'WARNING: This server is an AG readable secondary for all availability groups. UPDATE STATISTICS will fail for AG databases.', 10, 1) WITH NOWAIT;
+            SET @WarningsOut = ISNULL(@WarningsOut, N'') + N'AG_SECONDARY_SERVER: All local AGs are secondary replicas; ';
+        END;
+    END;
+
+    /* #144: Azure elastic pool DTU/vCore check.
+       On Azure SQL DB (EngineEdition=5), check if running in an elastic pool
+       where stats maintenance may consume shared pool resources. */
+    IF CONVERT(int, SERVERPROPERTY(N'EngineEdition')) = 5
+    BEGIN
+        BEGIN TRY
+            DECLARE @elastic_pool_name nvarchar(128);
+            EXEC sys.sp_executesql
+                N'SELECT @pool = elastic_pool_name FROM sys.database_service_objectives',
+                N'@pool nvarchar(128) OUTPUT',
+                @pool = @elastic_pool_name OUTPUT;
+            IF @elastic_pool_name IS NOT NULL
+            BEGIN
+                RAISERROR(N'WARNING: Running in Azure elastic pool [%s]. Statistics maintenance consumes', 10, 1, @elastic_pool_name) WITH NOWAIT;
+                RAISERROR(N'  shared pool DTU/vCore — other databases in the pool may be impacted.', 10, 1) WITH NOWAIT;
+                SET @warnings += N'ELASTIC_POOL: ' + @elastic_pool_name + N'; ';
+            END;
+        END TRY
+        BEGIN CATCH
+            /* sys.database_service_objectives may not exist on all Azure tiers */
+        END CATCH;
+    END;
+
+    /* #191: RCSI version store pressure warning.
+       Databases using READ_COMMITTED_SNAPSHOT_ISOLATION keep row versions in tempdb.
+       FULLSCAN statistics updates can increase version store usage significantly. */
+    DECLARE @rcsi_db_count int = 0;
+    SELECT @rcsi_db_count = COUNT(*)
+    FROM sys.databases AS d
+    WHERE d.is_read_committed_snapshot_on = 1
+    AND   d.state = 0 /* ONLINE */
+    AND   d.database_id > 4; /* user databases only */
+
+    IF @rcsi_db_count > 0
+    BEGIN
+        DECLARE @version_store_mb bigint = 0;
+        SELECT @version_store_mb = SUM(version_store_reserved_page_count) * 8 / 1024
+        FROM tempdb.sys.dm_db_file_space_usage;
+
+        IF @version_store_mb > 500 /* >500 MB version store already in use */
+        BEGIN
+            RAISERROR(N'WARNING: %d RCSI database(s) active, version store already %I64d MB.', 10, 1,
+                @rcsi_db_count, @version_store_mb) WITH NOWAIT;
+            RAISERROR(N'  FULLSCAN statistics updates may spike version store usage in tempdb.', 10, 1) WITH NOWAIT;
+            SET @warnings += N'RCSI_VERSION_STORE: ' + CONVERT(nvarchar(20), @version_store_mb) + N' MB in use; ';
+        END;
     END;
     /*#endregion 06-GUARDS */
 
@@ -2636,6 +2762,67 @@ BEGIN
             SET @safe_cnt_fqn = QUOTENAME(@safe_cnt_schema) + N'.' + QUOTENAME(@safe_cnt_table);
         END;
     END;
+
+    /* #182: Range validation for numeric parameters */
+    IF @ModificationThreshold IS NOT NULL AND @ModificationThreshold < 0
+    BEGIN
+        INSERT INTO @errors (error_message, error_severity)
+        SELECT N'@ModificationThreshold cannot be negative. Use 0 or positive integer.', 16;
+    END;
+
+    IF @StatisticsSample IS NOT NULL AND (@StatisticsSample < 1 OR @StatisticsSample > 100)
+    BEGIN
+        INSERT INTO @errors (error_message, error_severity)
+        SELECT N'@StatisticsSample must be between 1 and 100 (100 = FULLSCAN). Use NULL for SQL Server auto-sample.', 16;
+    END;
+
+    IF @ModificationPercent IS NOT NULL AND (@ModificationPercent < 0 OR @ModificationPercent > 100)
+    BEGIN
+        INSERT INTO @errors (error_message, error_severity)
+        SELECT N'@ModificationPercent must be between 0 and 100.', 16;
+    END;
+
+    IF @TimeLimit IS NOT NULL AND @TimeLimit < 0
+    BEGIN
+        INSERT INTO @errors (error_message, error_severity)
+        SELECT N'@TimeLimit cannot be negative. Use NULL for unlimited or positive integer for seconds.', 16;
+    END;
+
+    IF @MaxDOP IS NOT NULL AND @MaxDOP < 0
+    BEGIN
+        INSERT INTO @errors (error_message, error_severity)
+        SELECT N'@MaxDOP cannot be negative. Use NULL for default or 0 for unlimited.', 16;
+    END;
+
+    IF @MaxGrantPercent IS NOT NULL AND (@MaxGrantPercent < 1 OR @MaxGrantPercent > 100)
+    BEGIN
+        INSERT INTO @errors (error_message, error_severity)
+        SELECT N'@MaxGrantPercent must be between 1 and 100.', 16;
+    END;
+
+    /* #195: Standard Edition + @IncludeIndexedViews warning.
+       Indexed view statistics are updated but not used by the optimizer without
+       NOEXPAND hint on Standard/Web/Express editions. Only Enterprise/Developer
+       auto-match indexed views. */
+    IF  @IncludeIndexedViews = N'Y'
+    AND CONVERT(int, SERVERPROPERTY(N'EngineEdition')) NOT IN (3, 8) /* Not Enterprise (3) or MI (8) */
+    AND CONVERT(nvarchar(128), SERVERPROPERTY(N'Edition')) NOT LIKE N'Developer%'
+    BEGIN
+        RAISERROR(N'WARNING: @IncludeIndexedViews=Y on non-Enterprise edition. Indexed view statistics', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  will be updated but the optimizer will not auto-match views without NOEXPAND hint.', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  Queries must explicitly reference views WITH (NOEXPAND) to use these statistics.', 10, 1) WITH NOWAIT;
+        SET @warnings += N'INDEXED_VIEWS_NON_ENTERPRISE: Stats updated but NOEXPAND required; ';
+    END;
+
+    /* #170: @IncludeSystemObjects edition/role guard.
+       Updating system table statistics is unsupported on read-only secondaries
+       and can cause issues on replicas. Warn early. */
+    IF @IncludeSystemObjects = N'Y'
+    BEGIN
+        RAISERROR(N'WARNING: @IncludeSystemObjects=Y — system table statistics will be included.', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  This is unsupported on AG readable secondary replicas and may cause errors.', 10, 1) WITH NOWAIT;
+        SET @warnings += N'SYSTEM_OBJECTS_INCLUDED: system table stats may fail on replicas; ';
+    END;
     /*#endregion 08-VALIDATION */
 
     /*#region 09-DB-PARSE: @Databases parsing, AG secondary check */
@@ -2913,6 +3100,16 @@ BEGIN
             EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
         RETURN 1;
     END;
+
+    /* #161: Warn when @Databases matched zero databases (no AG secondaries — likely misspelling) */
+    IF  @database_count = 0
+    AND @ag_secondary_count = 0
+    AND @Databases IS NOT NULL
+    BEGIN
+        RAISERROR(N'WARNING: @Databases=''%s'' matched 0 databases. Check spelling. Valid keywords: ALL_DATABASES, USER_DATABASES, SYSTEM_DATABASES, AVAILABILITY_GROUP_DATABASES. Wildcards: %%', 10, 1, @Databases) WITH NOWAIT;
+        SET @WarningsOut = ISNULL(@WarningsOut, N'') +
+            N'NO_MATCHING_DATABASES: @Databases matched 0 databases; ';
+    END;
     /*#endregion 09-DB-PARSE */
 
     /*
@@ -3186,6 +3383,9 @@ BEGIN
         RAISERROR(N'', 10, 1) WITH NOWAIT;
         RAISERROR(N'Documentation: https://ola.hallengren.com/sql-server-index-and-statistics-maintenance.html', 10, 1) WITH NOWAIT;
 
+        /* #200: Set @StopReasonOut on parameter validation failure */
+        SET @StopReasonOut = N'PARAMETER_ERROR';
+
         IF @StatsInParallel = N'N'
             EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
         RETURN 50000;
@@ -3373,6 +3573,17 @@ BEGIN
     IF @supports_auto_drop = 1
         RAISERROR(N'AUTO_DROP:   Available (SQL 2022) - stats auto-drop on schema change by default', 10, 1) WITH NOWAIT;
 
+    /* #173: Linux case-sensitive collation warning */
+    DECLARE @server_collation nvarchar(128) = CONVERT(nvarchar(128), SERVERPROPERTY(N'Collation'));
+    IF @server_collation LIKE N'%_CS_%'
+    BEGIN
+        RAISERROR(N'Collation:   %s (CASE-SENSITIVE)', 10, 1, @server_collation) WITH NOWAIT;
+        RAISERROR(N'  Note: Case-sensitive collation — object name matching in @Tables, @ExcludeTables,', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  @Statistics, @ExcludeStatistics uses COLLATE DATABASE_DEFAULT. Ensure filter', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  values match the exact case of database object names.', 10, 1) WITH NOWAIT;
+        SET @warnings += N'CASE_SENSITIVE_COLLATION: ' + @server_collation + N'; ';
+    END;
+
     RAISERROR(N'Procedure:   %s', 10, 1, @procedure_version) WITH NOWAIT;
     RAISERROR(N'Start time:  %s', 10, 1, @start_time_display) WITH NOWAIT;
 
@@ -3464,6 +3675,22 @@ BEGIN
         RAISERROR(N'  @QueryStoreMetric        = %s', 10, 1, @QueryStoreMetric) WITH NOWAIT;
         RAISERROR(N'  @QueryStoreMinExecutions = %I64d', 10, 1, @QueryStoreMinExecutions) WITH NOWAIT;
         RAISERROR(N'  @QueryStoreRecentHours   = %d', 10, 1, @QueryStoreRecentHours) WITH NOWAIT;
+
+        /* #189: Pre-run QS READ_ONLY warning — alert DBA before discovery, not after */
+        DECLARE @qs_readonly_count int = 0;
+        SELECT @qs_readonly_count = COUNT(*)
+        FROM @tmpDatabases AS td
+        WHERE td.Selected = 1
+        AND EXISTS (
+            SELECT 1
+            FROM sys.databases AS d
+            WHERE d.name = td.DatabaseName COLLATE DATABASE_DEFAULT
+            AND   d.is_query_store_on = 1
+        );
+        /* Note: actual_state check requires per-database context (done in Phase 6).
+           This is a lighter pre-check using sys.databases.is_query_store_on. */
+        IF @qs_readonly_count > 0
+            RAISERROR(N'  Note: QS state per-database checked during Phase 6. READ_ONLY databases may yield stale priority data.', 10, 1) WITH NOWAIT;
     END;
 
     /*
@@ -3640,7 +3867,7 @@ BEGIN
     BEGIN
         SET @ag_is_primary = 1;
 
-        SELECT @ag_redo_initial_mb = MAX(drs.redo_queue_size) / 1024
+        SELECT @ag_redo_initial_mb = MAX(drs.redo_queue_size) / 1024.0
         FROM sys.dm_hadr_database_replica_states AS drs
         WHERE drs.is_local = 0
         AND   drs.is_primary_replica = 0;
@@ -3655,7 +3882,7 @@ BEGIN
     Query runs always for warnings and debug banner.
     */
     SELECT @tempdb_free_mb =
-        SUM(unallocated_extent_page_count) * 8 / 1024
+        SUM(unallocated_extent_page_count) * 8 / 1024.0
     FROM tempdb.sys.dm_db_file_space_usage;
 
     IF @tempdb_free_mb IS NOT NULL AND @tempdb_free_mb < 100
@@ -3709,20 +3936,31 @@ BEGIN
     */
     IF  @MaxDOP IS NOT NULL
     AND @rg_max_dop IS NOT NULL
-    AND @rg_max_dop > 0
-    AND @MaxDOP > @rg_max_dop
     BEGIN
-        DECLARE @rg_warn nvarchar(500) =
-            N'WARNING: @MaxDOP=' + CONVERT(nvarchar(10), @MaxDOP) +
-            N' but Resource Governor workload group [' + @rg_workload_group +
-            N'] caps MAX_DOP=' + CONVERT(nvarchar(10), @rg_max_dop) +
-            N'. @MaxDOP hint will be silently capped by SQL Server.';
-        RAISERROR(@rg_warn, 10, 1) WITH NOWAIT;
+        /* #194: When workload group max_dop=0 (uncapped), fall back to server-level MAXDOP */
+        DECLARE @effective_max_dop int = @rg_max_dop;
+        IF @effective_max_dop = 0
+            SELECT @effective_max_dop = CONVERT(int, value_in_use)
+            FROM sys.configurations
+            WHERE name = N'max degree of parallelism';
 
-        /* Add to warnings output for programmatic consumers */
-        SET @WarningsOut = ISNULL(@WarningsOut, N'') +
-            N'RG_MAXDOP_CAP: RG caps @MaxDOP from ' + CONVERT(nvarchar(10), @MaxDOP) +
-            N' to ' + CONVERT(nvarchar(10), @rg_max_dop) + N'; ';
+        IF  @effective_max_dop > 0
+        AND @MaxDOP > @effective_max_dop
+        BEGIN
+            DECLARE @rg_warn nvarchar(500) =
+                N'WARNING: @MaxDOP=' + CONVERT(nvarchar(10), @MaxDOP) +
+                CASE WHEN @rg_max_dop = 0
+                    THEN N' but server-level MAXDOP=' + CONVERT(nvarchar(10), @effective_max_dop)
+                    ELSE N' but Resource Governor workload group [' + @rg_workload_group +
+                         N'] caps MAX_DOP=' + CONVERT(nvarchar(10), @effective_max_dop)
+                END +
+                N'. @MaxDOP hint will be silently capped by SQL Server.';
+            RAISERROR(@rg_warn, 10, 1) WITH NOWAIT;
+
+            SET @WarningsOut = ISNULL(@WarningsOut, N'') +
+                N'RG_MAXDOP_CAP: RG caps @MaxDOP from ' + CONVERT(nvarchar(10), @MaxDOP) +
+                N' to ' + CONVERT(nvarchar(10), @effective_max_dop) + N'; ';
+        END;
     END;
 
     /*
@@ -3738,6 +3976,17 @@ BEGIN
     /*#endregion 12-HEADER */
 
     /*#region 13-RUN-INIT: CommandLog START, progress table, orphan cleanup */
+
+    /* #164: Set session context so sp_StatUpdate sessions are identifiable in dm_exec_requests */
+    BEGIN TRY
+        EXEC sys.sp_set_session_context @key = N'sp_StatUpdate_RunLabel', @value = @run_label, @read_only = 0;
+    END TRY
+    BEGIN CATCH
+        /* sp_set_session_context may not be available on all versions/editions — silently skip */
+        IF @Debug = 1
+            RAISERROR(N'  Note: sp_set_session_context not available — session context identifier not set.', 10, 1) WITH NOWAIT;
+    END CATCH;
+
     /*
     ============================================================================
     LOG RUN_HEADER TO COMMANDLOG
@@ -3840,11 +4089,26 @@ BEGIN
         /* Create unique progress table name using run_label for multiple concurrent runs */
         DECLARE @progress_table_name nvarchar(128) = N'##sp_StatUpdate_Progress';
 
-        /* Drop if exists from previous run in same session */
+        /* #186: Clean stale rows from dead sessions before creating/re-creating */
         IF OBJECT_ID('tempdb..' + @progress_table_name, 'U') IS NOT NULL
         BEGIN
-            EXECUTE (N'DROP TABLE ' + @progress_table_name);
+            /* Mark rows from dead sessions so monitoring tools see them as stale */
+            DECLARE @cleanup_spid nvarchar(10) = CONVERT(nvarchar(10), @@SPID);
+            EXECUTE (N'
+                UPDATE ' + @progress_table_name + N'
+                SET    Status = N''SESSION_DIED'',
+                       CurrentStat = N''(session no longer active)''
+                WHERE  SessionID NOT IN (SELECT session_id FROM sys.dm_exec_sessions)
+                AND    Status <> N''SESSION_DIED'';
+
+                DELETE FROM ' + @progress_table_name + N'
+                WHERE  SessionID = ' + @cleanup_spid + N';
+            ');
         END;
+
+        /* Drop and recreate for this session (original row was deleted above) */
+        IF OBJECT_ID('tempdb..' + @progress_table_name, 'U') IS NOT NULL
+            EXECUTE (N'DROP TABLE ' + @progress_table_name);
 
         EXECUTE (N'
             CREATE TABLE ' + @progress_table_name + N' (
@@ -3943,8 +4207,8 @@ BEGIN
             )
         FROM dbo.CommandLog AS cl_start
         WHERE cl_start.CommandType = N'SP_STATUPDATE_START'
-        /* Only clean orphans older than 24 hours (avoids concurrent run interference) */
-        AND   cl_start.StartTime < DATEADD(HOUR, -24, SYSDATETIME())
+        /* #148: Only clean orphans older than @OrphanedRunThresholdHours (avoids concurrent run interference) */
+        AND   cl_start.StartTime < DATEADD(HOUR, -@OrphanedRunThresholdHours, SYSDATETIME())
         /* Must have ExtendedInfo with RunLabel to avoid NULL=NULL matching */
         AND   cl_start.ExtendedInfo IS NOT NULL
         AND   cl_start.ExtendedInfo.exist('(/Parameters/RunLabel)[1]') = 1
@@ -4332,6 +4596,8 @@ OPTION (RECOMPILE);';
                     N'  WARNING: Skipping database ' + QUOTENAME(@CurrentDatabaseName) +
                     N' - ' + ERROR_MESSAGE();
                 RAISERROR(@dt_skip_msg, 10, 1) WITH NOWAIT;
+                /* #204: Add per-database skip to @WarningsOut */
+                SET @warnings += N'DB_SKIPPED: ' + @CurrentDatabaseName + N'; ';
             END CATCH;
 
             UPDATE @tmpDatabases
@@ -4521,6 +4787,8 @@ OPTION (RECOMPILE);';
                     N'  WARNING: Skipping database ' + QUOTENAME(@CurrentDatabaseName) +
                     N' - ' + ERROR_MESSAGE();
                 RAISERROR(@ds_skip_msg, 10, 1) WITH NOWAIT;
+                /* #204: Add per-database skip to @WarningsOut */
+                SET @warnings += N'DB_SKIPPED: ' + @CurrentDatabaseName + N'; ';
             END CATCH;
 
             UPDATE @tmpDatabases
@@ -5201,6 +5469,19 @@ OPTION (RECOMPILE);';
                             RAISERROR(N''    Warning: Query Store is READ_ONLY - priority data may be stale'', 10, 1) WITH NOWAIT;
                     END;
 
+                    /* #190: Check if @QueryStoreRecentHours exceeds QS retention */
+                    DECLARE @qs_retention_days int;
+                    SELECT @qs_retention_days = retention_period_in_days
+                    FROM sys.database_query_store_options;
+
+                    IF @qs_retention_days IS NOT NULL AND @QueryStoreRecentHours_param > (@qs_retention_days * 24)
+                    BEGIN
+                        DECLARE @qs_ret_warn nvarchar(500) = N''    Warning: @QueryStoreRecentHours=''
+                            + CONVERT(nvarchar(10), @QueryStoreRecentHours_param) + N''h exceeds QS retention ''
+                            + CONVERT(nvarchar(10), @qs_retention_days * 24) + N''h — enrichment may return no data'';
+                        RAISERROR(@qs_ret_warn, 10, 1) WITH NOWAIT;
+                    END;
+
                     /*
                     PERF: Batch Query Store enrichment (Issue #4)
                     Single query with GROUP BY instead of CROSS APPLY per row.
@@ -5313,7 +5594,10 @@ OPTION (RECOMPILE);';
                                     /* User-created first (auto_created=0), then auto-created (1) */
                                     CASE WHEN ISNULL(auto_created, 0) = 0 THEN CONVERT(bigint, 1000000000000) ELSE 0 END + ISNULL(modification_counter, 0)
                                 ELSE modification_counter
-                            END DESC
+                            END DESC,
+                            /* #185: Deterministic tie-breaker — stable order for same priority score */
+                            object_id ASC,
+                            stats_id ASC
                     )
                 FROM #stat_candidates
                 OPTION (MAX_GRANT_PERCENT = 25); /* Cap memory grant: prevents monopolizing server memory during maintenance — value replaced dynamically below */
@@ -5557,7 +5841,10 @@ OPTION (RECOMPILE);';
                             THEN /* User-created first (auto_created=0), then auto-created (1) */
                                  CASE WHEN ISNULL(s.auto_created, 0) = 0 THEN CONVERT(bigint, 1000000000000) ELSE 0 END + ISNULL(sp.modification_counter, 0)
                             ELSE ISNULL(sp.modification_counter, 0)
-                        END DESC
+                        END DESC,
+                        /* #185: Deterministic tie-breaker */
+                        s.object_id ASC,
+                        s.stats_id ASC
                 )
         FROM sys.stats AS s
         JOIN sys.objects AS o
@@ -6108,6 +6395,8 @@ OPTION (RECOMPILE);';
                     N'  WARNING: Skipping database ' + QUOTENAME(@CurrentDatabaseName) +
                     N' - ' + ERROR_MESSAGE();
                 RAISERROR(@db_skip_msg, 10, 1) WITH NOWAIT;
+                /* #204: Add per-database skip to @WarningsOut */
+                SET @warnings += N'DB_SKIPPED: ' + @CurrentDatabaseName + N'; ';
             END CATCH;
 
             /*
@@ -6389,6 +6678,29 @@ OPTION (RECOMPILE);';
     RAISERROR(N'  - On heaps:         %d', 10, 1, @heap_stats) WITH NOWAIT;
     RAISERROR(N'  - Memory-optimized: %d', 10, 1, @memory_optimized_stats) WITH NOWAIT;
     RAISERROR(N'  - Persisted sample: %d', 10, 1, @persisted_sample_stats) WITH NOWAIT;
+
+    /* #147: CDC-tracked tables warning — stats updates can delay CDC capture */
+    DECLARE @cdc_stats int = (SELECT COUNT_BIG(*) FROM #stats_to_process WHERE is_tracked_by_cdc = 1);
+    IF @cdc_stats > 0
+    BEGIN
+        RAISERROR(N'  - CDC-tracked:      %d (FULLSCAN may delay CDC capture job)', 10, 1, @cdc_stats) WITH NOWAIT;
+        SET @warnings += N'CDC_TABLES: ' + CONVERT(nvarchar(10), @cdc_stats) + N' stats on CDC-tracked tables; ';
+    END;
+
+    /* #192: Warn when replicated tables are a majority of candidates */
+    DECLARE @replicated_stats int = (SELECT COUNT_BIG(*) FROM #stats_to_process WHERE is_published = 1);
+    IF @replicated_stats > 0 AND @total_stats > 0
+    BEGIN
+        DECLARE @repl_pct int = @replicated_stats * 100 / @total_stats;
+        RAISERROR(N'  - Replicated:       %d (%d%%)', 10, 1, @replicated_stats, @repl_pct) WITH NOWAIT;
+        IF @repl_pct > 50
+        BEGIN
+            RAISERROR(N'  WARNING: >50%% of candidates are on replicated tables. Statistics updates', 10, 1) WITH NOWAIT;
+            RAISERROR(N'  generate log records that replicate to subscribers — monitor replication lag.', 10, 1) WITH NOWAIT;
+            SET @warnings += N'REPLICATION_MAJORITY: ' + CONVERT(nvarchar(10), @repl_pct) + N'%% of stats on replicated tables; ';
+        END;
+    END;
+
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     IF @total_stats = 0
@@ -6834,6 +7146,25 @@ OPTION (RECOMPILE);';
         ====================================================================
         AG REDO QUEUE CHECK (v2.7, #18)
         ====================================================================
+        */
+
+        /* #146: Periodic backup detection — check every 50 stats for new backup activity */
+        IF @stats_processed > 0 AND @stats_processed % 50 = 0
+        BEGIN
+            DECLARE @mid_run_backups int = 0;
+            SELECT @mid_run_backups = COUNT(*)
+            FROM sys.dm_exec_requests AS r
+            WHERE r.command LIKE N'BACKUP%';
+
+            IF @mid_run_backups > 0 AND @active_backups = 0
+            BEGIN
+                /* Backup started after our run began */
+                RAISERROR(N'  Note: %d backup(s) now running (started after sp_StatUpdate). I/O contention possible.', 10, 1, @mid_run_backups) WITH NOWAIT;
+                SET @warnings += N'BACKUP_STARTED_MID_RUN: ' + CONVERT(nvarchar(10), @mid_run_backups) + N' backup(s); ';
+            END;
+        END;
+
+        /*
         Before each stat update, check if AG secondary redo queue exceeds
         threshold. If over threshold, enter a wait loop. If wait exceeds
         @MaxAGWaitMinutes or @TimeLimit is reached during wait, stop the run.
@@ -6842,7 +7173,7 @@ OPTION (RECOMPILE);';
         AND @ag_is_primary = 1
         AND @Execute = N'Y'
         BEGIN
-            SELECT @ag_redo_queue_mb = MAX(drs.redo_queue_size) / 1024
+            SELECT @ag_redo_queue_mb = MAX(drs.redo_queue_size) / 1024.0
             FROM sys.dm_hadr_database_replica_states AS drs
             WHERE drs.is_local = 0
             AND   drs.is_primary_replica = 0
@@ -6885,8 +7216,17 @@ OPTION (RECOMPILE);';
 
                     WAITFOR DELAY '00:00:30';
 
+                    /* #141: Re-check time limit after WAITFOR to prevent overshoot */
+                    IF  @TimeLimit IS NOT NULL
+                    AND DATEDIFF(SECOND, @start_time, SYSDATETIME()) >= @TimeLimit
+                    BEGIN
+                        SELECT @stop_reason = N'TIME_LIMIT';
+                        RAISERROR(N'Time limit reached during AG redo queue wait.', 10, 1) WITH NOWAIT;
+                        BREAK;
+                    END;
+
                     /* Re-check redo queue */
-                    SELECT @ag_redo_queue_mb = MAX(drs.redo_queue_size) / 1024
+                    SELECT @ag_redo_queue_mb = MAX(drs.redo_queue_size) / 1024.0
                     FROM sys.dm_hadr_database_replica_states AS drs
                     WHERE drs.is_local = 0
                     AND   drs.is_primary_replica = 0
@@ -6927,7 +7267,7 @@ OPTION (RECOMPILE);';
         AND @Execute = N'Y'
         BEGIN
             SELECT @tempdb_free_mb =
-                SUM(unallocated_extent_page_count) * 8 / 1024
+                SUM(unallocated_extent_page_count) * 8 / 1024.0
             FROM tempdb.sys.dm_db_file_space_usage;
 
             IF @tempdb_free_mb < @MinTempdbFreeMB
@@ -7616,7 +7956,8 @@ OPTION (RECOMPILE);';
                        @count_out = COUNT(*),
                        @total_out = (SELECT COUNT(*) FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id))
                 FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id) AS isp
-                WHERE isp.modification_counter > 0';
+                WHERE isp.modification_counter > 0
+                AND   ISNULL(isp.rows, 0) > 0'; /* #171: Skip empty partitions (post-SWITCH OUT) */
 
             /*
             Use STRING_AGG on SQL 2017+ (faster, cleaner)
@@ -7643,11 +7984,12 @@ OPTION (RECOMPILE);';
                                SELECT N'', '' + CONVERT(nvarchar(10), isp.partition_number)
                                FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id) AS isp
                                WHERE isp.modification_counter > 0
+                               AND   ISNULL(isp.rows, 0) > 0 /* #171: Skip empty partitions */
                                ORDER BY isp.partition_number
                                FOR XML PATH(''''), TYPE
                            ).value(''.'', ''nvarchar(max)''), 1, 2, N''''),
                            @count_out = (SELECT COUNT(*) FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id)
-                                         WHERE modification_counter > 0),
+                                         WHERE modification_counter > 0 AND ISNULL(rows, 0) > 0),
                            @total_out = (SELECT COUNT(*) FROM sys.dm_db_incremental_stats_properties(@obj_id, @stat_id))';
 
                 EXEC sys.sp_executesql
@@ -8177,6 +8519,10 @@ OPTION (RECOMPILE);';
                                 ELEMENTS
                         );
 
+                    /* #153: Warn if command exceeds 4000 chars (older CommandLog schemas may have nvarchar(4000)) */
+                    IF LEN(@current_command) > 4000
+                        RAISERROR(N'  Note: UPDATE STATISTICS command is %d chars — may truncate on older CommandLog schemas with nvarchar(4000).', 10, 1, @current_command) WITH NOWAIT;
+
                     INSERT INTO
                         dbo.CommandLog
                     (
@@ -8303,16 +8649,16 @@ OPTION (RECOMPILE);';
                     @current_error_message = ERROR_MESSAGE(),
                     @stats_failed += 1,
                     /*
-                    TOCTOU carve-out: errors 208 (invalid object name) and 15009 (object not found)
-                    indicate the object was dropped between queue-load and execution — a race condition,
-                    not a real infrastructure failure. Exclude from @consecutive_failures to prevent
-                    false @MaxConsecutiveFailures triggers in concurrent DDL environments.
+                    TOCTOU carve-out: errors 208 (invalid object name), 15009 (object not found),
+                    and 2767 (statistics not found) indicate the object/stat was dropped between
+                    queue-load and execution — a race condition, not a real infrastructure failure.
+                    Exclude from @consecutive_failures to prevent false @MaxConsecutiveFailures triggers.
                     */
-                    @consecutive_failures += CASE WHEN ERROR_NUMBER() NOT IN (208, 15009) THEN 1 ELSE 0 END,
+                    @consecutive_failures += CASE WHEN ERROR_NUMBER() NOT IN (208, 15009, 2767) THEN 1 ELSE 0 END,
                     @claimed_table_stats_failed += CASE WHEN @StatsInParallel = N'Y' THEN 1 ELSE 0 END;
 
-                IF @current_error_number IN (208, 15009)
-                    RAISERROR(N'  ~ TOCTOU skip (error %d): object no longer exists — skipped, not counted as consecutive failure.', 10, 1, @current_error_number) WITH NOWAIT;
+                IF @current_error_number IN (208, 15009, 2767)
+                    RAISERROR(N'  ~ TOCTOU skip (error %d): object/statistic no longer exists — skipped, not counted as consecutive failure.', 10, 1, @current_error_number) WITH NOWAIT;
                 ELSE
                     RAISERROR(N'  X Error %d: %s', 16, 1, @current_error_number, @current_error_message) WITH NOWAIT;
 
@@ -8441,7 +8787,7 @@ OPTION (RECOMPILE);';
             END;
 
             DECLARE
-                @delay_time datetime = DATEADD(SECOND, @DelayBetweenStats, '00:00:00');
+                @delay_time datetime = DATEADD(MILLISECOND, CAST(@DelayBetweenStats * 1000 AS int), '00:00:00');
 
             WAITFOR DELAY @delay_time;
         END;
@@ -8809,7 +9155,12 @@ OPTION (RECOMPILE);';
         @StatsRemainingOut = @remaining_stats,
         @DurationSecondsOut = @duration_seconds,
         @WarningsOut = NULLIF(@warnings, N''),
-        @StopReasonOut = @stop_reason;
+        /* #179: If databases were skipped, append to stop reason so automation sees partial completion */
+        @StopReasonOut = CASE
+            WHEN @warnings LIKE N'%DB_SKIPPED:%' AND @stop_reason = N'COMPLETED'
+            THEN N'COMPLETED_WITH_SKIPPED_DBS'
+            ELSE @stop_reason
+        END;
 
     /*
     ============================================================================
