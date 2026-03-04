@@ -3924,6 +3924,21 @@ BEGIN
 
     RAISERROR(N'Mode: %s', 10, 1, @mode) WITH NOWAIT;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
+
+    /*
+    P2b fix (v2.4): Lightweight QS forced plan inventory check.
+    Runs unconditionally when Query Store is enabled (not gated on @QueryStorePriority).
+    Most users never set @QueryStorePriority=Y — this ensures the INFO message is visible.
+    This is informational only — not a stop condition.
+    */
+    IF EXISTS (SELECT 1 FROM sys.database_query_store_options WHERE actual_state IN (1, 2))
+    BEGIN
+        DECLARE @fp_count INT = 0;
+        SELECT @fp_count = COUNT(*) FROM sys.query_store_plan WHERE is_forced_plan = 1;
+        IF @fp_count > 0
+            RAISERROR(N'[sp_StatUpdate] INFO: %d forced plan(s) in Query Store. Use @QueryStorePriority=''Y'' to prioritize affected stats.', 0, 1, @fp_count) WITH NOWAIT;
+    END;
+
     /*#endregion 14-PRE-DISCOVERY */
 
     /*#region 15-DIRECT-MODE: Mode 1: DIRECT_TABLE and DIRECT_STRING */
