@@ -7694,18 +7694,27 @@ OPTION (RECOMPILE);';
 
                 /* v2.3: Update LastStatCompletedAt to track per-stat heartbeat for dead worker detection */
                 /* Uses dynamic SQL to avoid compile-time column validation when column doesn't exist yet */
+                /* P2d fix (v2.4): Nested TRY/CATCH — heartbeat write failure is non-fatal.
+                   Without this, a transient table lock or column error would fall into the outer CATCH,
+                   mark a successfully-completed stat as FAILED, and potentially trip @MaxConsecutiveFailures. */
                 IF  @StatsInParallel = N'Y'
                 AND @claimed_table_database IS NOT NULL
                 AND OBJECT_ID(N'dbo.QueueStatistic', N'U') IS NOT NULL
                 AND EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic') AND name = N'LastStatCompletedAt')
                 BEGIN
-                    EXEC sp_executesql
-                        N'UPDATE dbo.QueueStatistic SET LastStatCompletedAt = SYSDATETIME() WHERE QueueID = @qid AND DatabaseName = @db AND SchemaName = @sch AND ObjectName = @obj;',
-                        N'@qid int, @db sysname, @sch sysname, @obj sysname',
-                        @qid = @queue_id,
-                        @db = @claimed_table_database,
-                        @sch = @claimed_table_schema,
-                        @obj = @claimed_table_name;
+                    BEGIN TRY
+                        EXEC sp_executesql
+                            N'UPDATE dbo.QueueStatistic SET LastStatCompletedAt = SYSDATETIME() WHERE QueueID = @qid AND DatabaseName = @db AND SchemaName = @sch AND ObjectName = @obj;',
+                            N'@qid int, @db sysname, @sch sysname, @obj sysname',
+                            @qid = @queue_id,
+                            @db = @claimed_table_database,
+                            @sch = @claimed_table_schema,
+                            @obj = @claimed_table_name;
+                    END TRY
+                    BEGIN CATCH
+                        /* Heartbeat failure is non-fatal — the stat update succeeded. Log warning only. */
+                        RAISERROR(N'[sp_StatUpdate] WARNING: Heartbeat write failed (%s). Stat update was successful.', 0, 1, ERROR_MESSAGE()) WITH NOWAIT;
+                    END CATCH;
                 END;
 
                 RAISERROR(@progress_msg, 10, 1) WITH NOWAIT;
