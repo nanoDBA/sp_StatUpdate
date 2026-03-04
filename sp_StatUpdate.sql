@@ -7435,6 +7435,30 @@ OPTION (RECOMPILE);';
             SET @absolute_sampled_rows = CAST(@current_row_count * (@current_persisted_sample_percent / 100.0) AS BIGINT);
 
         /*
+        #183 (P2): Warn when @StatisticsSample explicitly overrides a persisted sample percent.
+        No behavior change — the update proceeds with @StatisticsSample as requested.
+        Gives the DBA immediate visibility when their PERSIST_SAMPLE_PERCENT setting is being
+        silently overridden. To preserve the persisted rate, leave @StatisticsSample NULL.
+        */
+        IF  @StatisticsSample IS NOT NULL
+        AND @current_persisted_sample_percent IS NOT NULL
+        AND CONVERT(int, ROUND(@current_persisted_sample_percent, 0)) <> @StatisticsSample
+        BEGIN
+            DECLARE @persist_ovr_msg nvarchar(1000);
+            SET @persist_ovr_msg =
+                N'WARNING: Stat [' + @current_schema_name + N'].[' + @current_table_name
+                + N'].[' + @current_stat_name + N'] has persisted sample '
+                + CONVERT(nvarchar(10), CONVERT(int, ROUND(@current_persisted_sample_percent, 0)))
+                + N'% — @StatisticsSample=' + CONVERT(nvarchar(10), @StatisticsSample)
+                + N' will override it. To preserve persisted sampling, leave @StatisticsSample NULL. (#183)';
+            RAISERROR(N'%s', 10, 1, @persist_ovr_msg) WITH NOWAIT; /* Use %s to avoid % in message being treated as format spec */
+            SET @warnings = @warnings
+                + N'PERSIST_SAMPLE_OVERRIDE: [' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name + N'] '
+                + N'persisted=' + CONVERT(nvarchar(10), CONVERT(int, ROUND(@current_persisted_sample_percent, 0)))
+                + N'% overridden by @StatisticsSample=' + CONVERT(nvarchar(10), @StatisticsSample) + N'%; ';
+        END;
+
+        /*
         Memory-optimized tables have special requirements
         - SQL Server 2014: Requires FULLSCAN or RESAMPLE, no sampling
         - SQL Server 2016+: Supports sampling
