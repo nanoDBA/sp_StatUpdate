@@ -4699,6 +4699,7 @@ OPTION (RECOMPILE);';
                               SELECT 1
                               FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
                               WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                                 OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                           )
                       )
                 /* Filtered stats mode filter */
@@ -5692,6 +5693,7 @@ OPTION (RECOMPILE);';
                       SELECT 1
                       FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
                       WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                          OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                   )
               )
         /*
