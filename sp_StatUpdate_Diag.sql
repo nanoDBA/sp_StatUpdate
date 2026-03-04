@@ -492,15 +492,38 @@ BEGIN
             99
         );
 
-        /* Return empty result sets in expected order */
-        SELECT Severity, Category, Finding, Evidence, Recommendation, ExampleCall FROM #recommendations ORDER BY SortPriority, FindingID;
-        SELECT [Status] = N'NO_DATA', TotalRuns = 0, CompletedRuns = 0, CompletionPct = 0, AvgDurationSec = 0, Trend = N'N/A';
-        SELECT * FROM #runs WHERE 1 = 0;
-        SELECT * FROM #stat_updates WHERE 1 = 0;
-        SELECT * FROM #stat_updates WHERE 1 = 0;
-        SELECT * FROM #stat_updates WHERE 1 = 0;
-        SELECT * FROM #runs WHERE 1 = 0;
-        IF @Obfuscate = 1 SELECT * FROM #obfuscation_map;
+        /* Return result sets in expected format */
+        IF @SingleResultSet = 0
+        BEGIN
+            SELECT Severity, Category, Finding, Evidence, Recommendation, ExampleCall FROM #recommendations ORDER BY SortPriority, FindingID;
+            SELECT [Status] = N'NO_DATA', TotalRuns = 0, CompletedRuns = 0, CompletionPct = 0, AvgDurationSec = 0, Trend = N'N/A';
+            SELECT * FROM #runs WHERE 1 = 0;
+            SELECT * FROM #stat_updates WHERE 1 = 0;
+            SELECT * FROM #stat_updates WHERE 1 = 0;
+            SELECT * FROM #stat_updates WHERE 1 = 0;
+            SELECT * FROM #runs WHERE 1 = 0;
+            IF @Obfuscate = 1 SELECT * FROM #obfuscation_map;
+        END
+        ELSE
+        BEGIN
+            /* Single result set mode: return NO_DATA recommendation row */
+            SELECT
+                ResultSetID   = 1,
+                ResultSetName = N'Recommendations',
+                RowNum        = 1,
+                RowData       = (
+                    SELECT
+                        Severity       = r.Severity,
+                        Category       = r.Category,
+                        Finding        = r.Finding,
+                        Evidence       = r.Evidence,
+                        Recommendation = r.Recommendation,
+                        ExampleCall    = r.ExampleCall
+                    FROM #recommendations AS r
+                    FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+                )
+            FROM #recommendations;
+        END;
 
         RETURN;
     END;
