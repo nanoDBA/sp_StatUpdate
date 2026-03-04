@@ -3402,17 +3402,29 @@ BEGIN
         @hw_cpu_count int,
         @hw_memory_mb bigint,
         @hw_numa_nodes int,
-        @hw_uptime_hours int;
+        @hw_uptime_hours int,
+        /* P1d fix (v2.4): process-level memory and visible schedulers for container awareness */
+        @process_memory_kb bigint,     /* SQL Server process memory (container limit, not host RAM) */
+        @visible_schedulers int;       /* Online schedulers visible to SQL (may differ from cpu_count in containers) */
 
     SELECT
         @hw_cpu_count = cpu_count,
         @hw_memory_mb = physical_memory_kb / 1024,
         @hw_numa_nodes = numa_node_count,
-        @hw_uptime_hours = DATEDIFF(HOUR, sqlserver_start_time, SYSDATETIME())
+        @hw_uptime_hours = DATEDIFF(HOUR, sqlserver_start_time, SYSDATETIME()) /* P1d: SQL Server uptime, not OS uptime */
     FROM sys.dm_os_sys_info;
 
+    /* P1d: Process memory from sys.dm_os_process_memory (reflects container memory limit) */
+    SELECT @process_memory_kb = physical_memory_in_use_kb
+    FROM sys.dm_os_process_memory;
+
+    /* P1d: Visible online schedulers (may be less than cpu_count in container deployments) */
+    SELECT @visible_schedulers = COUNT(*)
+    FROM sys.dm_os_schedulers
+    WHERE status = N'VISIBLE ONLINE';
+
     IF @hw_uptime_hours < 24
-        SET @warnings += N'LOW_UPTIME: Server restarted < 24h ago; ';
+        SET @warnings += N'LOW_UPTIME: SQL Server restarted < 24h ago; ';
 
     DECLARE @active_backups int = 0;
     SELECT @active_backups = COUNT(*)
@@ -3442,8 +3454,18 @@ BEGIN
         RAISERROR(N'', 10, 1) WITH NOWAIT;
         RAISERROR(N'Environment (hardware context):', 10, 1) WITH NOWAIT;
         DECLARE @hw_memory_gb bigint = @hw_memory_mb / 1024;
-        RAISERROR(N'  CPU cores: %d, Memory: %I64d MB (%I64d GB), NUMA nodes: %d, Uptime: %d hours', 10, 1,
-            @hw_cpu_count, @hw_memory_mb, @hw_memory_gb, @hw_numa_nodes, @hw_uptime_hours) WITH NOWAIT;
+        RAISERROR(N'  CPU cores: %d (visible schedulers: %d), NUMA nodes: %d, Uptime: %d hours (SQL Server)', 10, 1,
+            @hw_cpu_count, @visible_schedulers, @hw_numa_nodes, @hw_uptime_hours) WITH NOWAIT;
+        DECLARE
+            @proc_memory_mb bigint = @process_memory_kb / 1024,
+            @proc_memory_gb bigint = @process_memory_kb / 1024 / 1024;
+        RAISERROR(N'  Host memory: %I64d MB (%I64d GB) | Process (SQL) memory: %I64d MB', 10, 1,
+            @hw_memory_mb, @hw_memory_gb, @proc_memory_mb) WITH NOWAIT;
+        /* P1d: Divergence >20% between host and process memory signals container memory limit */
+        IF @process_memory_kb IS NOT NULL
+        AND @hw_memory_mb > 0
+        AND ABS(1.0 - CONVERT(float, @process_memory_kb) / CONVERT(float, @hw_memory_mb * 1024)) > 0.20
+            RAISERROR(N'  Note: Host vs process memory divergence >20%% — likely running inside a container with memory limit.', 10, 1) WITH NOWAIT;
 
         IF @hw_uptime_hours < 24
             RAISERROR(N'  Note: SQL Server restarted < 24h ago. Query Store/usage stats may be incomplete.', 10, 1) WITH NOWAIT;
