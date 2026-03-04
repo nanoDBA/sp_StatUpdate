@@ -36,11 +36,13 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.9.2026.03.04 (Major.Minor.YYYY.MM.DD)
+Version:    2.10.2026.03.04 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.9.2026.03.04 - P2 bug fixes: XACT_ABORT, EngineEdition label, MAXDOP gate, CommandLog advisory, log space @FailFast, Phase 6 QS per-db, CommandLog dual-accounting, TOCTOU false failures, LIKE metachar escape
+History:    2.10.2026.03.04 - Security/correctness fixes: @CompletionNotifyTable SQL injection (#155),
+                            QS forced plan warning broken join (#187), @DelayBetweenStats WAITFOR overshoot (#210)
+            2.9.2026.03.04 - P2 bug fixes: XACT_ABORT, EngineEdition label, MAXDOP gate, CommandLog advisory, log space @FailFast, Phase 6 QS per-db, CommandLog dual-accounting, TOCTOU false failures, LIKE metachar escape
             2.8.2026.03.04 - Version format update: MMDD → MM.DD for readability; no behavior change
             2.8.2026.0303 - v2.8 Bug fixes for deploy, @Tables, CommandLog:
                           - Fix: Deploy fails on pre-v2.3 servers. SQL Server validates column
@@ -624,7 +626,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.9.2026.03.04',
+        @procedure_version varchar(20) = '2.10.2026.03.04',
         @procedure_version_date datetime = '20260304',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
