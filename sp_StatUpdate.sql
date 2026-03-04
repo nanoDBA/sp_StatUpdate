@@ -2549,11 +2549,38 @@ BEGIN
 
     /*
     Validate @CompletionNotifyTable (#64)
+    P1 fix (#155): Apply PARSENAME+QUOTENAME sanitization to prevent SQL injection via
+    @CompletionNotifyTable. Identical pattern to @WhatIfOutputTable (P1b fix, v2.4).
+    PARSENAME returns NULL for names containing injection characters (semicolons, quotes, etc.).
+    QUOTENAME ensures safe bracket-quoting for the FQN used in dynamic SQL.
     */
     IF @CompletionNotifyTable IS NOT NULL AND @CompletionNotifyTable = N''
     BEGIN
         INSERT INTO @errors (error_message, error_severity)
         SELECT N'@CompletionNotifyTable cannot be empty string. Use NULL to disable or provide a table name.', 16;
+    END;
+
+    IF @CompletionNotifyTable IS NOT NULL AND @CompletionNotifyTable <> N''
+    BEGIN
+        DECLARE
+            @safe_cnt_schema sysname,
+            @safe_cnt_table  sysname,
+            @safe_cnt_fqn    nvarchar(512);
+
+        SET @safe_cnt_table  = PARSENAME(@CompletionNotifyTable, 1);
+        SET @safe_cnt_schema = ISNULL(PARSENAME(@CompletionNotifyTable, 2), N'dbo');
+
+        IF @safe_cnt_table IS NULL
+        BEGIN
+            INSERT INTO @errors (error_message, error_severity)
+            SELECT
+                N'@CompletionNotifyTable is not a valid table name. Use schema.table or table format (e.g., ''dbo.StatUpdateNotify''). Names with injection characters are rejected.',
+                16;
+        END;
+        ELSE
+        BEGIN
+            SET @safe_cnt_fqn = QUOTENAME(@safe_cnt_schema) + N'.' + QUOTENAME(@safe_cnt_table);
+        END;
     END;
     /*#endregion 08-VALIDATION */
 
@@ -8532,11 +8559,12 @@ OPTION (RECOMPILE);';
         BEGIN TRY
             DECLARE @notify_sql nvarchar(max);
 
+            /* P1 fix (#155): Use @safe_cnt_fqn (PARSENAME+QUOTENAME validated) instead of raw @CompletionNotifyTable */
             /* Auto-create table if it doesn't exist */
             SET @notify_sql = N'
-                IF OBJECT_ID(' + QUOTENAME(@CompletionNotifyTable, '''') + N', N''U'') IS NULL
+                IF OBJECT_ID(N''' + REPLACE(@safe_cnt_fqn, N'''', N'''''') + N''', N''U'') IS NULL
                 BEGIN
-                    CREATE TABLE ' + @CompletionNotifyTable + N' (
+                    CREATE TABLE ' + @safe_cnt_fqn + N' (
                         ID int IDENTITY(1,1) PRIMARY KEY,
                         RunLabel nvarchar(100) NOT NULL,
                         StartTime datetime2(7) NOT NULL,
@@ -8550,7 +8578,7 @@ OPTION (RECOMPILE);';
                         Warnings nvarchar(max) NULL
                     );
                 END;
-                INSERT INTO ' + @CompletionNotifyTable + N'
+                INSERT INTO ' + @safe_cnt_fqn + N'
                     (RunLabel, StartTime, EndTime, StopReason, StatsFound, StatsSucceeded, StatsFailed, StatsRemaining, DurationSeconds, Warnings)
                 VALUES
                     (@rl, @st, @et, @sr, @sf, @ss, @sfl, @rem, @dur, @wrn);';
