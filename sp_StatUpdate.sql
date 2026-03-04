@@ -8410,17 +8410,28 @@ OPTION (RECOMPILE);';
             WHERE idx = @qs_db_idx;
 
             BEGIN TRY
+                /*
+                P1 fix (#187): The original join on qsq.object_id = stp.object_id was broken.
+                sys.query_store_query.object_id is the compiled module ID (stored proc/function),
+                NOT the table's object_id. For ad-hoc queries it is always 0, so the join
+                never matched any ad-hoc query plans. Fixed by joining query_store_query_text
+                and checking if the table name appears in the query SQL text via CHARINDEX.
+                This correctly identifies forced plans referencing tables whose stats were updated.
+                */
                 SET @qs_check_sql = N'
                     SELECT @cnt = COUNT(DISTINCT qsp.plan_id)
                     FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan AS qsp
                     INNER JOIN ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_query AS qsq
                         ON qsq.query_id = qsp.query_id
+                    INNER JOIN ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_query_text AS qsqt
+                        ON qsqt.query_text_id = qsq.query_text_id
                     WHERE qsp.is_forced_plan = 1
-                    AND qsq.object_id IN (
-                        SELECT DISTINCT stp.object_id
-                        FROM #stats_to_process AS stp
+                    AND EXISTS (
+                        SELECT 1 FROM #stats_to_process AS stp
                         WHERE stp.database_name = @dbname COLLATE DATABASE_DEFAULT
                         AND stp.processed = 1
+                        AND CHARINDEX(stp.table_name COLLATE DATABASE_DEFAULT,
+                                      qsqt.query_sql_text COLLATE DATABASE_DEFAULT) > 0
                     )';
 
                 EXEC sp_executesql @qs_check_sql,
