@@ -1778,7 +1778,7 @@ BEGIN
            )
         BEGIN
             RAISERROR(N'ADVISORY: dbo.CommandLog has no index leading on CommandType. On large tables this causes full scans during orphan cleanup and adaptive sampling. Consider:', 10, 1) WITH NOWAIT;
-            RAISERROR(N'  CREATE NONCLUSTERED INDEX IX_CommandLog_CommandType_StartTime ON dbo.CommandLog (CommandType, StartTime) INCLUDE (DatabaseName, SchemaName, ObjectName, StatisticsName, ExtendedInfo, EndTime, ErrorNumber);', 10, 1) WITH NOWAIT;
+            RAISERROR(N'  CREATE NONCLUSTERED INDEX IX_CommandLog_CommandType_StartTime ON dbo.CommandLog (CommandType, StartTime) INCLUDE (DatabaseName, SchemaName, ObjectName, StatisticsName, EndTime, ErrorNumber);', 10, 1) WITH NOWAIT;
         END;
     END;
 
