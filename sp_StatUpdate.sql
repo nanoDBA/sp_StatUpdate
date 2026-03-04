@@ -676,6 +676,24 @@ BEGIN
         SELECT
             N'v2.8: Comprehensive issue sweep — 31 issues resolved (QS forced plans, indexed views, log space, RLS/columnstore/filter detection)';
 
+        /* P3f (v2.4): QUICK START section — printed before parameter list */
+        RAISERROR(N'=============================================', 10, 1) WITH NOWAIT;
+        RAISERROR(N'sp_StatUpdate — QUICK START', 10, 1) WITH NOWAIT;
+        RAISERROR(N'=============================================', 10, 1) WITH NOWAIT;
+        RAISERROR(N'The fastest path: use a @Preset for a pre-tuned configuration.', 10, 1) WITH NOWAIT;
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  NIGHTLY_MAINTENANCE   Smart staleness + MAXDOP 4 + StopByTime-aware', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  WEEKLY_FULL           FULLSCAN on all user tables, no time limit', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  OLTP_LIGHT            Sample-only, MAXDOP 2, skips large tables', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  WAREHOUSE_AGGRESSIVE  FULLSCAN + parallel, dedicated maintenance windows', 10, 1) WITH NOWAIT;
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(N'Examples:', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  EXEC sp_StatUpdate @Preset = N''NIGHTLY_MAINTENANCE'', @Database = N''MyDB'';', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  EXEC sp_StatUpdate @Preset = N''WEEKLY_FULL'', @Execute = N''N''; -- dry run first', 10, 1) WITH NOWAIT;
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(N'Then use individual parameters below to fine-tune.', 10, 1) WITH NOWAIT;
+        RAISERROR(N'=============================================', 10, 1) WITH NOWAIT;
+
         /*
         Parameter documentation
         */
@@ -1449,6 +1467,16 @@ BEGIN
         @persisted_pct_msg integer = 0,
         @iteration_time datetime2(7) = NULL, /*Captured once per loop iteration for consistent timing*/
         @log_error_msg nvarchar(4000) = NULL; /*For TRY/CATCH - truncate at assignment to leave room for prefix*/
+
+    /* P3e (v2.4): ETR (Estimated Time Remaining) tracking variables */
+    DECLARE
+        @etr_total_ms bigint = 0,          /* Running total ms across all completed stats */
+        @etr_completed int = 0,            /* Count of stats completed (successful executions) */
+        @etr_suffix nvarchar(50) = N'',    /* ETR display suffix appended to Complete message */
+        @etr_avg_ms bigint = 0,            /* Average ms per stat for current run */
+        @etr_remaining_count int = 0,      /* Stats remaining in queue */
+        @etr_ms bigint = 0,               /* Estimated remaining ms */
+        @etr_display nvarchar(20) = N'';   /* Human-readable ETR string (~Xh Ym, ~Xm, ~Xs) */
 
     /*
     Run identification for tracking completion
@@ -3264,6 +3292,10 @@ BEGIN
 
     RAISERROR(N'Procedure:   %s', 10, 1, @procedure_version) WITH NOWAIT;
     RAISERROR(N'Start time:  %s', 10, 1, @start_time_display) WITH NOWAIT;
+
+    /* P3d (v2.4): Show execute mode in banner — always visible including dry runs */
+    DECLARE @execute_mode_display nvarchar(60) = CASE @Execute WHEN N'N' THEN N'DRY RUN — no updates will be executed' ELSE N'EXECUTE' END;
+    RAISERROR(N'Mode:        %s', 10, 1, @execute_mode_display) WITH NOWAIT;
 
     /*
     Show database count and list if Debug mode
@@ -7753,8 +7785,36 @@ OPTION (RECOMPILE);';
                     @stats_succeeded += 1,
                     @consecutive_failures = 0, /* Reset on success */
                     @claimed_table_stats_updated += CASE WHEN @StatsInParallel = N'Y' THEN 1 ELSE 0 END,
-                    @duration_ms = DATEDIFF(MILLISECOND, @current_start_time, @current_end_time),
-                    @progress_msg = N'  Complete (' + CONVERT(nvarchar(10), @duration_ms) + N' ms)';
+                    @duration_ms = DATEDIFF(MILLISECOND, @current_start_time, @current_end_time);
+
+                /* P3e (v2.4): Update ETR running totals */
+                SET @etr_total_ms += @duration_ms;
+                SET @etr_completed += 1;
+                SET @etr_suffix = N'';
+
+                /* P3e (v2.4): Compute ETR after at least 3 stats completed (avoids wild early estimates) */
+                IF @etr_completed >= 3
+                BEGIN
+                    SET @etr_avg_ms = @etr_total_ms / @etr_completed;
+                    SET @etr_remaining_count = @total_stats - @stats_processed;
+                    IF @etr_remaining_count > 0
+                    BEGIN
+                        SET @etr_ms = CONVERT(bigint, @etr_remaining_count) * @etr_avg_ms;
+                        IF @etr_ms >= 3600000
+                            SET @etr_display = CONVERT(nvarchar(10), @etr_ms / 3600000) + N'h ' + CONVERT(nvarchar(10), (@etr_ms % 3600000) / 60000) + N'm';
+                        ELSE IF @etr_ms >= 60000
+                            SET @etr_display = CONVERT(nvarchar(10), @etr_ms / 60000) + N'm';
+                        ELSE
+                            SET @etr_display = CONVERT(nvarchar(10), @etr_ms / 1000) + N's';
+                        SET @etr_suffix = N' | ETR: ~' + @etr_display;
+                    END;
+                END;
+
+                SET @progress_msg =
+                    N'  Complete (' +
+                    CONVERT(nvarchar(10), @duration_ms / 1000) + N'.' +
+                    CONVERT(nvarchar(10), (@duration_ms % 1000) / 100) + N's)' +
+                    @etr_suffix;
 
                 /* v2.3: Update LastStatCompletedAt to track per-stat heartbeat for dead worker detection */
                 /* Uses dynamic SQL to avoid compile-time column validation when column doesn't exist yet */
