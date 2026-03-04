@@ -56,6 +56,7 @@ ALTER PROCEDURE
     @TopN integer = 20,                           /* top N items in detail result sets */
     @Help bit = 0,
     @Debug bit = 0,
+    @SingleResultSet bit = 0,       /* 0 = default multi-result-set, 1 = single result set with ResultSetID/RowData */
     @Version varchar(20) = NULL OUTPUT,
     @VersionDate datetime = NULL OUTPUT
 )
@@ -104,6 +105,7 @@ BEGIN
                 (N'@TopN',                     N'integer',  N'20',    N'Limit for detail result sets'),
                 (N'@Help',                     N'bit',      N'0',     N'Show this help'),
                 (N'@Debug',                    N'bit',      N'0',     N'Verbose diagnostic output'),
+                (N'@SingleResultSet',          N'bit',      N'0',     N'0 = default multi result sets, 1 = single result set (ResultSetID, ResultSetName, RowNum, RowData JSON). Enables INSERT...EXEC capture.'),
                 (N'@Version',                  N'varchar',  N'OUTPUT', N'Returns procedure version'),
                 (N'@VersionDate',              N'datetime', N'OUTPUT', N'Returns version date')
         ) AS v (parameter_name, data_type, default_value, description);
@@ -150,7 +152,8 @@ BEGIN
                 (5, N'Failing Statistics',           N'Stats with errors, grouped'),
                 (6, N'Long-Running Statistics',      N'Stats exceeding threshold'),
                 (7, N'Parameter Change History',     N'Parameter values across runs'),
-                (8, N'Obfuscation Map (conditional)', N'Only when @Obfuscate=1')
+                (8, N'Obfuscation Map (conditional)', N'Only when @Obfuscate=1'),
+                (0, N'Unified Result Set',            N'When @SingleResultSet=1: one result set with ResultSetID, ResultSetName, RowNum, RowData (JSON). Replaces result sets 1-8.')
         ) AS v (rs_num, rs_name, rs_desc);
 
         RETURN;
@@ -324,6 +327,16 @@ BEGIN
         ObjectType nvarchar(20) NOT NULL,
         OriginalName nvarchar(256) NOT NULL,
         ObfuscatedName nvarchar(50) NOT NULL
+    );
+
+    /* Single result set accumulator (populated only when @SingleResultSet = 1) */
+    CREATE TABLE #single_rs
+    (
+        SingleRsID      int             IDENTITY(1,1) NOT NULL PRIMARY KEY,
+        ResultSetID     int             NOT NULL,
+        ResultSetName   nvarchar(100)   NOT NULL,
+        RowNum          int             NOT NULL,
+        RowData         nvarchar(max)   NULL
     );
 
     /*
@@ -1013,207 +1026,495 @@ BEGIN
     RESULT SET 1: RECOMMENDATIONS
     ============================================================================
     */
-    SELECT
-        Severity,
-        Category,
-        Finding,
-        Evidence,
-        Recommendation,
-        ExampleCall
-    FROM #recommendations
-    ORDER BY
-        CASE Severity
-            WHEN N'CRITICAL' THEN 1
-            WHEN N'WARNING'  THEN 2
-            WHEN N'INFO'     THEN 3
-            ELSE 4
-        END,
-        SortPriority,
-        FindingID;
+    IF @SingleResultSet = 0
+    BEGIN
+        SELECT
+            Severity,
+            Category,
+            Finding,
+            Evidence,
+            Recommendation,
+            ExampleCall
+        FROM #recommendations
+        ORDER BY
+            CASE Severity
+                WHEN N'CRITICAL' THEN 1
+                WHEN N'WARNING'  THEN 2
+                WHEN N'INFO'     THEN 3
+                ELSE 4
+            END,
+            SortPriority,
+            FindingID;
+    END
+    ELSE
+    BEGIN
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT
+            ResultSetID   = 1,
+            ResultSetName = N'Recommendations',
+            RowNum        = ROW_NUMBER() OVER (
+                                ORDER BY
+                                    CASE r.Severity
+                                        WHEN N'CRITICAL' THEN 1
+                                        WHEN N'WARNING'  THEN 2
+                                        WHEN N'INFO'     THEN 3
+                                        ELSE 4
+                                    END,
+                                    r.SortPriority,
+                                    r.FindingID
+                            ),
+            RowData       = (
+                SELECT
+                    Severity       = r2.Severity,
+                    Category       = r2.Category,
+                    Finding        = r2.Finding,
+                    Evidence       = r2.Evidence,
+                    Recommendation = r2.Recommendation,
+                    ExampleCall    = r2.ExampleCall
+                FROM #recommendations AS r2
+                WHERE r2.FindingID = r.FindingID
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            )
+        FROM #recommendations AS r;
+    END;
 
     /*
     ============================================================================
     RESULT SET 2: RUN HEALTH SUMMARY
     ============================================================================
     */
-    SELECT
-        TotalRuns = @run_count,
-        CompletedRuns = @total_completed_runs,
-        KilledRuns = @killed_count,
-        CompletionPct = CASE
-            WHEN @run_count > 0
-            THEN CONVERT(decimal(5, 1), @total_completed_runs * 100.0 / @run_count)
-            ELSE 0
-        END,
-        TimeLimitedRuns = @time_limit_runs,
-        NaturalEndRuns = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason = N'COMPLETED'),
-        AvgDurationSec = (SELECT AVG(DurationSeconds) FROM #runs WHERE IsKilled = 0),
-        AvgStatsProcessed = (SELECT AVG(StatsProcessed) FROM #runs WHERE IsKilled = 0),
-        AvgStatsRemaining = (SELECT AVG(StatsRemaining) FROM #runs WHERE IsKilled = 0),
-        TotalStatUpdates = @stat_update_count,
-        TotalFailedUpdates = (SELECT COUNT_BIG(*) FROM #stat_updates WHERE ErrorNumber > 0),
-        AnalysisWindowDays = @DaysBack,
-        StopReasonDistribution = (
-            SELECT STRING_AGG(stop_summary, N', ')
-            FROM (
-                SELECT r.StopReason + N': ' + CONVERT(nvarchar(10), COUNT_BIG(*)) AS stop_summary
-                FROM #runs AS r
-                WHERE r.IsKilled = 0
-                AND   r.StopReason IS NOT NULL
-                GROUP BY r.StopReason
-            ) AS sr
-        );
+    IF @SingleResultSet = 0
+    BEGIN
+        SELECT
+            TotalRuns = @run_count,
+            CompletedRuns = @total_completed_runs,
+            KilledRuns = @killed_count,
+            CompletionPct = CASE
+                WHEN @run_count > 0
+                THEN CONVERT(decimal(5, 1), @total_completed_runs * 100.0 / @run_count)
+                ELSE 0
+            END,
+            TimeLimitedRuns = @time_limit_runs,
+            NaturalEndRuns = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason = N'COMPLETED'),
+            AvgDurationSec = (SELECT AVG(DurationSeconds) FROM #runs WHERE IsKilled = 0),
+            AvgStatsProcessed = (SELECT AVG(StatsProcessed) FROM #runs WHERE IsKilled = 0),
+            AvgStatsRemaining = (SELECT AVG(StatsRemaining) FROM #runs WHERE IsKilled = 0),
+            TotalStatUpdates = @stat_update_count,
+            TotalFailedUpdates = (SELECT COUNT_BIG(*) FROM #stat_updates WHERE ErrorNumber > 0),
+            AnalysisWindowDays = @DaysBack,
+            StopReasonDistribution = (
+                SELECT STRING_AGG(stop_summary, N', ')
+                FROM (
+                    SELECT r.StopReason + N': ' + CONVERT(nvarchar(10), COUNT_BIG(*)) AS stop_summary
+                    FROM #runs AS r
+                    WHERE r.IsKilled = 0
+                    AND   r.StopReason IS NOT NULL
+                    GROUP BY r.StopReason
+                ) AS sr
+            );
+    END
+    ELSE
+    BEGIN
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT
+            ResultSetID   = 2,
+            ResultSetName = N'Run Health Summary',
+            RowNum        = 1,
+            RowData       = (
+                SELECT
+                    TotalRuns              = @run_count,
+                    CompletedRuns          = @total_completed_runs,
+                    KilledRuns             = @killed_count,
+                    CompletionPct          = CASE
+                                                WHEN @run_count > 0
+                                                THEN CONVERT(decimal(5, 1), @total_completed_runs * 100.0 / @run_count)
+                                                ELSE 0
+                                            END,
+                    TimeLimitedRuns        = @time_limit_runs,
+                    NaturalEndRuns         = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason = N'COMPLETED'),
+                    AvgDurationSec         = (SELECT AVG(DurationSeconds) FROM #runs WHERE IsKilled = 0),
+                    AvgStatsProcessed      = (SELECT AVG(StatsProcessed) FROM #runs WHERE IsKilled = 0),
+                    AvgStatsRemaining      = (SELECT AVG(StatsRemaining) FROM #runs WHERE IsKilled = 0),
+                    TotalStatUpdates       = @stat_update_count,
+                    TotalFailedUpdates     = (SELECT COUNT_BIG(*) FROM #stat_updates WHERE ErrorNumber > 0),
+                    AnalysisWindowDays     = @DaysBack,
+                    StopReasonDistribution = (
+                        SELECT STRING_AGG(stop_summary, N', ')
+                        FROM (
+                            SELECT r.StopReason + N': ' + CONVERT(nvarchar(10), COUNT_BIG(*)) AS stop_summary
+                            FROM #runs AS r
+                            WHERE r.IsKilled = 0
+                            AND   r.StopReason IS NOT NULL
+                            GROUP BY r.StopReason
+                        ) AS sr
+                    )
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            );
+    END;
 
     /*
     ============================================================================
     RESULT SET 3: RUN DETAIL
     ============================================================================
     */
-    SELECT
-        RunLabel,
-        StartTime,
-        EndTime,
-        DurationSeconds,
-        DurationMinutes = DurationSeconds / 60,
-        StopReason,
-        StatsFound,
-        StatsProcessed,
-        StatsSucceeded,
-        StatsFailed,
-        StatsRemaining,
-        AvgSecPerStat = CASE
-            WHEN StatsProcessed > 0
-            THEN CONVERT(decimal(10, 1), DurationSeconds * 1.0 / StatsProcessed)
-            ELSE NULL
-        END,
-        IsKilled,
-        [Version],
-        [Databases],
-        TimeLimit,
-        ModificationThreshold,
-        TieredThresholds,
-        SortOrder,
-        QueryStorePriority,
-        StatsInParallel,
-        Preset,
-        LongRunningThresholdMinutes
-    FROM #runs
-    ORDER BY StartTime DESC;
+    IF @SingleResultSet = 0
+    BEGIN
+        SELECT
+            RunLabel,
+            StartTime,
+            EndTime,
+            DurationSeconds,
+            DurationMinutes = DurationSeconds / 60,
+            StopReason,
+            StatsFound,
+            StatsProcessed,
+            StatsSucceeded,
+            StatsFailed,
+            StatsRemaining,
+            AvgSecPerStat = CASE
+                WHEN StatsProcessed > 0
+                THEN CONVERT(decimal(10, 1), DurationSeconds * 1.0 / StatsProcessed)
+                ELSE NULL
+            END,
+            IsKilled,
+            [Version],
+            [Databases],
+            TimeLimit,
+            ModificationThreshold,
+            TieredThresholds,
+            SortOrder,
+            QueryStorePriority,
+            StatsInParallel,
+            Preset,
+            LongRunningThresholdMinutes
+        FROM #runs
+        ORDER BY StartTime DESC;
+    END
+    ELSE
+    BEGIN
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT
+            ResultSetID   = 3,
+            ResultSetName = N'Run Detail',
+            RowNum        = ROW_NUMBER() OVER (ORDER BY r.StartTime DESC),
+            RowData       = (
+                SELECT
+                    RunLabel                = r2.RunLabel,
+                    StartTime               = r2.StartTime,
+                    EndTime                 = r2.EndTime,
+                    DurationSeconds         = r2.DurationSeconds,
+                    DurationMinutes         = r2.DurationSeconds / 60,
+                    StopReason              = r2.StopReason,
+                    StatsFound              = r2.StatsFound,
+                    StatsProcessed          = r2.StatsProcessed,
+                    StatsSucceeded          = r2.StatsSucceeded,
+                    StatsFailed             = r2.StatsFailed,
+                    StatsRemaining          = r2.StatsRemaining,
+                    AvgSecPerStat           = CASE
+                                                WHEN r2.StatsProcessed > 0
+                                                THEN CONVERT(decimal(10, 1), r2.DurationSeconds * 1.0 / r2.StatsProcessed)
+                                                ELSE NULL
+                                              END,
+                    IsKilled                = r2.IsKilled,
+                    [Version]               = r2.[Version],
+                    [Databases]             = r2.[Databases],
+                    TimeLimit               = r2.TimeLimit,
+                    ModificationThreshold   = r2.ModificationThreshold,
+                    TieredThresholds        = r2.TieredThresholds,
+                    SortOrder               = r2.SortOrder,
+                    QueryStorePriority      = r2.QueryStorePriority,
+                    StatsInParallel         = r2.StatsInParallel,
+                    Preset                  = r2.Preset,
+                    LongRunningThresholdMinutes = r2.LongRunningThresholdMinutes
+                FROM #runs AS r2
+                WHERE r2.RunLabel = r.RunLabel
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            )
+        FROM #runs AS r;
+    END;
 
     /*
     ============================================================================
     RESULT SET 4: TOP TABLES BY MAINTENANCE COST
     ============================================================================
     */
-    SELECT TOP (@TopN)
-        DatabaseName = su.DatabaseName,
-        SchemaName = su.SchemaName,
-        TableName = su.ObjectName,
-        TotalUpdates = COUNT_BIG(*),
-        TotalDurationSec = SUM(su.DurationMs) / 1000,
-        AvgDurationMs = AVG(su.DurationMs),
-        MaxDurationMs = MAX(su.DurationMs),
-        AvgModCounter = AVG(su.ModificationCounter),
-        MaxSizeMB = MAX(su.SizeMB),
-        MaxRowCount = MAX(su.RowCount_),
-        FailCount = SUM(CASE WHEN su.ErrorNumber > 0 THEN 1 ELSE 0 END),
-        IsHeap = MAX(CONVERT(integer, ISNULL(su.IsHeap, 0))),
-        HasNorecompute = MAX(CONVERT(integer, ISNULL(su.HasNorecompute, 0))),
-        DistinctStats = COUNT(DISTINCT su.StatisticsName)
-    FROM #stat_updates AS su
-    GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName
-    ORDER BY SUM(su.DurationMs) DESC;
+    IF @SingleResultSet = 0
+    BEGIN
+        SELECT TOP (@TopN)
+            DatabaseName = su.DatabaseName,
+            SchemaName = su.SchemaName,
+            TableName = su.ObjectName,
+            TotalUpdates = COUNT_BIG(*),
+            TotalDurationSec = SUM(su.DurationMs) / 1000,
+            AvgDurationMs = AVG(su.DurationMs),
+            MaxDurationMs = MAX(su.DurationMs),
+            AvgModCounter = AVG(su.ModificationCounter),
+            MaxSizeMB = MAX(su.SizeMB),
+            MaxRowCount = MAX(su.RowCount_),
+            FailCount = SUM(CASE WHEN su.ErrorNumber > 0 THEN 1 ELSE 0 END),
+            IsHeap = MAX(CONVERT(integer, ISNULL(su.IsHeap, 0))),
+            HasNorecompute = MAX(CONVERT(integer, ISNULL(su.HasNorecompute, 0))),
+            DistinctStats = COUNT(DISTINCT su.StatisticsName)
+        FROM #stat_updates AS su
+        GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName
+        ORDER BY SUM(su.DurationMs) DESC;
+    END
+    ELSE
+    BEGIN
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT TOP (@TopN)
+            ResultSetID   = 4,
+            ResultSetName = N'Top Tables',
+            RowNum        = ROW_NUMBER() OVER (ORDER BY SUM(su.DurationMs) DESC),
+            RowData       = (
+                SELECT
+                    DatabaseName     = su2.DatabaseName,
+                    SchemaName       = su2.SchemaName,
+                    TableName        = su2.ObjectName,
+                    TotalUpdates     = COUNT_BIG(*),
+                    TotalDurationSec = SUM(su2.DurationMs) / 1000,
+                    AvgDurationMs    = AVG(su2.DurationMs),
+                    MaxDurationMs    = MAX(su2.DurationMs),
+                    AvgModCounter    = AVG(su2.ModificationCounter),
+                    MaxSizeMB        = MAX(su2.SizeMB),
+                    MaxRowCount      = MAX(su2.RowCount_),
+                    FailCount        = SUM(CASE WHEN su2.ErrorNumber > 0 THEN 1 ELSE 0 END),
+                    IsHeap           = MAX(CONVERT(integer, ISNULL(su2.IsHeap, 0))),
+                    HasNorecompute   = MAX(CONVERT(integer, ISNULL(su2.HasNorecompute, 0))),
+                    DistinctStats    = COUNT(DISTINCT su2.StatisticsName)
+                FROM #stat_updates AS su2
+                WHERE su2.DatabaseName = su.DatabaseName
+                AND   su2.SchemaName   = su.SchemaName
+                AND   su2.ObjectName   = su.ObjectName
+                GROUP BY su2.DatabaseName, su2.SchemaName, su2.ObjectName
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            )
+        FROM #stat_updates AS su
+        GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName
+        ORDER BY SUM(su.DurationMs) DESC;
+    END;
 
     /*
     ============================================================================
     RESULT SET 5: FAILING STATISTICS
     ============================================================================
     */
-    SELECT TOP (@TopN)
-        DatabaseName = su.DatabaseName,
-        SchemaName = su.SchemaName,
-        TableName = su.ObjectName,
-        StatisticsName = su.StatisticsName,
-        FailCount = COUNT_BIG(*),
-        DistinctRuns = COUNT(DISTINCT su.RunLabel),
-        ErrorNumbers = STUFF((
-            SELECT DISTINCT N', ' + CONVERT(nvarchar(20), su2.ErrorNumber)
-            FROM #stat_updates AS su2
-            WHERE su2.ErrorNumber > 0
-            AND   su2.DatabaseName = su.DatabaseName
-            AND   su2.SchemaName = su.SchemaName
-            AND   su2.ObjectName = su.ObjectName
-            AND   su2.StatisticsName = su.StatisticsName
-            FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N''),
-        LastError = MAX(LEFT(su.ErrorMessage, 500)),
-        LastFailDate = MAX(su.StartTime),
-        AvgSizeMB = AVG(su.SizeMB)
-    FROM #stat_updates AS su
-    WHERE su.ErrorNumber > 0
-    GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
-    ORDER BY COUNT_BIG(*) DESC;
+    IF @SingleResultSet = 0
+    BEGIN
+        SELECT TOP (@TopN)
+            DatabaseName = su.DatabaseName,
+            SchemaName = su.SchemaName,
+            TableName = su.ObjectName,
+            StatisticsName = su.StatisticsName,
+            FailCount = COUNT_BIG(*),
+            DistinctRuns = COUNT(DISTINCT su.RunLabel),
+            ErrorNumbers = STUFF((
+                SELECT DISTINCT N', ' + CONVERT(nvarchar(20), su2.ErrorNumber)
+                FROM #stat_updates AS su2
+                WHERE su2.ErrorNumber > 0
+                AND   su2.DatabaseName = su.DatabaseName
+                AND   su2.SchemaName = su.SchemaName
+                AND   su2.ObjectName = su.ObjectName
+                AND   su2.StatisticsName = su.StatisticsName
+                FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N''),
+            LastError = MAX(LEFT(su.ErrorMessage, 500)),
+            LastFailDate = MAX(su.StartTime),
+            AvgSizeMB = AVG(su.SizeMB)
+        FROM #stat_updates AS su
+        WHERE su.ErrorNumber > 0
+        GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+        ORDER BY COUNT_BIG(*) DESC;
+    END
+    ELSE
+    BEGIN
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT TOP (@TopN)
+            ResultSetID   = 5,
+            ResultSetName = N'Failing Statistics',
+            RowNum        = ROW_NUMBER() OVER (ORDER BY COUNT_BIG(*) DESC),
+            RowData       = (
+                SELECT
+                    DatabaseName   = su2.DatabaseName,
+                    SchemaName     = su2.SchemaName,
+                    TableName      = su2.ObjectName,
+                    StatisticsName = su2.StatisticsName,
+                    FailCount      = COUNT_BIG(*),
+                    DistinctRuns   = COUNT(DISTINCT su2.RunLabel),
+                    ErrorNumbers   = STUFF((
+                        SELECT DISTINCT N', ' + CONVERT(nvarchar(20), su3.ErrorNumber)
+                        FROM #stat_updates AS su3
+                        WHERE su3.ErrorNumber > 0
+                        AND   su3.DatabaseName   = su2.DatabaseName
+                        AND   su3.SchemaName     = su2.SchemaName
+                        AND   su3.ObjectName     = su2.ObjectName
+                        AND   su3.StatisticsName = su2.StatisticsName
+                        FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N''),
+                    LastError      = MAX(LEFT(su2.ErrorMessage, 500)),
+                    LastFailDate   = MAX(su2.StartTime),
+                    AvgSizeMB      = AVG(su2.SizeMB)
+                FROM #stat_updates AS su2
+                WHERE su2.ErrorNumber > 0
+                AND   su2.DatabaseName   = su.DatabaseName
+                AND   su2.SchemaName     = su.SchemaName
+                AND   su2.ObjectName     = su.ObjectName
+                AND   su2.StatisticsName = su.StatisticsName
+                GROUP BY su2.DatabaseName, su2.SchemaName, su2.ObjectName, su2.StatisticsName
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            )
+        FROM #stat_updates AS su
+        WHERE su.ErrorNumber > 0
+        GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+        ORDER BY COUNT_BIG(*) DESC;
+    END;
 
     /*
     ============================================================================
     RESULT SET 6: LONG-RUNNING STATISTICS
     ============================================================================
     */
-    SELECT TOP (@TopN)
-        DatabaseName = su.DatabaseName,
-        SchemaName = su.SchemaName,
-        TableName = su.ObjectName,
-        StatisticsName = su.StatisticsName,
-        UpdateCount = COUNT_BIG(*),
-        AvgDurationSec = AVG(su.DurationMs) / 1000,
-        MaxDurationSec = MAX(su.DurationMs) / 1000,
-        MinDurationSec = MIN(su.DurationMs) / 1000,
-        AvgSizeMB = AVG(su.SizeMB),
-        MaxRowCount = MAX(su.RowCount_),
-        AvgSamplePct = AVG(su.EffectiveSamplePct),
-        SampleSources = STUFF((
-            SELECT DISTINCT N', ' + su2.SampleSource
-            FROM #stat_updates AS su2
-            WHERE su2.ErrorNumber = 0
-            AND   su2.DurationMs > @LongRunningMinutes * 60 * 1000
-            AND   su2.DatabaseName = su.DatabaseName
-            AND   su2.SchemaName = su.SchemaName
-            AND   su2.ObjectName = su.ObjectName
-            AND   su2.StatisticsName = su.StatisticsName
-            AND   su2.SampleSource IS NOT NULL
-            FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N''),
-        IsHeap = MAX(CONVERT(integer, ISNULL(su.IsHeap, 0)))
-    FROM #stat_updates AS su
-    WHERE su.ErrorNumber = 0
-    AND   su.DurationMs > @LongRunningMinutes * 60 * 1000
-    GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
-    ORDER BY AVG(su.DurationMs) DESC;
+    IF @SingleResultSet = 0
+    BEGIN
+        SELECT TOP (@TopN)
+            DatabaseName = su.DatabaseName,
+            SchemaName = su.SchemaName,
+            TableName = su.ObjectName,
+            StatisticsName = su.StatisticsName,
+            UpdateCount = COUNT_BIG(*),
+            AvgDurationSec = AVG(su.DurationMs) / 1000,
+            MaxDurationSec = MAX(su.DurationMs) / 1000,
+            MinDurationSec = MIN(su.DurationMs) / 1000,
+            AvgSizeMB = AVG(su.SizeMB),
+            MaxRowCount = MAX(su.RowCount_),
+            AvgSamplePct = AVG(su.EffectiveSamplePct),
+            SampleSources = STUFF((
+                SELECT DISTINCT N', ' + su2.SampleSource
+                FROM #stat_updates AS su2
+                WHERE su2.ErrorNumber = 0
+                AND   su2.DurationMs > @LongRunningMinutes * 60 * 1000
+                AND   su2.DatabaseName = su.DatabaseName
+                AND   su2.SchemaName = su.SchemaName
+                AND   su2.ObjectName = su.ObjectName
+                AND   su2.StatisticsName = su.StatisticsName
+                AND   su2.SampleSource IS NOT NULL
+                FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N''),
+            IsHeap = MAX(CONVERT(integer, ISNULL(su.IsHeap, 0)))
+        FROM #stat_updates AS su
+        WHERE su.ErrorNumber = 0
+        AND   su.DurationMs > @LongRunningMinutes * 60 * 1000
+        GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+        ORDER BY AVG(su.DurationMs) DESC;
+    END
+    ELSE
+    BEGIN
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT TOP (@TopN)
+            ResultSetID   = 6,
+            ResultSetName = N'Long-Running Statistics',
+            RowNum        = ROW_NUMBER() OVER (ORDER BY AVG(su.DurationMs) DESC),
+            RowData       = (
+                SELECT
+                    DatabaseName   = su2.DatabaseName,
+                    SchemaName     = su2.SchemaName,
+                    TableName      = su2.ObjectName,
+                    StatisticsName = su2.StatisticsName,
+                    UpdateCount    = COUNT_BIG(*),
+                    AvgDurationSec = AVG(su2.DurationMs) / 1000,
+                    MaxDurationSec = MAX(su2.DurationMs) / 1000,
+                    MinDurationSec = MIN(su2.DurationMs) / 1000,
+                    AvgSizeMB      = AVG(su2.SizeMB),
+                    MaxRowCount    = MAX(su2.RowCount_),
+                    AvgSamplePct   = AVG(su2.EffectiveSamplePct),
+                    SampleSources  = STUFF((
+                        SELECT DISTINCT N', ' + su3.SampleSource
+                        FROM #stat_updates AS su3
+                        WHERE su3.ErrorNumber = 0
+                        AND   su3.DurationMs > @LongRunningMinutes * 60 * 1000
+                        AND   su3.DatabaseName   = su2.DatabaseName
+                        AND   su3.SchemaName     = su2.SchemaName
+                        AND   su3.ObjectName     = su2.ObjectName
+                        AND   su3.StatisticsName = su2.StatisticsName
+                        AND   su3.SampleSource IS NOT NULL
+                        FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N''),
+                    IsHeap         = MAX(CONVERT(integer, ISNULL(su2.IsHeap, 0)))
+                FROM #stat_updates AS su2
+                WHERE su2.ErrorNumber = 0
+                AND   su2.DurationMs > @LongRunningMinutes * 60 * 1000
+                AND   su2.DatabaseName   = su.DatabaseName
+                AND   su2.SchemaName     = su.SchemaName
+                AND   su2.ObjectName     = su.ObjectName
+                AND   su2.StatisticsName = su.StatisticsName
+                GROUP BY su2.DatabaseName, su2.SchemaName, su2.ObjectName, su2.StatisticsName
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            )
+        FROM #stat_updates AS su
+        WHERE su.ErrorNumber = 0
+        AND   su.DurationMs > @LongRunningMinutes * 60 * 1000
+        GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+        ORDER BY AVG(su.DurationMs) DESC;
+    END;
 
     /*
     ============================================================================
     RESULT SET 7: PARAMETER CHANGE HISTORY
     ============================================================================
     */
-    SELECT
-        RunLabel,
-        StartTime,
-        [Version],
-        TimeLimit,
-        ModificationThreshold,
-        TieredThresholds,
-        ThresholdLogic,
-        SortOrder,
-        QueryStorePriority,
-        StatisticsSample,
-        StatsInParallel,
-        Preset,
-        LongRunningThresholdMinutes,
-        LongRunningSamplePercent,
-        GroupByJoinPattern,
-        FilteredStatsMode,
-        BatchLimit,
-        FailFast
-    FROM #runs
-    ORDER BY StartTime DESC;
+    IF @SingleResultSet = 0
+    BEGIN
+        SELECT
+            RunLabel,
+            StartTime,
+            [Version],
+            TimeLimit,
+            ModificationThreshold,
+            TieredThresholds,
+            ThresholdLogic,
+            SortOrder,
+            QueryStorePriority,
+            StatisticsSample,
+            StatsInParallel,
+            Preset,
+            LongRunningThresholdMinutes,
+            LongRunningSamplePercent,
+            GroupByJoinPattern,
+            FilteredStatsMode,
+            BatchLimit,
+            FailFast
+        FROM #runs
+        ORDER BY StartTime DESC;
+    END
+    ELSE
+    BEGIN
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT
+            ResultSetID   = 7,
+            ResultSetName = N'Parameter Change History',
+            RowNum        = ROW_NUMBER() OVER (ORDER BY r.StartTime DESC),
+            RowData       = (
+                SELECT
+                    RunLabel                    = r2.RunLabel,
+                    StartTime                   = r2.StartTime,
+                    [Version]                   = r2.[Version],
+                    TimeLimit                   = r2.TimeLimit,
+                    ModificationThreshold       = r2.ModificationThreshold,
+                    TieredThresholds            = r2.TieredThresholds,
+                    ThresholdLogic              = r2.ThresholdLogic,
+                    SortOrder                   = r2.SortOrder,
+                    QueryStorePriority          = r2.QueryStorePriority,
+                    StatisticsSample            = r2.StatisticsSample,
+                    StatsInParallel             = r2.StatsInParallel,
+                    Preset                      = r2.Preset,
+                    LongRunningThresholdMinutes = r2.LongRunningThresholdMinutes,
+                    LongRunningSamplePercent    = r2.LongRunningSamplePercent,
+                    GroupByJoinPattern          = r2.GroupByJoinPattern,
+                    FilteredStatsMode           = r2.FilteredStatsMode,
+                    BatchLimit                  = r2.BatchLimit,
+                    FailFast                    = r2.FailFast
+                FROM #runs AS r2
+                WHERE r2.RunLabel = r.RunLabel
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            )
+        FROM #runs AS r;
+    END;
 
     /*
     ============================================================================
@@ -1222,13 +1523,53 @@ BEGIN
     */
     IF @Obfuscate = 1
     BEGIN
-        SELECT
-            ObjectType,
-            OriginalName,
-            ObfuscatedName
-        FROM #obfuscation_map
-        ORDER BY ObjectType, OriginalName;
+        IF @SingleResultSet = 0
+        BEGIN
+            SELECT
+                ObjectType,
+                OriginalName,
+                ObfuscatedName
+            FROM #obfuscation_map
+            ORDER BY ObjectType, OriginalName;
+        END
+        ELSE
+        BEGIN
+            INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+            SELECT
+                ResultSetID   = 8,
+                ResultSetName = N'Obfuscation Map',
+                RowNum        = ROW_NUMBER() OVER (ORDER BY om.ObjectType, om.OriginalName),
+                RowData       = (
+                    SELECT
+                        ObjectType     = om2.ObjectType,
+                        OriginalName   = om2.OriginalName,
+                        ObfuscatedName = om2.ObfuscatedName
+                    FROM #obfuscation_map AS om2
+                    WHERE om2.ObjectType   = om.ObjectType
+                    AND   om2.OriginalName = om.OriginalName
+                    FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+                )
+            FROM #obfuscation_map AS om;
+        END;
     END;
+
+    /*
+    ============================================================================
+    FINAL OUTPUT (single result set mode only)
+    ============================================================================
+    */
+    IF @SingleResultSet = 1
+    BEGIN
+        SELECT
+            ResultSetID,
+            ResultSetName,
+            RowNum,
+            RowData
+        FROM #single_rs
+        ORDER BY ResultSetID, RowNum;
+    END;
+
+    DROP TABLE IF EXISTS #single_rs;
 
     /*
     ============================================================================
