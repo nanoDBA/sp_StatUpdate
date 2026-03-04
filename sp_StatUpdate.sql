@@ -2065,14 +2065,45 @@ BEGIN
     /*
     Auto-create @WhatIfOutputTable if it doesn't exist, or validate schema if it does.
     P2 #10: Validate schema when table exists to give clear error message.
+    P1b fix (v2.4): Validate via PARSENAME+QUOTENAME BEFORE any EXECUTE to prevent SQL injection.
     */
     IF  @WhatIfOutputTable IS NOT NULL
     AND @Execute = N'N'
     BEGIN
+        /*
+        P1b: Use PARSENAME+QUOTENAME to sanitize the table name BEFORE any dynamic SQL.
+        PARSENAME returns NULL for names with injection characters (semicolons, quotes, etc.).
+        QUOTENAME ensures safe bracket-quoting for the final FQN used in dynamic SQL.
+        */
+        DECLARE
+            @safe_wio_schema sysname,
+            @safe_wio_table  sysname,
+            @safe_wio_fqn    nvarchar(512);
+
+        SET @safe_wio_table  = PARSENAME(@WhatIfOutputTable, 1);
+        SET @safe_wio_schema = ISNULL(PARSENAME(@WhatIfOutputTable, 2), N'dbo');
+
+        IF @safe_wio_table IS NULL
+        BEGIN
+            INSERT INTO
+                @errors
+            (
+                error_message,
+                error_severity
+            )
+            SELECT
+                error_message =
+                    N'@WhatIfOutputTable is not a valid table name. Use schema.table or table format (e.g., ''dbo.WhatIfResults'').',
+                error_severity = 16;
+        END;
+        ELSE
+        BEGIN
+            SET @safe_wio_fqn = QUOTENAME(@safe_wio_schema) + N'.' + QUOTENAME(@safe_wio_table);
+
         DECLARE @whatif_create_sql nvarchar(max) = N'
-            IF OBJECT_ID(N''' + REPLACE(@WhatIfOutputTable, N'''', N'''''') + N''', N''U'') IS NULL
+            IF OBJECT_ID(N''' + REPLACE(@safe_wio_fqn, N'''', N'''''') + N''', N''U'') IS NULL
             BEGIN
-                CREATE TABLE ' + @WhatIfOutputTable + N' (
+                CREATE TABLE ' + @safe_wio_fqn + N' (
                     SequenceNum int IDENTITY(1,1) PRIMARY KEY,
                     DatabaseName sysname NOT NULL,
                     SchemaName sysname NOT NULL,
@@ -2111,7 +2142,7 @@ BEGIN
         DECLARE @whatif_validate_sql nvarchar(max) = N'
             DECLARE @missing_cols nvarchar(500) = N'''';
             DECLARE @wrong_types nvarchar(500) = N'''';
-            DECLARE @tbl nvarchar(500) = N''' + REPLACE(@WhatIfOutputTable, N'''', N'''''') + N''';
+            DECLARE @tbl nvarchar(500) = N''' + REPLACE(@safe_wio_fqn, N'''', N'''''') + N''';
             DECLARE @obj_id int = OBJECT_ID(@tbl, N''U'');
 
             /* Check column existence */
@@ -2168,6 +2199,7 @@ BEGIN
                 error_message = ERROR_MESSAGE(),
                 error_severity = 16;
         END CATCH;
+        END; -- end ELSE (PARSENAME valid - safe to use @safe_wio_fqn)
     END;
 
     IF @LogToTable NOT IN (N'Y', N'N')
@@ -2267,30 +2299,10 @@ BEGIN
     END;
 
     /*
-    Validate @WhatIfOutputTable doesn't contain SQL injection characters
+    P1b fix (v2.4): Old blocklist-based @WhatIfOutputTable injection check removed.
+    Replaced by PARSENAME+QUOTENAME validation above, which fires BEFORE any EXECUTE
+    and rejects ALL invalid identifiers — not just those matching a partial keyword list.
     */
-    IF  @WhatIfOutputTable IS NOT NULL
-    AND (
-            @WhatIfOutputTable LIKE N'%;%'
-         OR @WhatIfOutputTable LIKE N'%--%'
-         OR @WhatIfOutputTable LIKE N'%/*%'
-         OR @WhatIfOutputTable LIKE N'%*/%'
-         OR @WhatIfOutputTable LIKE N'%''%'
-         OR @WhatIfOutputTable LIKE N'%xp_%'
-         OR @WhatIfOutputTable LIKE N'%sp_execute%'
-        )
-    BEGIN
-        INSERT INTO
-            @errors
-        (
-            error_message,
-            error_severity
-        )
-        SELECT
-            error_message =
-                N'The value for @WhatIfOutputTable contains invalid characters.',
-            error_severity = 16;
-    END;
 
     /*
     Validate @FilteredStatsMode
@@ -7902,8 +7914,9 @@ OPTION (RECOMPILE);';
             */
             IF @WhatIfOutputTable IS NOT NULL
             BEGIN
+                /* P1b fix: use @safe_wio_fqn (PARSENAME+QUOTENAME validated) instead of raw @WhatIfOutputTable */
                 DECLARE @whatif_insert_sql nvarchar(max) = N'
-                    INSERT INTO ' + @WhatIfOutputTable + N'
+                    INSERT INTO ' + @safe_wio_fqn + N'
                     (DatabaseName, SchemaName, TableName, StatName, Command, ModificationCounter, DaysStale, PageCount)
                     VALUES (@db, @schema, @table, @stat, @cmd, @mods, @days, @pages)';
 
