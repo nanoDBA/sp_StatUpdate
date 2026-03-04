@@ -491,6 +491,7 @@ ALTER PROCEDURE
     */
     @StatisticsSample integer = NULL, /*sample percent: NULL = let SQL Server decide (recommended), 1-100 = explicit %, 100 = FULLSCAN*/
     @PersistSamplePercent nvarchar(1) = N'Y', /*Y = add PERSIST_SAMPLE_PERCENT = ON (SQL 2016 SP1 CU4+) to remember sample rate*/
+    @PersistSampleMinRows bigint = 1000000, /*Minimum sampled rows for RESAMPLE_PERSIST to fire. If computed sampled rows (row_count × persisted_pct%) fall below this, RESAMPLE is skipped to avoid low-quality histograms. NULL = no floor check.*/
     @MaxDOP integer = NULL, /*MAXDOP for UPDATE STATISTICS (SQL 2016 SP2+ / SQL 2017 CU3+). NULL = server default*/
     @MaxGrantPercent int = 10, /*Memory grant cap percent (1-100) for the candidate discovery SELECT. Applied as OPTION(MAX_GRANT_PERCENT) on the internal ranking query. NULL = no hint. Default 10 limits memory monopolization during candidate enumeration.*/
 
@@ -1396,6 +1397,7 @@ BEGIN
         @current_days_stale integer = NULL,
         @current_page_count bigint = NULL,
         @current_persisted_sample_percent float = NULL,
+        @absolute_sampled_rows bigint = NULL, /*P1c: computed actual sampled rows from @current_row_count * @current_persisted_sample_percent*/
         @current_histogram_steps int = NULL,
         @current_partition_number integer = NULL,
         @current_forwarded_records bigint = NULL,
@@ -7164,6 +7166,17 @@ OPTION (RECOMPILE);';
         END;
 
         /*
+        P1c fix (v2.4): Compute absolute sampled rows for RESAMPLE_PERSIST quality floor check.
+        Reset each iteration so stale values from previous stats don't bleed through.
+        This is referenced by the ELSE IF RESAMPLE_PERSIST block below.
+        */
+        SET @absolute_sampled_rows = NULL;
+        IF  @current_row_count IS NOT NULL
+        AND @current_persisted_sample_percent IS NOT NULL
+        AND @current_persisted_sample_percent > 0
+            SET @absolute_sampled_rows = CAST(@current_row_count * (@current_persisted_sample_percent / 100.0) AS BIGINT);
+
+        /*
         Memory-optimized tables have special requirements
         - SQL Server 2014: Requires FULLSCAN or RESAMPLE, no sampling
         - SQL Server 2016+: Supports sampling
@@ -7209,10 +7222,13 @@ OPTION (RECOMPILE);';
         honor the existing setting by using RESAMPLE.
         This preserves the sample rate without overriding DBA-tuned values.
         Exception: Long-running stats use forced sample rate instead of RESAMPLE.
+        P1c fix (v2.4): Quality floor — skip RESAMPLE when persisted sample rate would produce
+        too few rows for meaningful histograms (controlled by @PersistSampleMinRows).
         */
         ELSE IF @effective_sample_percent IS NULL
         AND     @current_persisted_sample_percent IS NOT NULL
         AND     @is_long_running_stat = 0
+        AND     (@PersistSampleMinRows IS NULL OR @absolute_sampled_rows IS NULL OR @absolute_sampled_rows >= @PersistSampleMinRows)
         BEGIN
             SELECT
                 @with_clause = N'RESAMPLE',
@@ -7697,6 +7713,9 @@ OPTION (RECOMPILE);';
                                 @current_is_memory_optimized AS IsMemoryOptimized,
                                 @current_auto_created AS AutoCreated,
                                 @current_histogram_steps AS HistogramSteps,
+                                /* Persisted sample metadata (P1c, v2.4) */
+                                @current_persisted_sample_percent AS PersistedSamplePercent,
+                                @absolute_sampled_rows AS PersistedSampledRows,
                                 /* Filtered statistics metadata */
                                 @current_has_filter AS HasFilter,
                                 LEFT(@current_filter_definition, 500) AS FilterDefinition, /*truncate for XML*/
