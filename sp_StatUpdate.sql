@@ -36,11 +36,12 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.8.2026.0303 (Major.Minor.Year.MMDD)
+Version:    2.8.2026.03.04 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.8.2026.0303 - v2.8 Bug fixes for deploy, @Tables, CommandLog:
+History:    2.8.2026.03.04 - Version format update: MMDD → MM.DD for readability; no behavior change
+            2.8.2026.0303 - v2.8 Bug fixes for deploy, @Tables, CommandLog:
                           - Fix: Deploy fails on pre-v2.3 servers. SQL Server validates column
                             names at compile time; wrapped ParameterFingerprint and
                             LastStatCompletedAt references in sp_executesql (5 locations).
@@ -622,8 +623,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.8.2026.0303',
-        @procedure_version_date datetime = '20260303',
+        @procedure_version varchar(20) = '2.8.2026.03.04',
+        @procedure_version_date datetime = '20260304',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 

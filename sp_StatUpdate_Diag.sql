@@ -18,7 +18,7 @@ Based on:   sp_StatUpdate CommandLog format and Ola Hallengren's CommandLog tabl
 
 License:    MIT License (same as sp_StatUpdate)
 
-Version:    1.0.2026.0212 (Major.Minor.Year.MMDD)
+Version:    2026.03.04 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
 Requires:   - dbo.CommandLog table (Ola Hallengren's SQL Server Maintenance Solution)
             - sp_StatUpdate entries in CommandLog (SP_STATUPDATE_START/END + UPDATE_STATISTICS)
@@ -72,7 +72,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '1.0.2026.0212',
+        @procedure_version varchar(20) = '2026.03.04',
         @procedure_version_date datetime = '20260212';
 
     SET @Version = @procedure_version;
