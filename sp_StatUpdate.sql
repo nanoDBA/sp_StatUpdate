@@ -479,7 +479,7 @@ ALTER PROCEDURE
     QUERY STORE PRIORITIZATION (query-driven stat maintenance)
     ============================================================================
     */
-    @QueryStorePriority nvarchar(1) = N'N', /*Y = boost priority for stats on tables actively used by Query Store plans. Identifies "hot" tables for query-driven maintenance (not necessarily bad plans). N = ignore QS data*/
+    @QueryStorePriority nvarchar(1) = NULL, /*Y = boost priority for stats on tables actively used by Query Store plans. N = ignore QS data. NULL = default (normalized to N'N' when no preset, or to N'Y' by OLTP_LIGHT preset). P2e fix v2.4: changed from N'N' to NULL to allow presets to override.*/
     @QueryStoreMetric nvarchar(20) = N'CPU', /*resource metric for priority: CPU (total CPU ms, default), DURATION (elapsed time), READS (logical I/O), EXECUTIONS (count), AVG_CPU (total_cpu_ms/execution_count - favors expensive single-execution queries over frequent cheap ones)*/
     @QueryStoreMinExecutions bigint = 100, /*minimum plan executions to boost priority*/
     @QueryStoreRecentHours integer = 168, /*plans executed in last N hours (default: 7 days). Intentionally short - recent query activity more relevant than 30-day history*/
@@ -2802,6 +2802,15 @@ BEGIN
         RETURN 1;
     END;
     /*#endregion 09-DB-PARSE */
+
+    /*
+    P2e fix (v2.4): @QueryStorePriority late normalization.
+    Default was N'N' (non-NULL) which prevented OLTP_LIGHT preset from applying N'Y' override.
+    Default changed to NULL. Now: if no preset selected and user didn't specify, apply 'N' here.
+    This allows preset callers (like OLTP_LIGHT) to set 'Y' via their own block.
+    */
+    IF @QueryStorePriority IS NULL AND @Preset IS NULL
+        SET @QueryStorePriority = N'N'; /* apply functional default when no preset overrides it */
 
     /*#region 10-VALIDATION-REPORT: Validation reporting, error aggregation */
     /*
