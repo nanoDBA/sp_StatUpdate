@@ -195,6 +195,8 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operatio
 | `@SortOrder` | `'MODIFICATION_COUNTER'` | Priority order (see below) |
 | `@Execute` | `'Y'` | `'N'` for dry run |
 | `@FailFast` | `0` | `1` = abort on first error |
+| `@MaxGrantPercent` | `10` | Memory grant cap (%) on candidate discovery SELECT (1–100, `NULL` = disabled). Prevents discovery query from reserving excessive memory on busy servers. (v2.4+) |
+| `@MaxSecondsPerStat` | `NULL` | Per-stat duration cap (seconds). Stats estimated to exceed the remaining `@StopByTime` budget are skipped rather than started. Prevents overshoot on tight maintenance windows. (v2.4+) |
 
 ### Sort Orders
 
@@ -234,6 +236,7 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operatio
 | `@LongRunningSamplePercent` | `10` | Sample percent for long-running stats |
 | `@StatisticsSample` | `NULL` | `NULL`=SQL Server decides, `100`=FULLSCAN |
 | `@PersistSamplePercent` | `'Y'` | PERSIST_SAMPLE_PERCENT (SQL 2016 SP1 CU4+) |
+| `@PersistSampleMinRows` | `1000000` | Minimum sampled rows required before the RESAMPLE_PERSIST path is used. When `rowcount * sample_pct / 100` is below this value, falls back to a full FULLSCAN pass to ensure histogram quality. Prevents persisting under-sampled stats on small tables. (v2.4+) |
 | `@MaxDOP` | `NULL` | MAXDOP for UPDATE STATISTICS (SQL 2016 SP2+) |
 
 ### Logging & Output
@@ -412,7 +415,7 @@ Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and lo
 - **2.7.2026.0302** - AG redo queue pause (@MaxAGRedoQueueMB, @MaxAGWaitMinutes). tempdb pressure check (@MinTempdbFreeMB). New StopReasons: AG_REDO_QUEUE, TEMPDB_PRESSURE.
 - **2.6.2026.0302** - Multi-database direct mode: @Statistics and @StatisticsFromTable respect @Databases.
 - **2.5.2026.0302** - CommandLog index advisory, Resource Governor detection, @LockTimeout docs.
-- **2.4.2026.0302** - Region markers for LLM navigation. Collation-aware comparisons (COLLATE DATABASE_DEFAULT). Per-phase timing in debug mode.
+- **2.4.2026.0302** - Region markers for LLM navigation. Collation-aware comparisons (COLLATE DATABASE_DEFAULT). Per-phase timing in debug mode. **Comprehensive bug-fix and UX sprint (12 issues):** 4 P1 fixes (MAX_GRANT_PERCENT parameterized via `@MaxGrantPercent`, SQL injection hardened on DIRECT mode inputs, RESAMPLE floor added via `@PersistSampleMinRows`, container memory diagnostics improved); 5 P2 enhancements (ROWLOCK on discovery candidate query, heartbeat TRY/CATCH so write failures don't fail the stat, StopByTime overshoot protection via `@MaxSecondsPerStat`, QS forced plan detection unconditional on startup, OLTP_LIGHT preset `@StopByTime` fix); 3 P3 UX improvements (`@Help` QUICK START preset guide, dry-run `Mode:` label in startup banner, ETR `~Xm` in per-stat Complete message).
 - **2.3.2026.0302** - Bug fixes: applock release on CATCH, @@TRANCOUNT check, SET ANSI_WARNINGS/ARITHABORT, HAS_DBACCESS() filter, MAXRECURSION unlimited, midnight @StopByTime crossing, @CheckPermissionsOnly, CommandLog schema check.
 - **2.1.2026.0219** - Extended Awareness. Azure SQL detection, hardware context, RCSI awareness, Replication/CDC/Temporal detection. New: @MaxConsecutiveFailures, @WarningsOut, @StopReasonOut.
 - **2.0.2026.0212** - Environment Intelligence. CE version/trace flag/DB-scoped config detection. Staged discovery auto-fallback. Truncated partition handling. XE session overhaul. Diagnostic tool (sp_StatUpdate_Diag).
