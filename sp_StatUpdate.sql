@@ -838,7 +838,7 @@ BEGIN
                     WHEN N'@WarningsOut'
                     THEN N'OUTPUT: collected warnings (LOW_UPTIME, BACKUP_RUNNING, AZURE_SQL, etc.)'
                     WHEN N'@StopReasonOut'
-                    THEN N'OUTPUT: why execution stopped (COMPLETED, TIME_LIMIT, BATCH_LIMIT, FAIL_FAST, CONSECUTIVE_FAILURES, AG_REDO_QUEUE, TEMPDB_PRESSURE)'
+                    THEN N'OUTPUT: why execution stopped (COMPLETED, TIME_LIMIT, BATCH_LIMIT, FAIL_FAST, CONSECUTIVE_FAILURES, AG_REDO_QUEUE, TEMPDB_PRESSURE, LOG_SPACE_HIGH)'
                     WHEN N'@MaxConsecutiveFailures'
                     THEN N'stop after N consecutive failures (prevents cascading issues from shared resource problems)'
                     WHEN N'@MaxAGRedoQueueMB'
@@ -6832,6 +6832,17 @@ OPTION (RECOMPILE);';
                         RAISERROR(@log_msg, 10, 1) WITH NOWAIT;
                         SET @warnings += N'LOG_SPACE_HIGH: ' + @log_check_db + N'('
                             + CONVERT(nvarchar(10), CONVERT(int, @log_used_pct)) + N'%); ';
+
+                        /* @FailFast integration: abort when log pressure is critical */
+                        IF @FailFast = 1
+                        BEGIN
+                            RAISERROR(N'Transaction log pressure detected with @FailFast=1. Stopping.', 10, 1) WITH NOWAIT;
+                            SELECT @stop_reason = N'LOG_SPACE_HIGH';
+                            SET @WarningsOut = ISNULL(@WarningsOut, N'') +
+                                N'LOG_SPACE_HIGH: Stopped, log ' + @log_check_db +
+                                N' at ' + CONVERT(nvarchar(10), CONVERT(int, @log_used_pct)) + N'%; ';
+                            BREAK;
+                        END;
                     END;
                 END TRY
                 BEGIN CATCH /* Ignore - db may not be accessible */ END CATCH;
