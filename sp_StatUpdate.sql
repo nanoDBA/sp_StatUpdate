@@ -509,6 +509,7 @@ ALTER PROCEDURE
     */
     @TimeLimit integer = 3600, /*seconds (default: 1 hour, NULL = unlimited)*/
     @StopByTime nvarchar(8) = NULL, /*absolute wall-clock stop time (format: HH:MM or HH:MM:SS). Computes remaining seconds from now to specified time today. Overrides @TimeLimit when specified.*/
+    @MaxSecondsPerStat int = NULL, /*P2c fix (v2.4): When @StopByTime/@TimeLimit is set, check CommandLog history. If estimated duration for a stat exceeds both this cap AND remaining seconds, skip with warning. NULL = no per-stat cap. Only skips if CommandLog history exists (conservative).*/
     @BatchLimit integer = NULL, /*max stats to update per run*/
     @SortOrder nvarchar(50) = N'MODIFICATION_COUNTER', /*priority: MODIFICATION_COUNTER, DAYS_STALE, RANDOM, PAGE_COUNT, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED*/
     @DelayBetweenStats integer = NULL, /*seconds to wait between stats updates. Use during OLTP hours to reduce contention; NULL = no delay*/
@@ -7072,6 +7073,54 @@ OPTION (RECOMPILE);';
             SELECT
                 @stop_reason = N'COMPLETED';
             BREAK;
+        END;
+
+        /*
+        P2c fix (v2.4): @StopByTime window overshoot prevention.
+        When @MaxSecondsPerStat and @TimeLimit are both set, check CommandLog history
+        for estimated duration of this stat. If estimated > remaining_seconds, skip.
+        Conservative: if no history in CommandLog, always run it.
+        */
+        IF  @MaxSecondsPerStat IS NOT NULL
+        AND @TimeLimit IS NOT NULL
+        AND @commandlog_exists = 1
+        AND @Execute = N'Y'
+        AND @current_database IS NOT NULL
+        BEGIN
+            DECLARE
+                @p2c_estimated_seconds int = NULL,
+                @p2c_remaining_seconds int,
+                @p2c_skip_msg nvarchar(500);
+
+            SELECT @p2c_remaining_seconds = @TimeLimit - DATEDIFF(SECOND, @start_time, SYSDATETIME());
+
+            /* Estimate from CommandLog: avg of last 10 successful runs for this stat */
+            SELECT TOP (1)
+                @p2c_estimated_seconds = CONVERT(int, AVG(DATEDIFF(SECOND, cl.StartTime, cl.EndTime)))
+            FROM dbo.CommandLog AS cl
+            WHERE cl.CommandType = N'UPDATE_STATISTICS'
+            AND   cl.DatabaseName = @current_database
+            AND   cl.SchemaName = @current_schema_name
+            AND   cl.ObjectName = @current_table_name
+            AND   cl.StatisticsName = @current_stat_name
+            AND   cl.EndTime IS NOT NULL
+            AND   cl.ErrorNumber IS NULL
+            AND   cl.StartTime >= DATEADD(DAY, -90, SYSDATETIME()); /* last 90 days */
+
+            /* Skip if history exists AND estimated exceeds both the per-stat cap AND remaining window */
+            IF  @p2c_estimated_seconds IS NOT NULL
+            AND @p2c_estimated_seconds > @MaxSecondsPerStat
+            AND @p2c_estimated_seconds > @p2c_remaining_seconds
+            BEGIN
+                SELECT @p2c_skip_msg =
+                    N'  [P2c SKIP] ' + QUOTENAME(@current_schema_name) + N'.' +
+                    QUOTENAME(@current_table_name) + N'.' + QUOTENAME(@current_stat_name) +
+                    N' — estimated ' + CONVERT(nvarchar(10), @p2c_estimated_seconds) +
+                    N's, remaining ' + CONVERT(nvarchar(10), @p2c_remaining_seconds) + N's';
+                RAISERROR(@p2c_skip_msg, 10, 1) WITH NOWAIT;
+                SET @stats_skipped += 1;
+                CONTINUE; /* Already marked processed=1 above; skip execution */
+            END;
         END;
 
         SELECT
