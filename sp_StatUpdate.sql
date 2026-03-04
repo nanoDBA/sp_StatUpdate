@@ -7859,6 +7859,7 @@ OPTION (RECOMPILE);';
                 /*
                 Log to CommandLog
                 */
+                BEGIN TRY
                 IF  @LogToTable = N'Y'
                 AND @commandlog_exists = 1
                 BEGIN
@@ -8016,6 +8017,12 @@ OPTION (RECOMPILE);';
                         );
                     END;
                 END;
+                END TRY
+                BEGIN CATCH
+                    /* CommandLog INSERT failure is non-fatal: stat update succeeded. Log warning only. */
+                    SET @log_error_msg = LEFT(ERROR_MESSAGE(), 3900);
+                    RAISERROR(N'  WARNING: Failed to log success to CommandLog (%s). Stat update succeeded.', 10, 1, @log_error_msg) WITH NOWAIT;
+                END CATCH;
             END TRY
             BEGIN CATCH
                 SELECT
