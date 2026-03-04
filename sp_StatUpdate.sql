@@ -36,11 +36,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.11.2026.03.04 (Major.Minor.YYYY.MM.DD)
+Version:    2.12.2026.03.04 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.11.2026.03.04 - P1/P2 fixes: container memory warning always-on (#208),
+History:    2.12.2026.03.04 - P2 fixes: PERSIST_SAMPLE_PERCENT silent override warning (#183),
+                            ROWLOCK+READPAST deadlock retry loop with exponential backoff (#163),
+                            Query Store forced plans per-stat warning after stat update (#168)
+            2.11.2026.03.04 - P1/P2 fixes: container memory warning always-on (#208),
                             MAXDOP gate KB reference added (#196), @Tables unqualified
                             name multi-schema ambiguity warning (#209)
             2.10.2026.03.04 - Security/correctness fixes: @CompletionNotifyTable SQL injection (#155),
@@ -629,7 +632,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.11.2026.03.04',
+        @procedure_version varchar(20) = '2.12.2026.03.04',
         @procedure_version_date datetime = '20260304',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
