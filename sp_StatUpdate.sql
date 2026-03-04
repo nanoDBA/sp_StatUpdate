@@ -6913,7 +6913,7 @@ OPTION (RECOMPILE);';
                       (
                           SELECT
                               MIN(qs2.TablePriority)
-                          FROM dbo.QueueStatistic AS qs2 WITH (READPAST)
+                          FROM dbo.QueueStatistic AS qs2 WITH (ROWLOCK, READPAST) /* P2a fix: ROWLOCK prevents page/table lock escalation under parallel load */
                           WHERE qs2.QueueID = @queue_id
                           AND   qs2.TableStartTime IS NULL
                       );
