@@ -8030,10 +8030,19 @@ OPTION (RECOMPILE);';
                     @current_error_number = ERROR_NUMBER(),
                     @current_error_message = ERROR_MESSAGE(),
                     @stats_failed += 1,
-                    @consecutive_failures += 1,
+                    /*
+                    TOCTOU carve-out: errors 208 (invalid object name) and 15009 (object not found)
+                    indicate the object was dropped between queue-load and execution — a race condition,
+                    not a real infrastructure failure. Exclude from @consecutive_failures to prevent
+                    false @MaxConsecutiveFailures triggers in concurrent DDL environments.
+                    */
+                    @consecutive_failures += CASE WHEN ERROR_NUMBER() NOT IN (208, 15009) THEN 1 ELSE 0 END,
                     @claimed_table_stats_failed += CASE WHEN @StatsInParallel = N'Y' THEN 1 ELSE 0 END;
 
-                RAISERROR(N'  X Error %d: %s', 16, 1, @current_error_number, @current_error_message) WITH NOWAIT;
+                IF @current_error_number IN (208, 15009)
+                    RAISERROR(N'  ~ TOCTOU skip (error %d): object no longer exists — skipped, not counted as consecutive failure.', 10, 1, @current_error_number) WITH NOWAIT;
+                ELSE
+                    RAISERROR(N'  X Error %d: %s', 16, 1, @current_error_number, @current_error_message) WITH NOWAIT;
 
                 /*
                 Log error to CommandLog
