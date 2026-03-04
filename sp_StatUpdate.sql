@@ -36,11 +36,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.10.2026.03.04 (Major.Minor.YYYY.MM.DD)
+Version:    2.11.2026.03.04 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.10.2026.03.04 - Security/correctness fixes: @CompletionNotifyTable SQL injection (#155),
+History:    2.11.2026.03.04 - P1/P2 fixes: container memory warning always-on (#208),
+                            MAXDOP gate KB reference added (#196), @Tables unqualified
+                            name multi-schema ambiguity warning (#209)
+            2.10.2026.03.04 - Security/correctness fixes: @CompletionNotifyTable SQL injection (#155),
                             QS forced plan warning broken join (#187), @DelayBetweenStats WAITFOR overshoot (#210)
             2.9.2026.03.04 - P2 bug fixes: XACT_ABORT, EngineEdition label, MAXDOP gate, CommandLog advisory, log space @FailFast, Phase 6 QS per-db, CommandLog dual-accounting, TOCTOU false failures, LIKE metachar escape
             2.8.2026.03.04 - Version format update: MMDD → MM.DD for readability; no behavior change
@@ -626,7 +629,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.10.2026.03.04',
+        @procedure_version varchar(20) = '2.11.2026.03.04',
         @procedure_version_date datetime = '20260304',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -1667,8 +1670,11 @@ BEGIN
         @supports_maxdop_stats =
             CASE
                 WHEN @sql_major_version >= 15 THEN 1                            /* SQL 2019+ */
-                WHEN @sql_major_version = 14 AND @sql_build_number >= 3015 THEN 1 /* SQL 2017 CU3+ */
-                WHEN @sql_major_version = 13 AND @sql_build_number >= 5026 THEN 1 /* SQL 2016 SP2+ */
+                WHEN @sql_major_version = 14 AND @sql_build_number >= 3015 THEN 1 /* SQL 2017 CU3+ (14.0.3015.0, KB4041809) */
+                WHEN @sql_major_version = 13 AND @sql_build_number >= 5026 THEN 1 /* SQL 2016 SP2 RTM+ (13.0.5026.0, KB4041809) — NOT SP1 */
+                /* NOTE: SQL 2016 SP1 (13.0.4001) and below do NOT support MAXDOP in UPDATE STATISTICS.
+                         The feature was first shipped in SQL 2016 SP2 RTM (build 13.0.5026.0).
+                         KB4041809: https://support.microsoft.com/kb/4041809 */
                 ELSE 0
             END;
 
@@ -3478,7 +3484,9 @@ BEGIN
         @hw_uptime_hours int,
         /* P1d fix (v2.4): process-level memory and visible schedulers for container awareness */
         @process_memory_kb bigint,     /* SQL Server process memory (container limit, not host RAM) */
-        @visible_schedulers int;       /* Online schedulers visible to SQL (may differ from cpu_count in containers) */
+        @visible_schedulers int,       /* Online schedulers visible to SQL (may differ from cpu_count in containers) */
+        /* #208: container memory flag — set always, not just in debug mode */
+        @is_container_memory bit = 0;  /* 1 = SQL process memory differs >20% from host physical_memory_kb */
 
     SELECT
         @hw_cpu_count = cpu_count,
@@ -3508,6 +3516,32 @@ BEGIN
         SET @warnings += N'BACKUP_RUNNING: ' + CONVERT(nvarchar(10), @active_backups) + N' backup(s) active; ';
 
     /*
+    #208: Container memory detection — always runs, not gated on @Debug.
+    physical_memory_kb in sys.dm_os_sys_info reflects the *host* physical RAM.
+    Inside a Linux container with a cgroup memory limit (e.g. 4 GB on a 256 GB host)
+    this value is misleading for capacity planning and can trigger incorrect warnings.
+
+    Detection: SQL process memory (dm_os_process_memory.physical_memory_in_use_kb)
+    will diverge significantly from host physical_memory_kb when a container limit is active.
+    A >20% divergence is used as the threshold (same heuristic as previous debug-only note).
+
+    WARNING is always emitted (not just debug) and added to @WarningsOut so automation
+    can detect it programmatically. The diagnostic note in the debug banner is also
+    upgraded from "Note" to a labelled WARNING when the flag is set.
+    */
+    IF @process_memory_kb IS NOT NULL
+    AND @hw_memory_mb > 0
+    AND ABS(1.0 - CONVERT(float, @process_memory_kb) / CONVERT(float, @hw_memory_mb * 1024)) > 0.20
+    BEGIN
+        SET @is_container_memory = 1;
+        DECLARE @host_ram_gb bigint = @hw_memory_mb / 1024;
+        RAISERROR(N'WARNING: Container detected — physical_memory_kb reflects host RAM (%I64d GB), not the container memory limit. Container memory limit may be significantly lower. Check cgroup limits or sys.dm_os_process_memory for actual SQL memory usage. (#208)', 10, 1, @host_ram_gb) WITH NOWAIT;
+        SET @warnings += N'CONTAINER_MEMORY: physical_memory_kb reflects host RAM ('
+            + CONVERT(nvarchar(20), @host_ram_gb)
+            + N' GB); container cgroup limit may be lower — check sys.dm_os_process_memory; ';
+    END;
+
+    /*
     Trace flag status and hardware context in debug mode (Phase 1.3 - v2.0)
     Show active statistics-relevant trace flags and recommendations.
     */
@@ -3534,11 +3568,9 @@ BEGIN
             @proc_memory_gb bigint = @process_memory_kb / 1024 / 1024;
         RAISERROR(N'  Host memory: %I64d MB (%I64d GB) | Process (SQL) memory: %I64d MB', 10, 1,
             @hw_memory_mb, @hw_memory_gb, @proc_memory_mb) WITH NOWAIT;
-        /* P1d: Divergence >20% between host and process memory signals container memory limit */
-        IF @process_memory_kb IS NOT NULL
-        AND @hw_memory_mb > 0
-        AND ABS(1.0 - CONVERT(float, @process_memory_kb) / CONVERT(float, @hw_memory_mb * 1024)) > 0.20
-            RAISERROR(N'  Note: Host vs process memory divergence >20%% — likely running inside a container with memory limit.', 10, 1) WITH NOWAIT;
+        /* #208: Container memory — use flag set above (always-on detection) */
+        IF @is_container_memory = 1
+            RAISERROR(N'  WARNING: Container memory limit active — host RAM (%I64d GB) reported by physical_memory_kb. SQL process memory in use: %I64d MB. Capacity planning and memory warnings should use process memory, not host RAM. (#208)', 10, 1, @hw_memory_gb, @proc_memory_mb) WITH NOWAIT;
 
         IF @hw_uptime_hours < 24
             RAISERROR(N'  Note: SQL Server restarted < 24h ago. Query Store/usage stats may be incomplete.', 10, 1) WITH NOWAIT;
@@ -6040,6 +6072,61 @@ OPTION (RECOMPILE);';
             WHERE ID = @CurrentDatabaseID;
 
         END; /* End of WHILE database loop */
+
+        /*
+        #209: @Tables unqualified token multi-schema ambiguity warning.
+        When a token in @Tables contains no dot (no schema prefix), it matches ALL schemas
+        that have a table with that name. If the token matches tables in more than one schema
+        within any database in this run, emit a WARNING so the caller can use 'schema.table'
+        format to be precise.
+
+        This check does NOT change matching behavior — all matched tables are still processed.
+        It is purely diagnostic. A behavioral change (restrict to one schema) is a separate decision.
+
+        The warning fires per (token, database) pair where multiple schemas are matched.
+        Compatible with SQL 2016 (uses FOR XML PATH instead of STRING_AGG).
+        */
+        IF @Tables IS NOT NULL AND EXISTS (SELECT 1 FROM #stats_to_process)
+        BEGIN
+            DECLARE @ambig_warning nvarchar(max) = N'';
+
+            SELECT @ambig_warning = @ambig_warning +
+                N'TABLES_AMBIGUOUS: ''' + a.token + N''' matched '
+                + CONVERT(nvarchar(10), a.schema_count) + N' schemas in [' + a.database_name + N'] ('
+                + a.schema_list + N'). Use ''schema.table'' to target a specific table; '
+            FROM (
+                SELECT
+                    token            = LTRIM(RTRIM(ss.value)),
+                    database_name    = stp.database_name,
+                    schema_count     = COUNT(DISTINCT stp.schema_name),
+                    schema_list      = STUFF(
+                                           (   SELECT N', ' + stp2.schema_name
+                                               FROM #stats_to_process AS stp2
+                                               WHERE stp2.table_name COLLATE DATABASE_DEFAULT
+                                                     = LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT
+                                               AND   stp2.database_name = stp.database_name
+                                               GROUP BY stp2.schema_name
+                                               ORDER BY stp2.schema_name
+                                               FOR XML PATH(N''), TYPE
+                                           ).value(N'.', N'nvarchar(max)')
+                                           , 1, 2, N'')
+                FROM STRING_SPLIT(@Tables, N',') AS ss
+                INNER JOIN #stats_to_process AS stp
+                    ON stp.table_name COLLATE DATABASE_DEFAULT
+                       = LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT
+                /* Unqualified token: no dot means no explicit schema prefix */
+                WHERE CHARINDEX(N'.', LTRIM(RTRIM(ss.value))) = 0
+                GROUP BY LTRIM(RTRIM(ss.value)), stp.database_name
+                HAVING COUNT(DISTINCT stp.schema_name) > 1
+            ) AS a;
+
+            IF LEN(@ambig_warning) > 0
+            BEGIN
+                RAISERROR(N'WARNING: Unqualified @Tables token(s) matched multiple schemas — all matched tables are included. Specify ''schema.table'' format to target a specific table. %s', 10, 1, @ambig_warning) WITH NOWAIT;
+                SET @warnings += @ambig_warning;
+            END;
+        END;
+
     END; /* End of IF @mode = N'DISCOVERY' */
     /*#endregion 16-DISCOVERY */
 
