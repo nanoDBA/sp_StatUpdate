@@ -492,6 +492,7 @@ ALTER PROCEDURE
     @StatisticsSample integer = NULL, /*sample percent: NULL = let SQL Server decide (recommended), 1-100 = explicit %, 100 = FULLSCAN*/
     @PersistSamplePercent nvarchar(1) = N'Y', /*Y = add PERSIST_SAMPLE_PERCENT = ON (SQL 2016 SP1 CU4+) to remember sample rate*/
     @MaxDOP integer = NULL, /*MAXDOP for UPDATE STATISTICS (SQL 2016 SP2+ / SQL 2017 CU3+). NULL = server default*/
+    @MaxGrantPercent int = 10, /*Memory grant cap percent (1-100) for the candidate discovery SELECT. Applied as OPTION(MAX_GRANT_PERCENT) on the internal ranking query. NULL = no hint. Default 10 limits memory monopolization during candidate enumeration.*/
 
     /*
     ============================================================================
@@ -2830,6 +2831,24 @@ BEGIN
             error_severity = 16;
     END;
 
+    IF  @MaxGrantPercent IS NOT NULL
+    AND (
+            @MaxGrantPercent < 1
+         OR @MaxGrantPercent > 100
+        )
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'The value for @MaxGrantPercent must be NULL or between 1 and 100.',
+            error_severity = 16;
+    END;
+
     /*
     Validate @LockTimeout
     -1 is valid (infinite wait), 0+ is valid (timeout in seconds)
@@ -5094,10 +5113,24 @@ OPTION (RECOMPILE);';
                             END DESC
                     )
                 FROM #stat_candidates
-                OPTION (MAX_GRANT_PERCENT = 25); /* Cap memory grant: prevents monopolizing server memory during maintenance */
+                OPTION (MAX_GRANT_PERCENT = 25); /* Cap memory grant: prevents monopolizing server memory during maintenance — value replaced dynamically below */
 
                 DROP TABLE #stat_candidates;
                 ';
+
+                /*
+                P1a fix (v2.4): Parameterize MAX_GRANT_PERCENT in the candidate discovery SELECT.
+                Replace hardcoded 25 with @MaxGrantPercent, or remove hint entirely when NULL.
+                Gated on @supports_maxdop_stats (SQL 2016 SP2+) — older builds don't support the hint.
+                */
+                IF @MaxGrantPercent IS NOT NULL AND @supports_maxdop_stats = 1
+                    SET @staged_sql = REPLACE(@staged_sql,
+                        N'OPTION (MAX_GRANT_PERCENT = 25)',
+                        N'OPTION (MAX_GRANT_PERCENT = ' + CAST(@MaxGrantPercent AS nvarchar(3)) + N')');
+                ELSE
+                    SET @staged_sql = REPLACE(@staged_sql,
+                        N' OPTION (MAX_GRANT_PERCENT = 25);',
+                        N';'); /* Remove hint when NULL or unsupported */
 
                 /*
                 Execute staged discovery and insert results
