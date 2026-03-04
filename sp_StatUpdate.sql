@@ -40,7 +40,10 @@ Version:    2.14.2026.03.04 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.13.2026.03.04 - P3 fixes: @Databases='ALL' normalized to 'ALL_DATABASES' (#159),
+History:    2.14.2026.03.04 - Bulk resolution: 42 issues — safety guards, warnings, discovery
+                            tie-breaker, parameter validation, empty partition skip, backup
+                            mid-run detection, new @OrphanedRunThresholdHours parameter (#148)
+            2.13.2026.03.04 - P3 fixes: @Databases='ALL' normalized to 'ALL_DATABASES' (#159),
                             empty string parameters normalized to NULL with warning (#198)
             2.12.2026.03.04 - P2 fixes: PERSIST_SAMPLE_PERCENT silent override warning (#183),
                             ROWLOCK+READPAST deadlock retry loop with exponential backoff (#163),
