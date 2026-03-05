@@ -36,11 +36,13 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.14.2026.03.04 (Major.Minor.YYYY.MM.DD)
+Version:    2.15.2026.03.05 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.14.2026.03.04 - Bulk resolution: 42 issues — safety guards, warnings, discovery
+History:    2.15.2026.03.05 - Peak hours plan cache warning (#184), NORECOMPUTE+ON PARTITIONS
+                            syntax fix (#215), @Help completeness for all 66 parameters (#212, #213)
+            2.14.2026.03.04 - Bulk resolution: 42 issues — safety guards, warnings, discovery
                             tie-breaker, parameter validation, empty partition skip, backup
                             mid-run detection, new @OrphanedRunThresholdHours parameter (#148)
             2.13.2026.03.04 - P3 fixes: @Databases='ALL' normalized to 'ALL_DATABASES' (#159),
@@ -640,8 +642,8 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.14.2026.03.04',
-        @procedure_version_date datetime = '20260304',
+        @procedure_version varchar(20) = '2.15.2026.03.05',
+        @procedure_version_date datetime = '20260305',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -3887,6 +3889,16 @@ BEGIN
 
     IF @active_backups > 0
         SET @warnings += N'BACKUP_RUNNING: ' + CONVERT(nvarchar(10), @active_backups) + N' backup(s) active; ';
+
+    /* #184: Peak hours plan cache warning — UPDATE STATISTICS clears plan cache entries
+       for affected tables, which can cause recompilations during peak load. */
+    DECLARE @current_hour int = DATEPART(HOUR, SYSDATETIME());
+    IF @current_hour >= 8 AND @current_hour < 18
+    BEGIN
+        RAISERROR(N'WARNING: Running during business hours (%d:00). UPDATE STATISTICS clears plan cache', 10, 1, @current_hour) WITH NOWAIT;
+        RAISERROR(N'  entries for affected tables — expect query recompilations. Consider scheduling off-peak.', 10, 1) WITH NOWAIT;
+        SET @warnings += N'PEAK_HOURS: running at ' + CONVERT(nvarchar(5), @current_hour) + N':00 (plan cache impact); ';
+    END;
 
     /*
     #208: Container memory detection — always runs, not gated on @Debug.
