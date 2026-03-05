@@ -5581,9 +5581,10 @@ OPTION (RECOMPILE);';
                             RAISERROR(N''    Warning: Query Store is READ_ONLY - priority data may be stale'', 10, 1) WITH NOWAIT;
                     END;
 
-                    /* #190: Check if @QueryStoreRecentHours exceeds QS retention */
+                    /* #190: Check if @QueryStoreRecentHours exceeds QS retention.
+                       SQL 2022+ uses retention_period_in_days; SQL 2019 uses stale_query_threshold_days. */
                     DECLARE @qs_retention_days int;
-                    SELECT @qs_retention_days = retention_period_in_days
+                    SELECT @qs_retention_days = stale_query_threshold_days
                     FROM sys.database_query_store_options;
 
                     IF @qs_retention_days IS NOT NULL AND @QueryStoreRecentHours_param > (@qs_retention_days * 24)
