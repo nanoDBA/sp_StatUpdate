@@ -1088,14 +1088,40 @@ BEGIN
                     N'EXECUTE dbo.sp_StatUpdate @MinPageCount = 125000, @TimeLimit = 7200;'
                 ),
                 (
-                    N'Parallel Mode',
-                    N'Run from multiple SSMS windows for parallel processing',
-                    N'EXECUTE dbo.sp_StatUpdate @StatsInParallel = N''Y'', @TimeLimit = 3600;'
+                    N'Parallel Mode via SQL Agent',
+                    N'Create 2-3 Agent jobs with identical command, schedule simultaneously. Work coordinated via dbo.QueueStatistic.',
+                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''Production'', @StatsInParallel = N''Y'', @TimeLimit = 3600, @LockTimeout = 60;'
                 ),
                 (
                     N'Dry Run',
                     N'Show what would be updated without executing',
                     N'EXECUTE dbo.sp_StatUpdate @Execute = N''N'', @Debug = 1;'
+                ),
+                /* #213: Advanced examples */
+                (
+                    N'Query Store Prioritization',
+                    N'Update stats used by slowest queries first (by CPU, last 24h)',
+                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''Production'', @QueryStorePriority = N''Y'', @QueryStoreMetric = N''CPU'', @QueryStoreMinExecutions = 100, @QueryStoreRecentHours = 24, @TimeLimit = 3600;'
+                ),
+                (
+                    N'NORECOMPUTE Stats Only',
+                    N'Update only statistics with NORECOMPUTE flag (frozen stats needing manual refresh)',
+                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''Production'', @TargetNorecompute = N''Y'', @TimeLimit = 1800;'
+                ),
+                (
+                    N'Filtered Stats Drift Detection',
+                    N'Prioritize filtered statistics where selectivity has drifted significantly',
+                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''Production'', @FilteredStatsMode = N''PRIORITY'', @FilteredStatsStaleFactor = 1.5, @TimeLimit = 7200;'
+                ),
+                (
+                    N'Adaptive Sampling for Large Tables',
+                    N'Cap sample rate for stats that historically run >4 hours',
+                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''Production'', @LongRunningThresholdMinutes = 240, @LongRunningSamplePercent = 5, @TimeLimit = 7200;'
+                ),
+                (
+                    N'Incremental Stats (Partitioned Tables)',
+                    N'Update only modified partitions on partitioned tables with incremental stats',
+                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''Production'', @UpdateIncremental = 1, @SortOrder = N''MODIFICATION_COUNTER'', @TimeLimit = 3600;'
                 )
         ) AS example_data
         (
@@ -1169,9 +1195,9 @@ BEGIN
                 /* #9: Scheduling guidance */
                 (N'Scheduling',
                  N'Avoid overlapping with index maintenance (both acquire Sch-M). On AG primaries, Sch-M locks replay to secondaries via redo thread — use @MaxAGRedoQueueMB to protect secondaries. Run during off-peak concurrency windows.'),
-                /* #12: Parallel mode burst behavior */
+                /* #12, #212: Parallel mode — Agent job setup */
                 (N'Parallel Mode',
-                 N'Parallel mode creates burst I/O and concurrent Sch-M lock acquisitions. Start with 2-3 workers and conservative @LockTimeout (30-60s). Monitor dm_os_wait_stats for LCK_M_SCH_M contention. @DelayBetweenStats can pace workers.'),
+                 N'Production setup: create 2-3 identical SQL Agent jobs, schedule to start simultaneously. All run the same sp_StatUpdate with @StatsInParallel=Y — work distribution is automatic via dbo.QueueStatistic. First worker populates queue; others join and claim work. Dead workers detected via @DeadWorkerTimeoutMinutes (default 15). Start with 2-3 workers and @LockTimeout=30-60s. Monitor: SELECT COUNT(*) FROM dbo.QueueStatistic WHERE StatEndTime IS NOT NULL;'),
                 /* #36: Edition-specific behavior */
                 (N'Edition Notes',
                  N'MAXDOP: works on all editions (SQL 2016 SP2+). PERSIST_SAMPLE_PERCENT: all editions (SQL 2016 SP1 CU4+). Incremental stats: requires partitioning (Enterprise or Standard SP1+). Parallel stats: all editions.'),
