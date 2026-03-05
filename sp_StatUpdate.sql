@@ -7550,6 +7550,19 @@ OPTION (RECOMPILE);';
         /* Note: @has_with_option=0 case now handled once at startup to reduce debug noise */
 
         /*
+        FIX v2.9 (F-1): ON PARTITIONS must come immediately after RESAMPLE in the WITH clause.
+        Move the ON PARTITIONS clause into @with_clause BEFORE appending NORECOMPUTE.
+        This ensures correct T-SQL syntax: WITH RESAMPLE ON PARTITIONS(...), NORECOMPUTE
+        (not: WITH RESAMPLE, NORECOMPUTE ON PARTITIONS(...) which is a syntax error)
+        */
+        IF @on_partitions_clause <> N'' AND @with_clause LIKE N'%RESAMPLE%'
+        BEGIN
+            SELECT
+                @with_clause += @on_partitions_clause,
+                @on_partitions_clause = N''; -- Clear so it's not appended again at the end
+        END;
+
+        /*
         NORECOMPUTE: Preserve the flag on stats that have it set
         Without this, UPDATE STATISTICS clears the no_recompute flag
         */
