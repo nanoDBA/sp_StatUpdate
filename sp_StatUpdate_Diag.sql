@@ -90,25 +90,39 @@ BEGIN
             help_topic = N'Parameters',
             parameter_name = parameter_name,
             data_type = data_type,
-            default_value = default_value,
-            description = description
+            description = description,
+            valid_inputs = valid_inputs,
+            defaults = default_value
         FROM
         (
             VALUES
-                (N'@DaysBack',                 N'integer',  N'30',    N'History window in days'),
-                (N'@CommandLogDatabase',        N'sysname',  N'NULL',  N'Database containing CommandLog (NULL = current)'),
-                (N'@Obfuscate',                N'bit',      N'0',     N'0 = real names, 1 = hashed (safe for sharing)'),
-                (N'@LongRunningMinutes',        N'integer',  N'10',    N'Threshold for long-running stat detection'),
-                (N'@FailureThreshold',          N'integer',  N'3',     N'Same stat failing N+ times = CRITICAL'),
-                (N'@TimeLimitExhaustionPct',    N'integer',  N'80',    N'Warn if >X% runs hit TIME_LIMIT'),
-                (N'@ThroughputWindowDays',      N'integer',  N'7',     N'Window for throughput trend comparison'),
-                (N'@TopN',                     N'integer',  N'20',    N'Limit for detail result sets'),
-                (N'@Help',                     N'bit',      N'0',     N'Show this help'),
-                (N'@Debug',                    N'bit',      N'0',     N'Verbose diagnostic output'),
-                (N'@SingleResultSet',          N'bit',      N'0',     N'0 = default multi result sets, 1 = single result set (ResultSetID, ResultSetName, RowNum, RowData JSON). Enables INSERT...EXEC capture.'),
-                (N'@Version',                  N'varchar',  N'OUTPUT', N'Returns procedure version'),
-                (N'@VersionDate',              N'datetime', N'OUTPUT', N'Returns version date')
-        ) AS v (parameter_name, data_type, default_value, description);
+                (N'@DaysBack',                 N'integer',  N'History window in days — how far back to scan CommandLog',
+                    N'1-3650', N'30'),
+                (N'@CommandLogDatabase',        N'sysname',  N'Database containing dbo.CommandLog table. NULL = current database context.',
+                    N'NULL, database name (e.g., DBATools, master)', N'NULL (current database)'),
+                (N'@Obfuscate',                N'bit',      N'Hash database/schema/table/stat names for safe external sharing. Uses HASHBYTES MD5 with deterministic seed. Obfuscation map returned as result set 8.',
+                    N'0, 1', N'0'),
+                (N'@LongRunningMinutes',        N'integer',  N'Stats taking longer than this (in minutes) are flagged in W2 check and Long-Running Statistics result set',
+                    N'1-N minutes', N'10'),
+                (N'@FailureThreshold',          N'integer',  N'Same statistic failing this many times across runs triggers C2 CRITICAL finding',
+                    N'1-N', N'3'),
+                (N'@TimeLimitExhaustionPct',    N'integer',  N'If more than this percentage of runs hit TIME_LIMIT stop reason, triggers C3 CRITICAL finding',
+                    N'1-100', N'80'),
+                (N'@ThroughputWindowDays',      N'integer',  N'Compare recent N days throughput against prior window for C4 degrading throughput detection',
+                    N'1-@DaysBack', N'7'),
+                (N'@TopN',                     N'integer',  N'Maximum rows returned in detail result sets (Top Tables, Failing Stats, Long-Running Stats)',
+                    N'1-1000', N'20'),
+                (N'@Help',                     N'bit',      N'Show this help output and return immediately',
+                    N'0, 1', N'0'),
+                (N'@Debug',                    N'bit',      N'Verbose diagnostic output — shows intermediate temp table counts and timing',
+                    N'0, 1', N'0'),
+                (N'@SingleResultSet',          N'bit',      N'Collapse all result sets into one with columns (ResultSetID, ResultSetName, RowNum, RowData). RowData is JSON. Enables INSERT...EXEC capture in automation.',
+                    N'0, 1', N'0'),
+                (N'@Version',                  N'varchar(20)', N'OUTPUT: returns procedure version string (e.g., 2026.03.04)',
+                    N'OUTPUT', N'OUTPUT'),
+                (N'@VersionDate',              N'datetime', N'OUTPUT: returns procedure version date',
+                    N'OUTPUT', N'OUTPUT')
+        ) AS v (parameter_name, data_type, description, valid_inputs, default_value);
 
         /* Result set 2: Diagnostic checks */
         SELECT
@@ -155,6 +169,76 @@ BEGIN
                 (8, N'Obfuscation Map (conditional)', N'Only when @Obfuscate=1'),
                 (0, N'Unified Result Set',            N'When @SingleResultSet=1: one result set with ResultSetID, ResultSetName, RowNum, RowData (JSON). Replaces result sets 1-8.')
         ) AS v (rs_num, rs_name, rs_desc);
+
+        /* Result set 4: Examples */
+        SELECT
+            help_topic = N'Examples',
+            example_name = example_name,
+            example_description = example_description,
+            example_code = example_code
+        FROM
+        (
+            VALUES
+                (
+                    N'Quick Health Check',
+                    N'Run with defaults against current database CommandLog',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag;'
+                ),
+                (
+                    N'Obfuscated for Sharing',
+                    N'Hash all object names for safe sharing with consultants or support',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @Obfuscate = 1;'
+                ),
+                (
+                    N'Extended History',
+                    N'Analyze 90 days of history with debug output',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @DaysBack = 90, @Debug = 1;'
+                ),
+                (
+                    N'Remote CommandLog',
+                    N'CommandLog lives in a central DBA database',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @CommandLogDatabase = N''DBATools'';'
+                ),
+                (
+                    N'Strict Failure Detection',
+                    N'Flag stats failing 2+ times, long-running at 5 min',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @FailureThreshold = 2, @LongRunningMinutes = 5;'
+                ),
+                (
+                    N'Automation Capture',
+                    N'Single result set for INSERT...EXEC or PowerShell capture',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @SingleResultSet = 1;'
+                ),
+                (
+                    N'Multi-Server (PowerShell)',
+                    N'Use Invoke-StatUpdateDiag.ps1 for cross-server analysis',
+                    N'.\Invoke-StatUpdateDiag.ps1 -Servers "Server1","Server2" -OutputFormat Markdown -OutputPath C:\Reports'
+                )
+        ) AS example_data (example_name, example_description, example_code);
+
+        /* Result set 5: Operational Notes */
+        SELECT
+            help_topic = N'Operational Notes',
+            topic = topic,
+            detail = detail
+        FROM
+        (
+            VALUES
+                (N'Obfuscation',
+                 N'@Obfuscate=1 replaces database, schema, table, and statistic names with MD5 hashes (e.g., DB_a1b2c3, TBL_d4e5f6). Prefixes preserved for readability. Result set 8 contains the mapping table for internal correlation. Hash is deterministic within a run — same object always maps to same hash.'),
+                (N'Killed Run Detection',
+                 N'Two detection methods: (1) SP_STATUPDATE_START without matching SP_STATUPDATE_END = orphaned run, (2) SP_STATUPDATE_END with StopReason=KILLED = cleaned up by @CleanupOrphanedRuns. Both trigger C1 CRITICAL.'),
+                (N'Throughput Trend (C4)',
+                 N'Compares average seconds-per-stat in the recent @ThroughputWindowDays against the prior window of equal length. If recent average is >50% worse, triggers C4 CRITICAL. Data-dependent — requires sufficient runs in both windows.'),
+                (N'Overlapping Runs (W4)',
+                 N'Detects concurrent sp_StatUpdate executions by checking for overlapping StartTime/EndTime ranges. Excludes killed runs to prevent false positives from orphan-cleanup END records.'),
+                (N'SingleResultSet Mode',
+                 N'@SingleResultSet=1 wraps all 8 result sets into one table with columns: ResultSetID (int), ResultSetName (nvarchar), RowNum (int), RowData (nvarchar(max) as JSON). Use OPENJSON(RowData) to parse. Enables INSERT...EXEC patterns that fail with multiple result sets.'),
+                (N'CommandLog Requirements',
+                 N'Requires Ola Hallengren''s dbo.CommandLog table with sp_StatUpdate entries (CommandType IN SP_STATUPDATE_START, SP_STATUPDATE_END, UPDATE_STATISTICS). No data = no diagnostics (graceful empty result sets). @CommandLogDatabase lets you point to a central logging database.'),
+                (N'PowerShell Wrapper',
+                 N'Invoke-StatUpdateDiag.ps1 runs sp_StatUpdate_Diag across multiple servers in parallel, detects version skew and parameter inconsistencies, and generates Markdown/HTML/JSON reports. Use -Obfuscate for safe sharing.')
+        ) AS notes (topic, detail);
 
         RETURN;
     END;
