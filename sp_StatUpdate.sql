@@ -36,11 +36,22 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.8.2026.0303 (Major.Minor.Year.MMDD)
+Version:    2.9.2026.0305 (Major.Minor.Year.MMDD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.8.2026.0303 - v2.8 Bug fixes for deploy, @Tables, CommandLog:
+History:    2.9.2026.0305 - v2.9 Critical fix for incremental + NORECOMPUTE:
+                          - Fix: F-1 NORECOMPUTE + ON PARTITIONS syntax error (#215).
+                            When statistic is incremental (ON PARTITIONS clause) and has
+                            NORECOMPUTE flag, the command builder produced invalid T-SQL:
+                            "WITH RESAMPLE, NORECOMPUTE ON PARTITIONS(...)" instead of
+                            "WITH RESAMPLE ON PARTITIONS(...), NORECOMPUTE". ON PARTITIONS
+                            must immediately follow RESAMPLE per SQL Server syntax. Rare
+                            trigger (incremental + frozen stats + partial partition stale).
+                          - Note: F-2 (parallel TOCTOU race) documented for v2.10.
+                          - Verified: All v2.2-v2.3 fixes correct (DIRECT_TABLE columns,
+                            applock release, dead worker detection, TOCTOU counting).
+            2.8.2026.0303 - v2.8 Bug fixes for deploy, @Tables, CommandLog:
                           - Fix: Deploy fails on pre-v2.3 servers. SQL Server validates column
                             names at compile time; wrapped ParameterFingerprint and
                             LastStatCompletedAt references in sp_executesql (5 locations).
@@ -622,8 +633,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2.8.2026.0303',
-        @procedure_version_date datetime = '20260303',
+        @procedure_version varchar(20) = '2.9.2026.0305',
+        @procedure_version_date datetime = '20260305',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
