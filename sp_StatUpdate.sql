@@ -8225,6 +8225,19 @@ OPTION (RECOMPILE);';
         /* Note: @has_with_option=0 case now handled once at startup to reduce debug noise */
 
         /*
+        ON PARTITIONS must come immediately after RESAMPLE in the WITH clause,
+        before any other options like NORECOMPUTE.
+        Valid:   WITH RESAMPLE ON PARTITIONS(2, 3), NORECOMPUTE
+        Invalid: WITH RESAMPLE, NORECOMPUTE ON PARTITIONS(2, 3)
+        (#215 F-1 fix)
+        */
+        IF @on_partitions_clause <> N''
+        BEGIN
+            SELECT
+                @with_clause += @on_partitions_clause;
+        END;
+
+        /*
         NORECOMPUTE: Preserve the flag on stats that have it set
         Without this, UPDATE STATISTICS clears the no_recompute flag
         */
@@ -8250,16 +8263,6 @@ OPTION (RECOMPILE);';
         BEGIN
             SELECT
                 @current_command += N' WITH ' + @with_clause;
-        END;
-
-        /*
-        ON PARTITIONS must come AFTER the WITH clause.
-        Syntax: UPDATE STATISTICS [t] ([s]) WITH RESAMPLE ON PARTITIONS(2, 3);
-        */
-        IF @on_partitions_clause <> N''
-        BEGIN
-            SELECT
-                @current_command += @on_partitions_clause;
         END;
 
         SELECT
