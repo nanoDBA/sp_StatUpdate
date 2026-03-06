@@ -290,6 +290,12 @@ BEGIN
     IF @TopN < 1 OR @TopN > 1000
         SET @errors = @errors + N'@TopN must be between 1 and 1000. ';
 
+    IF @Obfuscate = 0 AND @ObfuscationMapTable IS NOT NULL
+        RAISERROR(N'WARNING: @ObfuscationMapTable is ignored when @Obfuscate = 0.', 10, 1) WITH NOWAIT;
+
+    IF @Obfuscate = 0 AND @ObfuscationSeed IS NOT NULL
+        RAISERROR(N'WARNING: @ObfuscationSeed is ignored when @Obfuscate = 0.', 10, 1) WITH NOWAIT;
+
     IF @errors <> N''
     BEGIN
         RAISERROR(N'Parameter validation failed: %s', 16, 1, @errors) WITH NOWAIT;
@@ -704,7 +710,7 @@ BEGIN
             N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + r.[Databases]), 2), 6)
         FROM #runs AS r
         WHERE r.[Databases] IS NOT NULL
-        AND   r.[Databases] NOT IN (N'USER_DATABASES', N'SYSTEM_DATABASES', N'ALL_DATABASES')  /* BUG-09: leave keywords unobfuscated */
+        AND   r.[Databases] NOT IN (N'USER_DATABASES', N'SYSTEM_DATABASES', N'ALL_DATABASES', N'AVAILABILITY_GROUP_DATABASES')  /* BUG-09: leave keywords unobfuscated */
         AND   NOT EXISTS (SELECT 1 FROM #obfuscation_map AS m WHERE m.OriginalName = r.[Databases] AND m.ObjectType = N'Database');
 
         /* Apply obfuscation to #stat_updates */
@@ -729,7 +735,7 @@ BEGIN
         SET r.[Databases] = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + r.[Databases]), 2), 6)
         FROM #runs AS r
         WHERE r.[Databases] IS NOT NULL
-        AND   r.[Databases] NOT IN (N'USER_DATABASES', N'SYSTEM_DATABASES', N'ALL_DATABASES');
+        AND   r.[Databases] NOT IN (N'USER_DATABASES', N'SYSTEM_DATABASES', N'ALL_DATABASES', N'AVAILABILITY_GROUP_DATABASES');
 
         /* Obfuscate RunLabels (contain server names) */
         UPDATE r
@@ -747,27 +753,45 @@ BEGIN
         /* Persist obfuscation map to table if requested */
         IF @ObfuscationMapTable IS NOT NULL
         BEGIN
-            DECLARE @map_sql nvarchar(max);
+            /* Build safe table reference from PARSENAME to prevent SQL injection.
+               Supports 1-part (dbo assumed), 2-part (schema.table), or 3-part (db.schema.table). */
+            DECLARE
+                @map_part1 sysname = PARSENAME(@ObfuscationMapTable, 1),  /* table */
+                @map_part2 sysname = PARSENAME(@ObfuscationMapTable, 2),  /* schema */
+                @map_part3 sysname = PARSENAME(@ObfuscationMapTable, 3),  /* database */
+                @map_safe_name nvarchar(500);
 
-            /* Auto-create table if it doesn't exist */
-            SET @map_sql = N'
-                IF OBJECT_ID(' + QUOTENAME(@ObfuscationMapTable, '''') + N') IS NULL
-                BEGIN
-                    CREATE TABLE ' + @ObfuscationMapTable + N' (
-                        ObjectType     nvarchar(20)   NOT NULL,
-                        OriginalName   nvarchar(256)  NOT NULL,
-                        ObfuscatedName nvarchar(50)   NOT NULL,
-                        CapturedAt     datetime2      NOT NULL DEFAULT SYSDATETIME()
-                    );
-                END;
+            IF @map_part1 IS NULL
+            BEGIN
+                RAISERROR(N'ERROR: @ObfuscationMapTable has invalid table name: %s', 16, 1, @ObfuscationMapTable) WITH NOWAIT;
+            END
+            ELSE
+            BEGIN
+                SET @map_safe_name = ISNULL(QUOTENAME(@map_part3) + N'.', N'')
+                    + ISNULL(QUOTENAME(@map_part2) + N'.', N'')
+                    + QUOTENAME(@map_part1);
 
-                INSERT INTO ' + @ObfuscationMapTable + N' (ObjectType, OriginalName, ObfuscatedName)
-                SELECT ObjectType, OriginalName, ObfuscatedName FROM #obfuscation_map;';
+                DECLARE @map_sql nvarchar(max);
 
-            EXECUTE sp_executesql @map_sql;
+                SET @map_sql = N'
+                    IF OBJECT_ID(' + QUOTENAME(@ObfuscationMapTable, '''') + N') IS NULL
+                    BEGIN
+                        CREATE TABLE ' + @map_safe_name + N' (
+                            ObjectType     nvarchar(20)   NOT NULL,
+                            OriginalName   nvarchar(256)  NOT NULL,
+                            ObfuscatedName nvarchar(50)   NOT NULL,
+                            CapturedAt     datetime2      NOT NULL DEFAULT SYSDATETIME()
+                        );
+                    END;
 
-            DECLARE @map_table_msg nvarchar(200) = N'  Obfuscation map saved to ' + @ObfuscationMapTable;
-            RAISERROR(@map_table_msg, 10, 1) WITH NOWAIT;
+                    INSERT INTO ' + @map_safe_name + N' (ObjectType, OriginalName, ObfuscatedName)
+                    SELECT ObjectType, OriginalName, ObfuscatedName FROM #obfuscation_map;';
+
+                EXECUTE sp_executesql @map_sql;
+
+                DECLARE @map_table_msg nvarchar(200) = N'  Obfuscation map saved to ' + @map_safe_name;
+                RAISERROR(@map_table_msg, 10, 1) WITH NOWAIT;
+            END;
         END;
 
         RAISERROR(N'', 10, 1) WITH NOWAIT;
