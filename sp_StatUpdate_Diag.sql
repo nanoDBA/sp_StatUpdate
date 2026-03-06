@@ -49,6 +49,8 @@ ALTER PROCEDURE
     @DaysBack integer = 30,                     /* history window in days */
     @CommandLogDatabase sysname = NULL,          /* NULL = current DB */
     @Obfuscate bit = 0,                         /* 0 = real names, 1 = hashed names */
+    @ObfuscationSeed nvarchar(128) = NULL,       /* salt for HASHBYTES — makes tokens unpredictable without seed */
+    @ObfuscationMapTable sysname = NULL,          /* persist obfuscation map to this table (auto-creates if missing) */
     @LongRunningMinutes integer = 10,            /* threshold for "long-running stat" detection */
     @FailureThreshold integer = 3,               /* same stat failing N+ times = CRITICAL */
     @TimeLimitExhaustionPct integer = 80,         /* warn if >X% of runs hit time limit */
@@ -100,8 +102,12 @@ BEGIN
                     N'1-3650', N'30'),
                 (N'@CommandLogDatabase',        N'sysname',  N'Database containing dbo.CommandLog table. NULL = current database context.',
                     N'NULL, database name (e.g., DBATools, master)', N'NULL (current database)'),
-                (N'@Obfuscate',                N'bit',      N'Hash database/schema/table/stat names for safe external sharing. Uses HASHBYTES MD5 with deterministic seed. Obfuscation map returned as result set 8.',
+                (N'@Obfuscate',                N'bit',      N'Hash database/schema/table/stat names for safe external sharing. Uses HASHBYTES MD5. Obfuscation map returned as result set 8 (multi-result-set mode only).',
                     N'0, 1', N'0'),
+                (N'@ObfuscationSeed',          N'nvarchar(128)', N'Salt prepended to names before hashing. Makes tokens unpredictable without the seed but deterministic across runs/servers with the same seed. NULL = unsalted (backward compatible).',
+                    N'NULL, any string up to 128 chars', N'NULL'),
+                (N'@ObfuscationMapTable',      N'sysname',  N'Persist obfuscation map to this table (auto-creates if missing, appends if exists). Enables saving the map on prod while exporting only obfuscated results. Requires @Obfuscate=1.',
+                    N'NULL, table name (e.g., dbo.DiagMap, tempdb.dbo.diag_map)', N'NULL'),
                 (N'@LongRunningMinutes',        N'integer',  N'Stats taking longer than this (in minutes) are flagged in W2 check and Long-Running Statistics result set',
                     N'1-N minutes', N'10'),
                 (N'@FailureThreshold',          N'integer',  N'Same statistic failing this many times across runs triggers C2 CRITICAL finding',
@@ -210,6 +216,11 @@ BEGIN
                     N'EXECUTE dbo.sp_StatUpdate_Diag @SingleResultSet = 1;'
                 ),
                 (
+                    N'Secure Obfuscated Export',
+                    N'Save map on prod, export only obfuscated results for external analysis',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @Obfuscate = 1, @SingleResultSet = 1, @ObfuscationSeed = N''MySecretSeed'', @ObfuscationMapTable = N''dbo.DiagObfuscationMap'';'
+                ),
+                (
                     N'Multi-Server (PowerShell)',
                     N'Use Invoke-StatUpdateDiag.ps1 for cross-server analysis',
                     N'.\Invoke-StatUpdateDiag.ps1 -Servers "Server1","Server2" -OutputFormat Markdown -OutputPath C:\Reports'
@@ -225,7 +236,7 @@ BEGIN
         (
             VALUES
                 (N'Obfuscation',
-                 N'@Obfuscate=1 replaces database, schema, table, and statistic names with MD5 hashes (e.g., DB_a1b2c3, TBL_d4e5f6). Prefixes preserved for readability. Result set 8 contains the mapping table for internal correlation. Hash is deterministic within a run — same object always maps to same hash.'),
+                 N'@Obfuscate=1 replaces names with MD5 hashes (e.g., DB_a1b2c3, TBL_d4e5f6). Prefixes preserved for readability. Map is result set 8 in multi-result-set mode (excluded from @SingleResultSet=1 to prevent leaking real names). Use @ObfuscationMapTable to persist the map on prod. Use @ObfuscationSeed to salt hashes — makes tokens stable across servers with the same seed but unpredictable without it.'),
                 (N'Killed Run Detection',
                  N'Two detection methods: (1) SP_STATUPDATE_START without matching SP_STATUPDATE_END = orphaned run, (2) SP_STATUPDATE_END with StopReason=KILLED = cleaned up by @CleanupOrphanedRuns. Both trigger C1 CRITICAL.'),
                 (N'Throughput Trend (C4)',
@@ -621,26 +632,29 @@ BEGIN
     BEGIN
         RAISERROR(N'Applying obfuscation...', 10, 1) WITH NOWAIT;
 
+        /* Seed prefix: when @ObfuscationSeed is provided, prepend to all names before hashing */
+        DECLARE @seed_prefix nvarchar(128) = ISNULL(@ObfuscationSeed, N'');
+
         /* Snapshot distinct names BEFORE obfuscating */
         INSERT INTO #obfuscation_map (ObjectType, OriginalName, ObfuscatedName)
         SELECT DISTINCT
             object_type = N'Database',
             original_name = su.DatabaseName,
-            obfuscated_name = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.DatabaseName), 2), 6)
+            obfuscated_name = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.DatabaseName), 2), 6)
         FROM #stat_updates AS su
         WHERE su.DatabaseName IS NOT NULL
         UNION
         SELECT DISTINCT
             N'Schema',
             su.SchemaName,
-            N'SCH_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.SchemaName), 2), 4)
+            N'SCH_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.SchemaName), 2), 4)
         FROM #stat_updates AS su
         WHERE su.SchemaName IS NOT NULL
         UNION
         SELECT DISTINCT
             N'Table',
             su.ObjectName,
-            N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.ObjectName), 2), 6)
+            N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.ObjectName), 2), 6)
         FROM #stat_updates AS su
         WHERE su.ObjectName IS NOT NULL
         UNION
@@ -648,11 +662,11 @@ BEGIN
             N'Statistic',
             su.StatisticsName,
             CASE
-                WHEN su.StatisticsName LIKE N'_WA_Sys_%' THEN N'_WA_Sys_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'PK_%'       THEN N'PK_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'IX_%'       THEN N'IX_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'UQ_%'       THEN N'UQ_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
-                ELSE N'STAT_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
+                WHEN su.StatisticsName LIKE N'_WA_Sys_%' THEN N'_WA_Sys_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
+                WHEN su.StatisticsName LIKE N'PK_%'       THEN N'PK_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
+                WHEN su.StatisticsName LIKE N'IX_%'       THEN N'IX_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
+                WHEN su.StatisticsName LIKE N'UQ_%'       THEN N'UQ_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
+                ELSE N'STAT_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
             END
         FROM #stat_updates AS su
         WHERE su.StatisticsName IS NOT NULL;
@@ -662,7 +676,7 @@ BEGIN
         SELECT DISTINCT
             N'RunDatabase',
             r.[Databases],
-            N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', r.[Databases]), 2), 6)
+            N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + r.[Databases]), 2), 6)
         FROM #runs AS r
         WHERE r.[Databases] IS NOT NULL
         AND   NOT EXISTS (SELECT 1 FROM #obfuscation_map AS m WHERE m.OriginalName = r.[Databases] AND m.ObjectType = N'Database');
@@ -670,36 +684,63 @@ BEGIN
         /* Apply obfuscation to #stat_updates */
         UPDATE su
         SET
-            su.DatabaseName = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.DatabaseName), 2), 6),
-            su.SchemaName = N'SCH_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.SchemaName), 2), 4),
-            su.ObjectName = N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.ObjectName), 2), 6),
+            su.DatabaseName = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.DatabaseName), 2), 6),
+            su.SchemaName = N'SCH_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.SchemaName), 2), 4),
+            su.ObjectName = N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.ObjectName), 2), 6),
             su.StatisticsName = CASE
-                WHEN su.StatisticsName LIKE N'_WA_Sys_%' THEN N'_WA_Sys_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'PK_%'       THEN N'PK_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'IX_%'       THEN N'IX_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'UQ_%'       THEN N'UQ_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
-                ELSE N'STAT_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
+                WHEN su.StatisticsName LIKE N'_WA_Sys_%' THEN N'_WA_Sys_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
+                WHEN su.StatisticsName LIKE N'PK_%'       THEN N'PK_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
+                WHEN su.StatisticsName LIKE N'IX_%'       THEN N'IX_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
+                WHEN su.StatisticsName LIKE N'UQ_%'       THEN N'UQ_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
+                ELSE N'STAT_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
             END
         FROM #stat_updates AS su;
 
         /* Obfuscate #runs.Databases */
         UPDATE r
-        SET r.[Databases] = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', r.[Databases]), 2), 6)
+        SET r.[Databases] = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + r.[Databases]), 2), 6)
         FROM #runs AS r
         WHERE r.[Databases] IS NOT NULL;
 
         /* Obfuscate RunLabels (contain server names) */
         UPDATE r
-        SET r.RunLabel = N'RUN_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', r.RunLabel), 2), 8)
+        SET r.RunLabel = N'RUN_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + r.RunLabel), 2), 8)
         FROM #runs AS r;
 
         UPDATE su
-        SET su.RunLabel = N'RUN_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.RunLabel), 2), 8)
+        SET su.RunLabel = N'RUN_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.RunLabel), 2), 8)
         FROM #stat_updates AS su
         WHERE su.RunLabel IS NOT NULL;
 
         DECLARE @obfuscation_count integer = (SELECT COUNT_BIG(*) FROM #obfuscation_map);
         RAISERROR(N'  Obfuscated %i mapping entries', 10, 1, @obfuscation_count) WITH NOWAIT;
+
+        /* Persist obfuscation map to table if requested */
+        IF @ObfuscationMapTable IS NOT NULL
+        BEGIN
+            DECLARE @map_sql nvarchar(max);
+
+            /* Auto-create table if it doesn't exist */
+            SET @map_sql = N'
+                IF OBJECT_ID(' + QUOTENAME(@ObfuscationMapTable, '''') + N') IS NULL
+                BEGIN
+                    CREATE TABLE ' + @ObfuscationMapTable + N' (
+                        ObjectType     nvarchar(20)   NOT NULL,
+                        OriginalName   nvarchar(256)  NOT NULL,
+                        ObfuscatedName nvarchar(50)   NOT NULL,
+                        CapturedAt     datetime2      NOT NULL DEFAULT SYSDATETIME()
+                    );
+                END;
+
+                INSERT INTO ' + @ObfuscationMapTable + N' (ObjectType, OriginalName, ObfuscatedName)
+                SELECT ObjectType, OriginalName, ObfuscatedName FROM #obfuscation_map;';
+
+            EXECUTE sp_executesql @map_sql;
+
+            DECLARE @map_table_msg nvarchar(200) = N'  Obfuscation map saved to ' + @ObfuscationMapTable;
+            RAISERROR(@map_table_msg, 10, 1) WITH NOWAIT;
+        END;
+
         RAISERROR(N'', 10, 1) WITH NOWAIT;
     END;
 
@@ -1641,22 +1682,9 @@ BEGIN
         END
         ELSE
         BEGIN
-            INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
-            SELECT
-                ResultSetID   = 8,
-                ResultSetName = N'Obfuscation Map',
-                RowNum        = ROW_NUMBER() OVER (ORDER BY om.ObjectType, om.OriginalName),
-                RowData       = (
-                    SELECT
-                        ObjectType     = om2.ObjectType,
-                        OriginalName   = om2.OriginalName,
-                        ObfuscatedName = om2.ObfuscatedName
-                    FROM #obfuscation_map AS om2
-                    WHERE om2.ObjectType   = om.ObjectType
-                    AND   om2.OriginalName = om.OriginalName
-                    FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
-                )
-            FROM #obfuscation_map AS om;
+            /* Map excluded from single result set to prevent real names leaking into exportable output.
+               Use @ObfuscationMapTable to persist the map, or use multi-result-set mode (default). */
+            RAISERROR(N'Obfuscation map excluded from single result set. Use @ObfuscationMapTable to persist the map.', 10, 1) WITH NOWAIT;
         END;
     END;
 
