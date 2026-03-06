@@ -22,7 +22,7 @@ Version:    2026.03.04 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.
 
 Requires:   - dbo.CommandLog table (Ola Hallengren's SQL Server Maintenance Solution)
             - sp_StatUpdate entries in CommandLog (SP_STATUPDATE_START/END + UPDATE_STATISTICS)
-            - SQL Server 2016+ (STRING_SPLIT, STRING_AGG)
+            - SQL Server 2017+ (STRING_AGG; STRING_SPLIT is 2016+ but STRING_AGG requires 2017+)
 
 Usage:      -- Quick health check (SSMS, real names):
             EXECUTE dbo.sp_StatUpdate_Diag;
@@ -73,7 +73,7 @@ BEGIN
     */
     DECLARE
         @procedure_version varchar(20) = '2026.03.04',
-        @procedure_version_date datetime = '20260212';
+        @procedure_version_date datetime = '20260304';  /* BUG-01 fix: was '20260212', corrected to match version string */
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -147,7 +147,7 @@ BEGIN
                 (N'I2', N'INFO',     N'PARAMETER_HISTORY',     N'How parameters changed across runs'),
                 (N'I3', N'INFO',     N'TOP_TABLES',            N'Tables consuming the most maintenance time'),
                 (N'I4', N'INFO',     N'UNUSED_FEATURES',       N'Available features not being used'),
-                (N'I5', N'INFO',     N'VERSION_HISTORY',       N'sp_StatUpdate versions used across analysis window')
+                (N'I5', N'INFO',     N'VERSION_HISTORY',       N'sp_StatUpdate versions used across analysis window — NOTE: not yet implemented (see GitHub issue)')  /* BUG-06: I5 documented but never implemented */
         ) AS v (check_id, severity, category, description);
 
         /* Result set 3: Result set order */
@@ -245,6 +245,17 @@ BEGIN
 
     /*
     ============================================================================
+    RUNTIME VERSION GUARD (BUG-02: STRING_AGG requires SQL Server 2017+)
+    ============================================================================
+    */
+    IF CAST(SERVERPROPERTY('ProductMajorVersion') AS integer) < 14
+    BEGIN
+        RAISERROR(N'sp_StatUpdate_Diag requires SQL Server 2017 or later (STRING_AGG).', 16, 1);
+        RETURN;
+    END;
+
+    /*
+    ============================================================================
     PARAMETER VALIDATION
     ============================================================================
     */
@@ -310,6 +321,12 @@ BEGIN
     RAISERROR(N'Analysis window: %i days', 10, 1, @DaysBack) WITH NOWAIT;
     DECLARE @obfuscate_int integer = CONVERT(integer, @Obfuscate);
     RAISERROR(N'Obfuscate: %i', 10, 1, @obfuscate_int) WITH NOWAIT;
+
+    /* BUG-07: orphan threshold now a named constant (was hardcoded 60 minutes).
+       Default 2880 = 48 hours, matching sp_StatUpdate @OrphanedRunThresholdHours default.
+       A run still in progress (no END record) is only classified as orphaned once this
+       threshold has elapsed; runs started more recently are excluded to avoid false C1 alerts. */
+    DECLARE @OrphanedRunThresholdMinutes integer = 2880;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     /*
@@ -480,14 +497,15 @@ BEGIN
             s.ExtendedInfo.value(N''(Parameters/RunLabel)[1]'', N''nvarchar(100)'')
     WHERE s.CommandType = N''SP_STATUPDATE_START''
     AND   s.StartTime >= DATEADD(DAY, -@days_back, GETDATE())
-    /* Exclude currently running (started < 1 hour ago with no END) */
-    AND   NOT (e.ID IS NULL AND DATEDIFF(MINUTE, s.StartTime, GETDATE()) < 60);
+    /* Exclude currently running (started within threshold with no END — see @OrphanedRunThresholdMinutes) */
+    AND   NOT (e.ID IS NULL AND DATEDIFF(MINUTE, s.StartTime, GETDATE()) < @orphan_minutes);
     ';
 
     EXECUTE sys.sp_executesql
         @sql,
-        N'@days_back integer',
-        @days_back = @DaysBack;
+        N'@days_back integer, @orphan_minutes integer',
+        @days_back = @DaysBack,
+        @orphan_minutes = @OrphanedRunThresholdMinutes;
 
     DECLARE @run_count integer = (SELECT COUNT_BIG(*) FROM #runs);
     DECLARE @killed_count integer = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 1);
@@ -637,10 +655,12 @@ BEGIN
         FROM #stat_updates AS su
         WHERE su.SchemaName IS NOT NULL
         UNION
+        /* BUG-08 fix: hash uses fully-qualified name (DB.Schema.Table) to prevent cross-DB collision.
+           OriginalName stored as qualified name for disambiguation in RS8. */
         SELECT DISTINCT
             N'Table',
-            su.ObjectName,
-            N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.ObjectName), 2), 6)
+            su.DatabaseName + N'.' + su.SchemaName + N'.' + su.ObjectName,
+            N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.DatabaseName + N'.' + su.SchemaName + N'.' + su.ObjectName), 2), 6)
         FROM #stat_updates AS su
         WHERE su.ObjectName IS NOT NULL
         UNION
@@ -657,7 +677,12 @@ BEGIN
         FROM #stat_updates AS su
         WHERE su.StatisticsName IS NOT NULL;
 
-        /* Also snapshot databases from #runs */
+        /* Also snapshot databases from #runs.
+           BUG-09: Known keywords (USER_DATABASES, SYSTEM_DATABASES, ALL_DATABASES) are left
+           unobfuscated because they contain no sensitive names. For comma-separated lists,
+           the entire string is hashed as one unit — individual database names within the list
+           cannot be reverse-mapped to their per-stat-update obfuscated counterparts. This is
+           a known limitation; the obfuscation map entry for such runs is marked "(multi-DB list)". */
         INSERT INTO #obfuscation_map (ObjectType, OriginalName, ObfuscatedName)
         SELECT DISTINCT
             N'RunDatabase',
@@ -665,6 +690,7 @@ BEGIN
             N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', r.[Databases]), 2), 6)
         FROM #runs AS r
         WHERE r.[Databases] IS NOT NULL
+        AND   r.[Databases] NOT IN (N'USER_DATABASES', N'SYSTEM_DATABASES', N'ALL_DATABASES')  /* BUG-09: leave keywords unobfuscated */
         AND   NOT EXISTS (SELECT 1 FROM #obfuscation_map AS m WHERE m.OriginalName = r.[Databases] AND m.ObjectType = N'Database');
 
         /* Apply obfuscation to #stat_updates */
@@ -672,7 +698,9 @@ BEGIN
         SET
             su.DatabaseName = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.DatabaseName), 2), 6),
             su.SchemaName = N'SCH_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.SchemaName), 2), 4),
-            su.ObjectName = N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.ObjectName), 2), 6),
+            /* BUG-08 fix: hash uses pre-update DatabaseName+SchemaName+ObjectName composite key;
+               SQL Server evaluates all RHS before applying SET, so original values are used here. */
+            su.ObjectName = N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.DatabaseName + N'.' + su.SchemaName + N'.' + su.ObjectName), 2), 6),
             su.StatisticsName = CASE
                 WHEN su.StatisticsName LIKE N'_WA_Sys_%' THEN N'_WA_Sys_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
                 WHEN su.StatisticsName LIKE N'PK_%'       THEN N'PK_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', su.StatisticsName), 2), 6)
@@ -682,11 +710,12 @@ BEGIN
             END
         FROM #stat_updates AS su;
 
-        /* Obfuscate #runs.Databases */
+        /* Obfuscate #runs.Databases — skip known keywords (BUG-09: they contain no sensitive names) */
         UPDATE r
         SET r.[Databases] = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', r.[Databases]), 2), 6)
         FROM #runs AS r
-        WHERE r.[Databases] IS NOT NULL;
+        WHERE r.[Databases] IS NOT NULL
+        AND   r.[Databases] NOT IN (N'USER_DATABASES', N'SYSTEM_DATABASES', N'ALL_DATABASES');
 
         /* Obfuscate RunLabels (contain server names) */
         UPDATE r
@@ -787,7 +816,10 @@ BEGIN
        ====================================================================== */
     DECLARE
         @total_completed_runs integer = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 0),
-        @time_limit_runs integer = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason = N'TIME_LIMIT');
+        @time_limit_runs integer = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason = N'TIME_LIMIT'),
+        /* BUG-12: use latest run's TimeLimit for the recommendation, not MAX across all TIME_LIMIT runs.
+           Using MAX of historical TIME_LIMIT runs could recommend an extreme value from a one-off test run. */
+        @latest_timelimit_sec integer = (SELECT TOP 1 TimeLimit FROM #runs WHERE IsKilled = 0 ORDER BY StartTime DESC);
 
     IF @total_completed_runs > 0
     AND @time_limit_runs * 100.0 / @total_completed_runs >= @TimeLimitExhaustionPct
@@ -800,15 +832,16 @@ BEGIN
                 + CONVERT(nvarchar(10), @total_completed_runs) + N' completed runs hit TIME_LIMIT ('
                 + CONVERT(nvarchar(10), CONVERT(integer, @time_limit_runs * 100.0 / @total_completed_runs)) + N'%)',
             N'Average stats remaining when time-limited: ' + CONVERT(nvarchar(10), AVG(r.StatsRemaining))
-                + N'. Average time limit used: ' + CONVERT(nvarchar(10), AVG(r.TimeLimit)) + N' seconds ('
-                + CONVERT(nvarchar(10), AVG(r.TimeLimit) / 60) + N' minutes)',
+                /* BUG-12 fix: show latest run's TimeLimit instead of AVG across TIME_LIMIT runs */
+                + N'. Current time limit (latest run): ' + ISNULL(CONVERT(nvarchar(10), @latest_timelimit_sec), N'NULL') + N' seconds ('
+                + ISNULL(CONVERT(nvarchar(10), @latest_timelimit_sec / 60), N'NULL') + N' minutes)',
             N'Stats are consistently not finishing within the time limit. Options: '
-                + N'(1) Increase @TimeLimit to ' + CONVERT(nvarchar(10), MAX(r.TimeLimit) * 2) + N' seconds, '
+                + N'(1) Increase @TimeLimit to ' + ISNULL(CONVERT(nvarchar(10), @latest_timelimit_sec * 2), N'<current_value_x2>') + N' seconds, '
                 + N'(2) Enable @LongRunningThresholdMinutes to cap slow individual stats, '
                 + N'(3) Raise @ModificationThreshold to reduce qualifying stats, '
                 + N'(4) Use @Preset = N''NIGHTLY_MAINTENANCE'' for balanced defaults.',
             N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @TimeLimit = '
-                + CONVERT(nvarchar(10), MAX(r.TimeLimit) * 2)
+                + ISNULL(CONVERT(nvarchar(10), @latest_timelimit_sec * 2), N'<current_value_x2>')
                 + N', @LongRunningThresholdMinutes = 30;',
             15
         FROM #runs AS r
@@ -969,8 +1002,8 @@ BEGIN
         N'WARNING',
         N'LONG_RUNNING_STATS',
         N'Stat consistently slow: ' + su.DatabaseName + N'.'
-            + su.ObjectName + N'.' + su.StatisticsName,
-        N'Avg duration: ' + CONVERT(nvarchar(10), AVG(su.DurationMs) / 1000)
+            + su.SchemaName + N'.' + su.ObjectName + N'.' + su.StatisticsName,  /* BUG-03 fix: was missing SchemaName */
+        N'Avg duration: ' + CONVERT(nvarchar(10), AVG(su.DurationMs) / 1000.0)
             + N' sec across ' + CONVERT(nvarchar(10), COUNT_BIG(*))
             + N' updates. Max size: ' + CONVERT(nvarchar(10), MAX(ISNULL(su.SizeMB, 0))) + N' MB'
             + N'. Avg rows: ' + CONVERT(nvarchar(20), AVG(su.RowCount_)),
@@ -1023,7 +1056,8 @@ BEGIN
         FROM #runs AS r
         WHERE r.IsKilled = 0
         AND   r.StatsRemaining > 0
-        AND   r.StatsFound > 0;
+        AND   r.StatsFound > 0
+        AND   r.StatsRemaining * 1.0 / NULLIF(r.StatsFound, 0) > 0.5;  /* BUG-04 fix: match EXISTS guard — only include runs with >50% remaining */
 
         RAISERROR(N'  [WARNING] W3: Stale-stats backlog detected', 10, 1) WITH NOWAIT;
     END;
@@ -1352,7 +1386,7 @@ BEGIN
             SchemaName = su.SchemaName,
             TableName = su.ObjectName,
             TotalUpdates = COUNT_BIG(*),
-            TotalDurationSec = SUM(su.DurationMs) / 1000,
+            TotalDurationSec = SUM(su.DurationMs) / 1000.0,  /* BUG-05 fix: was /1000 (integer division) */
             AvgDurationMs = AVG(su.DurationMs),
             MaxDurationMs = MAX(su.DurationMs),
             AvgModCounter = AVG(su.ModificationCounter),
@@ -1379,7 +1413,7 @@ BEGIN
                     SchemaName       = su2.SchemaName,
                     TableName        = su2.ObjectName,
                     TotalUpdates     = COUNT_BIG(*),
-                    TotalDurationSec = SUM(su2.DurationMs) / 1000,
+                    TotalDurationSec = SUM(su2.DurationMs) / 1000.0,  /* BUG-05 fix */
                     AvgDurationMs    = AVG(su2.DurationMs),
                     MaxDurationMs    = MAX(su2.DurationMs),
                     AvgModCounter    = AVG(su2.ModificationCounter),
@@ -1487,9 +1521,9 @@ BEGIN
             TableName = su.ObjectName,
             StatisticsName = su.StatisticsName,
             UpdateCount = COUNT_BIG(*),
-            AvgDurationSec = AVG(su.DurationMs) / 1000,
-            MaxDurationSec = MAX(su.DurationMs) / 1000,
-            MinDurationSec = MIN(su.DurationMs) / 1000,
+            AvgDurationSec = AVG(su.DurationMs) / 1000.0,  /* BUG-05 fix: was /1000 (integer division) */
+            MaxDurationSec = MAX(su.DurationMs) / 1000.0,
+            MinDurationSec = MIN(su.DurationMs) / 1000.0,
             AvgSizeMB = AVG(su.SizeMB),
             MaxRowCount = MAX(su.RowCount_),
             AvgSamplePct = AVG(su.EffectiveSamplePct),
@@ -1525,9 +1559,9 @@ BEGIN
                     TableName      = su2.ObjectName,
                     StatisticsName = su2.StatisticsName,
                     UpdateCount    = COUNT_BIG(*),
-                    AvgDurationSec = AVG(su2.DurationMs) / 1000,
-                    MaxDurationSec = MAX(su2.DurationMs) / 1000,
-                    MinDurationSec = MIN(su2.DurationMs) / 1000,
+                    AvgDurationSec = AVG(su2.DurationMs) / 1000.0,  /* BUG-05 fix */
+                    MaxDurationSec = MAX(su2.DurationMs) / 1000.0,
+                    MinDurationSec = MIN(su2.DurationMs) / 1000.0,
                     AvgSizeMB      = AVG(su2.SizeMB),
                     MaxRowCount    = MAX(su2.RowCount_),
                     AvgSamplePct   = AVG(su2.EffectiveSamplePct),
