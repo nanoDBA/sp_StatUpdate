@@ -4112,34 +4112,94 @@ BEGIN
             @parameters_xml xml =
             (
                 SELECT
+                    /* Identity */
                     @procedure_version AS [Version],
                     @run_label AS RunLabel,
                     @@SPID AS SessionID,
+
+                    /* Scope & targeting */
+                    @Preset AS Preset,
                     @Databases AS [Databases],
                     @database_count AS DatabaseCount,
                     @Tables AS [Tables],
+                    @ExcludeTables AS ExcludeTables,
+                    @ExcludeStatistics AS ExcludeStatistics,
                     @Statistics AS [Statistics],
                     @StatisticsFromTable AS StatisticsFromTable,
                     @TargetNorecompute AS TargetNorecompute,
+                    @IncludeSystemObjects AS IncludeSystemObjects,
+                    @IncludeIndexedViews AS IncludeIndexedViews,
+                    @SkipTablesWithColumnstore AS SkipTablesWithColumnstore,
+
+                    /* Thresholds */
                     @ModificationThreshold AS ModificationThreshold,
                     @ModificationPercent AS ModificationPercent,
                     @TieredThresholds AS TieredThresholds,
                     @ThresholdLogic AS ThresholdLogic,
                     @DaysStaleThreshold AS DaysStaleThreshold,
+                    @HoursStaleThreshold AS HoursStaleThreshold,
                     @MinPageCount AS MinPageCount,
-                    @IncludeSystemObjects AS IncludeSystemObjects,
+
+                    /* Filtered stats */
+                    @FilteredStatsMode AS FilteredStatsMode,
+                    @FilteredStatsStaleFactor AS FilteredStatsStaleFactor,
+
+                    /* Query Store */
+                    @QueryStorePriority AS QueryStorePriority,
+                    @QueryStoreMetric AS QueryStoreMetric,
+                    @QueryStoreMinExecutions AS QueryStoreMinExecutions,
+                    @QueryStoreRecentHours AS QueryStoreRecentHours,
+
+                    /* Update behavior */
                     @StatisticsSample AS StatisticsSample,
+                    @PersistSamplePercent AS PersistSamplePercent,
+                    @PersistSampleMinRows AS PersistSampleMinRows,
+                    @MaxDOP AS MaxDOP,
+                    @MaxGrantPercent AS MaxGrantPercent,
                     @UpdateIncremental AS UpdateIncremental,
+
+                    /* Execution control */
                     @TimeLimit AS TimeLimit,
+                    @StopByTime AS StopByTime,
+                    @MaxSecondsPerStat AS MaxSecondsPerStat,
                     @BatchLimit AS BatchLimit,
                     @SortOrder AS SortOrder,
-                    @StatsInParallel AS StatsInParallel,
+                    @DelayBetweenStats AS DelayBetweenStats,
+                    @MaxConsecutiveFailures AS MaxConsecutiveFailures,
                     @FailFast AS FailFast,
+
+                    /* Join pattern */
+                    @GroupByJoinPattern AS GroupByJoinPattern,
+                    @JoinPatternMinExecutions AS JoinPatternMinExecutions,
+
+                    /* Adaptive sampling */
                     @LongRunningThresholdMinutes AS LongRunningThresholdMinutes,
                     @LongRunningSamplePercent AS LongRunningSamplePercent,
+
+                    /* Environmental safety */
                     @MaxAGRedoQueueMB AS MaxAGRedoQueueMB,
                     @MaxAGWaitMinutes AS MaxAGWaitMinutes,
-                    @MinTempdbFreeMB AS MinTempdbFreeMB
+                    @MinTempdbFreeMB AS MinTempdbFreeMB,
+
+                    /* Discovery & performance */
+                    @StagedDiscovery AS StagedDiscovery,
+                    @CollectHeapForwarding AS CollectHeapForwarding,
+
+                    /* Logging & output */
+                    @LockTimeout AS LockTimeout,
+                    @LogToTable AS LogToTable,
+                    @LogSkippedToCommandLog AS LogSkippedToCommandLog,
+                    @ProgressLogInterval AS ProgressLogInterval,
+                    @ReturnDetailedResults AS ReturnDetailedResults,
+                    @CompletionNotifyTable AS CompletionNotifyTable,
+
+                    /* Parallel */
+                    @StatsInParallel AS StatsInParallel,
+                    @DeadWorkerTimeoutMinutes AS DeadWorkerTimeoutMinutes,
+
+                    /* Cleanup */
+                    @CleanupOrphanedRuns AS CleanupOrphanedRuns,
+                    @OrphanedRunThresholdHours AS OrphanedRunThresholdHours
                 FOR
                     XML RAW(N'Parameters'),
                     ELEMENTS
