@@ -64,6 +64,18 @@ ADD EVENT sqlserver.error_reported
 -- Capture wait statistics for blocking/performance issues
 -- Note: XE predicates require numeric map_key values for wait_type
 -- Query sys.dm_xe_map_values WHERE name = 'wait_types' to find values
+/* BUG-11 IMPORTANT: Verify wait_type map_key values for YOUR SQL Server version before use.
+   The numeric values below are version-specific and may differ across SQL Server releases.
+   Run this query on your target SQL Server instance to confirm the correct map_key values:
+
+   SELECT map_key, map_value FROM sys.dm_xe_map_values
+   WHERE name = N'wait_types'
+   AND map_value IN (N'LCK_M_SCH_S', N'LCK_M_SCH_M', N'LCK_M_U', N'LCK_M_X',
+                     N'PAGEIOLATCH_SH', N'PAGEIOLATCH_EX', N'CXPACKET', N'ASYNC_NETWORK_IO');
+
+   If the map_key values differ from what is configured below, update the WHERE clause in
+   the sqlos.wait_completed event accordingly. Incorrect values will silently capture nothing.
+*/
 ADD EVENT sqlos.wait_completed
 (
     ACTION (sqlserver.session_id, sqlserver.database_name)
@@ -91,11 +103,14 @@ ADD EVENT sqlserver.sql_statement_starting
     )
 ),
 
--- Capture long-running statement COMPLETION (> 10 seconds)
+-- Capture long-running UPDATE STATISTICS COMPLETION (> 10 seconds)
+-- BUG-10 fix: added UPDATE STATISTICS filter to prevent non-stats long queries from
+-- flooding the ring buffer and evicting relevant events (ALLOW_SINGLE_EVENT_LOSS mode).
 ADD EVENT sqlserver.sql_statement_completed
 (
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text, sqlserver.plan_handle)
     WHERE duration > 10000000  -- > 10 seconds (in microseconds)
+    AND sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N'%UPDATE STATISTICS%')
 ),
 
 -- Capture lock escalation (common during large stat scans)
