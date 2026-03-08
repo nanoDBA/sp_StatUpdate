@@ -36,7 +36,7 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.15.2026.03.05 (Major.Minor.YYYY.MM.DD)
+Version:    2.16.2026.03.08 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
@@ -642,8 +642,8 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.15.2026.03.05',
-        @procedure_version_date datetime = '20260305',
+        @procedure_version varchar(20) = '2.16.2026.03.08',
+        @procedure_version_date datetime = '20260308',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -8689,6 +8689,7 @@ OPTION (RECOMPILE);';
                                 @sample_source AS SampleSource,
                                 @mode AS Mode,
                                 @run_label AS RunLabel,
+                                @stats_processed AS ProcessingPosition,
                                 @procedure_version AS Version
                             FOR
                                 XML RAW(N'ExtendedInfo'),

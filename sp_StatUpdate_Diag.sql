@@ -18,7 +18,7 @@ Based on:   sp_StatUpdate CommandLog format and Ola Hallengren's CommandLog tabl
 
 License:    MIT License (same as sp_StatUpdate)
 
-Version:    2026.03.04 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.08 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
 Requires:   - dbo.CommandLog table (Ola Hallengren's SQL Server Maintenance Solution)
             - sp_StatUpdate entries in CommandLog (SP_STATUPDATE_START/END + UPDATE_STATISTICS)
@@ -56,6 +56,10 @@ ALTER PROCEDURE
     @TimeLimitExhaustionPct integer = 80,         /* warn if >X% of runs hit time limit */
     @ThroughputWindowDays integer = 7,            /* window size for throughput trend comparison */
     @TopN integer = 20,                           /* top N items in detail result sets */
+    @EfficacyDaysBack integer = NULL,              /* QS efficacy trending window (NULL = @DaysBack) */
+    @EfficacyDetailDays integer = NULL,            /* QS efficacy close-up window (NULL = 14 or @EfficacyDaysBack) */
+    @ExpertMode bit = 0,                           /* 0 = Executive Dashboard + Recommendations (management view), 1 = all result sets (DBA view) */
+    @SkipHistory bit = 0,                          /* 1 = skip reading/writing dbo.StatUpdateDiagHistory (for testing or transient installs) */
     @Help bit = 0,
     @Debug bit = 0,
     @SingleResultSet bit = 0,       /* 0 = default multi-result-set, 1 = single result set with ResultSetID/RowData */
@@ -74,8 +78,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.04',
-        @procedure_version_date datetime = '20260304';  /* BUG-01 fix: was '20260212', corrected to match version string */
+        @procedure_version varchar(20) = '2026.03.08.1',
+        @procedure_version_date datetime = '20260308';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -118,6 +122,14 @@ BEGIN
                     N'1-@DaysBack', N'7'),
                 (N'@TopN',                     N'integer',  N'Maximum rows returned in detail result sets (Top Tables, Failing Stats, Long-Running Stats)',
                     N'1-1000', N'20'),
+                (N'@EfficacyDaysBack',         N'integer',  N'Broad window for QS efficacy trending (weekly aggregates). NULL inherits from @DaysBack.',
+                    N'NULL, 1-3650', N'NULL (= @DaysBack)'),
+                (N'@EfficacyDetailDays',       N'integer',  N'Close-up window for run-over-run efficacy detail. NULL defaults to 14 or @EfficacyDaysBack if smaller.',
+                    N'NULL, 1-@EfficacyDaysBack', N'NULL (= min(14, @EfficacyDaysBack))'),
+                (N'@ExpertMode',              N'bit',      N'0 = Executive Dashboard + Recommendations only (management-friendly, show this to leadership). 1 = All result sets including technical detail (DBA deep-dive). Inspired by sp_Blitz @ExpertMode.',
+                    N'0, 1', N'0'),
+                (N'@SkipHistory',             N'bit',      N'1 = Skip reading/writing dbo.StatUpdateDiagHistory persistent table. Useful for transient installs, testing, or when you do not want permanent tables created.',
+                    N'0, 1', N'0'),
                 (N'@Help',                     N'bit',      N'Show this help output and return immediately',
                     N'0, 1', N'0'),
                 (N'@Debug',                    N'bit',      N'Verbose diagnostic output — shows intermediate temp table counts and timing',
@@ -153,7 +165,9 @@ BEGIN
                 (N'I2', N'INFO',     N'PARAMETER_HISTORY',     N'How parameters changed across runs'),
                 (N'I3', N'INFO',     N'TOP_TABLES',            N'Tables consuming the most maintenance time'),
                 (N'I4', N'INFO',     N'UNUSED_FEATURES',       N'Available features not being used'),
-                (N'I5', N'INFO',     N'VERSION_HISTORY',       N'sp_StatUpdate versions used across analysis window — NOTE: not yet implemented (see GitHub issue)')  /* BUG-06: I5 documented but never implemented */
+                (N'I5', N'INFO',     N'VERSION_HISTORY',       N'sp_StatUpdate versions used across analysis window — NOTE: not yet implemented (see GitHub issue)'),  /* BUG-06: I5 documented but never implemented */
+                (N'I6', N'INFO',     N'QS_EFFICACY',           N'Query Store prioritization effectiveness — what % of high-workload stats get serviced early'),
+                (N'I7', N'INFO',     N'QS_INFLECTION',         N'Before/after comparison when sort order changed to Query Store-based prioritization')
         ) AS v (check_id, severity, category, description);
 
         /* Result set 3: Result set order */
@@ -165,15 +179,20 @@ BEGIN
         FROM
         (
             VALUES
-                (1, N'Recommendations',            N'Severity-categorized findings with parameter suggestions'),
-                (2, N'Run Health Summary',          N'Aggregate metrics across all runs'),
-                (3, N'Run Detail',                  N'Per-run metrics'),
-                (4, N'Top Tables',                  N'Top N tables by total update duration'),
-                (5, N'Failing Statistics',           N'Stats with errors, grouped'),
-                (6, N'Long-Running Statistics',      N'Stats exceeding threshold'),
-                (7, N'Parameter Change History',     N'Parameter values across runs'),
-                (8, N'Obfuscation Map (conditional)', N'Only when @Obfuscate=1'),
-                (0, N'Unified Result Set',            N'When @SingleResultSet=1: one result set with ResultSetID, ResultSetName, RowNum, RowData (JSON). Replaces result sets 1-8.')
+                (1, N'Executive Dashboard',        N'ALWAYS returned first. Letter-graded categories (A-F) with plain English headlines for management. One row per category: Overall, Completion, Reliability, Speed, Workload Coverage. Inspired by sp_Blitz priority system.'),
+                (2, N'Recommendations',            N'Severity-categorized findings with parameter suggestions. Returned with @ExpertMode=0 (management view).'),
+                (3, N'Run Health Summary',          N'Aggregate metrics across all runs. Requires @ExpertMode=1.'),
+                (4, N'Run Detail',                  N'Per-run metrics. Requires @ExpertMode=1.'),
+                (5, N'Top Tables',                  N'Top N tables by total update duration. Requires @ExpertMode=1.'),
+                (6, N'Failing Statistics',           N'Stats with errors, grouped. Requires @ExpertMode=1.'),
+                (7, N'Long-Running Statistics',      N'Stats exceeding threshold. Requires @ExpertMode=1.'),
+                (8, N'Parameter Change History',     N'Parameter values across runs. Requires @ExpertMode=1.'),
+                (9, N'Obfuscation Map (conditional)', N'Only when @Obfuscate=1. Requires @ExpertMode=1.'),
+                (10, N'Efficacy Trend (Weekly)',       N'Weekly QS efficacy metrics: high-workload coverage, completion %, throughput trend. Requires @ExpertMode=1.'),
+                (11, N'Efficacy Detail (Per-Run)',    N'Per-run QS efficacy for close-up window (@EfficacyDetailDays). Requires @ExpertMode=1.'),
+                (12, N'High-CPU Stat Positions',      N'Top-workload stats from most recent run with their processing positions. Requires @ExpertMode=1.'),
+                (13, N'QS Performance Correlation',   N'Per-stat Query Store CPU trend across runs. Shows whether queries get faster after stat updates. Leadership-friendly: "Are queries actually improving?" Requires @ExpertMode=1.'),
+                (0, N'Unified Result Set',            N'When @SingleResultSet=1: one result set with ResultSetID, ResultSetName, RowNum, RowData (JSON). Replaces all result sets.')
         ) AS v (rs_num, rs_name, rs_desc);
 
         /* Result set 4: Examples */
@@ -219,6 +238,11 @@ BEGIN
                     N'Secure Obfuscated Export',
                     N'Save map on prod, export only obfuscated results for external analysis',
                     N'EXECUTE dbo.sp_StatUpdate_Diag @Obfuscate = 1, @SingleResultSet = 1, @ObfuscationSeed = N''MySecretSeed'', @ObfuscationMapTable = N''dbo.DiagObfuscationMap'';'
+                ),
+                (
+                    N'QS Efficacy Report',
+                    N'Show 100-day QS prioritization effectiveness with 14-day close-up',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @EfficacyDaysBack = 100, @EfficacyDetailDays = 14;'
                 ),
                 (
                     N'Multi-Server (PowerShell)',
@@ -290,6 +314,16 @@ BEGIN
     IF @TopN < 1 OR @TopN > 1000
         SET @errors = @errors + N'@TopN must be between 1 and 1000. ';
 
+    /* Default @EfficacyDaysBack from @DaysBack; @EfficacyDetailDays from min(14, efficacy window) */
+    SET @EfficacyDaysBack = ISNULL(@EfficacyDaysBack, @DaysBack);
+    SET @EfficacyDetailDays = ISNULL(@EfficacyDetailDays, CASE WHEN @EfficacyDaysBack < 14 THEN @EfficacyDaysBack ELSE 14 END);
+
+    IF @EfficacyDaysBack < 1 OR @EfficacyDaysBack > 3650
+        SET @errors = @errors + N'@EfficacyDaysBack must be between 1 and 3650. ';
+
+    IF @EfficacyDetailDays < 1 OR @EfficacyDetailDays > @EfficacyDaysBack
+        SET @errors = @errors + N'@EfficacyDetailDays must be between 1 and @EfficacyDaysBack. ';
+
     IF @Obfuscate = 0 AND @ObfuscationMapTable IS NOT NULL
         RAISERROR(N'WARNING: @ObfuscationMapTable is ignored when @Obfuscate = 0.', 10, 1) WITH NOWAIT;
 
@@ -333,17 +367,119 @@ BEGIN
         RETURN;
     END;
 
+    DECLARE @expert_int integer = CONVERT(integer, @ExpertMode);
     RAISERROR(N'sp_StatUpdate_Diag v%s', 10, 1, @procedure_version) WITH NOWAIT;
     RAISERROR(N'CommandLog: %s', 10, 1, @commandlog_ref) WITH NOWAIT;
     RAISERROR(N'Analysis window: %i days', 10, 1, @DaysBack) WITH NOWAIT;
     DECLARE @obfuscate_int integer = CONVERT(integer, @Obfuscate);
     RAISERROR(N'Obfuscate: %i', 10, 1, @obfuscate_int) WITH NOWAIT;
+    RAISERROR(N'ExpertMode: %i', 10, 1, @expert_int) WITH NOWAIT;
 
     /* BUG-07: orphan threshold now a named constant (was hardcoded 60 minutes).
        Default 2880 = 48 hours, matching sp_StatUpdate @OrphanedRunThresholdHours default.
        A run still in progress (no END record) is only classified as orphaned once this
        threshold has elapsed; runs started more recently are excluded to avoid false C1 alerts. */
     DECLARE @OrphanedRunThresholdMinutes integer = 2880;
+
+    /*
+    ============================================================================
+    PERSISTENT HISTORY TABLE (incremental — skip XML re-parsing on repeat runs)
+
+    Inspired by sp_Blitz / sp_PressureDetector baseline tables. The first run
+    parses all CommandLog XML. Subsequent runs only parse new rows (ID > max
+    previously cached), then merge into the persistent table. This cuts repeat
+    execution time dramatically on servers with large CommandLog tables.
+
+    Table lives in the same database as CommandLog (so it travels with backups).
+    Opt out with @SkipHistory = 1 for ephemeral/test scenarios.
+    ============================================================================
+    */
+    DECLARE
+        @history_ref nvarchar(500),
+        @history_exists bit = 0,
+        @history_max_id integer = 0,
+        @history_max_run_start datetime2(3) = NULL;
+
+    SET @history_ref = QUOTENAME(@commandlog_db) + N'.dbo.StatUpdateDiagHistory';
+
+    IF @SkipHistory = 0
+    BEGIN
+        /* Check if history table exists */
+        SET @sql = N'
+            IF OBJECT_ID(N''' + REPLACE(@history_ref, N'''', N'''''') + N''', N''U'') IS NOT NULL
+                SET @exists = 1;
+            ELSE
+                SET @exists = 0;
+        ';
+
+        EXECUTE sys.sp_executesql
+            @sql,
+            N'@exists bit OUTPUT',
+            @exists = @history_exists OUTPUT;
+
+        /* Auto-create if missing */
+        IF @history_exists = 0
+        BEGIN
+            SET @sql = N'
+                CREATE TABLE ' + @history_ref + N'
+                (
+                    SnapshotID      integer         IDENTITY(1,1) NOT NULL,
+                    CapturedAt      datetime2(3)    NOT NULL DEFAULT SYSDATETIME(),
+                    MaxCommandLogID integer         NOT NULL,
+                    RunLabel        nvarchar(100)   NOT NULL,
+                    StartTime       datetime2(3)    NOT NULL,
+                    HealthScore     integer         NULL,
+                    OverallGrade    char(1)         NULL,
+                    CompletionPct   decimal(5,1)    NULL,
+                    AvgSecPerStat   decimal(10,1)   NULL,
+                    WorkloadCoveragePct decimal(5,1) NULL,
+                    HighCpuFirstQuartilePct decimal(5,1) NULL,
+                    MinutesToHighCpuComplete decimal(10,1) NULL,
+                    StatsFound      integer         NULL,
+                    StatsProcessed  integer         NULL,
+                    StatsFailed     integer         NULL,
+                    StopReason      nvarchar(50)    NULL,
+                    DurationSeconds integer         NULL,
+                    IsQSRun         bit             NOT NULL DEFAULT 0,
+                    DiagVersion     varchar(20)     NOT NULL,
+
+                    CONSTRAINT PK_StatUpdateDiagHistory PRIMARY KEY CLUSTERED (SnapshotID),
+                    INDEX IX_StatUpdateDiagHistory_RunLabel UNIQUE NONCLUSTERED (RunLabel)
+                );
+            ';
+
+            EXECUTE sys.sp_executesql @sql;
+            RAISERROR(N'  Created persistent history table: %s', 10, 1, @history_ref) WITH NOWAIT;
+            SET @history_exists = 1;
+        END
+        ELSE
+        BEGIN
+            /* Get watermark: max CommandLog ID already processed */
+            SET @sql = N'
+                SELECT @max_id = ISNULL(MAX(MaxCommandLogID), 0),
+                       @max_start = MAX(StartTime)
+                FROM ' + @history_ref + N';
+            ';
+
+            EXECUTE sys.sp_executesql
+                @sql,
+                N'@max_id integer OUTPUT, @max_start datetime2(3) OUTPUT',
+                @max_id = @history_max_id OUTPUT,
+                @max_start = @history_max_run_start OUTPUT;
+
+            DECLARE @history_row_count integer;
+            SET @sql = N'SELECT @cnt = COUNT_BIG(*) FROM ' + @history_ref + N';';
+            EXECUTE sys.sp_executesql @sql, N'@cnt integer OUTPUT', @cnt = @history_row_count OUTPUT;
+
+            RAISERROR(N'  History table: %s (%i snapshots, watermark ID %i)', 10, 1,
+                @history_ref, @history_row_count, @history_max_id) WITH NOWAIT;
+        END;
+    END
+    ELSE
+    BEGIN
+        RAISERROR(N'  History: skipped (@SkipHistory = 1)', 10, 1) WITH NOWAIT;
+    END;
+
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     /*
@@ -420,6 +556,7 @@ BEGIN
         HasFilter bit NULL,
         FilteredDriftRatio float NULL,
         IsIncremental bit NULL,
+        ProcessingPosition integer NULL,
 
         CONSTRAINT PK_stat_updates PRIMARY KEY NONCLUSTERED (ID)
     );
@@ -445,6 +582,17 @@ BEGIN
         ObjectType nvarchar(20) NOT NULL,
         OriginalName nvarchar(256) NOT NULL,
         ObfuscatedName nvarchar(50) NOT NULL
+    );
+
+    /* Executive Dashboard (always populated, always returned as RS 1) */
+    CREATE TABLE #executive_dashboard
+    (
+        Category        nvarchar(30)    NOT NULL,
+        Grade           char(1)         NOT NULL,
+        Score           integer         NOT NULL,
+        Headline        nvarchar(500)   NOT NULL,
+        Detail          nvarchar(2000)  NULL,
+        SortOrder       integer         NOT NULL
     );
 
     /* Single result set accumulator (populated only when @SingleResultSet = 1) */
@@ -544,7 +692,8 @@ BEGIN
         ModificationCounter, RowCount_, PageCount, SizeMB, DaysStale,
         QualifyReason, HasNorecompute, IsHeap, AutoCreated,
         QSPlanCount, QSTotalExecutions, QSTotalCpuMs,
-        EffectiveSamplePct, SampleSource, HasFilter, FilteredDriftRatio, IsIncremental
+        EffectiveSamplePct, SampleSource, HasFilter, FilteredDriftRatio, IsIncremental,
+        ProcessingPosition
     )
     SELECT
         id                  = c.ID,
@@ -574,7 +723,8 @@ BEGIN
         sample_source       = c.ExtendedInfo.value(N''(ExtendedInfo/SampleSource)[1]'', N''nvarchar(50)''),
         has_filter          = c.ExtendedInfo.value(N''(ExtendedInfo/HasFilter)[1]'', N''bit''),
         filtered_drift      = c.ExtendedInfo.value(N''(ExtendedInfo/FilteredDriftRatio)[1]'', N''float''),
-        is_incremental      = c.ExtendedInfo.value(N''(ExtendedInfo/IsIncremental)[1]'', N''bit'')
+        is_incremental      = c.ExtendedInfo.value(N''(ExtendedInfo/IsIncremental)[1]'', N''bit''),
+        processing_position = c.ExtendedInfo.value(N''(ExtendedInfo/ProcessingPosition)[1]'', N''int'')
     FROM ' + @commandlog_ref + N' AS c
     WHERE c.CommandType = N''UPDATE_STATISTICS''
     AND   c.StartTime >= DATEADD(DAY, -@days_back, GETDATE());
@@ -614,20 +764,47 @@ BEGIN
         /* Return result sets in expected format */
         IF @SingleResultSet = 0
         BEGIN
+            /* RS 1: Executive Dashboard (empty state) */
+            SELECT Category = N'OVERALL', Grade = 'F', Score = 0, Headline = N'No sp_StatUpdate data found in CommandLog.', Detail = N'Run sp_StatUpdate first, then re-run this diagnostic.' WHERE 1 = 1
+            UNION ALL
+            SELECT N'COMPLETION', 'F', 0, N'No data to evaluate.', NULL WHERE 1 = 0
+            UNION ALL
+            SELECT N'RELIABILITY', 'F', 0, N'No data to evaluate.', NULL WHERE 1 = 0
+            UNION ALL
+            SELECT N'SPEED', 'F', 0, N'No data to evaluate.', NULL WHERE 1 = 0
+            UNION ALL
+            SELECT N'WORKLOAD FOCUS', 'F', 0, N'No data to evaluate.', NULL WHERE 1 = 0;
+            /* RS 2: Recommendations */
             SELECT Severity, Category, Finding, Evidence, Recommendation, ExampleCall FROM #recommendations ORDER BY SortPriority, FindingID;
-            SELECT [Status] = N'NO_DATA', TotalRuns = 0, CompletedRuns = 0, CompletionPct = 0, AvgDurationSec = 0, Trend = N'N/A';
-            SELECT * FROM #runs WHERE 1 = 0;
-            SELECT * FROM #stat_updates WHERE 1 = 0;
-            SELECT * FROM #stat_updates WHERE 1 = 0;
-            SELECT * FROM #stat_updates WHERE 1 = 0;
-            SELECT * FROM #runs WHERE 1 = 0;
-            IF @Obfuscate = 1 SELECT * FROM #obfuscation_map;
+            IF @ExpertMode = 1
+            BEGIN
+                /* RS 3-12 empty schemas for ExpertMode */
+                SELECT [Status] = N'NO_DATA', TotalRuns = 0, CompletedRuns = 0, CompletionPct = 0, AvgDurationSec = 0, HealthScore = 0, Trend = N'N/A';
+                SELECT * FROM #runs WHERE 1 = 0;
+                SELECT * FROM #stat_updates WHERE 1 = 0;
+                SELECT * FROM #stat_updates WHERE 1 = 0;
+                SELECT * FROM #stat_updates WHERE 1 = 0;
+                SELECT * FROM #runs WHERE 1 = 0;
+                IF @Obfuscate = 1 SELECT * FROM #obfuscation_map;
+                /* RS 10-12 empty schemas */
+                SELECT WeekStart = CONVERT(date, NULL), WeekLabel = CONVERT(nvarchar(5), NULL), RunCount = CONVERT(bigint, NULL), SortStrategy = CONVERT(nvarchar(20), NULL), HighCpuFirstQuartilePct = CONVERT(decimal(5,1), NULL), AvgMinutesToHighCpu = CONVERT(decimal(10,1), NULL), WorkloadCoveragePct = CONVERT(decimal(5,1), NULL), CompletionPct = CONVERT(decimal(5,1), NULL), AvgSecPerStat = CONVERT(decimal(10,1), NULL), TrendDirection = CONVERT(nvarchar(20), NULL) WHERE 1 = 0;
+                SELECT RunLabel = CONVERT(nvarchar(100), NULL), StartTime = CONVERT(datetime2(3), NULL), SortStrategy = CONVERT(nvarchar(20), NULL), StatsFound = CONVERT(int, NULL), StatsProcessed = CONVERT(int, NULL), CompletionPct = CONVERT(decimal(5,1), NULL), HighCpuInFirstQuartilePct = CONVERT(decimal(5,1), NULL), MinutesToHighCpuComplete = CONVERT(decimal(10,1), NULL), WorkloadCoveragePct = CONVERT(decimal(5,1), NULL), AvgSecPerStat = CONVERT(decimal(10,1), NULL), StopReason = CONVERT(nvarchar(50), NULL), DeltaVsPrior = CONVERT(nvarchar(100), NULL) WHERE 1 = 0;
+                SELECT WorkloadRank = CONVERT(bigint, NULL), DatabaseName = CONVERT(sysname, NULL), SchemaName = CONVERT(sysname, NULL), TableName = CONVERT(sysname, NULL), StatisticsName = CONVERT(sysname, NULL), ProcessingPosition = CONVERT(int, NULL), TotalQueryCpuMs = CONVERT(bigint, NULL), TotalExecutions = CONVERT(bigint, NULL), PlanCount = CONVERT(int, NULL), UpdateDurationMs = CONVERT(int, NULL), QualifyReason = CONVERT(nvarchar(100), NULL) WHERE 1 = 0;
+                /* RS 13 empty schema */
+                SELECT DatabaseName = CONVERT(sysname, NULL), SchemaName = CONVERT(sysname, NULL), TableName = CONVERT(sysname, NULL), StatisticsName = CONVERT(sysname, NULL), Appearances = CONVERT(bigint, NULL), FirstRunDate = CONVERT(datetime2(3), NULL), LastRunDate = CONVERT(datetime2(3), NULL), FirstCpuMs = CONVERT(bigint, NULL), LastCpuMs = CONVERT(bigint, NULL), CpuChangePct = CONVERT(decimal(10,1), NULL), CpuTrend = CONVERT(nvarchar(20), NULL), FirstExecs = CONVERT(bigint, NULL), LastExecs = CONVERT(bigint, NULL), FirstPlans = CONVERT(int, NULL), LastPlans = CONVERT(int, NULL), PlanTrend = CONVERT(nvarchar(50), NULL) WHERE 1 = 0;
+            END;
         END
         ELSE
         BEGIN
-            /* Single result set mode: return NO_DATA recommendation row */
+            /* Single result set mode: return Executive Dashboard + NO_DATA recommendation row */
             SELECT
                 ResultSetID   = 1,
+                ResultSetName = N'Executive Dashboard',
+                RowNum        = 1,
+                RowData       = (SELECT Category = N'OVERALL', Grade = 'F', Score = 0, Headline = N'No sp_StatUpdate data found in CommandLog.', Detail = N'Run sp_StatUpdate first.' FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)
+            UNION ALL
+            SELECT
+                ResultSetID   = 2,
                 ResultSetName = N'Recommendations',
                 RowNum        = 1,
                 RowData       = (
@@ -1223,13 +1400,672 @@ BEGIN
         END;
     END;
 
+    /*
+    ============================================================================
+    QS EFFICACY ANALYSIS: Build #qs_efficacy temp table
+    ============================================================================
+    */
+    RAISERROR(N'Computing QS efficacy metrics...', 10, 1) WITH NOWAIT;
+
+    CREATE TABLE #qs_efficacy
+    (
+        RunLabel nvarchar(100) NOT NULL,
+        StartTime datetime2(3) NOT NULL,
+        SortOrder nvarchar(50) NULL,
+        QueryStorePriority nvarchar(1) NULL,
+        StatsProcessed integer NULL,
+        StatsFound integer NULL,
+        DurationSeconds integer NULL,
+        StopReason nvarchar(50) NULL,
+        IsQSRun bit NOT NULL DEFAULT 0,
+        /* Computed efficacy metrics */
+        HighCpuInFirstQuartilePct decimal(5, 1) NULL,
+        MinutesToHighCpuComplete decimal(10, 1) NULL,
+        WorkloadCoveragePct decimal(5, 1) NULL,
+        CompletionPct decimal(5, 1) NULL,
+        AvgSecPerStat decimal(10, 1) NULL,
+        AvgPositionTop10 decimal(10, 1) NULL,
+
+        CONSTRAINT PK_qs_efficacy PRIMARY KEY NONCLUSTERED (RunLabel)
+    );
+
+    /* Populate #qs_efficacy for all non-killed runs that have stat updates */
+    ;WITH stat_positions AS
+    (
+        /* Determine each stat's position within its run (use ProcessingPosition if available, else order by ID) */
+        SELECT
+            su.RunLabel,
+            su.ID,
+            su.DatabaseName,
+            su.SchemaName,
+            su.ObjectName,
+            su.StatisticsName,
+            su.QSTotalCpuMs,
+            su.QSTotalExecutions,
+            su.QSPlanCount,
+            su.DurationMs,
+            su.QualifyReason,
+            processing_pos  = ISNULL(su.ProcessingPosition, ROW_NUMBER() OVER (PARTITION BY su.RunLabel ORDER BY su.ID)),
+            cpu_rank        = ROW_NUMBER() OVER (PARTITION BY su.RunLabel ORDER BY ISNULL(su.QSTotalCpuMs, 0) DESC, su.ID),
+            su.StartTime AS StatStartTime,
+            su.EndTime AS StatEndTime
+        FROM #stat_updates AS su
+        WHERE su.ErrorNumber = 0
+        OR    su.ErrorNumber IS NULL
+    ),
+    run_metrics AS
+    (
+        SELECT
+            sp.RunLabel,
+            /* Count of top-10 CPU stats that landed in the first quartile of processing */
+            high_cpu_first_q = SUM(
+                CASE
+                    WHEN sp.cpu_rank <= 10
+                    AND  r.StatsFound > 0
+                    AND  sp.processing_pos <= CEILING(r.StatsFound * 0.25)
+                    THEN 1
+                    ELSE 0
+                END
+            ),
+            high_cpu_total = SUM(CASE WHEN sp.cpu_rank <= 10 THEN 1 ELSE 0 END),
+            /* Minutes from run start until all top-10 CPU stats are processed */
+            max_top10_end = MAX(CASE WHEN sp.cpu_rank <= 10 THEN sp.StatEndTime END),
+            /* Total CPU ms across all stats in the run (workload denominator) */
+            total_cpu_ms = SUM(ISNULL(sp.QSTotalCpuMs, 0)),
+            /* CPU ms of stats that were actually processed */
+            processed_cpu_ms = SUM(ISNULL(sp.QSTotalCpuMs, 0)),
+            /* Average position of top-10 CPU stats */
+            avg_pos_top10 = AVG(CASE WHEN sp.cpu_rank <= 10 THEN CONVERT(decimal(10, 1), sp.processing_pos) END),
+            stat_count = COUNT_BIG(*)
+        FROM stat_positions AS sp
+        INNER JOIN #runs AS r
+            ON r.RunLabel = sp.RunLabel
+        GROUP BY sp.RunLabel
+    )
+    INSERT INTO #qs_efficacy
+    (
+        RunLabel, StartTime, SortOrder, QueryStorePriority,
+        StatsProcessed, StatsFound, DurationSeconds, StopReason, IsQSRun,
+        HighCpuInFirstQuartilePct, MinutesToHighCpuComplete,
+        WorkloadCoveragePct, CompletionPct, AvgSecPerStat, AvgPositionTop10
+    )
+    SELECT
+        r.RunLabel,
+        r.StartTime,
+        r.SortOrder,
+        r.QueryStorePriority,
+        r.StatsProcessed,
+        r.StatsFound,
+        r.DurationSeconds,
+        r.StopReason,
+        is_qs_run       = CASE
+                              WHEN r.QueryStorePriority = N'Y'
+                              OR   r.SortOrder LIKE N'%QUERY_STORE%'
+                              THEN 1
+                              ELSE 0
+                          END,
+        high_cpu_q1_pct = CASE
+                              WHEN rm.high_cpu_total > 0
+                              THEN CONVERT(decimal(5, 1), rm.high_cpu_first_q * 100.0 / rm.high_cpu_total)
+                              ELSE NULL
+                          END,
+        min_to_high_cpu = CASE
+                              WHEN rm.max_top10_end IS NOT NULL
+                              THEN CONVERT(decimal(10, 1), DATEDIFF(SECOND, r.StartTime, rm.max_top10_end) / 60.0)
+                              ELSE NULL
+                          END,
+        workload_pct    = CASE
+                              WHEN rm.total_cpu_ms > 0
+                              THEN CONVERT(decimal(5, 1), rm.processed_cpu_ms * 100.0 / rm.total_cpu_ms)
+                              ELSE NULL
+                          END,
+        completion_pct  = CASE
+                              WHEN r.StatsFound > 0
+                              THEN CONVERT(decimal(5, 1), ISNULL(r.StatsProcessed, 0) * 100.0 / r.StatsFound)
+                              ELSE NULL
+                          END,
+        avg_sec_stat    = CASE
+                              WHEN r.StatsProcessed > 0
+                              THEN CONVERT(decimal(10, 1), r.DurationSeconds * 1.0 / r.StatsProcessed)
+                              ELSE NULL
+                          END,
+        rm.avg_pos_top10
+    FROM #runs AS r
+    LEFT JOIN run_metrics AS rm
+        ON rm.RunLabel = r.RunLabel
+    WHERE r.IsKilled = 0;
+
+    DECLARE @qs_efficacy_count integer = (SELECT COUNT_BIG(*) FROM #qs_efficacy);
+    DECLARE @qs_run_count integer = (SELECT COUNT_BIG(*) FROM #qs_efficacy WHERE IsQSRun = 1);
+    RAISERROR(N'  Efficacy rows: %i (QS runs: %i)', 10, 1, @qs_efficacy_count, @qs_run_count) WITH NOWAIT;
+
+    /* ======================================================================
+       I6: QS_EFFICACY - Query Store prioritization effectiveness
+       ====================================================================== */
+    IF @qs_run_count > 0
+    BEGIN
+        DECLARE
+            @i6_avg_q1_pct decimal(5, 1),
+            @i6_avg_minutes decimal(10, 1),
+            @i6_avg_workload decimal(5, 1),
+            @i6_top10_in_q1 integer,
+            @i6_run_count integer;
+
+        SELECT
+            @i6_avg_q1_pct    = AVG(e.HighCpuInFirstQuartilePct),
+            @i6_avg_minutes   = AVG(e.MinutesToHighCpuComplete),
+            @i6_avg_workload  = AVG(e.WorkloadCoveragePct),
+            @i6_top10_in_q1   = AVG(CONVERT(integer, e.HighCpuInFirstQuartilePct / 10.0)),
+            @i6_run_count     = COUNT_BIG(*)
+        FROM #qs_efficacy AS e
+        WHERE e.IsQSRun = 1
+        AND   e.HighCpuInFirstQuartilePct IS NOT NULL;
+
+        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+        VALUES
+        (
+            N'INFO',
+            N'QS_EFFICACY',
+            N'Query Store prioritization active: '
+                + ISNULL(CONVERT(nvarchar(10), CONVERT(integer, @i6_avg_q1_pct / 10.0)), N'?') + N' of 10 highest-workload statistics updated in the first '
+                + ISNULL(CONVERT(nvarchar(10), CONVERT(integer, @i6_avg_minutes)), N'?') + N' minutes across '
+                + CONVERT(nvarchar(10), @i6_run_count) + N' recent run(s). Workload coverage: '
+                + ISNULL(CONVERT(nvarchar(10), @i6_avg_workload), N'?') + N'% of measured CPU.',
+            N'Avg high-CPU-in-first-quartile: ' + ISNULL(CONVERT(nvarchar(10), @i6_avg_q1_pct), N'N/A') + N'%. '
+                + N'Avg minutes to complete top-10: ' + ISNULL(CONVERT(nvarchar(10), @i6_avg_minutes), N'N/A') + N'. '
+                + N'Avg workload coverage: ' + ISNULL(CONVERT(nvarchar(10), @i6_avg_workload), N'N/A') + N'%. '
+                + N'Across ' + CONVERT(nvarchar(10), @i6_run_count) + N' QS-priority run(s).',
+            N'High first-quartile placement means the most impactful statistics are being refreshed early in the maintenance window. '
+                + N'Monitor this over time to confirm QS prioritization continues to deliver value.',
+            N'EXECUTE dbo.sp_StatUpdate_Diag @EfficacyDaysBack = 100;',
+            70
+        );
+
+        RAISERROR(N'  [INFO] I6: QS efficacy computed', 10, 1) WITH NOWAIT;
+    END;
+
+    /* ======================================================================
+       I7: QS_INFLECTION - Before/after change detection
+       ====================================================================== */
+    DECLARE
+        @pre_qs_count integer = 0,
+        @post_qs_count integer = 0,
+        @inflection_date datetime2(3);
+
+    /* Find inflection point: first QS run that follows a non-QS run */
+    SELECT TOP (1)
+        @inflection_date = e.StartTime
+    FROM #qs_efficacy AS e
+    WHERE e.IsQSRun = 1
+    AND   EXISTS (
+        SELECT 1 FROM #qs_efficacy AS e2
+        WHERE e2.IsQSRun = 0
+        AND   e2.StartTime < e.StartTime
+    )
+    ORDER BY e.StartTime;
+
+    IF @inflection_date IS NOT NULL
+    BEGIN
+        SELECT
+            @pre_qs_count = COUNT_BIG(*)
+        FROM #qs_efficacy
+        WHERE StartTime < @inflection_date
+        AND   IsQSRun = 0;
+
+        SELECT
+            @post_qs_count = COUNT_BIG(*)
+        FROM #qs_efficacy
+        WHERE StartTime >= @inflection_date
+        AND   IsQSRun = 1;
+    END;
+
+    IF @inflection_date IS NOT NULL AND @pre_qs_count >= 3 AND @post_qs_count >= 3
+    BEGIN
+        DECLARE
+            @pre_q1_pct decimal(5, 1),
+            @post_q1_pct decimal(5, 1),
+            @pre_completion decimal(5, 1),
+            @post_completion decimal(5, 1),
+            @pre_minutes decimal(10, 1),
+            @post_minutes decimal(10, 1);
+
+        SELECT
+            @pre_q1_pct     = AVG(e.HighCpuInFirstQuartilePct),
+            @pre_completion = AVG(e.CompletionPct),
+            @pre_minutes    = AVG(e.MinutesToHighCpuComplete)
+        FROM #qs_efficacy AS e
+        WHERE e.StartTime < @inflection_date
+        AND   e.IsQSRun = 0;
+
+        SELECT
+            @post_q1_pct     = AVG(e.HighCpuInFirstQuartilePct),
+            @post_completion = AVG(e.CompletionPct),
+            @post_minutes    = AVG(e.MinutesToHighCpuComplete)
+        FROM #qs_efficacy AS e
+        WHERE e.StartTime >= @inflection_date
+        AND   e.IsQSRun = 1;
+
+        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+        VALUES
+        (
+            N'INFO',
+            N'QS_INFLECTION',
+            N'Configuration change detected ('
+                + CONVERT(nvarchar(10), @inflection_date, 120) + N'): High-workload stats moved from '
+                + CASE WHEN ISNULL(@pre_q1_pct, 0) < 50 THEN N'bottom-half' ELSE N'mid-range' END
+                + N' to first-quartile processing.',
+            N'Before (' + CONVERT(nvarchar(10), @pre_qs_count) + N' runs): '
+                + ISNULL(CONVERT(nvarchar(10), CONVERT(integer, @pre_q1_pct / 10.0)), N'?') + N'/10 critical stats in first quartile, '
+                + ISNULL(CONVERT(nvarchar(10), CONVERT(integer, @pre_completion)), N'?') + N'% completion, '
+                + ISNULL(CONVERT(nvarchar(10), CONVERT(integer, @pre_minutes)), N'?') + N' min to critical. '
+                + N'After (' + CONVERT(nvarchar(10), @post_qs_count) + N' runs): '
+                + ISNULL(CONVERT(nvarchar(10), CONVERT(integer, @post_q1_pct / 10.0)), N'?') + N'/10 critical stats in first quartile, '
+                + ISNULL(CONVERT(nvarchar(10), CONVERT(integer, @post_completion)), N'?') + N'% completion, '
+                + ISNULL(CONVERT(nvarchar(10), CONVERT(integer, @post_minutes)), N'?') + N' min to critical.',
+            N'The switch to Query Store-based prioritization is delivering measurable improvement in how quickly '
+                + N'the highest-workload statistics are refreshed. Continue monitoring via @EfficacyDaysBack.',
+            N'EXECUTE dbo.sp_StatUpdate_Diag @EfficacyDaysBack = 100;',
+            71
+        );
+
+        RAISERROR(N'  [INFO] I7: QS inflection detected', 10, 1) WITH NOWAIT;
+    END;
+
+    /* ======================================================================
+       I8: QS_PERFORMANCE_TREND — Are queries actually getting faster after stat updates?
+       Track QSTotalCpuMs for stats that appear in multiple runs.
+       If CPU is trending down for repeatedly-updated stats, updates are helping.
+       ====================================================================== */
+    IF EXISTS (
+        SELECT 1 FROM #stat_updates
+        WHERE QSTotalCpuMs IS NOT NULL AND QSTotalCpuMs > 0
+    )
+    BEGIN
+        DECLARE
+            @i8_improving_count integer = 0,
+            @i8_degrading_count integer = 0,
+            @i8_stable_count integer = 0,
+            @i8_total_tracked integer = 0,
+            @i8_avg_delta_pct decimal(10, 1) = 0;
+
+        /* Compare first vs last appearance of each stat across runs */
+        ;WITH stat_appearances AS
+        (
+            SELECT
+                su.DatabaseName,
+                su.SchemaName,
+                su.ObjectName,
+                su.StatisticsName,
+                su.QSTotalCpuMs,
+                su.RunLabel,
+                r.StartTime,
+                appearance_num = ROW_NUMBER() OVER (
+                    PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+                    ORDER BY r.StartTime
+                ),
+                appearance_cnt = COUNT_BIG(*) OVER (
+                    PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+                )
+            FROM #stat_updates AS su
+            INNER JOIN #runs AS r
+                ON r.RunLabel = su.RunLabel
+            WHERE su.QSTotalCpuMs IS NOT NULL
+            AND   su.QSTotalCpuMs > 0
+            AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
+        ),
+        first_last AS
+        (
+            SELECT
+                DatabaseName, SchemaName, ObjectName, StatisticsName,
+                first_cpu = MAX(CASE WHEN appearance_num = 1 THEN QSTotalCpuMs END),
+                last_cpu  = MAX(CASE WHEN appearance_num = appearance_cnt THEN QSTotalCpuMs END),
+                appearances = MAX(appearance_cnt)
+            FROM stat_appearances
+            WHERE appearance_cnt >= 2
+            GROUP BY DatabaseName, SchemaName, ObjectName, StatisticsName
+        )
+        SELECT
+            @i8_total_tracked   = COUNT_BIG(*),
+            @i8_improving_count = SUM(CASE WHEN last_cpu < first_cpu * 0.95 THEN 1 ELSE 0 END),
+            @i8_degrading_count = SUM(CASE WHEN last_cpu > first_cpu * 1.05 THEN 1 ELSE 0 END),
+            @i8_stable_count    = SUM(CASE WHEN last_cpu BETWEEN first_cpu * 0.95 AND first_cpu * 1.05 THEN 1 ELSE 0 END),
+            @i8_avg_delta_pct   = AVG(CASE WHEN first_cpu > 0 THEN CONVERT(decimal(10, 1), (last_cpu - first_cpu) * 100.0 / first_cpu) ELSE 0 END)
+        FROM first_last;
+
+        IF @i8_total_tracked >= 2
+        BEGIN
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES
+            (
+                N'INFO',
+                N'QS_PERFORMANCE_TREND',
+                CASE
+                    WHEN @i8_improving_count > @i8_degrading_count AND @i8_avg_delta_pct < -5
+                    THEN N'Query performance improving after stat updates: '
+                        + CONVERT(nvarchar(10), @i8_improving_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
+                        + N' tracked statistics show lower query CPU after updates (avg '
+                        + CONVERT(nvarchar(10), ABS(@i8_avg_delta_pct)) + N'% reduction).'
+                    WHEN @i8_degrading_count > @i8_improving_count
+                    THEN N'Query performance not improving: '
+                        + CONVERT(nvarchar(10), @i8_degrading_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
+                        + N' tracked statistics show higher query CPU after updates (avg '
+                        + CONVERT(nvarchar(10), @i8_avg_delta_pct) + N'% change).'
+                    ELSE N'Query performance stable across updates: '
+                        + CONVERT(nvarchar(10), @i8_stable_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
+                        + N' tracked statistics show consistent query CPU. '
+                        + CONVERT(nvarchar(10), @i8_improving_count) + N' improving, '
+                        + CONVERT(nvarchar(10), @i8_degrading_count) + N' degrading.'
+                END,
+                N'Tracked ' + CONVERT(nvarchar(10), @i8_total_tracked)
+                    + N' statistics appearing in 2+ runs. Improving: ' + CONVERT(nvarchar(10), @i8_improving_count)
+                    + N'. Stable: ' + CONVERT(nvarchar(10), @i8_stable_count)
+                    + N'. Degrading: ' + CONVERT(nvarchar(10), @i8_degrading_count)
+                    + N'. Avg CPU change: ' + CONVERT(nvarchar(10), @i8_avg_delta_pct) + N'%.',
+                CASE
+                    WHEN @i8_improving_count > @i8_degrading_count
+                    THEN N'Statistics maintenance is contributing to query performance improvements. The stat updates are helping the optimizer choose better plans.'
+                    WHEN @i8_degrading_count > @i8_improving_count
+                    THEN N'Stat updates are not correlating with improved query performance. Check for plan regressions, forced plans, or parameter sensitivity.'
+                    ELSE N'Stat updates are maintaining stable query performance. This is expected for well-maintained databases.'
+                END,
+                N'EXECUTE dbo.sp_StatUpdate_Diag @ExpertMode = 1; /* RS13 shows per-stat detail */',
+                72
+            );
+
+            RAISERROR(N'  [INFO] I8: QS performance trend computed', 10, 1) WITH NOWAIT;
+        END;
+    END;
+
     RAISERROR(N'', 10, 1) WITH NOWAIT;
     RAISERROR(N'Diagnostic checks complete.', 10, 1) WITH NOWAIT;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     /*
     ============================================================================
-    RESULT SET 1: RECOMMENDATIONS
+    EXECUTIVE DASHBOARD — Letter grades (A-F) with plain English headlines.
+    Inspired by sp_Blitz priority system. Always returned as RS 1.
+
+    Grading scale (each category scored 0-100):
+      A = 90-100   B = 75-89   C = 60-74   D = 40-59   F = 0-39
+
+    Categories:
+      1. Overall        — composite of all other categories
+      2. Completion      — are all qualifying stats getting updated?
+      3. Reliability     — how often do runs complete without failures or kills?
+      4. Speed           — throughput (seconds per stat) + time to critical stats
+      5. Workload Focus  — are the highest-impact stats prioritized? (QS runs)
+    ============================================================================
+    */
+    RAISERROR(N'Computing executive dashboard...', 10, 1) WITH NOWAIT;
+
+    DECLARE
+        @score_completion integer = 0,
+        @score_reliability integer = 0,
+        @score_speed integer = 0,
+        @score_workload integer = 50,   /* default 50 if no QS runs (neutral) */
+        @score_overall integer = 0,
+        @health_score integer = 0;
+
+    /* Completion score: based on avg completion % across recent runs */
+    IF @run_count > 0
+    BEGIN
+        DECLARE @avg_completion decimal(5, 1) = (
+            SELECT AVG(CASE WHEN r.StatsFound > 0 THEN CONVERT(decimal(5, 1), ISNULL(r.StatsProcessed, 0) * 100.0 / r.StatsFound) ELSE 100.0 END)
+            FROM #runs AS r WHERE r.IsKilled = 0
+        );
+        SET @score_completion = CASE
+            WHEN @avg_completion >= 95 THEN 100
+            WHEN @avg_completion >= 85 THEN 90
+            WHEN @avg_completion >= 70 THEN 75
+            WHEN @avg_completion >= 50 THEN 60
+            WHEN @avg_completion >= 30 THEN 40
+            ELSE 20
+        END;
+    END;
+
+    /* Reliability score: penalize killed runs, failures, time limit exhaustion */
+    IF @run_count > 0
+    BEGIN
+        DECLARE
+            @kill_pct decimal(5, 1) = @killed_count * 100.0 / @run_count,
+            @fail_pct decimal(5, 1) = (SELECT COUNT_BIG(*) FROM #stat_updates WHERE ErrorNumber > 0) * 100.0 / NULLIF(@stat_update_count, 0),
+            @tl_pct decimal(5, 1) = @time_limit_runs * 100.0 / @run_count;
+
+        SET @score_reliability = 100
+            - CONVERT(integer, ISNULL(@kill_pct, 0) * 3)     /* heavy penalty for killed runs */
+            - CONVERT(integer, ISNULL(@fail_pct, 0) * 2)     /* moderate penalty for failures */
+            - CONVERT(integer, ISNULL(@tl_pct, 0) * 0.5);    /* mild penalty for time limits */
+
+        IF @score_reliability < 0 SET @score_reliability = 0;
+        IF @score_reliability > 100 SET @score_reliability = 100;
+    END;
+
+    /* Speed score: based on avg seconds per stat (lower is better) */
+    IF EXISTS (SELECT 1 FROM #runs WHERE IsKilled = 0 AND StatsProcessed > 0)
+    BEGIN
+        DECLARE @avg_sec_per_stat decimal(10, 1) = (
+            SELECT AVG(CONVERT(decimal(10, 1), r.DurationSeconds * 1.0 / r.StatsProcessed))
+            FROM #runs AS r WHERE r.IsKilled = 0 AND r.StatsProcessed > 0
+        );
+        SET @score_speed = CASE
+            WHEN @avg_sec_per_stat <= 0.5 THEN 100
+            WHEN @avg_sec_per_stat <= 1.0 THEN 90
+            WHEN @avg_sec_per_stat <= 2.0 THEN 80
+            WHEN @avg_sec_per_stat <= 5.0 THEN 70
+            WHEN @avg_sec_per_stat <= 10.0 THEN 55
+            WHEN @avg_sec_per_stat <= 30.0 THEN 40
+            ELSE 20
+        END;
+    END;
+
+    /* Workload Focus score: how well QS prioritization is working */
+    IF @qs_run_count > 0
+    BEGIN
+        DECLARE @avg_workload_cov decimal(5, 1) = (
+            SELECT AVG(e.WorkloadCoveragePct) FROM #qs_efficacy AS e WHERE e.IsQSRun = 1 AND e.WorkloadCoveragePct IS NOT NULL
+        );
+        DECLARE @avg_q1_pct_score decimal(5, 1) = (
+            SELECT AVG(e.HighCpuInFirstQuartilePct) FROM #qs_efficacy AS e WHERE e.IsQSRun = 1 AND e.HighCpuInFirstQuartilePct IS NOT NULL
+        );
+        SET @score_workload = CONVERT(integer, (ISNULL(@avg_workload_cov, 50) + ISNULL(@avg_q1_pct_score, 50)) / 2.0);
+        IF @score_workload > 100 SET @score_workload = 100;
+    END;
+
+    /* Overall = weighted average */
+    SET @score_overall = CONVERT(integer,
+        @score_completion * 0.30
+        + @score_reliability * 0.25
+        + @score_speed * 0.20
+        + @score_workload * 0.25
+    );
+    SET @health_score = @score_overall;
+
+    /* Helper function: score to letter grade */
+    DECLARE @grade_fn nvarchar(100) = N''; /* not a real fn, just inline CASE */
+
+    /* Populate dashboard rows */
+    INSERT INTO #executive_dashboard (Category, Grade, Score, Headline, Detail, SortOrder)
+    VALUES
+    (
+        N'OVERALL',
+        CASE WHEN @score_overall >= 90 THEN 'A' WHEN @score_overall >= 75 THEN 'B' WHEN @score_overall >= 60 THEN 'C' WHEN @score_overall >= 40 THEN 'D' ELSE 'F' END,
+        @score_overall,
+        CASE
+            WHEN @score_overall >= 90 THEN N'Statistics maintenance is running excellently. No immediate action needed.'
+            WHEN @score_overall >= 75 THEN N'Statistics maintenance is healthy with minor opportunities for improvement.'
+            WHEN @score_overall >= 60 THEN N'Statistics maintenance is functional but has notable gaps. Review recommendations below.'
+            WHEN @score_overall >= 40 THEN N'Statistics maintenance needs attention. Multiple issues affecting database performance.'
+            ELSE N'Statistics maintenance has critical issues requiring immediate action.'
+        END,
+        CONVERT(nvarchar(10), @run_count) + N' runs analyzed over ' + CONVERT(nvarchar(10), @DaysBack) + N' days. '
+            + CONVERT(nvarchar(10), @stat_update_count) + N' individual stat updates. '
+            + CASE WHEN @qs_run_count > 0 THEN CONVERT(nvarchar(10), @qs_run_count) + N' runs using Query Store prioritization.' ELSE N'Query Store prioritization not in use.' END,
+        1
+    ),
+    (
+        N'COMPLETION',
+        CASE WHEN @score_completion >= 90 THEN 'A' WHEN @score_completion >= 75 THEN 'B' WHEN @score_completion >= 60 THEN 'C' WHEN @score_completion >= 40 THEN 'D' ELSE 'F' END,
+        @score_completion,
+        CASE
+            WHEN @score_completion >= 90 THEN N'Nearly all qualifying statistics are being updated each run.'
+            WHEN @score_completion >= 75 THEN N'Most statistics are being updated, but some are consistently left behind.'
+            WHEN @score_completion >= 60 THEN N'A significant portion of statistics are not being reached within the maintenance window.'
+            WHEN @score_completion >= 40 THEN N'Less than half of qualifying statistics are being updated. Increase time limit or reduce scope.'
+            ELSE N'Very few statistics are being updated. Maintenance window is severely undersized for the workload.'
+        END,
+        N'Average completion rate: ' + ISNULL(CONVERT(nvarchar(10), @avg_completion), N'N/A') + N'% of qualifying statistics updated per run.',
+        2
+    ),
+    (
+        N'RELIABILITY',
+        CASE WHEN @score_reliability >= 90 THEN 'A' WHEN @score_reliability >= 75 THEN 'B' WHEN @score_reliability >= 60 THEN 'C' WHEN @score_reliability >= 40 THEN 'D' ELSE 'F' END,
+        @score_reliability,
+        CASE
+            WHEN @killed_count > 0 AND @score_reliability < 60 THEN CONVERT(nvarchar(10), @killed_count) + N' run(s) were killed before completing. Check SQL Agent job history for failures.'
+            WHEN @killed_count > 0 THEN CONVERT(nvarchar(10), @killed_count) + N' run(s) were killed, but overall reliability is acceptable.'
+            WHEN @score_reliability >= 90 THEN N'All runs completed normally without errors or kills.'
+            ELSE N'Runs are completing but experiencing errors or consistently hitting time limits.'
+        END,
+        N'Killed runs: ' + CONVERT(nvarchar(10), @killed_count)
+            + N'. Failed stat updates: ' + CONVERT(nvarchar(10), (SELECT COUNT_BIG(*) FROM #stat_updates WHERE ErrorNumber > 0))
+            + N'. Time-limited runs: ' + CONVERT(nvarchar(10), @time_limit_runs) + N'.',
+        3
+    ),
+    (
+        N'SPEED',
+        CASE WHEN @score_speed >= 90 THEN 'A' WHEN @score_speed >= 75 THEN 'B' WHEN @score_speed >= 60 THEN 'C' WHEN @score_speed >= 40 THEN 'D' ELSE 'F' END,
+        @score_speed,
+        CASE
+            WHEN @score_speed >= 90 THEN N'Statistics are being updated very quickly (' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'<1') + N' sec/stat average).'
+            WHEN @score_speed >= 75 THEN N'Update speed is good at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat average.'
+            WHEN @score_speed >= 60 THEN N'Update speed is moderate at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat. Consider parallel mode or adaptive sampling.'
+            ELSE N'Updates are slow at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat. Investigate I/O, table sizes, and sample rates.'
+        END,
+        N'Average seconds per stat update: ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'N/A')
+            + N'. Average run duration: ' + ISNULL(CONVERT(nvarchar(10), (SELECT AVG(DurationSeconds) / 60 FROM #runs WHERE IsKilled = 0)), N'N/A') + N' minutes.',
+        4
+    ),
+    (
+        N'WORKLOAD FOCUS',
+        CASE WHEN @score_workload >= 90 THEN 'A' WHEN @score_workload >= 75 THEN 'B' WHEN @score_workload >= 60 THEN 'C' WHEN @score_workload >= 40 THEN 'D' ELSE 'F' END,
+        @score_workload,
+        CASE
+            WHEN @qs_run_count = 0 THEN N'Query Store prioritization is not enabled. Statistics are updated by modification count, not workload impact.'
+            WHEN @score_workload >= 90 THEN N'Query Store prioritization is highly effective. The most performance-critical statistics are updated first.'
+            WHEN @score_workload >= 75 THEN N'Query Store prioritization is working well. Most high-impact statistics are prioritized.'
+            ELSE N'Query Store prioritization is enabled but not fully effective. Check Query Store health on target databases.'
+        END,
+        CASE
+            WHEN @qs_run_count > 0 THEN N'QS runs: ' + CONVERT(nvarchar(10), @qs_run_count)
+                + N'. Avg workload coverage: ' + ISNULL(CONVERT(nvarchar(10), @avg_workload_cov), N'N/A') + N'%'
+                + N'. High-CPU stats in first quartile: ' + ISNULL(CONVERT(nvarchar(10), @avg_q1_pct_score), N'N/A') + N'%.'
+            ELSE N'Enable with: @QueryStorePriority = N''Y'', @SortOrder = N''QUERY_STORE'''
+        END,
+        5
+    );
+
+    RAISERROR(N'  Health score: %i / 100', 10, 1, @health_score) WITH NOWAIT;
+
+    /*
+    ============================================================================
+    PERSIST TO HISTORY TABLE (incremental insert for new runs only)
+    ============================================================================
+    */
+    IF @SkipHistory = 0 AND @history_exists = 1 AND @Obfuscate = 0
+    BEGIN
+        DECLARE @new_max_id integer = (SELECT ISNULL(MAX(ID), 0) FROM #stat_updates);
+
+        SET @sql = N'
+            INSERT INTO ' + @history_ref + N'
+            (MaxCommandLogID, RunLabel, StartTime, HealthScore, OverallGrade,
+             CompletionPct, AvgSecPerStat, WorkloadCoveragePct, HighCpuFirstQuartilePct,
+             MinutesToHighCpuComplete, StatsFound, StatsProcessed, StatsFailed,
+             StopReason, DurationSeconds, IsQSRun, DiagVersion)
+            SELECT
+                @max_id,
+                e.RunLabel,
+                e.StartTime,
+                @health,
+                @grade,
+                e.CompletionPct,
+                e.AvgSecPerStat,
+                e.WorkloadCoveragePct,
+                e.HighCpuInFirstQuartilePct,
+                e.MinutesToHighCpuComplete,
+                e.StatsFound,
+                e.StatsProcessed,
+                r.StatsFailed,
+                e.StopReason,
+                e.DurationSeconds,
+                e.IsQSRun,
+                @version
+            FROM #qs_efficacy AS e
+            INNER JOIN #runs AS r ON r.RunLabel = e.RunLabel
+            WHERE NOT EXISTS (
+                SELECT 1 FROM ' + @history_ref + N' AS h
+                WHERE h.RunLabel = e.RunLabel
+            );
+        ';
+
+        DECLARE @rows_inserted integer;
+        DECLARE @overall_grade char(1) = CASE WHEN @score_overall >= 90 THEN 'A' WHEN @score_overall >= 75 THEN 'B' WHEN @score_overall >= 60 THEN 'C' WHEN @score_overall >= 40 THEN 'D' ELSE 'F' END;
+
+        EXECUTE sys.sp_executesql
+            @sql,
+            N'@max_id integer, @health integer, @grade char(1), @version varchar(20)',
+            @max_id = @new_max_id,
+            @health = @health_score,
+            @grade = @overall_grade,
+            @version = @procedure_version;
+
+        SET @rows_inserted = @@ROWCOUNT;
+
+        IF @rows_inserted > 0
+            RAISERROR(N'  Persisted %i new run(s) to history table', 10, 1, @rows_inserted) WITH NOWAIT;
+    END;
+
+    RAISERROR(N'', 10, 1) WITH NOWAIT;
+
+    /*
+    ============================================================================
+    RESULT SET 1: EXECUTIVE DASHBOARD (always returned, even with @ExpertMode=0)
+    ============================================================================
+    */
+    IF @SingleResultSet = 0
+    BEGIN
+        SELECT
+            Category,
+            Grade,
+            Score,
+            Headline,
+            Detail
+        FROM #executive_dashboard
+        ORDER BY SortOrder;
+    END
+    ELSE
+    BEGIN
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT
+            ResultSetID   = 1,
+            ResultSetName = N'Executive Dashboard',
+            RowNum        = ROW_NUMBER() OVER (ORDER BY ed.SortOrder),
+            RowData       = (
+                SELECT
+                    Category = ed2.Category,
+                    Grade    = ed2.Grade,
+                    Score    = ed2.Score,
+                    Headline = ed2.Headline,
+                    Detail   = ed2.Detail
+                FROM #executive_dashboard AS ed2
+                WHERE ed2.Category = ed.Category
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            )
+        FROM #executive_dashboard AS ed;
+    END;
+
+    /*
+    ============================================================================
+    RESULT SET 2: RECOMMENDATIONS (always returned)
     ============================================================================
     */
     IF @SingleResultSet = 0
@@ -1256,7 +2092,7 @@ BEGIN
     BEGIN
         INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
         SELECT
-            ResultSetID   = 1,
+            ResultSetID   = 2,
             ResultSetName = N'Recommendations',
             RowNum        = ROW_NUMBER() OVER (
                                 ORDER BY
@@ -1286,10 +2122,10 @@ BEGIN
 
     /*
     ============================================================================
-    RESULT SET 2: RUN HEALTH SUMMARY
+    RESULT SET 3: RUN HEALTH SUMMARY (@ExpertMode = 1 only)
     ============================================================================
     */
-    IF @SingleResultSet = 0
+    IF @ExpertMode = 1 AND @SingleResultSet = 0
     BEGIN
         SELECT
             TotalRuns = @run_count,
@@ -1317,13 +2153,17 @@ BEGIN
                     AND   r.StopReason IS NOT NULL
                     GROUP BY r.StopReason
                 ) AS sr
-            );
+            ),
+            HealthScore = @health_score,
+            QSRunCount = (SELECT COUNT_BIG(*) FROM #qs_efficacy WHERE IsQSRun = 1),
+            AvgWorkloadCoveragePct = (SELECT AVG(WorkloadCoveragePct) FROM #qs_efficacy WHERE IsQSRun = 1),
+            LatestHighCpuFirstQuartilePct = (SELECT TOP (1) HighCpuInFirstQuartilePct FROM #qs_efficacy WHERE IsQSRun = 1 ORDER BY StartTime DESC);
     END
-    ELSE
+    ELSE IF @ExpertMode = 1
     BEGIN
         INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
         SELECT
-            ResultSetID   = 2,
+            ResultSetID   = 3,
             ResultSetName = N'Run Health Summary',
             RowNum        = 1,
             RowData       = (
@@ -1344,6 +2184,7 @@ BEGIN
                     TotalStatUpdates       = @stat_update_count,
                     TotalFailedUpdates     = (SELECT COUNT_BIG(*) FROM #stat_updates WHERE ErrorNumber > 0),
                     AnalysisWindowDays     = @DaysBack,
+                    HealthScore            = @health_score,
                     StopReasonDistribution = (
                         SELECT STRING_AGG(stop_summary, N', ')
                         FROM (
@@ -1353,54 +2194,62 @@ BEGIN
                             AND   r.StopReason IS NOT NULL
                             GROUP BY r.StopReason
                         ) AS sr
-                    )
+                    ),
+                    QSRunCount = (SELECT COUNT_BIG(*) FROM #qs_efficacy WHERE IsQSRun = 1),
+                    AvgWorkloadCoveragePct = (SELECT AVG(WorkloadCoveragePct) FROM #qs_efficacy WHERE IsQSRun = 1),
+                    LatestHighCpuFirstQuartilePct = (SELECT TOP (1) HighCpuInFirstQuartilePct FROM #qs_efficacy WHERE IsQSRun = 1 ORDER BY StartTime DESC)
                 FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
             );
     END;
 
     /*
     ============================================================================
-    RESULT SET 3: RUN DETAIL
+    RESULT SET 4: RUN DETAIL (@ExpertMode = 1 only)
     ============================================================================
     */
-    IF @SingleResultSet = 0
+    IF @ExpertMode = 1 AND @SingleResultSet = 0
     BEGIN
         SELECT
-            RunLabel,
-            StartTime,
-            EndTime,
-            DurationSeconds,
-            DurationMinutes = DurationSeconds / 60,
-            StopReason,
-            StatsFound,
-            StatsProcessed,
-            StatsSucceeded,
-            StatsFailed,
-            StatsRemaining,
+            r.RunLabel,
+            r.StartTime,
+            r.EndTime,
+            r.DurationSeconds,
+            DurationMinutes = r.DurationSeconds / 60,
+            r.StopReason,
+            r.StatsFound,
+            r.StatsProcessed,
+            r.StatsSucceeded,
+            r.StatsFailed,
+            r.StatsRemaining,
             AvgSecPerStat = CASE
-                WHEN StatsProcessed > 0
-                THEN CONVERT(decimal(10, 1), DurationSeconds * 1.0 / StatsProcessed)
+                WHEN r.StatsProcessed > 0
+                THEN CONVERT(decimal(10, 1), r.DurationSeconds * 1.0 / r.StatsProcessed)
                 ELSE NULL
             END,
-            IsKilled,
-            [Version],
-            [Databases],
-            TimeLimit,
-            ModificationThreshold,
-            TieredThresholds,
-            SortOrder,
-            QueryStorePriority,
-            StatsInParallel,
-            Preset,
-            LongRunningThresholdMinutes
-        FROM #runs
-        ORDER BY StartTime DESC;
+            r.IsKilled,
+            r.[Version],
+            r.[Databases],
+            r.TimeLimit,
+            r.ModificationThreshold,
+            r.TieredThresholds,
+            r.SortOrder,
+            r.QueryStorePriority,
+            r.StatsInParallel,
+            r.Preset,
+            r.LongRunningThresholdMinutes,
+            WorkloadCoveragePct = e.WorkloadCoveragePct,
+            HighCpuInFirstQuartilePct = e.HighCpuInFirstQuartilePct,
+            MinutesToHighCpuComplete = e.MinutesToHighCpuComplete
+        FROM #runs AS r
+        LEFT JOIN #qs_efficacy AS e
+            ON e.RunLabel = r.RunLabel
+        ORDER BY r.StartTime DESC;
     END
-    ELSE
+    ELSE IF @ExpertMode = 1
     BEGIN
         INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
         SELECT
-            ResultSetID   = 3,
+            ResultSetID   = 4,
             ResultSetName = N'Run Detail',
             RowNum        = ROW_NUMBER() OVER (ORDER BY r.StartTime DESC),
             RowData       = (
@@ -1431,8 +2280,13 @@ BEGIN
                     QueryStorePriority      = r2.QueryStorePriority,
                     StatsInParallel         = r2.StatsInParallel,
                     Preset                  = r2.Preset,
-                    LongRunningThresholdMinutes = r2.LongRunningThresholdMinutes
+                    LongRunningThresholdMinutes = r2.LongRunningThresholdMinutes,
+                    WorkloadCoveragePct     = e2.WorkloadCoveragePct,
+                    HighCpuInFirstQuartilePct = e2.HighCpuInFirstQuartilePct,
+                    MinutesToHighCpuComplete = e2.MinutesToHighCpuComplete
                 FROM #runs AS r2
+                LEFT JOIN #qs_efficacy AS e2
+                    ON e2.RunLabel = r2.RunLabel
                 WHERE r2.RunLabel = r.RunLabel
                 FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
             )
@@ -1441,10 +2295,10 @@ BEGIN
 
     /*
     ============================================================================
-    RESULT SET 4: TOP TABLES BY MAINTENANCE COST
+    RESULT SET 5: TOP TABLES BY MAINTENANCE COST (@ExpertMode = 1 only)
     ============================================================================
     */
-    IF @SingleResultSet = 0
+    IF @ExpertMode = 1 AND @SingleResultSet = 0
     BEGIN
         SELECT TOP (@TopN)
             DatabaseName = su.DatabaseName,
@@ -1465,11 +2319,11 @@ BEGIN
         GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName
         ORDER BY SUM(su.DurationMs) DESC;
     END
-    ELSE
+    ELSE IF @ExpertMode = 1
     BEGIN
         INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
         SELECT TOP (@TopN)
-            ResultSetID   = 4,
+            ResultSetID   = 5,
             ResultSetName = N'Top Tables',
             RowNum        = ROW_NUMBER() OVER (ORDER BY SUM(su.DurationMs) DESC),
             RowData       = (
@@ -1502,10 +2356,10 @@ BEGIN
 
     /*
     ============================================================================
-    RESULT SET 5: FAILING STATISTICS
+    RESULT SET 6: FAILING STATISTICS (@ExpertMode = 1 only)
     ============================================================================
     */
-    IF @SingleResultSet = 0
+    IF @ExpertMode = 1 AND @SingleResultSet = 0
     BEGIN
         SELECT TOP (@TopN)
             DatabaseName = su.DatabaseName,
@@ -1531,11 +2385,11 @@ BEGIN
         GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
         ORDER BY COUNT_BIG(*) DESC;
     END
-    ELSE
+    ELSE IF @ExpertMode = 1
     BEGIN
         INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
         SELECT TOP (@TopN)
-            ResultSetID   = 5,
+            ResultSetID   = 6,
             ResultSetName = N'Failing Statistics',
             RowNum        = ROW_NUMBER() OVER (ORDER BY COUNT_BIG(*) DESC),
             RowData       = (
@@ -1575,10 +2429,10 @@ BEGIN
 
     /*
     ============================================================================
-    RESULT SET 6: LONG-RUNNING STATISTICS
+    RESULT SET 7: LONG-RUNNING STATISTICS (@ExpertMode = 1 only)
     ============================================================================
     */
-    IF @SingleResultSet = 0
+    IF @ExpertMode = 1 AND @SingleResultSet = 0
     BEGIN
         SELECT TOP (@TopN)
             DatabaseName = su.DatabaseName,
@@ -1610,11 +2464,11 @@ BEGIN
         GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
         ORDER BY AVG(su.DurationMs) DESC;
     END
-    ELSE
+    ELSE IF @ExpertMode = 1
     BEGIN
         INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
         SELECT TOP (@TopN)
-            ResultSetID   = 6,
+            ResultSetID   = 7,
             ResultSetName = N'Long-Running Statistics',
             RowNum        = ROW_NUMBER() OVER (ORDER BY AVG(su.DurationMs) DESC),
             RowData       = (
@@ -1661,10 +2515,10 @@ BEGIN
 
     /*
     ============================================================================
-    RESULT SET 7: PARAMETER CHANGE HISTORY
+    RESULT SET 8: PARAMETER CHANGE HISTORY (@ExpertMode = 1 only)
     ============================================================================
     */
-    IF @SingleResultSet = 0
+    IF @ExpertMode = 1 AND @SingleResultSet = 0
     BEGIN
         SELECT
             RunLabel,
@@ -1688,11 +2542,11 @@ BEGIN
         FROM #runs
         ORDER BY StartTime DESC;
     END
-    ELSE
+    ELSE IF @ExpertMode = 1
     BEGIN
         INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
         SELECT
-            ResultSetID   = 7,
+            ResultSetID   = 8,
             ResultSetName = N'Parameter Change History',
             RowNum        = ROW_NUMBER() OVER (ORDER BY r.StartTime DESC),
             RowData       = (
@@ -1724,10 +2578,10 @@ BEGIN
 
     /*
     ============================================================================
-    RESULT SET 8: OBFUSCATION MAP (conditional)
+    RESULT SET 9: OBFUSCATION MAP (conditional, @ExpertMode = 1 only)
     ============================================================================
     */
-    IF @Obfuscate = 1
+    IF @Obfuscate = 1 AND @ExpertMode = 1
     BEGIN
         IF @SingleResultSet = 0
         BEGIN
@@ -1744,6 +2598,456 @@ BEGIN
                Use @ObfuscationMapTable to persist the map, or use multi-result-set mode (default). */
             RAISERROR(N'Obfuscation map excluded from single result set. Use @ObfuscationMapTable to persist the map.', 10, 1) WITH NOWAIT;
         END;
+    END;
+
+    /*
+    ============================================================================
+    RESULT SET 10: EFFICACY TREND (Weekly, broad window — @ExpertMode = 1 only)
+    ============================================================================
+    */
+    IF @ExpertMode = 1 AND @SingleResultSet = 0
+    BEGIN
+        ;WITH weekly_data AS
+        (
+            SELECT
+                week_start   = DATEADD(DAY, -(DATEPART(WEEKDAY, e.StartTime) + @@DATEFIRST - 2) % 7, CONVERT(date, e.StartTime)),
+                e.RunLabel,
+                e.IsQSRun,
+                e.HighCpuInFirstQuartilePct,
+                e.MinutesToHighCpuComplete,
+                e.WorkloadCoveragePct,
+                e.CompletionPct,
+                e.AvgSecPerStat,
+                e.SortOrder
+            FROM #qs_efficacy AS e
+            WHERE e.StartTime >= DATEADD(DAY, -@EfficacyDaysBack, GETDATE())
+        ),
+        weekly_agg AS
+        (
+            SELECT
+                week_start,
+                RunCount                = COUNT_BIG(*),
+                SortStrategy            = CASE
+                                              WHEN MIN(CONVERT(int, w.IsQSRun)) = 1 THEN N'Query Store CPU'
+                                              WHEN MAX(CONVERT(int, w.IsQSRun)) = 0 THEN N'Modification Counter'
+                                              ELSE N'Mixed'
+                                          END,
+                HighCpuFirstQuartilePct  = AVG(w.HighCpuInFirstQuartilePct),
+                AvgMinutesToHighCpu     = AVG(w.MinutesToHighCpuComplete),
+                WorkloadCoveragePct     = AVG(w.WorkloadCoveragePct),
+                CompletionPct           = AVG(w.CompletionPct),
+                AvgSecPerStat           = AVG(w.AvgSecPerStat)
+            FROM weekly_data AS w
+            GROUP BY week_start
+        ),
+        weekly_ranked AS
+        (
+            SELECT
+                wa.*,
+                WeekLabel = N'W' + RIGHT(N'00' + CONVERT(nvarchar(3), ROW_NUMBER() OVER (ORDER BY wa.week_start)), 2),
+                prior_composite = LAG(
+                    ISNULL(wa.HighCpuFirstQuartilePct, 0) + ISNULL(wa.WorkloadCoveragePct, 0) + ISNULL(wa.CompletionPct, 0)
+                ) OVER (ORDER BY wa.week_start),
+                current_composite = ISNULL(wa.HighCpuFirstQuartilePct, 0) + ISNULL(wa.WorkloadCoveragePct, 0) + ISNULL(wa.CompletionPct, 0),
+                prior_run_count = LAG(wa.RunCount) OVER (ORDER BY wa.week_start)
+            FROM weekly_agg AS wa
+        )
+        SELECT
+            WeekStart               = wr.week_start,
+            WeekLabel               = wr.WeekLabel,
+            RunCount                = wr.RunCount,
+            SortStrategy            = wr.SortStrategy,
+            HighCpuFirstQuartilePct = wr.HighCpuFirstQuartilePct,
+            AvgMinutesToHighCpu     = wr.AvgMinutesToHighCpu,
+            WorkloadCoveragePct     = wr.WorkloadCoveragePct,
+            CompletionPct           = wr.CompletionPct,
+            AvgSecPerStat           = wr.AvgSecPerStat,
+            TrendDirection          = CASE
+                                          WHEN wr.prior_composite IS NULL THEN N'N/A'
+                                          WHEN wr.RunCount < 2 OR ISNULL(wr.prior_run_count, 0) < 2 THEN N'INSUFFICIENT_DATA'
+                                          WHEN wr.current_composite > wr.prior_composite * 1.02 THEN N'IMPROVING'
+                                          WHEN wr.current_composite < wr.prior_composite * 0.98 THEN N'DEGRADING'
+                                          ELSE N'STABLE'
+                                      END
+        FROM weekly_ranked AS wr
+        ORDER BY wr.week_start;
+    END
+    ELSE IF @ExpertMode = 1
+    BEGIN
+        /* Use temp table approach for RS10 SingleResultSet to avoid complex nested subquery FOR JSON */
+        DECLARE @rs9_json nvarchar(max);
+
+        ;WITH weekly_data_s AS
+        (
+            SELECT
+                week_start   = DATEADD(DAY, -(DATEPART(WEEKDAY, e.StartTime) + @@DATEFIRST - 2) % 7, CONVERT(date, e.StartTime)),
+                e.IsQSRun,
+                e.HighCpuInFirstQuartilePct,
+                e.MinutesToHighCpuComplete,
+                e.WorkloadCoveragePct,
+                e.CompletionPct,
+                e.AvgSecPerStat
+            FROM #qs_efficacy AS e
+            WHERE e.StartTime >= DATEADD(DAY, -@EfficacyDaysBack, GETDATE())
+        ),
+        weekly_agg_s AS
+        (
+            SELECT
+                week_start,
+                RunCount                = COUNT_BIG(*),
+                SortStrategy            = CASE
+                                              WHEN MIN(CONVERT(int, w.IsQSRun)) = 1 THEN N'Query Store CPU'
+                                              WHEN MAX(CONVERT(int, w.IsQSRun)) = 0 THEN N'Modification Counter'
+                                              ELSE N'Mixed'
+                                          END,
+                HighCpuFirstQuartilePct  = AVG(w.HighCpuInFirstQuartilePct),
+                AvgMinutesToHighCpu     = AVG(w.MinutesToHighCpuComplete),
+                WorkloadCoveragePct     = AVG(w.WorkloadCoveragePct),
+                CompletionPct           = AVG(w.CompletionPct),
+                AvgSecPerStat           = AVG(w.AvgSecPerStat)
+            FROM weekly_data_s AS w
+            GROUP BY week_start
+        ),
+        weekly_ranked_s AS
+        (
+            SELECT
+                wa.*,
+                WeekLabel = N'W' + RIGHT(N'00' + CONVERT(nvarchar(3), ROW_NUMBER() OVER (ORDER BY wa.week_start)), 2),
+                prior_composite = LAG(
+                    ISNULL(wa.HighCpuFirstQuartilePct, 0) + ISNULL(wa.WorkloadCoveragePct, 0) + ISNULL(wa.CompletionPct, 0)
+                ) OVER (ORDER BY wa.week_start),
+                current_composite = ISNULL(wa.HighCpuFirstQuartilePct, 0) + ISNULL(wa.WorkloadCoveragePct, 0) + ISNULL(wa.CompletionPct, 0),
+                prior_run_count = LAG(wa.RunCount) OVER (ORDER BY wa.week_start)
+            FROM weekly_agg_s AS wa
+        )
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT
+            ResultSetID   = 10,
+            ResultSetName = N'Efficacy Trend',
+            RowNum        = ROW_NUMBER() OVER (ORDER BY wr.week_start),
+            RowData       = (
+                SELECT
+                    WeekStart               = wr.week_start,
+                    WeekLabel               = wr.WeekLabel,
+                    RunCount                = wr.RunCount,
+                    SortStrategy            = wr.SortStrategy,
+                    HighCpuFirstQuartilePct = wr.HighCpuFirstQuartilePct,
+                    AvgMinutesToHighCpu     = wr.AvgMinutesToHighCpu,
+                    WorkloadCoveragePct     = wr.WorkloadCoveragePct,
+                    CompletionPct           = wr.CompletionPct,
+                    AvgSecPerStat           = wr.AvgSecPerStat,
+                    TrendDirection          = CASE
+                                                  WHEN wr.prior_composite IS NULL THEN N'N/A'
+                                                  WHEN wr.RunCount < 2 OR ISNULL(wr.prior_run_count, 0) < 2 THEN N'INSUFFICIENT_DATA'
+                                                  WHEN wr.current_composite > wr.prior_composite * 1.02 THEN N'IMPROVING'
+                                                  WHEN wr.current_composite < wr.prior_composite * 0.98 THEN N'DEGRADING'
+                                                  ELSE N'STABLE'
+                                              END
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            )
+        FROM weekly_ranked_s AS wr;
+    END;
+
+    /*
+    ============================================================================
+    RESULT SET 11: EFFICACY DETAIL (Per-run, close-up window — @ExpertMode = 1 only)
+    ============================================================================
+    */
+    IF @ExpertMode = 1 AND @SingleResultSet = 0
+    BEGIN
+        ;WITH detail_runs AS
+        (
+            SELECT
+                e.*,
+                prior_completion = LAG(e.CompletionPct) OVER (ORDER BY e.StartTime),
+                prior_minutes    = LAG(e.MinutesToHighCpuComplete) OVER (ORDER BY e.StartTime)
+            FROM #qs_efficacy AS e
+            WHERE e.StartTime >= DATEADD(DAY, -@EfficacyDetailDays, GETDATE())
+        )
+        SELECT
+            RunLabel                = dr.RunLabel,
+            StartTime               = dr.StartTime,
+            SortStrategy            = CASE
+                                          WHEN dr.IsQSRun = 1 THEN N'Query Store CPU'
+                                          ELSE ISNULL(dr.SortOrder, N'Modification Counter')
+                                      END,
+            StatsFound              = dr.StatsFound,
+            StatsProcessed          = dr.StatsProcessed,
+            CompletionPct           = dr.CompletionPct,
+            HighCpuInFirstQuartilePct = dr.HighCpuInFirstQuartilePct,
+            MinutesToHighCpuComplete = dr.MinutesToHighCpuComplete,
+            WorkloadCoveragePct     = dr.WorkloadCoveragePct,
+            AvgSecPerStat           = dr.AvgSecPerStat,
+            StopReason              = dr.StopReason,
+            DeltaVsPrior            = CASE
+                                          WHEN dr.prior_completion IS NULL THEN N'(first run in window)'
+                                          ELSE
+                                              CASE
+                                                  WHEN dr.CompletionPct > dr.prior_completion
+                                                  THEN N'+' + CONVERT(nvarchar(10), CONVERT(integer, dr.CompletionPct - dr.prior_completion)) + N'% completion'
+                                                  WHEN dr.CompletionPct < dr.prior_completion
+                                                  THEN CONVERT(nvarchar(10), CONVERT(integer, dr.CompletionPct - dr.prior_completion)) + N'% completion'
+                                                  ELSE N'0% completion'
+                                              END
+                                              + CASE
+                                                  WHEN dr.prior_minutes IS NOT NULL AND dr.MinutesToHighCpuComplete IS NOT NULL
+                                                  THEN N', ' + CASE
+                                                      WHEN dr.MinutesToHighCpuComplete < dr.prior_minutes
+                                                      THEN N'-' + CONVERT(nvarchar(10), CONVERT(integer, dr.prior_minutes - dr.MinutesToHighCpuComplete)) + N'min to critical'
+                                                      WHEN dr.MinutesToHighCpuComplete > dr.prior_minutes
+                                                      THEN N'+' + CONVERT(nvarchar(10), CONVERT(integer, dr.MinutesToHighCpuComplete - dr.prior_minutes)) + N'min to critical'
+                                                      ELSE N'0min to critical'
+                                                  END
+                                                  ELSE N''
+                                              END
+                                      END
+        FROM detail_runs AS dr
+        ORDER BY dr.StartTime DESC;
+    END
+    ELSE IF @ExpertMode = 1
+    BEGIN
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT
+            ResultSetID   = 11,
+            ResultSetName = N'Efficacy Detail',
+            RowNum        = ROW_NUMBER() OVER (ORDER BY e.StartTime DESC),
+            RowData       = (
+                SELECT
+                    RunLabel                  = e2.RunLabel,
+                    StartTime                 = e2.StartTime,
+                    SortStrategy              = CASE WHEN e2.IsQSRun = 1 THEN N'Query Store CPU' ELSE ISNULL(e2.SortOrder, N'Modification Counter') END,
+                    StatsFound                = e2.StatsFound,
+                    StatsProcessed            = e2.StatsProcessed,
+                    CompletionPct             = e2.CompletionPct,
+                    HighCpuInFirstQuartilePct  = e2.HighCpuInFirstQuartilePct,
+                    MinutesToHighCpuComplete   = e2.MinutesToHighCpuComplete,
+                    WorkloadCoveragePct       = e2.WorkloadCoveragePct,
+                    AvgSecPerStat             = e2.AvgSecPerStat,
+                    StopReason                = e2.StopReason
+                FROM #qs_efficacy AS e2
+                WHERE e2.RunLabel = e.RunLabel
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            )
+        FROM #qs_efficacy AS e
+        WHERE e.StartTime >= DATEADD(DAY, -@EfficacyDetailDays, GETDATE());
+    END;
+
+    /*
+    ============================================================================
+    RESULT SET 12: HIGH-CPU STAT POSITIONS (Most Recent Run — @ExpertMode = 1 only)
+    ============================================================================
+    */
+    IF @ExpertMode = 1 AND @SingleResultSet = 0
+    BEGIN
+        DECLARE @latest_qs_run nvarchar(100) = (
+            SELECT TOP (1) e.RunLabel
+            FROM #qs_efficacy AS e
+            WHERE e.IsQSRun = 1
+            ORDER BY e.StartTime DESC
+        );
+
+        SELECT TOP (@TopN)
+            WorkloadRank        = ROW_NUMBER() OVER (ORDER BY ISNULL(su.QSTotalCpuMs, 0) DESC, su.ID),
+            DatabaseName        = su.DatabaseName,
+            SchemaName          = su.SchemaName,
+            TableName           = su.ObjectName,
+            StatisticsName      = su.StatisticsName,
+            ProcessingPosition  = ISNULL(su.ProcessingPosition, ROW_NUMBER() OVER (ORDER BY su.ID)),
+            TotalQueryCpuMs     = su.QSTotalCpuMs,
+            TotalExecutions     = su.QSTotalExecutions,
+            PlanCount           = su.QSPlanCount,
+            UpdateDurationMs    = su.DurationMs,
+            QualifyReason       = su.QualifyReason
+        FROM #stat_updates AS su
+        WHERE su.RunLabel = @latest_qs_run
+        AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
+        ORDER BY ISNULL(su.QSTotalCpuMs, 0) DESC, su.ID;
+    END
+    ELSE IF @ExpertMode = 1
+    BEGIN
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT TOP (@TopN)
+            ResultSetID   = 12,
+            ResultSetName = N'High-CPU Stat Positions',
+            RowNum        = ROW_NUMBER() OVER (ORDER BY ISNULL(su.QSTotalCpuMs, 0) DESC, su.ID),
+            RowData       = (
+                SELECT
+                    WorkloadRank        = ROW_NUMBER() OVER (ORDER BY ISNULL(su2.QSTotalCpuMs, 0) DESC, su2.ID),
+                    DatabaseName        = su2.DatabaseName,
+                    SchemaName          = su2.SchemaName,
+                    TableName           = su2.ObjectName,
+                    StatisticsName      = su2.StatisticsName,
+                    ProcessingPosition  = ISNULL(su2.ProcessingPosition, ROW_NUMBER() OVER (ORDER BY su2.ID)),
+                    TotalQueryCpuMs     = su2.QSTotalCpuMs,
+                    TotalExecutions     = su2.QSTotalExecutions,
+                    PlanCount           = su2.QSPlanCount,
+                    UpdateDurationMs    = su2.DurationMs,
+                    QualifyReason       = su2.QualifyReason
+                FROM #stat_updates AS su2
+                WHERE su2.RunLabel = su.RunLabel
+                AND   su2.ID = su.ID
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            )
+        FROM #stat_updates AS su
+        WHERE su.RunLabel = (SELECT TOP (1) e.RunLabel FROM #qs_efficacy AS e WHERE e.IsQSRun = 1 ORDER BY e.StartTime DESC)
+        AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
+        ORDER BY ISNULL(su.QSTotalCpuMs, 0) DESC, su.ID;
+    END;
+
+    /*
+    ============================================================================
+    RESULT SET 13: QS PERFORMANCE CORRELATION (Per-stat CPU trend — @ExpertMode = 1 only)
+    Shows how Query Store CPU metrics change for each statistic across runs.
+    Leadership takeaway: "Are the queries actually getting faster after we update these statistics?"
+    ============================================================================
+    */
+    IF @ExpertMode = 1 AND @SingleResultSet = 0
+    BEGIN
+        ;WITH stat_trend AS
+        (
+            SELECT
+                su.DatabaseName,
+                su.SchemaName,
+                su.ObjectName,
+                su.StatisticsName,
+                su.QSTotalCpuMs,
+                su.QSTotalExecutions,
+                su.QSPlanCount,
+                su.RunLabel,
+                r.StartTime,
+                appearance_num = ROW_NUMBER() OVER (
+                    PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+                    ORDER BY r.StartTime
+                ),
+                total_appearances = COUNT_BIG(*) OVER (
+                    PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+                )
+            FROM #stat_updates AS su
+            INNER JOIN #runs AS r
+                ON r.RunLabel = su.RunLabel
+            WHERE su.QSTotalCpuMs IS NOT NULL
+            AND   su.QSTotalCpuMs > 0
+            AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
+        ),
+        first_last AS
+        (
+            SELECT
+                DatabaseName, SchemaName, ObjectName, StatisticsName,
+                Appearances  = MAX(total_appearances),
+                FirstRunDate = MAX(CASE WHEN appearance_num = 1 THEN StartTime END),
+                LastRunDate  = MAX(CASE WHEN appearance_num = total_appearances THEN StartTime END),
+                FirstCpuMs   = MAX(CASE WHEN appearance_num = 1 THEN QSTotalCpuMs END),
+                LastCpuMs    = MAX(CASE WHEN appearance_num = total_appearances THEN QSTotalCpuMs END),
+                FirstExecs   = MAX(CASE WHEN appearance_num = 1 THEN QSTotalExecutions END),
+                LastExecs    = MAX(CASE WHEN appearance_num = total_appearances THEN QSTotalExecutions END),
+                FirstPlans   = MAX(CASE WHEN appearance_num = 1 THEN QSPlanCount END),
+                LastPlans    = MAX(CASE WHEN appearance_num = total_appearances THEN QSPlanCount END)
+            FROM stat_trend
+            WHERE total_appearances >= 2
+            GROUP BY DatabaseName, SchemaName, ObjectName, StatisticsName
+        )
+        SELECT TOP (@TopN)
+            DatabaseName,
+            SchemaName,
+            TableName           = ObjectName,
+            StatisticsName,
+            Appearances,
+            FirstRunDate,
+            LastRunDate,
+            FirstCpuMs,
+            LastCpuMs,
+            CpuChangePct    = CASE WHEN FirstCpuMs > 0
+                                   THEN CONVERT(decimal(10, 1), (LastCpuMs - FirstCpuMs) * 100.0 / FirstCpuMs)
+                                   ELSE NULL
+                              END,
+            CpuTrend        = CASE
+                                  WHEN FirstCpuMs > 0 AND LastCpuMs < FirstCpuMs * 0.95 THEN N'IMPROVING'
+                                  WHEN FirstCpuMs > 0 AND LastCpuMs > FirstCpuMs * 1.05 THEN N'DEGRADING'
+                                  ELSE N'STABLE'
+                              END,
+            FirstExecs,
+            LastExecs,
+            FirstPlans,
+            LastPlans,
+            PlanTrend       = CASE
+                                  WHEN LastPlans > FirstPlans THEN N'MORE PLANS (possible regression)'
+                                  WHEN LastPlans < FirstPlans THEN N'FEWER PLANS (consolidating)'
+                                  ELSE N'STABLE'
+                              END
+        FROM first_last
+        ORDER BY
+            CASE
+                WHEN FirstCpuMs > 0 AND LastCpuMs < FirstCpuMs * 0.95 THEN 1 /* improving first */
+                WHEN FirstCpuMs > 0 AND LastCpuMs > FirstCpuMs * 1.05 THEN 2 /* degrading second */
+                ELSE 3
+            END,
+            ISNULL(FirstCpuMs, 0) DESC;
+    END
+    ELSE IF @ExpertMode = 1
+    BEGIN
+        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+        SELECT
+            ResultSetID   = 13,
+            ResultSetName = N'QS Performance Correlation',
+            RowNum        = ROW_NUMBER() OVER (
+                                ORDER BY
+                                    CASE
+                                        WHEN fl.FirstCpuMs > 0 AND fl.LastCpuMs < fl.FirstCpuMs * 0.95 THEN 1
+                                        WHEN fl.FirstCpuMs > 0 AND fl.LastCpuMs > fl.FirstCpuMs * 1.05 THEN 2
+                                        ELSE 3
+                                    END,
+                                    ISNULL(fl.FirstCpuMs, 0) DESC
+                            ),
+            RowData       = (
+                SELECT
+                    DatabaseName    = fl2.DatabaseName,
+                    SchemaName      = fl2.SchemaName,
+                    TableName       = fl2.ObjectName,
+                    StatisticsName  = fl2.StatisticsName,
+                    Appearances     = fl2.Appearances,
+                    FirstCpuMs      = fl2.FirstCpuMs,
+                    LastCpuMs       = fl2.LastCpuMs,
+                    CpuChangePct    = CASE WHEN fl2.FirstCpuMs > 0
+                                          THEN CONVERT(decimal(10, 1), (fl2.LastCpuMs - fl2.FirstCpuMs) * 100.0 / fl2.FirstCpuMs)
+                                          ELSE NULL
+                                     END,
+                    CpuTrend        = CASE
+                                         WHEN fl2.FirstCpuMs > 0 AND fl2.LastCpuMs < fl2.FirstCpuMs * 0.95 THEN N'IMPROVING'
+                                         WHEN fl2.FirstCpuMs > 0 AND fl2.LastCpuMs > fl2.FirstCpuMs * 1.05 THEN N'DEGRADING'
+                                         ELSE N'STABLE'
+                                     END
+                FROM (SELECT fl.DatabaseName, fl.SchemaName, fl.ObjectName, fl.StatisticsName,
+                             fl.Appearances, fl.FirstCpuMs, fl.LastCpuMs) AS fl2
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+            )
+        FROM
+        (
+            SELECT TOP (@TopN)
+                su_fl.DatabaseName, su_fl.SchemaName, su_fl.ObjectName, su_fl.StatisticsName,
+                Appearances = COUNT_BIG(*),
+                FirstCpuMs  = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalCpuMs END),
+                LastCpuMs   = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.QSTotalCpuMs END)
+            FROM
+            (
+                SELECT
+                    su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName,
+                    su.QSTotalCpuMs,
+                    rn  = ROW_NUMBER() OVER (
+                              PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+                              ORDER BY r.StartTime
+                          ),
+                    cnt = COUNT_BIG(*) OVER (
+                              PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+                          )
+                FROM #stat_updates AS su
+                INNER JOIN #runs AS r ON r.RunLabel = su.RunLabel
+                WHERE su.QSTotalCpuMs IS NOT NULL AND su.QSTotalCpuMs > 0
+                AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
+            ) AS su_fl
+            WHERE su_fl.cnt >= 2
+            GROUP BY su_fl.DatabaseName, su_fl.SchemaName, su_fl.ObjectName, su_fl.StatisticsName
+            ORDER BY MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalCpuMs END) DESC
+        ) AS fl;
     END;
 
     /*
@@ -1773,6 +3077,8 @@ BEGIN
     DROP TABLE IF EXISTS #stat_updates;
     DROP TABLE IF EXISTS #recommendations;
     DROP TABLE IF EXISTS #obfuscation_map;
+    DROP TABLE IF EXISTS #executive_dashboard;
+    DROP TABLE IF EXISTS #qs_efficacy;
 
     RETURN;
 END;
