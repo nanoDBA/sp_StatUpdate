@@ -371,14 +371,121 @@ EXEC sp_StatUpdate @Databases = 'USER_DATABASES', @ExposeProgressToAllSessions =
 
 ## Diagnostic Tool
 
-**sp_StatUpdate_Diag** analyzes CommandLog history and produces actionable recommendations.
+**sp_StatUpdate_Diag** analyzes CommandLog history and produces actionable recommendations. Two viewing modes: management-friendly dashboard or full DBA deep-dive.
+
+### Management View (Default)
 
 ```sql
--- Basic diagnostic (last 30 days)
+-- Show your boss: letter grades + plain English recommendations
 EXEC dbo.sp_StatUpdate_Diag;
+```
 
--- Obfuscated for external sharing (hashes names)
-EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1;
+Returns 2 result sets:
+
+| RS | Name | What It Shows |
+|----|------|---------------|
+| 1 | **Executive Dashboard** | A-F letter grades for Overall, Completion, Reliability, Speed, and Workload Focus |
+| 2 | **Recommendations** | Severity-categorized findings with fix-it SQL |
+
+Example dashboard output:
+
+```text
+Category         Grade  Score  Headline
+---------------- -----  -----  --------------------------------------------------------
+OVERALL          B      75     Statistics maintenance is healthy with minor opportunities...
+COMPLETION       A      92     Nearly all qualifying statistics are being updated each run.
+RELIABILITY      C      55     2 run(s) were killed before completing. Check SQL Agent...
+SPEED            A      90     Statistics are being updated very quickly (0.4 sec/stat).
+WORKLOAD FOCUS   B      78     Query Store prioritization is working well.
+```
+
+### DBA Deep-Dive
+
+```sql
+-- Full technical detail: 13 result sets
+EXEC dbo.sp_StatUpdate_Diag @ExpertMode = 1;
+```
+
+| RS | Name | Description |
+|----|------|-------------|
+| 1 | Executive Dashboard | Letter grades (always returned) |
+| 2 | Recommendations | Findings with remediation SQL (always returned) |
+| 3 | Run Health Summary | Aggregate metrics: total runs, killed, completion %, QS coverage |
+| 4 | Run Detail | Per-run: duration, stats found/processed, stop reason, efficacy |
+| 5 | Top Tables | Tables consuming the most maintenance time |
+| 6 | Failing Statistics | Stats with repeated errors |
+| 7 | Long-Running Statistics | Stats exceeding the duration threshold |
+| 8 | Parameter Change History | How parameters changed across runs |
+| 9 | Obfuscation Map | Only when `@Obfuscate = 1` |
+| 10 | Efficacy Trend (Weekly) | Week-over-week QS prioritization metrics |
+| 11 | Efficacy Detail (Per-Run) | Run-over-run with delta vs prior |
+| 12 | High-CPU Stat Positions | Top-workload stats from most recent run |
+| 13 | QS Performance Correlation | Per-stat CPU trend: are queries getting faster after updates? |
+
+### Proving QS Prioritization Value
+
+After switching from modification-counter to Query Store CPU-based sort order, show leadership the impact:
+
+```sql
+-- Broad trending: last 100 days, close-up on last 14
+EXEC dbo.sp_StatUpdate_Diag
+    @ExpertMode = 1,
+    @EfficacyDaysBack = 100,
+    @EfficacyDetailDays = 14;
+```
+
+Key result sets for this story:
+
+- **RS 10 (Efficacy Trend)**: Weekly roll-up showing high-CPU stats reaching first quartile, workload coverage %, trend direction
+- **RS 11 (Efficacy Detail)**: Per-run showing completion %, time-to-critical stats, delta vs prior run
+- **RS 13 (QS Performance Correlation)**: Per-stat CPU before vs after — "5 of 5 tracked stats show 8% lower query CPU"
+- **I7 check**: Automatically detects the configuration change point and compares before/after metrics
+- **I8 check**: Summarizes whether queries are actually faster after stat updates
+
+### Persistent History
+
+The diagnostic tool auto-creates `dbo.StatUpdateDiagHistory` to track health scores over time. Each run inserts only new data (watermark-based, no duplicates).
+
+```sql
+-- View health score trend
+SELECT CapturedAt, RunLabel, HealthScore, OverallGrade, CompletionPct, WorkloadCoveragePct
+FROM dbo.StatUpdateDiagHistory
+ORDER BY CapturedAt DESC;
+
+-- Skip history creation (testing or ephemeral environments)
+EXEC dbo.sp_StatUpdate_Diag @SkipHistory = 1;
+```
+
+### Obfuscated Mode
+
+Hash all names for safe external sharing. Prefixes (`IX_`, `PK_`, `DB_`) are preserved for context.
+
+```sql
+-- Obfuscated for sharing with vendors or support
+EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1, @ExpertMode = 1;
+
+-- Deterministic hashing with a seed (reproducible across runs)
+EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1, @ObfuscationSeed = N'my-secret-seed';
+
+-- Persist the mapping table for later decoding
+EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1, @ObfuscationMapTable = N'dbo.DiagObfMap';
+```
+
+### Custom Analysis
+
+```sql
+-- Last 90 days, only top 5 items, long-running threshold at 15 minutes
+EXEC dbo.sp_StatUpdate_Diag
+    @DaysBack = 90,
+    @TopN = 5,
+    @LongRunningMinutes = 15,
+    @ExpertMode = 1;
+
+-- CommandLog in a different database
+EXEC dbo.sp_StatUpdate_Diag @CommandLogDatabase = N'DBATools';
+
+-- Single result set mode (JSON) for programmatic consumption
+EXEC dbo.sp_StatUpdate_Diag @SingleResultSet = 1, @ExpertMode = 1;
 ```
 
 ### Multi-Server (PowerShell)
@@ -387,16 +494,43 @@ EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1;
 .\Invoke-StatUpdateDiag.ps1 `
     -Servers "Server1", "Server2,2500", "Server3" `
     -CommandLogDatabase "Maintenance" `
-    -OutputPath ".\diag_output"
+    -OutputPath ".\diag_output" `
+    -OutputFormat Markdown
 ```
+
+Cross-server analysis detects version skew and parameter inconsistencies.
 
 ### Diagnostic Checks
 
-| Severity | Checks |
-|----------|--------|
-| CRITICAL | Killed runs, repeated stat failures, time limit exhaustion, degrading throughput |
-| WARNING | Suboptimal parameters, long-running stats, stale-stats backlog, overlapping runs |
-| INFO | Run health trends, parameter history, top tables by cost, version history |
+| Severity | ID | Checks |
+|----------|----|--------|
+| CRITICAL | C1-C4 | Killed runs, repeated stat failures, time limit exhaustion, degrading throughput |
+| WARNING | W1-W5 | Suboptimal parameters, long-running stats, stale-stats backlog, overlapping runs, QS not effective |
+| INFO | I1-I5 | Run health trends, parameter history, top tables by cost, unused features, version history |
+| INFO | I6 | QS efficacy: "10 of 10 highest-workload stats updated in first 1 minute" |
+| INFO | I7 | QS inflection: before/after comparison when QS prioritization was enabled |
+| INFO | I8 | QS performance trend: per-stat CPU correlation across runs |
+
+### Diag Parameter Reference
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `@DaysBack` | `30` | History window in days |
+| `@ExpertMode` | `0` | `0` = dashboard + recommendations, `1` = all 13 result sets |
+| `@SkipHistory` | `0` | `1` = skip persistent history table |
+| `@Obfuscate` | `0` | `1` = hash all names for external sharing |
+| `@ObfuscationSeed` | `NULL` | Salt for deterministic hashing |
+| `@ObfuscationMapTable` | `NULL` | Persist obfuscation map to a table |
+| `@EfficacyDaysBack` | `NULL` | QS efficacy broad window (NULL = @DaysBack) |
+| `@EfficacyDetailDays` | `NULL` | QS efficacy close-up window (NULL = 14) |
+| `@LongRunningMinutes` | `10` | Threshold for long-running stat detection |
+| `@FailureThreshold` | `3` | Same stat failing N+ times = CRITICAL |
+| `@TimeLimitExhaustionPct` | `80` | Warn if >X% of runs hit time limit |
+| `@ThroughputWindowDays` | `7` | Window for throughput trend comparison |
+| `@TopN` | `20` | Top N items in detail result sets |
+| `@CommandLogDatabase` | `NULL` | CommandLog location (NULL = current DB) |
+| `@SingleResultSet` | `0` | `1` = JSON-formatted single result set |
+| `@Debug` | `0` | `1` = verbose output |
 
 ## Extended Events
 
@@ -411,6 +545,8 @@ Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and lo
 
 ## Version History
 
+- **2.16.2026.0308** - QS Efficacy Trending + Executive Dashboard. sp_StatUpdate: ProcessingPosition in per-stat ExtendedInfo XML. Diag: @ExpertMode (management vs DBA view), @SkipHistory, persistent StatUpdateDiagHistory table, Executive Dashboard with A-F grades, RS 13 QS Performance Correlation (per-stat CPU trend), I6/I7/I8 checks for QS efficacy/inflection/performance correlation. 13 result sets total. @EfficacyDaysBack, @EfficacyDetailDays parameters. 122 tests.
+- **2.14.2026.0304** - Bulk issue resolution (42 issues). New: @OrphanedRunThresholdHours. AG/safety guards, warnings, discovery improvements. See CLAUDE.md for full details.
 - **2.8.2026.0302** - Comprehensive issue sweep (31 issues resolved). New params: @IncludeIndexedViews, @LogSkippedToCommandLog, @ReturnDetailedResults, @CompletionNotifyTable. Detection: QS forced plan warning, RLS, wide stats, columnstore context, filtered index mismatch, computed columns, Stretch DB skip, log space check. Azure MI vs DB distinction. 12-topic @Help operational notes.
 - **2.7.2026.0302** - AG redo queue pause (@MaxAGRedoQueueMB, @MaxAGWaitMinutes). tempdb pressure check (@MinTempdbFreeMB). New StopReasons: AG_REDO_QUEUE, TEMPDB_PRESSURE.
 - **2.6.2026.0302** - Multi-database direct mode: @Statistics and @StatisticsFromTable respect @Databases.
