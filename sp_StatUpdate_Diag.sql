@@ -36,7 +36,7 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.09.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.09.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
 History:    2026.03.09.1 - RunLabel dedup prevents PK violation on duplicate START entries (#216).
                          Watermark gap detection resets when CommandLog archived (#232).
@@ -139,7 +139,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.09.1',
+        @procedure_version varchar(20) = '2026.03.09.2',
         @procedure_version_date datetime = '20260309';
 
     SET @Version = @procedure_version;
@@ -545,7 +545,7 @@ BEGIN
             BEGIN
                 RAISERROR(N'  WARNING: History watermark (%i) exceeds CommandLog max ID (%i). Resetting watermark — CommandLog may have been archived.', 10, 1,
                     @history_max_id, @cl_max_id) WITH NOWAIT;
-                SET @history_max_id = @cl_max_id;
+                SET @history_max_id = 0;    /* #240: reset to 0, not @cl_max_id — NOT EXISTS dedup guard prevents duplicates */
             END;
 
             RAISERROR(N'  History table: %s (%i snapshots, watermark ID %i)', 10, 1,
@@ -2224,6 +2224,15 @@ BEGIN
             WHEN @avg_completion >= 30 THEN 40
             ELSE 20
         END;
+
+        /* #238: If majority of runs hit TIME_LIMIT, cap completion score —
+           a 95% avg looks great but means nothing if the window is too short */
+        DECLARE @tl_run_pct decimal(5, 1) = @time_limit_runs * 100.0 / @run_count;
+
+        IF @tl_run_pct >= 80.0 AND @score_completion > 60
+            SET @score_completion = 60;     /* Can't exceed C if 80%+ runs hit time limit */
+        ELSE IF @tl_run_pct >= 50.0 AND @score_completion > 75
+            SET @score_completion = 75;     /* Can't exceed B if 50%+ runs hit time limit */
     END;
 
     /* Reliability score: penalize killed runs, failures, time limit exhaustion */
@@ -2327,7 +2336,13 @@ BEGIN
         @score_completion,
         CASE
             WHEN @score_completion >= 90 THEN N'Nearly all qualifying statistics are being updated each run.'
+            WHEN @score_completion >= 75 AND @tl_run_pct >= 50.0
+                THEN N'Most statistics are updated, but ' + CONVERT(nvarchar(10), @time_limit_runs)
+                     + N' of ' + CONVERT(nvarchar(10), @run_count) + N' runs hit the time limit.'
             WHEN @score_completion >= 75 THEN N'Most statistics are being updated, but some are consistently left behind.'
+            WHEN @score_completion >= 60 AND @tl_run_pct >= 50.0
+                THEN N'Maintenance window is too short — ' + CONVERT(nvarchar(10), @time_limit_runs)
+                     + N' of ' + CONVERT(nvarchar(10), @run_count) + N' runs hit the time limit before finishing.'
             WHEN @score_completion >= 60 THEN N'A significant portion of statistics are not being reached within the maintenance window.'
             WHEN @score_completion >= 40 THEN N'Less than half of qualifying statistics are being updated. Increase time limit or reduce scope.'
             ELSE N'Very few statistics are being updated. Maintenance window is severely undersized for the workload.'
