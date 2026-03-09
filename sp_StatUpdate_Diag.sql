@@ -16,16 +16,71 @@ Purpose:    Analyze CommandLog data from sp_StatUpdate runs to detect problems,
 
 Based on:   sp_StatUpdate CommandLog format and Ola Hallengren's CommandLog table.
 
-License:    MIT License (same as sp_StatUpdate)
+License:    MIT License
+
+            Permission is hereby granted, free of charge, to any person obtaining a copy
+            of this software and associated documentation files (the "Software"), to deal
+            in the Software without restriction, including without limitation the rights
+            to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+            copies of the Software, and to permit persons to whom the Software is
+            furnished to do so, subject to the following conditions:
+
+            The above copyright notice and this permission notice shall be included in all
+            copies or substantial portions of the Software.
+
+            THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+            IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+            FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+            AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+            LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+            OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+            SOFTWARE.
 
 Version:    2026.03.09.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+
+History:    2026.03.09.1 - RunLabel dedup prevents PK violation on duplicate START entries (#216).
+                         Watermark gap detection resets when CommandLog archived (#232).
+                         I5 VERSION_HISTORY implemented (was documented but missing).
+                         I8 QS_PERFORMANCE_TREND: per-stat per-execution CPU trend.
+                         StatUpdateDiagCache persistent table avoids XML re-parse.
+                         New @Help note for automation / @SingleResultSet.
+            2026.03.08.1 - Executive Dashboard (RS 1): letter grades A-F, health score 0-100,
+                         5 categories (Overall, Completion, Reliability, Speed, Workload Focus).
+                         @ExpertMode parameter: 0 = management view (2 RS), 1 = DBA deep-dive (13 RS).
+                         Persistent history table (dbo.StatUpdateDiagHistory) with watermark-based
+                         incremental inserts. @SkipHistory parameter to opt out.
+                         QS Performance Correlation (I8 + RS 13): per-stat CPU trend detail.
+                         QS Efficacy Trending (I6/I7 + RS 10/11/12): weekly aggregates,
+                         per-run detail, high-CPU stat positions.
+                         RS renumbered: RS 1 = Dashboard, RS 2 = Recommendations (always),
+                         RS 3-13 = ExpertMode=1 only.
+            2026.03.05   - I5 VERSION_HISTORY check stub added. @ObfuscationSeed and
+                         @ObfuscationMapTable parameters for deterministic obfuscation.
+                         Bug fixes: SQL injection in @CommandLogDatabase, missing AG keyword
+                         in @Help, parameter validation warnings.
+            2026.02.12   - Initial release. 8 diagnostic checks (C1-C4, W1-W5, I1-I4),
+                         obfuscation mode, @SingleResultSet, @Help, @Debug.
+                         9 result sets. 53 tests.
 
 Requires:   - dbo.CommandLog table (Ola Hallengren's SQL Server Maintenance Solution)
             - sp_StatUpdate entries in CommandLog (SP_STATUPDATE_START/END + UPDATE_STATISTICS)
             - SQL Server 2017+ (STRING_AGG; STRING_SPLIT is 2016+ but STRING_AGG requires 2017+)
 
-Usage:      -- Quick health check (SSMS, real names):
+Key Features:
+    - Executive Dashboard with A-F grades and health scores
+    - 16 diagnostic checks across CRITICAL/WARNING/INFO severities
+    - Obfuscation mode for safe external sharing (HASHBYTES-based)
+    - Persistent history for trend tracking (dbo.StatUpdateDiagHistory)
+    - Persistent stat cache for fast re-runs (dbo.StatUpdateDiagCache)
+    - Query Store efficacy analysis (proves QS prioritization value)
+    - @ExpertMode: management view (2 RS) vs DBA deep-dive (13 RS)
+    - @SingleResultSet for stable automation interface
+
+Usage:      -- Quick health check (management dashboard):
             EXECUTE dbo.sp_StatUpdate_Diag;
+
+            -- Full DBA deep-dive:
+            EXECUTE dbo.sp_StatUpdate_Diag @ExpertMode = 1;
 
             -- Obfuscated for sharing externally:
             EXECUTE dbo.sp_StatUpdate_Diag @Obfuscate = 1;
