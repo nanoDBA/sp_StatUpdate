@@ -36,7 +36,7 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.16.2026.03.08 (Major.Minor.YYYY.MM.DD)
+Version:    2.18.2026.03.09 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
@@ -642,8 +642,8 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.16.2026.03.08',
-        @procedure_version_date datetime = '20260308',
+        @procedure_version varchar(20) = '2.18.2026.03.09',
+        @procedure_version_date datetime = '20260309',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -1297,7 +1297,16 @@ BEGIN
                  N'On Standard Edition, indexed view statistics are only used by the optimizer when the view is referenced with the NOEXPAND hint. UPDATE STATISTICS on the view is valid, but the optimizer may ignore the stats without NOEXPAND. Enterprise Edition uses indexed view stats automatically.'),
                 /* #193: @ReturnDetailedResults vs CommandLog */
                 (N'Output Channels',
-                 N'@ReturnDetailedResults and CommandLog are independent output channels. Skipped stats (TOCTOU, @MaxSecondsPerStat) appear in @ReturnDetailedResults but not CommandLog unless @LogSkippedToCommandLog=Y. CommandLog requires @LogToTable=Y. Both channels report the same succeeded/failed stats.')
+                 N'@ReturnDetailedResults and CommandLog are independent output channels. Skipped stats (TOCTOU, @MaxSecondsPerStat) appear in @ReturnDetailedResults but not CommandLog unless @LogSkippedToCommandLog=Y. CommandLog requires @LogToTable=Y. Both channels report the same succeeded/failed stats.'),
+                /* #162: modification_counter limitations */
+                (N'modification_counter Limitations',
+                 N'modification_counter can be reset by DBCC UPDATEUSAGE, certain restore operations, and detach/attach cycles. Columnstore bulk loads may undercount modifications. DBCC SHOW_STATISTICS shows histogram-level staleness but modification_counter is the only programmatic signal. If modification_counter is unreliable, use @SortOrder=N''DAYS_STALE'' or @DaysStaleThreshold to qualify stats by age instead.'),
+                /* #143: Ascending key detection */
+                (N'Ascending Key Stats',
+                 N'Ascending key columns (identity, datetime inserts) accumulate rows beyond the histogram''s highest RANGE_HI_KEY, causing cardinality underestimates for recent values. Trace flags 2389/2390 (legacy CE) and 4139 (new CE quick stats) can help. Use @DaysStaleThreshold with a low value (e.g. 1-2 days) to catch ascending key stats that have few modifications but stale histograms. @SortOrder=N''DAYS_STALE'' prioritizes the oldest stats first.'),
+                /* #156: Compressed tables and @MinPageCount */
+                (N'Compressed Tables',
+                 N'@MinPageCount uses used_page_count from sys.dm_db_partition_stats which reflects compressed (on-disk) page counts, not the uncompressed data size. ROW or PAGE compressed tables may appear smaller than their actual data volume. A table with 500K rows might show 100 pages compressed vs 5000 uncompressed. If using @MinPageCount to skip small tables, compressed tables may be incorrectly skipped.')
         ) AS note_data
         (
             topic,
@@ -1642,6 +1651,7 @@ BEGIN
         @stats_processed integer = 0,
         @stats_succeeded integer = 0,
         @stats_failed integer = 0,
+        @stats_toctou integer = 0,
         @stats_skipped integer = 0,
         @consecutive_failures integer = 0,
         @warnings nvarchar(max) = N''; /* Collected warnings for @WarningsOut OUTPUT */
@@ -4199,10 +4209,17 @@ BEGIN
 
                     /* Cleanup */
                     @CleanupOrphanedRuns AS CleanupOrphanedRuns,
-                    @OrphanedRunThresholdHours AS OrphanedRunThresholdHours
+                    @OrphanedRunThresholdHours AS OrphanedRunThresholdHours,
+
+                    /* Meta / diagnostic (#242) */
+                    @Execute AS [Execute],
+                    @Debug AS [Debug],
+                    @CheckPermissionsOnly AS CheckPermissionsOnly,
+                    @WhatIfOutputTable AS WhatIfOutputTable,
+                    @ExposeProgressToAllSessions AS ExposeProgressToAllSessions
                 FOR
                     XML RAW(N'Parameters'),
-                    ELEMENTS
+                    ELEMENTS XSINIL
             );
 
         /*
@@ -5751,6 +5768,15 @@ OPTION (RECOMPILE);';
                     temporal_type,
                     priority = ROW_NUMBER() OVER (
                         ORDER BY
+                            /* #167: Filtered stats priority boost — when @FilteredStatsMode=PRIORITY, boost filtered stats showing drift */
+                            CASE WHEN @FilteredStatsMode_param = N''PRIORITY''
+                                      AND has_filter = 1
+                                      AND ISNULL(rows, 0) > 0
+                                      AND unfiltered_rows IS NOT NULL
+                                      AND (CONVERT(float, unfiltered_rows) / rows) > @FilteredStatsStaleFactor_param
+                                 THEN CONVERT(bigint, 500000000000)
+                                 ELSE 0
+                            END +
                             ISNULL(qs_priority_boost, 0) +
                             CASE @SortOrder_param
                                 WHEN N''MODIFICATION_COUNTER'' THEN modification_counter
@@ -5821,6 +5847,7 @@ OPTION (RECOMPILE);';
                       @ExcludeTables_param nvarchar(max),
                       @ExcludeStatistics_param nvarchar(max),
                       @FilteredStatsMode_param nvarchar(10),
+                      @FilteredStatsStaleFactor_param float,
                       @QueryStorePriority_param nvarchar(1),
                       @QueryStoreMetric_param nvarchar(20),
                       @QueryStoreMinExecutions_param bigint,
@@ -5842,6 +5869,7 @@ OPTION (RECOMPILE);';
                     @ExcludeTables_param = @ExcludeTables,
                     @ExcludeStatistics_param = @ExcludeStatistics,
                     @FilteredStatsMode_param = @FilteredStatsMode,
+                    @FilteredStatsStaleFactor_param = @FilteredStatsStaleFactor,
                     @QueryStorePriority_param = @QueryStorePriority,
                     @QueryStoreMetric_param = @QueryStoreMetric,
                     @QueryStoreMinExecutions_param = @QueryStoreMinExecutions,
@@ -5973,6 +6001,15 @@ OPTION (RECOMPILE);';
                         Query Store boost based on selected metric.
                         Uses actual resource consumption to prioritize expensive queries.
                         */
+                        /* #167: Filtered stats priority boost — when @FilteredStatsMode=PRIORITY, boost filtered stats showing drift */
+                        CASE WHEN @FilteredStatsMode_param = N''PRIORITY''
+                                  AND s.has_filter = 1
+                                  AND ISNULL(sp.rows, 0) > 0
+                                  AND sp.unfiltered_rows IS NOT NULL
+                                  AND (CONVERT(float, sp.unfiltered_rows) / sp.rows) > @FilteredStatsStaleFactor_param
+                             THEN CONVERT(bigint, 500000000000)
+                             ELSE 0
+                        END +
                         CASE
                             WHEN @QueryStorePriority_param = N''Y''
                             AND  ISNULL(qs_stats.total_executions, 0) >= @QueryStoreMinExecutions_param
@@ -6507,8 +6544,7 @@ OPTION (RECOMPILE);';
                 BEGIN CATCH END CATCH;
             END;
 
-            /* #28: Columnstore context detection — CCI modification_counter can be misleadingly low after bulk loads */
-            IF @Debug = 1
+            /* #28/#149: Columnstore context detection — always-on warning (promoted from debug-only) */
             BEGIN
                 DECLARE @cs_check_sql nvarchar(max) = N'
                     SELECT @cnt = COUNT(DISTINCT stp.object_id)
@@ -6530,6 +6566,33 @@ OPTION (RECOMPILE);';
                         DECLARE @cs_msg nvarchar(500) = N'    Columnstore: ' + CONVERT(nvarchar(10), @cs_table_count)
                             + N' table(s) with columnstore indexes — modification_counter may underreport after bulk loads';
                         RAISERROR(@cs_msg, 10, 1) WITH NOWAIT;
+                        SET @warnings += N'COLUMNSTORE_TABLES: ' + CONVERT(nvarchar(10), @cs_table_count) + N' table(s) with columnstore indexes; ';
+                    END;
+                END TRY
+                BEGIN CATCH END CATCH;
+            END;
+
+            /* #156: Compressed tables page_count inflation warning */
+            IF @MinPageCount > 0
+            BEGIN
+                DECLARE @compressed_check_sql nvarchar(max) = N'
+                    SELECT @cnt = COUNT(DISTINCT stp.object_id)
+                    FROM #stats_to_process AS stp
+                    INNER JOIN ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.partitions AS p
+                        ON p.object_id = stp.object_id AND p.index_id IN (0, 1)
+                    WHERE stp.database_name = @dbname COLLATE DATABASE_DEFAULT
+                    AND p.data_compression > 0';
+                DECLARE @compressed_table_count int = 0;
+                BEGIN TRY
+                    EXEC sp_executesql @compressed_check_sql,
+                        N'@dbname sysname, @cnt int OUTPUT',
+                        @dbname = @CurrentDatabaseName, @cnt = @compressed_table_count OUTPUT;
+                    IF @compressed_table_count > 0
+                    BEGIN
+                        DECLARE @comp_msg nvarchar(500) = N'    Compressed: ' + CONVERT(nvarchar(10), @compressed_table_count)
+                            + N' table(s) — @MinPageCount uses compressed page counts (actual data may be larger)';
+                        RAISERROR(@comp_msg, 10, 1) WITH NOWAIT;
+                        SET @warnings += N'COMPRESSED_TABLES: ' + CONVERT(nvarchar(10), @compressed_table_count) + N' table(s) with compression — @MinPageCount uses compressed page counts; ';
                     END;
                 END TRY
                 BEGIN CATCH END CATCH;
@@ -6904,6 +6967,7 @@ OPTION (RECOMPILE);';
             StatsProcessed = 0,
             StatsSucceeded = 0,
             StatsFailed = 0,
+            StatsToctou = 0,
             StatsSkipped = 0,
             StatsRemaining = 0,
             DatabasesProcessed = @database_count,
@@ -8823,21 +8887,27 @@ OPTION (RECOMPILE);';
                 SELECT
                     @current_end_time = SYSDATETIME(),
                     @current_error_number = ERROR_NUMBER(),
-                    @current_error_message = ERROR_MESSAGE(),
-                    @stats_failed += 1,
-                    /*
-                    TOCTOU carve-out: errors 208 (invalid object name), 15009 (object not found),
-                    and 2767 (statistics not found) indicate the object/stat was dropped between
-                    queue-load and execution — a race condition, not a real infrastructure failure.
-                    Exclude from @consecutive_failures to prevent false @MaxConsecutiveFailures triggers.
-                    */
-                    @consecutive_failures += CASE WHEN ERROR_NUMBER() NOT IN (208, 15009, 2767) THEN 1 ELSE 0 END,
-                    @claimed_table_stats_failed += CASE WHEN @StatsInParallel = N'Y' THEN 1 ELSE 0 END;
+                    @current_error_message = ERROR_MESSAGE();
 
+                /*
+                TOCTOU carve-out: errors 208 (invalid object name), 15009 (object not found),
+                and 2767 (statistics not found) indicate the object/stat was dropped between
+                queue-load and execution — a race condition, not a real infrastructure failure.
+                Count separately from real failures to avoid misleading summary output (#222).
+                */
                 IF @current_error_number IN (208, 15009, 2767)
-                    RAISERROR(N'  ~ TOCTOU skip (error %d): object/statistic no longer exists — skipped, not counted as consecutive failure.', 10, 1, @current_error_number) WITH NOWAIT;
+                BEGIN
+                    SELECT @stats_toctou += 1;
+                    RAISERROR(N'  ~ TOCTOU skip (error %d): object/statistic no longer exists — not counted as failure.', 10, 1, @current_error_number) WITH NOWAIT;
+                END;
                 ELSE
+                BEGIN
+                    SELECT
+                        @stats_failed += 1,
+                        @consecutive_failures += 1,
+                        @claimed_table_stats_failed += CASE WHEN @StatsInParallel = N'Y' THEN 1 ELSE 0 END;
                     RAISERROR(N'  X Error %d: %s', 16, 1, @current_error_number, @current_error_message) WITH NOWAIT;
+                END;
 
                 /*
                 Log error to CommandLog
@@ -8886,6 +8956,20 @@ OPTION (RECOMPILE);';
                     @return_code = @current_error_number;
 
                 /*
+                I/O corruption (823/824/825): Abort immediately and advise CHECKDB (#222).
+                Continuing stats maintenance on a database with I/O corruption risks further damage.
+                */
+                IF @current_error_number IN (823, 824, 825)
+                BEGIN
+                    RAISERROR(N'', 10, 1) WITH NOWAIT;
+                    RAISERROR(N'CRITICAL: I/O corruption detected (error %d). Aborting stats maintenance.', 16, 1, @current_error_number) WITH NOWAIT;
+                    RAISERROR(N'  Run DBCC CHECKDB on database [%s] to assess corruption extent.', 10, 1, @current_database) WITH NOWAIT;
+                    SELECT @stop_reason = N'IO_CORRUPTION';
+                    SET @warnings = @warnings + N'IO_CORRUPTION: Error ' + CONVERT(nvarchar(10), @current_error_number) + N' on [' + @current_database + N']; ';
+                    BREAK;
+                END;
+
+                /*
                 FailFast: Abort on first error if enabled
                 */
                 IF @FailFast = 1
@@ -8903,7 +8987,7 @@ OPTION (RECOMPILE);';
                 IF @MaxConsecutiveFailures IS NOT NULL AND @consecutive_failures >= @MaxConsecutiveFailures
                 BEGIN
                     RAISERROR(N'', 10, 1) WITH NOWAIT;
-                    RAISERROR(N'Aborting: %d consecutive failures reached (possible shared resource issue).', 16, 1, @consecutive_failures) WITH NOWAIT;
+                    RAISERROR(N'Aborting: %d consecutive failures reached. Last error %d: %s', 16, 1, @consecutive_failures, @current_error_number, @current_error_message) WITH NOWAIT;
                     SELECT @stop_reason = N'CONSECUTIVE_FAILURES';
                     BREAK;
                 END;
@@ -9137,6 +9221,8 @@ OPTION (RECOMPILE);';
     RAISERROR(N'Stats processed: %d / %d', 10, 1, @stats_processed, @total_stats) WITH NOWAIT;
     RAISERROR(N'  Succeeded:     %d', 10, 1, @stats_succeeded) WITH NOWAIT;
     RAISERROR(N'  Failed:        %d', 10, 1, @stats_failed) WITH NOWAIT;
+    IF @stats_toctou > 0
+        RAISERROR(N'  TOCTOU skips:  %d (dropped objects)', 10, 1, @stats_toctou) WITH NOWAIT;
     RAISERROR(N'  Skipped:       %d (dry run)', 10, 1, @stats_skipped) WITH NOWAIT;
     RAISERROR(N'  Remaining:     %d', 10, 1, @remaining_stats) WITH NOWAIT;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
@@ -9274,6 +9360,7 @@ OPTION (RECOMPILE);';
                     @stats_processed AS StatsProcessed,
                     @stats_succeeded AS StatsSucceeded,
                     @stats_failed AS StatsFailed,
+                    @stats_toctou AS StatsToctou,
                     @remaining_stats AS StatsRemaining,
                     @duration_seconds AS DurationSeconds,
                     @stop_reason AS StopReason,
@@ -9324,6 +9411,9 @@ OPTION (RECOMPILE);';
     POPULATE OUTPUT PARAMETERS (for automation)
     ============================================================================
     */
+    IF @stats_toctou > 0
+        SET @warnings = @warnings + N'TOCTOU_SKIPS: ' + CONVERT(nvarchar(10), @stats_toctou) + N' stat(s) skipped (objects dropped during run); ';
+
     SELECT
         @StatsFoundOut = @total_stats,
         @StatsProcessedOut = @stats_processed,
@@ -9423,6 +9513,7 @@ OPTION (RECOMPILE);';
         StatsProcessed = @stats_processed,
         StatsSucceeded = @stats_succeeded,
         StatsFailed = @stats_failed,
+        StatsToctou = @stats_toctou,
         StatsSkipped = @stats_skipped,
         StatsRemaining = @remaining_stats,
         DatabasesProcessed = @database_count,
