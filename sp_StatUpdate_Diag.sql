@@ -54,12 +54,18 @@ History:    2026.03.09.1 - RunLabel dedup prevents PK violation on duplicate STA
                          per-run detail, high-CPU stat positions.
                          RS renumbered: RS 1 = Dashboard, RS 2 = Recommendations (always),
                          RS 3-13 = ExpertMode=1 only.
-            2026.03.05   - I5 VERSION_HISTORY check stub added. @ObfuscationSeed and
-                         @ObfuscationMapTable parameters for deterministic obfuscation.
-                         Bug fixes: SQL injection in @CommandLogDatabase, missing AG keyword
-                         in @Help, parameter validation warnings.
+            2026.03.06   - Security/correctness: SQL injection fix in @CommandLogDatabase,
+                         missing AG keyword in @Help, parameter validation warnings.
+                         12 bug fixes from SME review (BUG-01 through BUG-12).
+                         @ObfuscationSeed and @ObfuscationMapTable parameters for
+                         deterministic, reproducible obfuscation across runs.
+                         @Help enhanced with valid_inputs, examples, operational notes.
+            2026.03.04.1 - Version format adopted CalVer (YYYY.MM.DD).
+                         @SingleResultSet parameter: wraps all output into one table with
+                         stable ResultSetID column for INSERT...EXEC automation.
+                         Fix: empty-data path respects @SingleResultSet + @Obfuscate.
             2026.02.12   - Initial release. 8 diagnostic checks (C1-C4, W1-W5, I1-I4),
-                         obfuscation mode, @SingleResultSet, @Help, @Debug.
+                         obfuscation mode, @Help, @Debug.
                          9 result sets. 53 tests.
 
 Requires:   - dbo.CommandLog table (Ola Hallengren's SQL Server Maintenance Solution)
