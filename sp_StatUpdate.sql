@@ -36,7 +36,7 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.18.2026.03.09 (Major.Minor.YYYY.MM.DD)
+Version:    2.19.2026.03.09 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
@@ -482,6 +482,8 @@ ALTER PROCEDURE
     @IncludeSystemObjects nvarchar(1) = N'N', /*Y = include system object statistics (sys.* tables/views)*/
     @IncludeIndexedViews nvarchar(1) = N'N', /*Y = include statistics on indexed views (sys.stats on views with clustered index). N = user tables only (default). UPDATE STATISTICS on indexed views is valid SQL. (#49)*/
     @SkipTablesWithColumnstore nchar(1) = N'N', /*Y = skip tables that have a nonclustered columnstore index (type 5 or 6 in sys.indexes). Use when plan stability is paramount - updating rowstore stats on NCCI tables may change batch mode execution plans.*/
+    @TemporalCoSchedule nvarchar(1) = N'Y', /*Y = when a system-versioned temporal table qualifies, also schedule history table stats. Prevents cross-table cardinality inconsistency for FOR SYSTEM_TIME queries. N = independent scheduling. (#201)*/
+    @AscendingKeyBoost nvarchar(1) = N'Y', /*Y = identity/ascending key columns qualify with any modifications, bypassing normal threshold (#143). Detects via sys.identity_columns on leading stat column. N = normal threshold only.*/
 
     /*
     ============================================================================
@@ -600,6 +602,7 @@ ALTER PROCEDURE
     ============================================================================
     */
     @StatsInParallel nvarchar(1) = N'N', /*Y = use queue-based parallel processing*/
+    @MaxWorkers int = NULL, /*max concurrent parallel workers (#181). Before claiming work, count active sessions in QueueStatistic. If >= @MaxWorkers, exit cleanly with RAISERROR. NULL = unlimited.*/
     @DeadWorkerTimeoutMinutes int = 15, /*consider worker dead if no progress for N minutes (NULL = only check dm_exec_sessions). P2 #4: Reduced from 30 to 15 min.*/
 
     /*
@@ -642,7 +645,7 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.18.2026.03.09',
+        @procedure_version varchar(20) = '2.19.2026.03.09',
         @procedure_version_date datetime = '20260309',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -836,10 +839,16 @@ BEGIN
                     THEN N'wall-clock stop time (HH:MM or HH:MM:SS). Computes remaining seconds from now to specified time today and uses as @TimeLimit. Overrides @TimeLimit when specified.'
                     WHEN N'@SkipTablesWithColumnstore'
                     THEN N'Y = skip tables with nonclustered/clustered columnstore indexes (type 5/6 in sys.indexes). Use when plan stability is critical — updating rowstore stats alongside NCCIs may change batch mode execution plans.'
+                    WHEN N'@TemporalCoSchedule'
+                    THEN N'Y = when a system-versioned temporal table qualifies, also schedule its history table stats (#201). Prevents cardinality inconsistency for FOR SYSTEM_TIME queries that join current + history tables. N = independent scheduling.'
+                    WHEN N'@AscendingKeyBoost'
+                    THEN N'Y = identity/ascending key columns qualify with any modifications, bypassing normal threshold (#143). Detects via sys.identity_columns on the stat''s leading column. Prevents histogram staleness for insert-heavy tables. N = normal threshold only.'
                     WHEN N'@CheckPermissionsOnly'
                     THEN N'Y = check required permissions (VIEW ANY DATABASE, VIEW DATABASE STATE, INSERT on CommandLog) and report missing ones. No stats updates are executed. Diagnostic mode.'
                     WHEN N'@StatsInParallel'
                     THEN N'Y = use queue-based parallel processing (requires Queue tables)'
+                    WHEN N'@MaxWorkers'
+                    THEN N'max concurrent parallel workers (#181). Before joining queue, counts active sessions. If >= limit, exits cleanly (StopReason=MAX_WORKERS, return 0). NULL = unlimited. Use to prevent blocking storms on OLTP systems.'
                     WHEN N'@DeadWorkerTimeoutMinutes'
                     THEN N'parallel mode: consider worker dead if no progress for N minutes (default 15). Uses LastStatCompletedAt heartbeat column for accurate per-stat tracking. Units: minutes (same as @MaxAGWaitMinutes). Only applies when @StatsInParallel=Y.'
                     WHEN N'@Help'
@@ -896,6 +905,8 @@ BEGIN
                     WHEN N'@IncludeIndexedViews' THEN N'Y, N'
                     WHEN N'@TargetNorecompute' THEN N'Y, N, BOTH'
                     WHEN N'@SkipTablesWithColumnstore' THEN N'Y, N'
+                    WHEN N'@TemporalCoSchedule' THEN N'Y, N'
+                    WHEN N'@AscendingKeyBoost' THEN N'Y, N'
                     WHEN N'@QueryStorePriority' THEN N'Y, N'
                     WHEN N'@GroupByJoinPattern' THEN N'Y, N'
                     WHEN N'@StagedDiscovery' THEN N'Y, N'
@@ -944,6 +955,7 @@ BEGIN
                     WHEN N'@MaxSecondsPerStat' THEN N'NULL (disabled), 1-N seconds'
                     WHEN N'@PersistSampleMinRows' THEN N'NULL (no floor), 1-N rows'
                     WHEN N'@OrphanedRunThresholdHours' THEN N'1-N hours'
+                    WHEN N'@MaxWorkers' THEN N'NULL (unlimited), 1-N workers'
                     WHEN N'@DeadWorkerTimeoutMinutes' THEN N'NULL, 1-N minutes'
                     WHEN N'@ReturnDetailedResults' THEN N'0, 1'
                     WHEN N'@FailFast' THEN N'0, 1'
@@ -999,6 +1011,10 @@ BEGIN
                     THEN N'NULL'
                     WHEN N'@SkipTablesWithColumnstore'
                     THEN N'N'
+                    WHEN N'@TemporalCoSchedule'
+                    THEN N'Y'
+                    WHEN N'@AscendingKeyBoost'
+                    THEN N'Y'
                     WHEN N'@CheckPermissionsOnly'
                     THEN N'N'
                     WHEN N'@MinPageCount'
@@ -1059,6 +1075,8 @@ BEGIN
                     THEN N'Y'
                     WHEN N'@StatsInParallel'
                     THEN N'N'
+                    WHEN N'@MaxWorkers'
+                    THEN N'NULL (unlimited)'
                     WHEN N'@DeadWorkerTimeoutMinutes'
                     THEN N'15'
                     WHEN N'@Help'
@@ -1270,10 +1288,10 @@ BEGIN
                  N'Avoid overlapping with index maintenance (both acquire Sch-M). On AG primaries, Sch-M locks replay to secondaries via redo thread — use @MaxAGRedoQueueMB to protect secondaries. Run during off-peak concurrency windows.'),
                 /* #12, #212: Parallel mode — Agent job setup */
                 (N'Parallel Mode',
-                 N'Production setup: create 2-3 identical SQL Agent jobs, schedule to start simultaneously. All run the same sp_StatUpdate with @StatsInParallel=Y — work distribution is automatic via dbo.QueueStatistic. First worker populates queue; others join and claim work. Dead workers detected via @DeadWorkerTimeoutMinutes (default 15). Start with 2-3 workers and @LockTimeout=30-60s. Monitor: SELECT COUNT(*) FROM dbo.QueueStatistic WHERE StatEndTime IS NOT NULL;'),
-                /* #36: Edition-specific behavior */
+                 N'Production setup: create 2-3 identical SQL Agent jobs, schedule to start simultaneously. All run the same sp_StatUpdate with @StatsInParallel=Y — work distribution is automatic via dbo.QueueStatistic. First worker populates queue; others join and claim work. Dead workers detected via @DeadWorkerTimeoutMinutes (default 15). Use @MaxWorkers to cap concurrent workers (prevents blocking storms). Start with 2-3 workers and @LockTimeout=30-60s. Monitor: SELECT COUNT(*) FROM dbo.QueueStatistic WHERE StatEndTime IS NOT NULL;'),
+                /* #36: Edition-specific behavior, #197: SQL 2025 compatibility */
                 (N'Edition Notes',
-                 N'MAXDOP: works on all editions (SQL 2016 SP2+). PERSIST_SAMPLE_PERCENT: all editions (SQL 2016 SP1 CU4+). Incremental stats: requires partitioning (Enterprise or Standard SP1+). Parallel stats: all editions.'),
+                 N'MAXDOP: works on all editions (SQL 2016 SP2+). PERSIST_SAMPLE_PERCENT: all editions (SQL 2016 SP1 CU4+). Incremental stats: requires partitioning (Enterprise or Standard SP1+). Parallel stats: all editions. SQL 2025 (v17): fully compatible — all features enabled via forward-compatible >= version checks.'),
                 /* #11: PERSIST_SAMPLE_PERCENT CU history */
                 (N'PERSIST_SAMPLE_PERCENT',
                  N'Available since SQL 2016 SP1 CU4 (build 4446+). Early CUs had bugs — ensure fleet CU consistency. RESAMPLE ignores persisted percent (uses previously computed rate). To audit: SELECT name, has_persisted_sample FROM sys.stats. To remove: UPDATE STATISTICS WITH SAMPLE (without PERSIST).'),
@@ -1306,7 +1324,10 @@ BEGIN
                  N'Ascending key columns (identity, datetime inserts) accumulate rows beyond the histogram''s highest RANGE_HI_KEY, causing cardinality underestimates for recent values. Trace flags 2389/2390 (legacy CE) and 4139 (new CE quick stats) can help. Use @DaysStaleThreshold with a low value (e.g. 1-2 days) to catch ascending key stats that have few modifications but stale histograms. @SortOrder=N''DAYS_STALE'' prioritizes the oldest stats first.'),
                 /* #156: Compressed tables and @MinPageCount */
                 (N'Compressed Tables',
-                 N'@MinPageCount uses used_page_count from sys.dm_db_partition_stats which reflects compressed (on-disk) page counts, not the uncompressed data size. ROW or PAGE compressed tables may appear smaller than their actual data volume. A table with 500K rows might show 100 pages compressed vs 5000 uncompressed. If using @MinPageCount to skip small tables, compressed tables may be incorrectly skipped.')
+                 N'@MinPageCount uses used_page_count from sys.dm_db_partition_stats which reflects compressed (on-disk) page counts, not the uncompressed data size. ROW or PAGE compressed tables may appear smaller than their actual data volume. A table with 500K rows might show 100 pages compressed vs 5000 uncompressed. If using @MinPageCount to skip small tables, compressed tables may be incorrectly skipped.'),
+                /* #206: Filter combination logic */
+                (N'Filter Combination (AND Logic)',
+                 N'Discovery filters (@Tables, @ExcludeTables, @ExcludeStatistics, @TargetNorecompute, @FilteredStatsMode) are combined with AND logic. Example: @Tables=N''dbo.Orders'', @ExcludeStatistics=N''_WA_Sys%%'' processes only non-auto-created stats on dbo.Orders. To process "all stats on table A PLUS specific stats on table B", run two separate invocations. Note: @Statistics triggers DIRECT mode (skips discovery entirely) and cannot be combined with @Tables.')
         ) AS note_data
         (
             topic,
@@ -1400,8 +1421,9 @@ BEGIN
 
     /*
     SQL Server version detection
-    Major version: 13 = 2016, 14 = 2017, 15 = 2019, 16 = 2022
+    Major version: 13 = 2016, 14 = 2017, 15 = 2019, 16 = 2022, 17 = 2025
     Build number used for feature detection (e.g., PERSIST_SAMPLE_PERCENT, MAXDOP in UPDATE STATISTICS)
+    Future versions (>= 17) inherit SQL 2022 feature set — all >= comparisons forward-compatible.
     */
     DECLARE
         @sql_version numeric(18, 10) =
@@ -1461,10 +1483,10 @@ BEGIN
         */
         @supports_persist_sample bit = 0,
         @supports_maxdop_stats bit = 0,
-        /* SQL 2022+ feature detection */
+        /* SQL 2022+ feature detection (includes SQL 2025/v17+) */
         @supports_auto_drop bit = 0;
 
-    /* Set AUTO_DROP support flag (SQL 2022+) */
+    /* Set AUTO_DROP support flag (SQL 2022+ / v16+) */
     IF @sql_major_version >= 16
         SET @supports_auto_drop = 1;
 
@@ -3683,7 +3705,7 @@ BEGIN
     SQL 2022 AUTO_DROP note (Phase 1.2 - v2.0)
     */
     IF @supports_auto_drop = 1
-        RAISERROR(N'AUTO_DROP:   Available (SQL 2022) - stats auto-drop on schema change by default', 10, 1) WITH NOWAIT;
+        RAISERROR(N'AUTO_DROP:   Available (SQL 2022+) - stats auto-drop on schema change by default', 10, 1) WITH NOWAIT;
 
     /* #173: Linux case-sensitive collation warning */
     DECLARE @server_collation nvarchar(128) = CONVERT(nvarchar(128), SERVERPROPERTY(N'Collation'));
@@ -4140,6 +4162,8 @@ BEGIN
                     @IncludeSystemObjects AS IncludeSystemObjects,
                     @IncludeIndexedViews AS IncludeIndexedViews,
                     @SkipTablesWithColumnstore AS SkipTablesWithColumnstore,
+                    @TemporalCoSchedule AS TemporalCoSchedule,
+                    @AscendingKeyBoost AS AscendingKeyBoost,
 
                     /* Thresholds */
                     @ModificationThreshold AS ModificationThreshold,
@@ -4205,6 +4229,7 @@ BEGIN
 
                     /* Parallel */
                     @StatsInParallel AS StatsInParallel,
+                    @MaxWorkers AS MaxWorkers,
                     @DeadWorkerTimeoutMinutes AS DeadWorkerTimeoutMinutes,
 
                     /* Cleanup */
@@ -5478,6 +5503,37 @@ OPTION (RECOMPILE);';
                     );
                 END;
 
+                /*
+                #143: Ascending key boost — identity column stats with ANY modifications
+                bypass normal thresholds. Leading column of stat checked against
+                sys.identity_columns. This prevents histogram staleness for insert-heavy
+                tables where modification_counter hasn''t hit threshold yet.
+                */
+                IF @AscendingKeyBoost_param = N''Y''
+                BEGIN
+                    DECLARE @ascending_rescued int = 0;
+
+                    UPDATE sc
+                    SET sc.qualifies = 1
+                    FROM #stat_candidates AS sc
+                    WHERE sc.qualifies = 0
+                    AND   sc.modification_counter > 0
+                    AND   EXISTS (
+                        SELECT 1
+                        FROM sys.stats_columns AS stc
+                        JOIN sys.identity_columns AS ic
+                          ON ic.object_id = stc.object_id AND ic.column_id = stc.column_id
+                        WHERE stc.object_id = sc.object_id
+                        AND   stc.stats_id = sc.stats_id
+                        AND   stc.stats_column_id = 1
+                    );
+
+                    SET @ascending_rescued = @@ROWCOUNT;
+
+                    IF @ascending_rescued > 0 AND @Debug_param = 1
+                        RAISERROR(N''    Phase 4: Ascending key boost rescued %d stat(s)'', 10, 1, @ascending_rescued) WITH NOWAIT;
+                END;
+
                 /* Delete non-qualifying stats early */
                 DELETE FROM #stat_candidates WHERE qualifies = 0;
 
@@ -5854,6 +5910,7 @@ OPTION (RECOMPILE);';
                       @QueryStoreRecentHours_param integer,
                       @SkipTablesWithColumnstore_param nchar(1),
                       @IncludeIndexedViews_param nvarchar(1),
+                      @AscendingKeyBoost_param nvarchar(1),
                       @Debug_param bit',
                     @SortOrder_param = @SortOrder,
                     @TargetNorecompute_param = @TargetNorecompute,
@@ -5876,6 +5933,7 @@ OPTION (RECOMPILE);';
                     @QueryStoreRecentHours_param = @QueryStoreRecentHours,
                     @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore,
                     @IncludeIndexedViews_param = @IncludeIndexedViews,
+                    @AscendingKeyBoost_param = @AscendingKeyBoost,
                     @Debug_param = @Debug;
             END; /* End of staged discovery */
 
@@ -6263,6 +6321,20 @@ OPTION (RECOMPILE);';
                       OR ISNULL(DATEDIFF(HOUR, sp.last_updated, SYSDATETIME()), 999999) >= @HoursStaleThreshold_param
                   )
               )
+              /* #143: Ascending key boost - identity column stats with any modifications bypass thresholds */
+        OR    (
+                  @AscendingKeyBoost_param = N''Y''
+                  AND ISNULL(sp.modification_counter, 0) > 0
+                  AND EXISTS (
+                      SELECT 1
+                      FROM sys.stats_columns AS stc
+                      JOIN sys.identity_columns AS ic
+                        ON ic.object_id = stc.object_id AND ic.column_id = stc.column_id
+                      WHERE stc.object_id = s.object_id
+                      AND   stc.stats_id = s.stats_id
+                      AND   stc.stats_column_id = 1
+                  )
+              )
               ) /* End of threshold logic wrapper - ensures table/exclusion filters apply to both OR and AND modes */
         /* Table filter */
         AND   (
@@ -6375,7 +6447,8 @@ OPTION (RECOMPILE);';
                 @QueryStoreMinExecutions_param bigint,
                 @QueryStoreRecentHours_param integer,
                 @SkipTablesWithColumnstore_param nchar(1),
-                @IncludeIndexedViews_param nvarchar(1)';
+                @IncludeIndexedViews_param nvarchar(1),
+                @AscendingKeyBoost_param nvarchar(1)';
 
         /*
         Execute discovery in target database
@@ -6438,7 +6511,8 @@ OPTION (RECOMPILE);';
                 @QueryStoreMinExecutions_param = @QueryStoreMinExecutions,
                 @QueryStoreRecentHours_param = @QueryStoreRecentHours,
                 @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore,
-                @IncludeIndexedViews_param = @IncludeIndexedViews;
+                @IncludeIndexedViews_param = @IncludeIndexedViews,
+                @AscendingKeyBoost_param = @AscendingKeyBoost;
 
             END; /* End of legacy discovery (explicit or fallback) */
 
@@ -6861,6 +6935,144 @@ OPTION (RECOMPILE);';
 
     /*
     ============================================================================
+    TEMPORAL HISTORY TABLE CO-SCHEDULING (#201)
+    ============================================================================
+    When a system-versioned temporal table (temporal_type=2) qualifies for update,
+    also schedule its history table stats. Prevents cross-table cardinality
+    inconsistency for FOR SYSTEM_TIME queries that join current + history tables.
+    */
+    IF  @TemporalCoSchedule = N'Y'
+    AND @mode = N'DISCOVERY'
+    AND EXISTS (SELECT 1 FROM #stats_to_process WHERE temporal_type = 2)
+    BEGIN
+        DECLARE
+            @temporal_db sysname,
+            @temporal_sql nvarchar(max),
+            @temporal_coscheduled int = 0;
+
+        DECLARE temporal_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT DISTINCT database_name
+            FROM #stats_to_process
+            WHERE temporal_type = 2;
+
+        OPEN temporal_cursor;
+        FETCH NEXT FROM temporal_cursor INTO @temporal_db;
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            /*
+            For each database with temporal tables in the result set,
+            find history table stats that aren't already scheduled.
+            Uses sys.tables.history_table_id to link current → history.
+            */
+            SET @temporal_sql = N'
+                SELECT
+                    database_name = @db_param,
+                    schema_name = OBJECT_SCHEMA_NAME(hs.object_id),
+                    table_name = OBJECT_NAME(hs.object_id),
+                    stat_name = hs.name,
+                    object_id = hs.object_id,
+                    stats_id = hs.stats_id,
+                    no_recompute = hs.no_recompute,
+                    is_incremental = hs.is_incremental,
+                    is_memory_optimized = 0,
+                    is_heap = CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM sys.indexes AS ix
+                        WHERE ix.object_id = hs.object_id AND ix.index_id = 1
+                    ) THEN 1 ELSE 0 END,
+                    auto_created = hs.auto_created,
+                    is_published = ISNULL(ht.is_published, 0),
+                    is_tracked_by_cdc = ISNULL(ht.is_tracked_by_cdc, 0),
+                    temporal_type = ISNULL(ht.temporal_type, 1),
+                    modification_counter = ISNULL(sp.modification_counter, 0),
+                    row_count = ISNULL(sp.rows, 0),
+                    days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 999),
+                    page_count = ISNULL(
+                        (SELECT SUM(ps.used_page_count)
+                         FROM sys.dm_db_partition_stats AS ps
+                         WHERE ps.object_id = hs.object_id AND ps.index_id IN (0, 1)), 0)
+                FROM sys.stats AS hs
+                JOIN sys.tables AS ht ON ht.object_id = hs.object_id
+                CROSS APPLY sys.dm_db_stats_properties(hs.object_id, hs.stats_id) AS sp
+                WHERE ht.temporal_type = 1
+                AND   ht.object_id IN (
+                    SELECT ct.history_table_id
+                    FROM sys.tables AS ct
+                    WHERE ct.temporal_type = 2
+                    AND   ct.object_id IN (
+                        SELECT DISTINCT stp.object_id
+                        FROM #stats_to_process AS stp
+                        WHERE stp.database_name = @db_param
+                        AND   stp.temporal_type = 2
+                    )
+                )
+                AND   NOT EXISTS (
+                    SELECT 1
+                    FROM #stats_to_process AS existing
+                    WHERE existing.database_name = @db_param
+                    AND   existing.object_id = hs.object_id
+                    AND   existing.stats_id = hs.stats_id
+                );';
+
+            BEGIN TRY
+                DECLARE @temporal_full_sql nvarchar(max) =
+                    N'USE ' + QUOTENAME(@temporal_db) + N'; ' + @temporal_sql;
+
+                INSERT INTO #stats_to_process
+                (
+                    database_name, schema_name, table_name, stat_name,
+                    object_id, stats_id, no_recompute, is_incremental,
+                    is_memory_optimized, is_heap, auto_created,
+                    is_published, is_tracked_by_cdc, temporal_type,
+                    modification_counter, row_count, days_stale, page_count,
+                    priority
+                )
+                EXEC sys.sp_executesql
+                    @temporal_full_sql,
+                    N'@db_param sysname',
+                    @db_param = @temporal_db;
+
+                SET @temporal_coscheduled += @@ROWCOUNT;
+            END TRY
+            BEGIN CATCH
+                IF @Debug = 1
+                BEGIN
+                    DECLARE @temporal_err nvarchar(500) = ERROR_MESSAGE();
+                    RAISERROR(N'  Temporal co-schedule warning (%s): %s', 10, 1, @temporal_db, @temporal_err) WITH NOWAIT;
+                END;
+            END CATCH;
+
+            FETCH NEXT FROM temporal_cursor INTO @temporal_db;
+        END;
+
+        CLOSE temporal_cursor;
+        DEALLOCATE temporal_cursor;
+
+        IF @temporal_coscheduled > 0
+        BEGIN
+            DECLARE @temporal_msg nvarchar(200);
+            SET @temporal_msg = N'Temporal co-schedule: Added ' +
+                CONVERT(nvarchar(10), @temporal_coscheduled) +
+                N' history table stat(s) for consistency';
+            RAISERROR(@temporal_msg, 10, 1) WITH NOWAIT;
+
+            /* Assign priority to co-scheduled stats — place them right after their parent tables */
+            UPDATE stp
+            SET stp.priority = parent.max_priority + 1
+            FROM #stats_to_process AS stp
+            CROSS APPLY (
+                SELECT max_priority = MAX(p.priority)
+                FROM #stats_to_process AS p
+                WHERE p.database_name = stp.database_name
+                AND   p.temporal_type = 2
+            ) AS parent
+            WHERE stp.priority = 0
+            AND   stp.temporal_type = 1;
+        END;
+    END;
+
+    /*
+    ============================================================================
     REPORT DISCOVERED STATISTICS
     ============================================================================
     */
@@ -7145,6 +7357,45 @@ OPTION (RECOMPILE);';
                 BEGIN CATCH
                     /* Non-blocking: if fingerprint check fails, proceed to join the queue */
                 END CATCH;
+            END;
+
+            /*
+            #181: Max worker count coordination.
+            Before claiming, count active workers (sessions still alive in dm_exec_sessions).
+            If >= @MaxWorkers, exit cleanly without joining the queue.
+            */
+            IF @MaxWorkers IS NOT NULL AND @queue_id IS NOT NULL
+            BEGIN
+                DECLARE @active_worker_count int = 0;
+
+                SELECT
+                    @active_worker_count = COUNT(DISTINCT qs.SessionID)
+                FROM dbo.QueueStatistic AS qs
+                JOIN sys.dm_exec_sessions AS ses
+                  ON ses.session_id = qs.SessionID
+                WHERE qs.QueueID = @queue_id
+                AND   qs.StatEndTime IS NULL;
+
+                IF @active_worker_count >= @MaxWorkers
+                BEGIN
+                    DECLARE @mw_msg nvarchar(500);
+                    SET @mw_msg = N'Max parallel workers reached (' +
+                        CONVERT(nvarchar(10), @active_worker_count) + N' active, limit ' +
+                        CONVERT(nvarchar(10), @MaxWorkers) + N'). Exiting cleanly.';
+                    RAISERROR(@mw_msg, 10, 1) WITH NOWAIT;
+
+                    SET @StopReasonOut = N'MAX_WORKERS';
+                    EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+                    RETURN 0;
+                END;
+
+                IF @Debug = 1
+                BEGIN
+                    DECLARE @mw_debug nvarchar(200);
+                    SET @mw_debug = N'  Active workers: ' + CONVERT(nvarchar(10), @active_worker_count) +
+                        N' / ' + CONVERT(nvarchar(10), @MaxWorkers) + N' max';
+                    RAISERROR(@mw_debug, 10, 1) WITH NOWAIT;
+                END;
             END;
 
             /*
