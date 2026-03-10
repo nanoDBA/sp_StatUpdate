@@ -128,6 +128,8 @@ ALTER PROCEDURE
     @EfficacyDetailDays integer = NULL,            /* QS efficacy close-up window (NULL = 14 or @EfficacyDaysBack) */
     @ExpertMode bit = 0,                           /* 0 = Executive Dashboard + Recommendations (management view), 1 = all result sets (DBA view) */
     @SkipHistory bit = 0,                          /* 1 = skip reading/writing dbo.StatUpdateDiagHistory (for testing or transient installs) */
+    @GradeOverrides nvarchar(500) = NULL,          /* force grades or IGNORE categories: 'RELIABILITY=A, SPEED=IGNORE' */
+    @GradeWeights nvarchar(500) = NULL,            /* custom category weights (auto-normalized): 'COMPLETION=40, WORKLOAD=40' */
     @Help bit = 0,
     @Debug bit = 0,
     @SingleResultSet bit = 0,       /* 0 = default multi-result-set, 1 = single result set with ResultSetID/RowData */
@@ -198,6 +200,10 @@ BEGIN
                     N'0, 1', N'0'),
                 (N'@SkipHistory',             N'bit',      N'1 = Skip reading/writing dbo.StatUpdateDiagHistory persistent table. Useful for transient installs, testing, or when you do not want permanent tables created.',
                     N'0, 1', N'0'),
+                (N'@GradeOverrides',         N'nvarchar(500)', N'Force dashboard grades or ignore categories. Comma-separated CATEGORY=VALUE pairs. Categories: COMPLETION, RELIABILITY, SPEED, WORKLOAD. Values: A/B/C/D/F (force grade) or IGNORE (exclude from OVERALL). Example: ''RELIABILITY=A, SPEED=IGNORE'' — forces Reliability to A, excludes Speed from the overall score.',
+                    N'NULL, comma-separated pairs (e.g., ''RELIABILITY=A'', ''SPEED=IGNORE, WORKLOAD=B'')', N'NULL'),
+                (N'@GradeWeights',           N'nvarchar(500)', N'Custom category weights for OVERALL score. Comma-separated CATEGORY=WEIGHT pairs. Integers, auto-normalized to sum to 100%. Omitted categories keep default weight. Weight of 0 = same as IGNORE. Defaults: COMPLETION=30, RELIABILITY=25, SPEED=20, WORKLOAD=25.',
+                    N'NULL, comma-separated pairs (e.g., ''COMPLETION=50'', ''COMPLETION=40, WORKLOAD=40, SPEED=20'')', N'NULL'),
                 (N'@Help',                     N'bit',      N'Show this help output and return immediately',
                     N'0, 1', N'0'),
                 (N'@Debug',                    N'bit',      N'Verbose diagnostic output — shows intermediate temp table counts and timing',
@@ -402,6 +408,142 @@ BEGIN
     IF @Obfuscate = 0 AND @ObfuscationSeed IS NOT NULL
         RAISERROR(N'WARNING: @ObfuscationSeed is ignored when @Obfuscate = 0.', 10, 1) WITH NOWAIT;
 
+    /* ---- Grade Override / Weight parsing ---- */
+    DECLARE
+        @override_completion  char(1) = NULL,  /* NULL=computed, A-F=forced, X=IGNORE */
+        @override_reliability char(1) = NULL,
+        @override_speed       char(1) = NULL,
+        @override_workload    char(1) = NULL,
+        @weight_completion    decimal(5, 2) = 30.0,
+        @weight_reliability   decimal(5, 2) = 25.0,
+        @weight_speed         decimal(5, 2) = 20.0,
+        @weight_workload      decimal(5, 2) = 25.0,
+        @has_overrides        bit = 0;
+
+    IF @GradeOverrides IS NOT NULL
+    BEGIN
+        SET @has_overrides = 1;
+
+        DECLARE @go_pair nvarchar(100), @go_cat nvarchar(50), @go_val nvarchar(50);
+        DECLARE go_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@GradeOverrides, N',') WHERE LTRIM(RTRIM(value)) <> N'';
+        OPEN go_cursor;
+        FETCH NEXT FROM go_cursor INTO @go_pair;
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            IF CHARINDEX(N'=', @go_pair) = 0
+            BEGIN
+                SET @errors = @errors + N'@GradeOverrides: invalid pair ''' + @go_pair + N''' (expected CATEGORY=VALUE). ';
+                FETCH NEXT FROM go_cursor INTO @go_pair;
+                CONTINUE;
+            END;
+
+            SET @go_cat = UPPER(LTRIM(RTRIM(LEFT(@go_pair, CHARINDEX(N'=', @go_pair) - 1))));
+            SET @go_val = UPPER(LTRIM(RTRIM(SUBSTRING(@go_pair, CHARINDEX(N'=', @go_pair) + 1, 50))));
+
+            IF @go_cat NOT IN (N'COMPLETION', N'RELIABILITY', N'SPEED', N'WORKLOAD')
+            BEGIN
+                SET @errors = @errors + N'@GradeOverrides: unknown category ''' + @go_cat + N'''. Valid: COMPLETION, RELIABILITY, SPEED, WORKLOAD. ';
+                FETCH NEXT FROM go_cursor INTO @go_pair;
+                CONTINUE;
+            END;
+
+            IF @go_val NOT IN (N'A', N'B', N'C', N'D', N'F', N'IGNORE')
+            BEGIN
+                SET @errors = @errors + N'@GradeOverrides: invalid value ''' + @go_val + N''' for ' + @go_cat + N'. Valid: A, B, C, D, F, IGNORE. ';
+                FETCH NEXT FROM go_cursor INTO @go_pair;
+                CONTINUE;
+            END;
+
+            DECLARE @go_code char(1) = CASE WHEN @go_val = N'IGNORE' THEN 'X' ELSE LEFT(@go_val, 1) END;
+
+            IF @go_cat = N'COMPLETION'   SET @override_completion  = @go_code;
+            IF @go_cat = N'RELIABILITY'  SET @override_reliability = @go_code;
+            IF @go_cat = N'SPEED'        SET @override_speed       = @go_code;
+            IF @go_cat = N'WORKLOAD'     SET @override_workload    = @go_code;
+
+            FETCH NEXT FROM go_cursor INTO @go_pair;
+        END;
+
+        CLOSE go_cursor;
+        DEALLOCATE go_cursor;
+    END;
+
+    IF @GradeWeights IS NOT NULL
+    BEGIN
+        SET @has_overrides = 1;
+
+        DECLARE @gw_pair nvarchar(100), @gw_cat nvarchar(50), @gw_val_str nvarchar(50), @gw_val integer;
+        DECLARE gw_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT LTRIM(RTRIM(value)) FROM STRING_SPLIT(@GradeWeights, N',') WHERE LTRIM(RTRIM(value)) <> N'';
+        OPEN gw_cursor;
+        FETCH NEXT FROM gw_cursor INTO @gw_pair;
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            IF CHARINDEX(N'=', @gw_pair) = 0
+            BEGIN
+                SET @errors = @errors + N'@GradeWeights: invalid pair ''' + @gw_pair + N''' (expected CATEGORY=WEIGHT). ';
+                FETCH NEXT FROM gw_cursor INTO @gw_pair;
+                CONTINUE;
+            END;
+
+            SET @gw_cat = UPPER(LTRIM(RTRIM(LEFT(@gw_pair, CHARINDEX(N'=', @gw_pair) - 1))));
+            SET @gw_val_str = LTRIM(RTRIM(SUBSTRING(@gw_pair, CHARINDEX(N'=', @gw_pair) + 1, 50)));
+
+            IF @gw_cat NOT IN (N'COMPLETION', N'RELIABILITY', N'SPEED', N'WORKLOAD')
+            BEGIN
+                SET @errors = @errors + N'@GradeWeights: unknown category ''' + @gw_cat + N'''. Valid: COMPLETION, RELIABILITY, SPEED, WORKLOAD. ';
+                FETCH NEXT FROM gw_cursor INTO @gw_pair;
+                CONTINUE;
+            END;
+
+            IF TRY_CONVERT(integer, @gw_val_str) IS NULL OR TRY_CONVERT(integer, @gw_val_str) < 0
+            BEGIN
+                SET @errors = @errors + N'@GradeWeights: invalid weight ''' + @gw_val_str + N''' for ' + @gw_cat + N'. Must be a non-negative integer. ';
+                FETCH NEXT FROM gw_cursor INTO @gw_pair;
+                CONTINUE;
+            END;
+
+            SET @gw_val = CONVERT(integer, @gw_val_str);
+
+            IF @gw_cat = N'COMPLETION'   SET @weight_completion  = CONVERT(decimal(5, 2), @gw_val);
+            IF @gw_cat = N'RELIABILITY'  SET @weight_reliability = CONVERT(decimal(5, 2), @gw_val);
+            IF @gw_cat = N'SPEED'        SET @weight_speed       = CONVERT(decimal(5, 2), @gw_val);
+            IF @gw_cat = N'WORKLOAD'     SET @weight_workload    = CONVERT(decimal(5, 2), @gw_val);
+
+            FETCH NEXT FROM gw_cursor INTO @gw_pair;
+        END;
+
+        CLOSE gw_cursor;
+        DEALLOCATE gw_cursor;
+    END;
+
+    /* Apply IGNORE → weight=0, weight=0 → IGNORE (they are equivalent) */
+    IF @override_completion  = 'X' SET @weight_completion  = 0;
+    IF @override_reliability = 'X' SET @weight_reliability = 0;
+    IF @override_speed       = 'X' SET @weight_speed       = 0;
+    IF @override_workload    = 'X' SET @weight_workload    = 0;
+    IF @weight_completion  = 0 AND @override_completion  IS NULL SET @override_completion  = 'X';
+    IF @weight_reliability = 0 AND @override_reliability IS NULL SET @override_reliability = 'X';
+    IF @weight_speed       = 0 AND @override_speed       IS NULL SET @override_speed       = 'X';
+    IF @weight_workload    = 0 AND @override_workload    IS NULL SET @override_workload    = 'X';
+
+    /* Normalize weights to sum to 1.0 */
+    DECLARE @weight_sum decimal(10, 2) = @weight_completion + @weight_reliability + @weight_speed + @weight_workload;
+
+    IF @has_overrides = 1 AND @weight_sum = 0
+        SET @errors = @errors + N'All categories are IGNOREd or have weight 0 — cannot compute OVERALL score. ';
+
+    IF @weight_sum > 0
+    BEGIN
+        SET @weight_completion  = @weight_completion  / @weight_sum;
+        SET @weight_reliability = @weight_reliability / @weight_sum;
+        SET @weight_speed       = @weight_speed       / @weight_sum;
+        SET @weight_workload    = @weight_workload    / @weight_sum;
+    END;
+
     IF @errors <> N''
     BEGIN
         RAISERROR(N'Parameter validation failed: %s', 16, 1, @errors) WITH NOWAIT;
@@ -455,6 +597,24 @@ BEGIN
     DECLARE @obfuscate_int integer = CONVERT(integer, @Obfuscate);
     RAISERROR(N'Obfuscate: %i', 10, 1, @obfuscate_int) WITH NOWAIT;
     RAISERROR(N'ExpertMode: %i', 10, 1, @expert_int) WITH NOWAIT;
+
+    IF @has_overrides = 1
+    BEGIN
+        DECLARE @override_msg nvarchar(500) = N'Grade overrides active:';
+        IF @override_completion  IS NOT NULL SET @override_msg = @override_msg + N' COMPLETION=' + CASE @override_completion  WHEN 'X' THEN N'IGNORE' ELSE @override_completion  END;
+        IF @override_reliability IS NOT NULL SET @override_msg = @override_msg + N' RELIABILITY=' + CASE @override_reliability WHEN 'X' THEN N'IGNORE' ELSE @override_reliability END;
+        IF @override_speed       IS NOT NULL SET @override_msg = @override_msg + N' SPEED=' + CASE @override_speed       WHEN 'X' THEN N'IGNORE' ELSE @override_speed       END;
+        IF @override_workload    IS NOT NULL SET @override_msg = @override_msg + N' WORKLOAD=' + CASE @override_workload    WHEN 'X' THEN N'IGNORE' ELSE @override_workload    END;
+        RAISERROR(@override_msg, 10, 1) WITH NOWAIT;
+
+        DECLARE @weight_msg nvarchar(500) = N'Effective weights: COMPLETION='
+            + CONVERT(nvarchar(10), CONVERT(integer, @weight_completion * 100))
+            + N', RELIABILITY=' + CONVERT(nvarchar(10), CONVERT(integer, @weight_reliability * 100))
+            + N', SPEED=' + CONVERT(nvarchar(10), CONVERT(integer, @weight_speed * 100))
+            + N', WORKLOAD=' + CONVERT(nvarchar(10), CONVERT(integer, @weight_workload * 100))
+            + N' (sum=100)';
+        RAISERROR(@weight_msg, 10, 1) WITH NOWAIT;
+    END;
 
     /* BUG-07: orphan threshold now a named constant (was hardcoded 60 minutes).
        Default 2880 = 48 hours, matching sp_StatUpdate @OrphanedRunThresholdHours default.
@@ -2029,52 +2189,77 @@ BEGIN
         WHERE e.IsQSRun = 1
         AND   e.HighCpuInFirstQuartilePct IS NOT NULL;
 
-        /* GAP-E: Estimate time without prioritization for comparison.
-           Without QS prioritization, critical stats land at random positions.
-           Expected position = midpoint (StatsFound/2), so expected time =
-           AvgSecPerStat * (StatsFound/2) / 60.0 minutes. */
-        DECLARE
-            @i6_estimated_no_qs_min decimal(10, 1);
+        IF @i6_run_count = 0
+        BEGIN
+            /* QS-flagged runs exist but none had usable CPU metrics (all HighCpuInFirstQuartilePct IS NULL).
+               This happens when Query Store was recently enabled, has no runtime stats, or databases have minimal activity. */
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES
+            (
+                N'INFO',
+                N'QS_EFFICACY',
+                N'Query Store prioritization is configured but no CPU workload data was found in '
+                    + CONVERT(nvarchar(10), @qs_run_count) + N' recent QS run(s). '
+                    + N'This may indicate Query Store was recently enabled, has no runtime stats yet, '
+                    + N'or the monitored databases have minimal query activity.',
+                N'QS-flagged runs found: ' + CONVERT(nvarchar(10), @qs_run_count)
+                    + N'. None contained usable CPU metrics in sys.query_store_runtime_stats.',
+                N'Verify Query Store is in READ_WRITE mode and has accumulated runtime statistics. '
+                    + N'Check: SELECT actual_state_desc FROM sys.database_query_store_options;',
+                N'EXECUTE dbo.sp_StatUpdate_Diag @EfficacyDaysBack = 100, @Debug = 1;',
+                70
+            );
+            RAISERROR(N'  [INFO] I6: QS runs found but no CPU data available', 10, 1) WITH NOWAIT;
+        END
+        ELSE
+        BEGIN
+            /* GAP-E: Estimate time without prioritization for comparison.
+               Without QS prioritization, critical stats land at random positions.
+               Expected position = midpoint (StatsFound/2), so expected time =
+               AvgSecPerStat * (StatsFound/2) / 60.0 minutes. */
+            DECLARE
+                @i6_estimated_no_qs_min decimal(10, 1);
 
-        SELECT
-            @i6_estimated_no_qs_min = AVG(e.AvgSecPerStat * e.StatsFound / 2.0 / 60.0)
-        FROM #qs_efficacy AS e
-        WHERE e.IsQSRun = 1
-        AND   e.HighCpuInFirstQuartilePct IS NOT NULL
-        AND   e.AvgSecPerStat > 0
-        AND   e.StatsFound > 0;
+            SELECT
+                @i6_estimated_no_qs_min = AVG(e.AvgSecPerStat * e.StatsFound / 2.0 / 60.0)
+            FROM #qs_efficacy AS e
+            WHERE e.IsQSRun = 1
+            AND   e.HighCpuInFirstQuartilePct IS NOT NULL
+            AND   e.AvgSecPerStat > 0
+            AND   e.StatsFound > 0;
 
-        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
-        VALUES
-        (
-            N'INFO',
-            N'QS_EFFICACY',
-            N'Query Store prioritization active: '
-                + ISNULL(CONVERT(nvarchar(10), CONVERT(integer, @i6_avg_q1_pct / 10.0)), N'?') + N' of 10 highest-workload statistics updated in the first '
-                + ISNULL(CONVERT(nvarchar(10), CONVERT(integer, @i6_avg_minutes)), N'?') + N' minutes across '
-                + CONVERT(nvarchar(10), @i6_run_count) + N' recent run(s). Workload coverage: '
-                + ISNULL(CONVERT(nvarchar(10), @i6_avg_workload), N'?') + N'% of measured CPU.'
-                + CASE WHEN @i6_estimated_no_qs_min IS NOT NULL AND @i6_avg_minutes IS NOT NULL
-                    THEN N' Critical stats reached in '
-                        + CONVERT(nvarchar(10), CONVERT(integer, @i6_avg_minutes)) + N' min (QS) vs ~'
-                        + CONVERT(nvarchar(10), CONVERT(integer, @i6_estimated_no_qs_min)) + N' min estimated without prioritization.'
-                    ELSE N''
-                END,
-            N'Avg high-CPU-in-first-quartile: ' + ISNULL(CONVERT(nvarchar(10), @i6_avg_q1_pct), N'N/A') + N'%. '
-                + N'Avg minutes to complete top-10: ' + ISNULL(CONVERT(nvarchar(10), @i6_avg_minutes), N'N/A') + N'. '
-                + N'Avg workload coverage: ' + ISNULL(CONVERT(nvarchar(10), @i6_avg_workload), N'N/A') + N'%. '
-                + N'Across ' + CONVERT(nvarchar(10), @i6_run_count) + N' QS-priority run(s).'
-                + CASE WHEN @i6_estimated_no_qs_min IS NOT NULL
-                    THEN N' Estimated without QS: ~' + CONVERT(nvarchar(10), CONVERT(integer, @i6_estimated_no_qs_min)) + N' min to reach critical stats.'
-                    ELSE N''
-                END,
-            N'High first-quartile placement means the most impactful statistics are being refreshed early in the maintenance window. '
-                + N'Monitor this over time to confirm QS prioritization continues to deliver value.',
-            N'EXECUTE dbo.sp_StatUpdate_Diag @EfficacyDaysBack = 100;',
-            70
-        );
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES
+            (
+                N'INFO',
+                N'QS_EFFICACY',
+                N'Query Store prioritization active: '
+                    + CONVERT(nvarchar(10), CONVERT(integer, @i6_avg_q1_pct / 10.0)) + N' of 10 highest-workload statistics updated in the first '
+                    + CONVERT(nvarchar(10), CONVERT(integer, @i6_avg_minutes)) + N' minutes across '
+                    + CONVERT(nvarchar(10), @i6_run_count) + N' recent run(s). Workload coverage: '
+                    + CONVERT(nvarchar(10), @i6_avg_workload) + N'% of measured CPU.'
+                    + CASE WHEN @i6_estimated_no_qs_min IS NOT NULL AND @i6_avg_minutes IS NOT NULL
+                        THEN N' Critical stats reached in '
+                            + CONVERT(nvarchar(10), CONVERT(integer, @i6_avg_minutes)) + N' min (QS) vs ~'
+                            + CONVERT(nvarchar(10), CONVERT(integer, @i6_estimated_no_qs_min)) + N' min estimated without prioritization.'
+                        ELSE N''
+                    END,
+                N'Avg high-CPU-in-first-quartile: ' + CONVERT(nvarchar(10), @i6_avg_q1_pct) + N'%. '
+                    + N'Avg minutes to complete top-10: ' + CONVERT(nvarchar(10), @i6_avg_minutes) + N'. '
+                    + N'Avg workload coverage: ' + CONVERT(nvarchar(10), @i6_avg_workload) + N'%. '
+                    + N'Across ' + CONVERT(nvarchar(10), @i6_run_count) + N' QS-priority run(s).'
+                    + CASE WHEN @i6_estimated_no_qs_min IS NOT NULL
+                        THEN N' Estimated without QS: ~' + CONVERT(nvarchar(10), CONVERT(integer, @i6_estimated_no_qs_min)) + N' min to reach critical stats.'
+                        ELSE N''
+                    END,
+                N'High first-quartile placement means the most impactful statistics are being refreshed early in the maintenance window. '
+                    + N'Monitor this over time to confirm QS prioritization continues to deliver value.',
+                N'EXECUTE dbo.sp_StatUpdate_Diag @EfficacyDaysBack = 100;',
+                70
+            );
 
-        RAISERROR(N'  [INFO] I6: QS efficacy computed', 10, 1) WITH NOWAIT;
+            RAISERROR(N'  [INFO] I6: QS efficacy computed', 10, 1) WITH NOWAIT;
+        END;
     END;
 
     /* ======================================================================
@@ -2422,12 +2607,25 @@ BEGIN
         IF @score_workload > 100 SET @score_workload = 100;
     END;
 
-    /* Overall = weighted average */
+    /* Apply grade overrides: forced grades map to fixed scores (A=95, B=82, C=67, D=50, F=20) */
+    DECLARE
+        @effective_completion  integer = @score_completion,
+        @effective_reliability integer = @score_reliability,
+        @effective_speed       integer = @score_speed,
+        @effective_workload    integer = @score_workload;
+
+    IF @override_completion  IN ('A','B','C','D','F') SET @effective_completion  = CASE @override_completion  WHEN 'A' THEN 95 WHEN 'B' THEN 82 WHEN 'C' THEN 67 WHEN 'D' THEN 50 ELSE 20 END;
+    IF @override_reliability IN ('A','B','C','D','F') SET @effective_reliability = CASE @override_reliability WHEN 'A' THEN 95 WHEN 'B' THEN 82 WHEN 'C' THEN 67 WHEN 'D' THEN 50 ELSE 20 END;
+    IF @override_speed       IN ('A','B','C','D','F') SET @effective_speed       = CASE @override_speed       WHEN 'A' THEN 95 WHEN 'B' THEN 82 WHEN 'C' THEN 67 WHEN 'D' THEN 50 ELSE 20 END;
+    IF @override_workload    IN ('A','B','C','D','F') SET @effective_workload    = CASE @override_workload    WHEN 'A' THEN 95 WHEN 'B' THEN 82 WHEN 'C' THEN 67 WHEN 'D' THEN 50 ELSE 20 END;
+
+    /* Overall = weighted average (defaults: COMPLETION=30%, RELIABILITY=25%, SPEED=20%, WORKLOAD=25%;
+       overridden by @GradeWeights, normalized to sum to 1.0; IGNOREd categories get weight 0) */
     SET @score_overall = CONVERT(integer,
-        @score_completion * 0.30
-        + @score_reliability * 0.25
-        + @score_speed * 0.20
-        + @score_workload * 0.25
+        @effective_completion  * @weight_completion
+        + @effective_reliability * @weight_reliability
+        + @effective_speed       * @weight_speed
+        + @effective_workload    * @weight_workload
     );
     SET @health_score = @score_overall;
 
@@ -2448,7 +2646,10 @@ BEGIN
             END;
     END;
 
-    /* Populate dashboard rows */
+    /* Populate dashboard rows.
+       Override logic: IGNORE → Grade='-', Score=0, headline prefixed '[IGNORED]'.
+       Forced grade → use forced grade/score, headline prefixed '[OVERRIDE: X]', detail shows actual score.
+       OVERALL appends '[Overrides active]' when any override is in effect. */
     INSERT INTO #executive_dashboard (Category, Grade, Score, Headline, Detail, Trend, SortOrder)
     VALUES
     (
@@ -2462,7 +2663,8 @@ BEGIN
             WHEN @score_overall >= 40 THEN N'Statistics maintenance needs attention. Multiple issues affecting database performance.'
             ELSE N'Statistics maintenance has critical issues requiring immediate action.'
         END
-            + CASE WHEN @overall_trend IS NOT NULL THEN N' (' + @overall_trend + N' from prior assessment: ' + CONVERT(nvarchar(10), @prior_health) + N' -> ' + CONVERT(nvarchar(10), @score_overall) + N')' ELSE N'' END,
+            + CASE WHEN @overall_trend IS NOT NULL THEN N' (' + @overall_trend + N' from prior assessment: ' + CONVERT(nvarchar(10), @prior_health) + N' -> ' + CONVERT(nvarchar(10), @score_overall) + N')' ELSE N'' END
+            + CASE WHEN @has_overrides = 1 THEN N' [Overrides active]' ELSE N'' END,
         CONVERT(nvarchar(10), @run_count) + N' runs analyzed over ' + CONVERT(nvarchar(10), @DaysBack) + N' days. '
             + CONVERT(nvarchar(10), @stat_update_count) + N' individual stat updates. '
             + CASE WHEN @qs_run_count > 0 THEN CONVERT(nvarchar(10), @qs_run_count) + N' runs using Query Store prioritization.' ELSE N'Query Store prioritization not in use.' END,
@@ -2471,72 +2673,96 @@ BEGIN
     ),
     (
         N'COMPLETION',
-        CASE WHEN @score_completion >= 90 THEN 'A' WHEN @score_completion >= 75 THEN 'B' WHEN @score_completion >= 60 THEN 'C' WHEN @score_completion >= 40 THEN 'D' ELSE 'F' END,
-        @score_completion,
-        CASE
-            WHEN @score_completion >= 90 THEN N'Nearly all qualifying statistics are being updated each run.'
-            WHEN @score_completion >= 75 AND @tl_run_pct >= 50.0
-                THEN N'Most statistics are updated, but ' + CONVERT(nvarchar(10), @time_limit_runs)
-                     + N' of ' + CONVERT(nvarchar(10), @run_count) + N' runs hit the time limit.'
-            WHEN @score_completion >= 75 THEN N'Most statistics are being updated, but some are consistently left behind.'
-            WHEN @score_completion >= 60 AND @tl_run_pct >= 50.0
-                THEN N'Maintenance window is too short — ' + CONVERT(nvarchar(10), @time_limit_runs)
-                     + N' of ' + CONVERT(nvarchar(10), @run_count) + N' runs hit the time limit before finishing.'
-            WHEN @score_completion >= 60 THEN N'A significant portion of statistics are not being reached within the maintenance window.'
-            WHEN @score_completion >= 40 THEN N'Less than half of qualifying statistics are being updated. Increase time limit or reduce scope.'
-            ELSE N'Very few statistics are being updated. Maintenance window is severely undersized for the workload.'
-        END,
-        N'Average completion rate: ' + ISNULL(CONVERT(nvarchar(10), @avg_completion), N'N/A') + N'% of qualifying statistics updated per run.',
+        CASE WHEN @override_completion = 'X' THEN '-'
+             WHEN @override_completion IN ('A','B','C','D','F') THEN @override_completion
+             WHEN @score_completion >= 90 THEN 'A' WHEN @score_completion >= 75 THEN 'B' WHEN @score_completion >= 60 THEN 'C' WHEN @score_completion >= 40 THEN 'D' ELSE 'F' END,
+        CASE WHEN @override_completion = 'X' THEN 0 ELSE @score_completion END,
+        CASE WHEN @override_completion = 'X' THEN N'[IGNORED] '
+             WHEN @override_completion IN ('A','B','C','D','F') THEN N'[OVERRIDE: ' + @override_completion + N'] '
+             ELSE N'' END
+            + CASE
+                WHEN @score_completion >= 90 THEN N'Nearly all qualifying statistics are being updated each run.'
+                WHEN @score_completion >= 75 AND @tl_run_pct >= 50.0
+                    THEN N'Most statistics are updated, but ' + CONVERT(nvarchar(10), @time_limit_runs)
+                         + N' of ' + CONVERT(nvarchar(10), @run_count) + N' runs hit the time limit.'
+                WHEN @score_completion >= 75 THEN N'Most statistics are being updated, but some are consistently left behind.'
+                WHEN @score_completion >= 60 AND @tl_run_pct >= 50.0
+                    THEN N'Maintenance window is too short — ' + CONVERT(nvarchar(10), @time_limit_runs)
+                         + N' of ' + CONVERT(nvarchar(10), @run_count) + N' runs hit the time limit before finishing.'
+                WHEN @score_completion >= 60 THEN N'A significant portion of statistics are not being reached within the maintenance window.'
+                WHEN @score_completion >= 40 THEN N'Less than half of qualifying statistics are being updated. Increase time limit or reduce scope.'
+                ELSE N'Very few statistics are being updated. Maintenance window is severely undersized for the workload.'
+            END,
+        N'Average completion rate: ' + ISNULL(CONVERT(nvarchar(10), @avg_completion), N'N/A') + N'% of qualifying statistics updated per run.'
+            + CASE WHEN @override_completion IN ('A','B','C','D','F') THEN N' (actual score: ' + CONVERT(nvarchar(10), @score_completion) + N')' ELSE N'' END,
         NULL,
         2
     ),
     (
         N'RELIABILITY',
-        CASE WHEN @score_reliability >= 90 THEN 'A' WHEN @score_reliability >= 75 THEN 'B' WHEN @score_reliability >= 60 THEN 'C' WHEN @score_reliability >= 40 THEN 'D' ELSE 'F' END,
-        @score_reliability,
-        CASE
-            WHEN @killed_count > 0 AND @score_reliability < 60 THEN CONVERT(nvarchar(10), @killed_count) + N' run(s) were killed before completing. Check SQL Agent job history for failures.'
-            WHEN @killed_count > 0 THEN CONVERT(nvarchar(10), @killed_count) + N' run(s) were killed, but overall reliability is acceptable.'
-            WHEN @score_reliability >= 90 THEN N'All runs completed normally without errors or kills.'
-            ELSE N'Runs are completing but experiencing errors or consistently hitting time limits.'
-        END,
+        CASE WHEN @override_reliability = 'X' THEN '-'
+             WHEN @override_reliability IN ('A','B','C','D','F') THEN @override_reliability
+             WHEN @score_reliability >= 90 THEN 'A' WHEN @score_reliability >= 75 THEN 'B' WHEN @score_reliability >= 60 THEN 'C' WHEN @score_reliability >= 40 THEN 'D' ELSE 'F' END,
+        CASE WHEN @override_reliability = 'X' THEN 0 ELSE @score_reliability END,
+        CASE WHEN @override_reliability = 'X' THEN N'[IGNORED] '
+             WHEN @override_reliability IN ('A','B','C','D','F') THEN N'[OVERRIDE: ' + @override_reliability + N'] '
+             ELSE N'' END
+            + CASE
+                WHEN @killed_count > 0 AND @score_reliability < 60 THEN CONVERT(nvarchar(10), @killed_count) + N' run(s) were killed before completing. Check SQL Agent job history for failures.'
+                WHEN @killed_count > 0 THEN CONVERT(nvarchar(10), @killed_count) + N' run(s) were killed, but overall reliability is acceptable.'
+                WHEN @score_reliability >= 90 THEN N'All runs completed normally without errors or kills.'
+                ELSE N'Runs are completing but experiencing errors or consistently hitting time limits.'
+            END,
         N'Killed runs: ' + CONVERT(nvarchar(10), @killed_count)
             + N'. Failed stat updates: ' + CONVERT(nvarchar(10), (SELECT COUNT_BIG(*) FROM #stat_updates WHERE ErrorNumber > 0))
-            + N'. Time-limited runs: ' + CONVERT(nvarchar(10), @time_limit_runs) + N'.',
+            + N'. Time-limited runs: ' + CONVERT(nvarchar(10), @time_limit_runs) + N'.'
+            + CASE WHEN @override_reliability IN ('A','B','C','D','F') THEN N' (actual score: ' + CONVERT(nvarchar(10), @score_reliability) + N')' ELSE N'' END,
         NULL,
         3
     ),
     (
         N'SPEED',
-        CASE WHEN @score_speed >= 90 THEN 'A' WHEN @score_speed >= 75 THEN 'B' WHEN @score_speed >= 60 THEN 'C' WHEN @score_speed >= 40 THEN 'D' ELSE 'F' END,
-        @score_speed,
-        CASE
-            WHEN @score_speed >= 90 THEN N'Statistics are being updated very quickly (' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'<1') + N' sec/stat average).'
-            WHEN @score_speed >= 75 THEN N'Update speed is good at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat average.'
-            WHEN @score_speed >= 60 THEN N'Update speed is moderate at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat. Consider parallel mode or adaptive sampling.'
-            ELSE N'Updates are slow at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat. Investigate I/O, table sizes, and sample rates.'
-        END,
+        CASE WHEN @override_speed = 'X' THEN '-'
+             WHEN @override_speed IN ('A','B','C','D','F') THEN @override_speed
+             WHEN @score_speed >= 90 THEN 'A' WHEN @score_speed >= 75 THEN 'B' WHEN @score_speed >= 60 THEN 'C' WHEN @score_speed >= 40 THEN 'D' ELSE 'F' END,
+        CASE WHEN @override_speed = 'X' THEN 0 ELSE @score_speed END,
+        CASE WHEN @override_speed = 'X' THEN N'[IGNORED] '
+             WHEN @override_speed IN ('A','B','C','D','F') THEN N'[OVERRIDE: ' + @override_speed + N'] '
+             ELSE N'' END
+            + CASE
+                WHEN @score_speed >= 90 THEN N'Statistics are being updated very quickly (' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'<1') + N' sec/stat average).'
+                WHEN @score_speed >= 75 THEN N'Update speed is good at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat average.'
+                WHEN @score_speed >= 60 THEN N'Update speed is moderate at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat. Consider parallel mode or adaptive sampling.'
+                ELSE N'Updates are slow at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat. Investigate I/O, table sizes, and sample rates.'
+            END,
         N'Average seconds per stat update: ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'N/A')
-            + N'. Average run duration: ' + ISNULL(CONVERT(nvarchar(10), (SELECT AVG(DurationSeconds) / 60 FROM #runs WHERE IsKilled = 0)), N'N/A') + N' minutes.',
+            + N'. Average run duration: ' + ISNULL(CONVERT(nvarchar(10), (SELECT AVG(DurationSeconds) / 60 FROM #runs WHERE IsKilled = 0)), N'N/A') + N' minutes.'
+            + CASE WHEN @override_speed IN ('A','B','C','D','F') THEN N' (actual score: ' + CONVERT(nvarchar(10), @score_speed) + N')' ELSE N'' END,
         NULL,
         4
     ),
     (
         N'WORKLOAD FOCUS',
-        CASE WHEN @score_workload >= 90 THEN 'A' WHEN @score_workload >= 75 THEN 'B' WHEN @score_workload >= 60 THEN 'C' WHEN @score_workload >= 40 THEN 'D' ELSE 'F' END,
-        @score_workload,
-        CASE
-            WHEN @qs_run_count = 0 THEN N'Query Store prioritization is not enabled. Statistics are updated by modification count, not workload impact.'
-            WHEN @score_workload >= 90 THEN N'Query Store prioritization is highly effective. The most performance-critical statistics are updated first.'
-            WHEN @score_workload >= 75 THEN N'Query Store prioritization is working well. Most high-impact statistics are prioritized.'
-            ELSE N'Query Store prioritization is enabled but not fully effective. Check Query Store health on target databases.'
-        END,
+        CASE WHEN @override_workload = 'X' THEN '-'
+             WHEN @override_workload IN ('A','B','C','D','F') THEN @override_workload
+             WHEN @score_workload >= 90 THEN 'A' WHEN @score_workload >= 75 THEN 'B' WHEN @score_workload >= 60 THEN 'C' WHEN @score_workload >= 40 THEN 'D' ELSE 'F' END,
+        CASE WHEN @override_workload = 'X' THEN 0 ELSE @score_workload END,
+        CASE WHEN @override_workload = 'X' THEN N'[IGNORED] '
+             WHEN @override_workload IN ('A','B','C','D','F') THEN N'[OVERRIDE: ' + @override_workload + N'] '
+             ELSE N'' END
+            + CASE
+                WHEN @qs_run_count = 0 THEN N'Query Store prioritization is not enabled. Statistics are updated by modification count, not workload impact.'
+                WHEN @score_workload >= 90 THEN N'Query Store prioritization is highly effective. The most performance-critical statistics are updated first.'
+                WHEN @score_workload >= 75 THEN N'Query Store prioritization is working well. Most high-impact statistics are prioritized.'
+                ELSE N'Query Store prioritization is enabled but not fully effective. Check Query Store health on target databases.'
+            END,
         CASE
             WHEN @qs_run_count > 0 THEN N'QS runs: ' + CONVERT(nvarchar(10), @qs_run_count)
                 + N'. Avg workload coverage: ' + ISNULL(CONVERT(nvarchar(10), @avg_workload_cov), N'N/A') + N'%'
                 + N'. High-CPU stats in first quartile: ' + ISNULL(CONVERT(nvarchar(10), @avg_q1_pct_score), N'N/A') + N'%.'
             ELSE N'Enable with: @QueryStorePriority = N''Y'', @SortOrder = N''QUERY_STORE'''
-        END,
+        END
+            + CASE WHEN @override_workload IN ('A','B','C','D','F') THEN N' (actual score: ' + CONVERT(nvarchar(10), @score_workload) + N')' ELSE N'' END,
         NULL,
         5
     );
