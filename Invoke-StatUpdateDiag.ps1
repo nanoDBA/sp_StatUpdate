@@ -32,11 +32,31 @@
 .PARAMETER Obfuscate
     When specified, all output uses hashed names (safe for external sharing).
 
+.PARAMETER ObfuscationSeed
+    Salt for HASHBYTES obfuscation. Makes tokens deterministic across runs/servers
+    with the same seed but unpredictable without it. Requires -Obfuscate.
+
+.PARAMETER ExpertMode
+    0 = management view (dashboard + recommendations only), 1 = DBA deep-dive (all 13 RS).
+    Defaults to 0.
+
 .PARAMETER LongRunningMinutes
     Threshold for long-running stat detection. Defaults to 10.
 
+.PARAMETER FailureThreshold
+    Number of failures before triggering C2 CRITICAL. Defaults to 3.
+
+.PARAMETER ThroughputWindowDays
+    Window for throughput trend analysis (C4). Defaults to 7.
+
 .PARAMETER TopN
     Limit for detail result sets. Defaults to 20.
+
+.PARAMETER EfficacyDaysBack
+    Broad trending window for QS efficacy analysis (RS 9). Defaults to @DaysBack.
+
+.PARAMETER EfficacyDetailDays
+    Close-up run-over-run window for QS efficacy detail (RS 10). Defaults to 14.
 
 .PARAMETER TrustServerCertificate
     Trust the SQL Server certificate without validation. Defaults to $true.
@@ -81,9 +101,21 @@ param(
 
     [switch]$Obfuscate,
 
+    [string]$ObfuscationSeed,
+
+    [int]$ExpertMode = 0,
+
     [int]$LongRunningMinutes = 10,
 
+    [int]$FailureThreshold = 3,
+
+    [int]$ThroughputWindowDays = 7,
+
     [int]$TopN = 20,
+
+    [Nullable[int]]$EfficacyDaysBack,
+
+    [Nullable[int]]$EfficacyDetailDays,
 
     [bool]$TrustServerCertificate = $true,
 
@@ -113,7 +145,8 @@ Write-Host ""
 Write-Host "Servers:         $($Servers.Count)"
 Write-Host "CommandLog DB:   $CommandLogDatabase"
 Write-Host "Days back:       $DaysBack"
-Write-Host "Obfuscate:       $Obfuscate"
+Write-Host "Obfuscate:       $Obfuscate$(if ($ObfuscationSeed) { ' (seeded)' })"
+Write-Host "ExpertMode:      $ExpertMode"
 Write-Host "Output:          $OutputPath"
 Write-Host "Format:          $OutputFormat"
 Write-Host ""
@@ -125,8 +158,14 @@ Write-Host ""
 $procParams = @{
     DaysBack             = $DaysBack
     Obfuscate            = if ($Obfuscate) { 1 } else { 0 }
+    ObfuscationSeed      = $ObfuscationSeed
+    ExpertMode           = $ExpertMode
     LongRunningMinutes   = $LongRunningMinutes
+    FailureThreshold     = $FailureThreshold
+    ThroughputWindowDays = $ThroughputWindowDays
     TopN                 = $TopN
+    EfficacyDaysBack     = $EfficacyDaysBack
+    EfficacyDetailDays   = $EfficacyDetailDays
     CommandLogDatabase   = $CommandLogDatabase
 }
 
@@ -167,9 +206,21 @@ $Servers | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
         $paramList = @(
             "@DaysBack = $($paramsLocal.DaysBack)",
             "@Obfuscate = $($paramsLocal.Obfuscate)",
+            "@ExpertMode = $($paramsLocal.ExpertMode)",
             "@LongRunningMinutes = $($paramsLocal.LongRunningMinutes)",
+            "@FailureThreshold = $($paramsLocal.FailureThreshold)",
+            "@ThroughputWindowDays = $($paramsLocal.ThroughputWindowDays)",
             "@TopN = $($paramsLocal.TopN)"
         )
+        if ($paramsLocal.ObfuscationSeed) {
+            $paramList += "@ObfuscationSeed = N'$($paramsLocal.ObfuscationSeed)'"
+        }
+        if ($null -ne $paramsLocal.EfficacyDaysBack) {
+            $paramList += "@EfficacyDaysBack = $($paramsLocal.EfficacyDaysBack)"
+        }
+        if ($null -ne $paramsLocal.EfficacyDetailDays) {
+            $paramList += "@EfficacyDetailDays = $($paramsLocal.EfficacyDetailDays)"
+        }
         if ($paramsLocal.CommandLogDatabase -and $paramsLocal.CommandLogDatabase -ne $dbLocal) {
             $paramList += "@CommandLogDatabase = N'$($paramsLocal.CommandLogDatabase)'"
         }
