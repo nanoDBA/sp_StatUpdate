@@ -458,72 +458,134 @@ EXEC dbo.sp_StatUpdate_Diag @SkipHistory = 1;
 
 ### Obfuscated Mode
 
-Hash all names for safe external sharing. Prefixes (`IX_`, `PK_`, `DB_`) are preserved for context.
+Hash all database, table, and statistics names for safe external sharing. Prefixes (`IX_`, `PK_`, `DB_`, `_WA_Sys_`) are preserved so consultants can still reason about object types.
+
+#### Quick Start: Share a Report with a Consultant
 
 ```sql
--- Obfuscated for sharing with vendors or support
-EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1, @ExpertMode = 1;
-
--- Deterministic hashing with a seed (reproducible across runs)
-EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1, @ObfuscationSeed = N'my-secret-seed';
-
--- Persist the mapping table for later decoding
-EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1, @ObfuscationMapTable = N'dbo.DiagObfMap';
+-- 1. Generate obfuscated report with a seed (keeps tokens stable across runs)
+EXEC dbo.sp_StatUpdate_Diag
+    @Obfuscate = 1,
+    @ExpertMode = 1,
+    @ObfuscationSeed = N'acme-2026-q1';
 ```
 
-#### Output Files
+Output tokens look like: `DB_7f2a`, `TBL_e4c1`, `IX_STAT_9b3d`. The seed ensures the same object always maps to the same token — so if a consultant says "TBL_e4c1 is slow", you can decode it consistently.
 
-When running the PowerShell wrapper with `-Obfuscate`, three files are produced:
+#### T-SQL Examples
+
+```sql
+-- Basic: one-off obfuscated output (random hashes, no persistence)
+EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1, @ExpertMode = 1;
+
+-- Seeded: deterministic hashes (same name = same token every time)
+EXEC dbo.sp_StatUpdate_Diag
+    @Obfuscate = 1,
+    @ExpertMode = 1,
+    @ObfuscationSeed = N'acme-2026-q1';
+
+-- Seeded + persisted map table: decode tokens later without re-running
+EXEC dbo.sp_StatUpdate_Diag
+    @Obfuscate = 1,
+    @ExpertMode = 1,
+    @ObfuscationSeed = N'acme-2026-q1',
+    @ObfuscationMapTable = N'dbo.DiagObfMap';
+
+-- After running with @ObfuscationMapTable, the proc prints a decode query:
+--   === Decode obfuscated tokens ===
+--   SELECT ObjectType, OriginalName, ObfuscatedName
+--   FROM dbo.DiagObfMap WHERE ObfuscatedName = N'<paste_token_here>';
+```
+
+#### PowerShell: Multi-Server Obfuscated Reports
+
+When running the wrapper with `-Obfuscate`, three files are produced per run:
 
 | File | Contains | Share externally? |
 |------|----------|-------------------|
 | `*_SAFE_TO_SHARE.{md,html,json}` | Obfuscated names only | Yes |
 | `*_CONFIDENTIAL.{md,html,json}` | Real server/database/table names | **No** |
-| `*_CONFIDENTIAL_DECODE.sql` | T-SQL script mapping obfuscated tokens to real names | **No** |
+| `*_CONFIDENTIAL_DECODE.sql` | Standalone T-SQL script to decode tokens | **No** |
 
 ```powershell
+# Generate reports for 3 servers — Markdown format, seeded obfuscation
+.\Invoke-StatUpdateDiag.ps1 `
+    -Servers "PROD-SQL01", "PROD-SQL02", "PROD-SQL03" `
+    -Obfuscate `
+    -ObfuscationSeed "acme-2026-q1" `
+    -OutputFormat Markdown `
+    -OutputPath "C:\temp\diag"
+
+# Output:
+#   C:\temp\diag\sp_StatUpdate_Diag_20260310_SAFE_TO_SHARE.md   <-- send this
+#   C:\temp\diag\sp_StatUpdate_Diag_20260310_CONFIDENTIAL.md    <-- keep this
+#   C:\temp\diag\sp_StatUpdate_Diag_20260310_CONFIDENTIAL_DECODE.sql
+
+# Same thing with JSON output and server list from a file
 .\Invoke-StatUpdateDiag.ps1 `
     -Servers (Get-Content servers.txt) `
     -Obfuscate `
-    -ObfuscationSeed "my-secret-seed" `
+    -ObfuscationSeed "acme-2026-q1" `
     -OutputFormat JSON `
-    -OutputPath "C:\temp\diag_report"
+    -OutputPath "C:\temp\diag"
+
+# Also persist the map table on each server for later decoding
+.\Invoke-StatUpdateDiag.ps1 `
+    -Servers "PROD-SQL01", "PROD-SQL02" `
+    -Obfuscate `
+    -ObfuscationSeed "acme-2026-q1" `
+    -ObfuscationMapTable "dbo.DiagObfMap" `
+    -OutputPath "C:\temp\diag"
 ```
 
-Without `-Obfuscate`, a single report file is produced as before (no suffix).
+Without `-Obfuscate`, a single report file is produced (no suffix).
+
+#### Typical Workflow: Consultant Engagement
+
+```
+1. DBA runs:     Invoke-StatUpdateDiag.ps1 -Servers ... -Obfuscate -ObfuscationSeed "..."
+2. DBA sends:    *_SAFE_TO_SHARE.md to consultant (no real names visible)
+3. Consultant:   "TBL_e4c1 has a C2 finding — stat IX_STAT_9b3d fails every run"
+4. DBA decodes:  Opens _CONFIDENTIAL_DECODE.sql in SSMS, searches for TBL_e4c1
+5. DBA finds:    TBL_e4c1 = dbo.OrderHistory, IX_STAT_9b3d = IX_OrderHistory_Date
+6. DBA fixes:    The actual object, shares updated SAFE_TO_SHARE report to confirm
+```
 
 ### Decoding Obfuscated Results
 
-When a consultant returns findings referencing obfuscated tokens like `TBL_a1b2c3`, you have two options:
+When a consultant returns findings referencing tokens like `TBL_e4c1`, you have two options:
 
 **Option A: Use the decode SQL file (no server access needed)**
 
-Open the `_CONFIDENTIAL_DECODE.sql` file generated alongside the report. It contains the full obfuscation map in a temp table with ready-to-run queries:
+The `_CONFIDENTIAL_DECODE.sql` file is a standalone T-SQL script with the full map in a temp table:
 
 ```sql
--- 1. Run the script in SSMS (creates #ObfuscationMap)
--- 2. Decode a specific token:
-SELECT * FROM #ObfuscationMap WHERE ObfuscatedName = N'TBL_a1b2c3';
--- 3. See full map:
+-- 1. Open _CONFIDENTIAL_DECODE.sql in SSMS and execute it (creates #ObfuscationMap)
+-- 2. Decode a specific token from the consultant's findings:
+SELECT * FROM #ObfuscationMap WHERE ObfuscatedName = N'TBL_e4c1';
+-- 3. Decode multiple tokens at once:
+SELECT * FROM #ObfuscationMap WHERE ObfuscatedName IN (N'TBL_e4c1', N'IX_STAT_9b3d', N'DB_7f2a');
+-- 4. Full map sorted by server:
 SELECT * FROM #ObfuscationMap ORDER BY ServerName, ObjectType, OriginalName;
 ```
 
-**Option B: Query the map table on prod servers**
+**Option B: Query the persisted map table on the server**
 
-If you used `-ObfuscationMapTable` to persist the map on each server:
+If you used `@ObfuscationMapTable` (T-SQL) or `-ObfuscationMapTable` (PowerShell):
 
 ```sql
 -- Decode a single token
 SELECT ObjectType, OriginalName, ObfuscatedName
 FROM dbo.DiagObfMap
-WHERE ObfuscatedName = N'TBL_a1b2c3';
+WHERE ObfuscatedName = N'TBL_e4c1';
 
--- Full map for this server
+-- Export full map to CSV (useful for Excel cross-referencing)
+-- In SSMS: Results to File, then run:
 SELECT ObjectType, OriginalName, ObfuscatedName
 FROM dbo.DiagObfMap
 ORDER BY ObjectType, OriginalName;
 
--- Decode across servers (linked servers)
+-- Decode across multiple servers via linked servers
 SELECT 'PROD-SQL01' AS [Server], ObjectType, OriginalName, ObfuscatedName
 FROM [PROD-SQL01].master.dbo.DiagObfMap
 UNION ALL
@@ -532,11 +594,12 @@ FROM [PROD-SQL02].master.dbo.DiagObfMap
 ORDER BY [Server], ObjectType, OriginalName;
 ```
 
-**Key points:**
-- The seed makes hashes **deterministic** — the same name produces the same token across servers and runs, so findings are cross-referenceable
+**How obfuscation works:**
+- **With a seed**: Hashes are **deterministic** — the same object always produces the same token across servers, runs, and time. This means `TBL_e4c1` in Monday's report is the same table as `TBL_e4c1` in Friday's report.
+- **Without a seed**: Hashes are random per run. Useful for one-off sharing but tokens can't be correlated across runs.
 - The map table **appends** on each run (no data loss from prior runs)
-- The `_CONFIDENTIAL_DECODE.sql` file is standalone — no server access needed to decode tokens
-- Without the seed, the map, or access to the server, obfuscated tokens cannot be reversed
+- The `_CONFIDENTIAL_DECODE.sql` file is standalone — works in any SSMS session, no server access needed
+- Without the seed, the map, or the decode file, obfuscated tokens **cannot** be reversed (HASHBYTES is one-way)
 
 ### Custom Analysis
 
@@ -572,7 +635,7 @@ Cross-server analysis detects version skew and parameter inconsistencies.
 | Severity | ID | Checks |
 |----------|----|--------|
 | CRITICAL | C1-C4 | Killed runs, repeated stat failures, time limit exhaustion, degrading throughput |
-| WARNING | W1-W5 | Suboptimal parameters, long-running stats, stale-stats backlog, overlapping runs, QS not effective |
+| WARNING | W1-W6 | Suboptimal parameters, long-running stats, stale-stats backlog, overlapping runs, QS not effective, excessive overhead |
 | INFO | I1-I5 | Run health trends, parameter history, top tables by cost, unused features, version history |
 | INFO | I6 | QS efficacy: "10 of 10 highest-workload stats updated in first 1 minute" |
 | INFO | I7 | QS inflection: before/after comparison when QS prioritization was enabled |

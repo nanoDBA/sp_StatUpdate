@@ -36,9 +36,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.09.3 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.10 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.09.2 - I8 silent failure: inserts INFO recommendation when no QS CPU data exists (#239).
+History:    2026.03.10   - DECLARE-in-loop fix for @map_table_msg variable.
+                         RAISERROR decode query output when @ObfuscationMapTable is used.
+            2026.03.09.3 - W6 EXCESSIVE_OVERHEAD diagnostic check: flags runs where discovery/environment
+                         overhead exceeds 40% of wall-clock time.
+                         PAGE compression on StatUpdateDiagHistory PK and IX.
+            2026.03.09.2 - I8 silent failure: inserts INFO recommendation when no QS CPU data exists (#239).
                          @SingleResultSet=1 auto-promotes @ExpertMode=1 for stable ResultSetID contract (#236).
             2026.03.09.1 - RunLabel dedup prevents PK violation on duplicate START entries (#216).
                          Watermark gap detection resets when CommandLog archived (#232).
@@ -141,8 +146,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.09.3',
-        @procedure_version_date datetime = '20260309';
+        @procedure_version varchar(20) = '2026.03.10',
+        @procedure_version_date datetime = '20260310';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
