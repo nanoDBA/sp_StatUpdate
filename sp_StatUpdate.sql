@@ -40,7 +40,10 @@ Version:    2.21.2026.03.10 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.20.2026.03.10 - 9 RFCs: @CommandLogRetentionDays param (#251), TRENDING @Help
+History:    2.21.2026.03.10 - Fix Phase 6 QS object_id domain mismatch (#271): replaced broken
+                            module-id join with plan XML table extraction + PARSENAME bracket
+                            stripping. Both staged and legacy discovery paths fixed.
+            2.20.2026.03.10 - 9 RFCs: @CommandLogRetentionDays param (#251), TRENDING @Help
                             topic (#243), ObjectId/StatsId in ExtendedInfo (#250), heartbeat
                             column cache (#245), PERSIST_SAMPLE_INADEQUATE warning (#246),
                             forced plan filter (#244, #249), container OOMKill warning (#247),
