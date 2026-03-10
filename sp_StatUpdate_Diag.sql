@@ -36,9 +36,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.10 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.10.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.10   - DECLARE-in-loop fix for @map_table_msg variable.
+History:    2026.03.10.1 - @GradeOverrides and @GradeWeights parameters for Executive Dashboard.
+                         Force grades (RELIABILITY=A), exclude categories (SPEED=IGNORE),
+                         or change weights (COMPLETION=50, auto-normalized to 100%).
+                         I6 QS_EFFICACY: graceful message when QS runs exist but no CPU data
+                         (was emitting question marks).
+            2026.03.10   - DECLARE-in-loop fix for @map_table_msg variable.
                          RAISERROR decode query output when @ObfuscationMapTable is used.
             2026.03.09.3 - W6 EXCESSIVE_OVERHEAD diagnostic check: flags runs where discovery/environment
                          overhead exceeds 40% of wall-clock time.
@@ -148,7 +153,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.10',
+        @procedure_version varchar(20) = '2026.03.10.1',
         @procedure_version_date datetime = '20260310';
 
     SET @Version = @procedure_version;
