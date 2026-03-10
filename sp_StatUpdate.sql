@@ -601,7 +601,7 @@ ALTER PROCEDURE
 
     When @StatsInParallel = 'Y':
       - First worker populates dbo.QueueStatistic with qualifying stats
-      - All workers claim work via UPDATE ... WHERE StatStartTime IS NULL
+      - All workers claim work via UPDATE ... WHERE TableStartTime IS NULL
       - Dead workers detected via sys.dm_exec_sessions (sleeping workers between stats appear in dm_exec_sessions but not dm_exec_requests)
       - Run same EXECUTE from multiple sessions/jobs for parallelism
 
@@ -1302,7 +1302,7 @@ BEGIN
                  N'Avoid overlapping with index maintenance (both acquire Sch-M). On AG primaries, Sch-M locks replay to secondaries via redo thread — use @MaxAGRedoQueueMB to protect secondaries. Run during off-peak concurrency windows.'),
                 /* #12, #212: Parallel mode — Agent job setup */
                 (N'Parallel Mode',
-                 N'Production setup: create 2-3 identical SQL Agent jobs, schedule to start simultaneously. All run the same sp_StatUpdate with @StatsInParallel=Y — work distribution is automatic via dbo.QueueStatistic. First worker populates queue; others join and claim work. Dead workers detected via @DeadWorkerTimeoutMinutes (default 15). Use @MaxWorkers to cap concurrent workers (prevents blocking storms). Start with 2-3 workers and @LockTimeout=30-60s. Monitor: SELECT COUNT(*) FROM dbo.QueueStatistic WHERE StatEndTime IS NOT NULL;'),
+                 N'Production setup: create 2-3 identical SQL Agent jobs, schedule to start simultaneously. All run the same sp_StatUpdate with @StatsInParallel=Y — work distribution is automatic via dbo.QueueStatistic. First worker populates queue; others join and claim work. Dead workers detected via @DeadWorkerTimeoutMinutes (default 15). Use @MaxWorkers to cap concurrent workers (prevents blocking storms). Start with 2-3 workers and @LockTimeout=30-60s. Monitor: SELECT COUNT(*) FROM dbo.QueueStatistic WHERE TableEndTime IS NOT NULL;'),
                 /* #36: Edition-specific behavior, #197: SQL 2025 compatibility */
                 (N'Edition Notes',
                  N'MAXDOP: works on all editions (SQL 2016 SP2+). PERSIST_SAMPLE_PERCENT: all editions (SQL 2016 SP1 CU4+). Incremental stats: requires partitioning (Enterprise or Standard SP1+). Parallel stats: all editions. SQL 2025 (v17): fully compatible — all features enabled via forward-compatible >= version checks.'),
@@ -7522,7 +7522,7 @@ OPTION (RECOMPILE);';
                 JOIN sys.dm_exec_sessions AS ses
                   ON ses.session_id = qs.SessionID
                 WHERE qs.QueueID = @queue_id
-                AND   qs.StatEndTime IS NULL;
+                AND   qs.TableEndTime IS NULL;
 
                 IF @active_worker_count >= @MaxWorkers
                 BEGIN
@@ -10172,7 +10172,7 @@ EXECUTE dbo.sp_StatUpdate
     @TimeLimit = 7200;
 
 -- Monitor parallel progress from another session
-SELECT * FROM dbo.QueueStatistic WHERE QueueID = 1 AND StatStartTime IS NOT NULL;
+SELECT * FROM dbo.QueueStatistic WHERE QueueID = 1 AND TableStartTime IS NOT NULL;
 
 -------------------------------------------------------------------------------
 DIRECT MODE - When you know exactly what needs updating
