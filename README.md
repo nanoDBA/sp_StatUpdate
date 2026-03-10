@@ -241,6 +241,8 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operatio
 
 ### Logging & Output
 
+> **Two-phase logging:** Like Ola Hallengren's `CommandExecute`, sp_StatUpdate inserts a CommandLog row with NULL `EndTime` before each stat update, then updates `EndTime` on completion. Query in-progress stats with: `SELECT * FROM dbo.CommandLog WHERE EndTime IS NULL AND CommandType = 'UPDATE_STATISTICS';`
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@LogToTable` | `'Y'` | Log to dbo.CommandLog |
@@ -456,6 +458,89 @@ ORDER BY CapturedAt DESC;
 EXEC dbo.sp_StatUpdate_Diag @SkipHistory = 1;
 ```
 
+### Grade Overrides
+
+Customize the Executive Dashboard when you know certain issues are expected or irrelevant.
+
+#### @GradeOverrides — Force Grades or Ignore Categories
+
+Force a specific letter grade (A/B/C/D/F) or exclude a category entirely (IGNORE).
+
+```sql
+-- "I know about the 2 killed runs — don't penalize the score"
+EXEC dbo.sp_StatUpdate_Diag @GradeOverrides = 'RELIABILITY=A';
+
+-- "I don't use Query Store — exclude workload focus from my score"
+EXEC dbo.sp_StatUpdate_Diag @GradeOverrides = 'WORKLOAD=IGNORE';
+
+-- Force multiple: known slow stats + don't care about QS
+EXEC dbo.sp_StatUpdate_Diag
+    @GradeOverrides = 'SPEED=B, WORKLOAD=IGNORE';
+
+-- "Only care about completion and speed — ignore everything else"
+EXEC dbo.sp_StatUpdate_Diag
+    @GradeOverrides = 'RELIABILITY=IGNORE, WORKLOAD=IGNORE';
+
+-- Force a low grade to flag a known problem for management visibility
+EXEC dbo.sp_StatUpdate_Diag @GradeOverrides = 'COMPLETION=F';
+```
+
+**Valid categories:** `COMPLETION`, `RELIABILITY`, `SPEED`, `WORKLOAD`
+**Valid values:** `A`, `B`, `C`, `D`, `F` (force grade), `IGNORE` (exclude from OVERALL score)
+
+#### @GradeWeights — Custom Category Weights
+
+Change how much each category contributes to the OVERALL score. Values are integers that auto-normalize to sum to 100%.
+
+```sql
+-- Default weights: COMPLETION=30, RELIABILITY=25, SPEED=20, WORKLOAD=25
+
+-- Single category override: bump completion importance
+-- 50 + 25(default) + 20(default) + 25(default) = 120 → normalized to 42/21/17/21
+EXEC dbo.sp_StatUpdate_Diag @GradeWeights = 'COMPLETION=50';
+
+-- Two categories: only care about completion and speed equally
+-- 50 + 25(default) + 50 + 25(default) = 150 → normalized to 33/17/33/17
+EXEC dbo.sp_StatUpdate_Diag @GradeWeights = 'COMPLETION=50, SPEED=50';
+
+-- Weight=0 is the same as IGNORE — excludes category from OVERALL
+EXEC dbo.sp_StatUpdate_Diag @GradeWeights = 'WORKLOAD=0';
+
+-- All four explicit (auto-normalized, don't need to sum to 100)
+EXEC dbo.sp_StatUpdate_Diag
+    @GradeWeights = 'COMPLETION=40, RELIABILITY=10, SPEED=30, WORKLOAD=20';
+```
+
+#### Combining Overrides and Weights
+
+```sql
+-- Force reliability to A (known kills are expected) AND
+-- weight completion heavily for management reporting
+EXEC dbo.sp_StatUpdate_Diag
+    @GradeOverrides = 'RELIABILITY=A',
+    @GradeWeights = 'COMPLETION=40, WORKLOAD=40';
+```
+
+#### Dashboard Output with Overrides
+
+```
+Category        Grade  Score  Headline
+--------------  -----  -----  ---------------------------------------------------
+OVERALL         B         86  Statistics maintenance is healthy... [Overrides active]
+COMPLETION      A        100  Nearly all qualifying statistics are being updated...
+RELIABILITY     A         28  [OVERRIDE: A] 2 run(s) were killed...
+SPEED           -          0  [IGNORED] Updates are slow at 17.9 sec/stat...
+WORKLOAD FOCUS  D         50  Query Store prioritization is not enabled...
+```
+
+- `[OVERRIDE: A]` — grade forced; Detail column shows `(actual score: 28)`
+- `[IGNORED]` — excluded from OVERALL; Grade=`-`, Score=0
+- `[Overrides active]` — shown on OVERALL when any override/weight change is active
+
+**Weight normalization:** Weights are integers that auto-normalize to sum to 100%. Passing a single category (e.g., `'COMPLETION=50'`) keeps the other three at their defaults (25, 20, 25), then all four are normalized together (50+25+20+25=120 → 42/21/17/21%). Weight of 0 is equivalent to IGNORE.
+
+**Note:** History table (`StatUpdateDiagHistory`) always uses hardcoded weights (30/25/20/25) — overrides only affect the current dashboard view, not persisted scores.
+
 ### Obfuscated Mode
 
 Hash all database, table, and statistics names for safe external sharing. Prefixes (`IX_`, `PK_`, `DB_`, `_WA_Sys_`) are preserved so consultants can still reason about object types.
@@ -648,6 +733,8 @@ Cross-server analysis detects version skew and parameter inconsistencies.
 | `@DaysBack` | `30` | History window in days |
 | `@ExpertMode` | `0` | `0` = dashboard + recommendations, `1` = all 13 result sets |
 | `@SkipHistory` | `0` | `1` = skip persistent history table |
+| `@GradeOverrides` | `NULL` | Force grades or ignore categories: `'RELIABILITY=A, SPEED=IGNORE'` |
+| `@GradeWeights` | `NULL` | Custom category weights (auto-normalized to 100%): `'COMPLETION=50, WORKLOAD=50'` |
 | `@Obfuscate` | `0` | `1` = hash all names for external sharing |
 | `@ObfuscationSeed` | `NULL` | Salt for deterministic hashing |
 | `@ObfuscationMapTable` | `NULL` | Persist obfuscation map to a table |
