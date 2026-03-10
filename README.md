@@ -471,6 +471,73 @@ EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1, @ObfuscationSeed = N'my-secret-seed'
 EXEC dbo.sp_StatUpdate_Diag @Obfuscate = 1, @ObfuscationMapTable = N'dbo.DiagObfMap';
 ```
 
+#### Output Files
+
+When running the PowerShell wrapper with `-Obfuscate`, three files are produced:
+
+| File | Contains | Share externally? |
+|------|----------|-------------------|
+| `*_SAFE_TO_SHARE.{md,html,json}` | Obfuscated names only | Yes |
+| `*_CONFIDENTIAL.{md,html,json}` | Real server/database/table names | **No** |
+| `*_CONFIDENTIAL_DECODE.sql` | T-SQL script mapping obfuscated tokens to real names | **No** |
+
+```powershell
+.\Invoke-StatUpdateDiag.ps1 `
+    -Servers (Get-Content servers.txt) `
+    -Obfuscate `
+    -ObfuscationSeed "my-secret-seed" `
+    -OutputFormat JSON `
+    -OutputPath "C:\temp\diag_report"
+```
+
+Without `-Obfuscate`, a single report file is produced as before (no suffix).
+
+### Decoding Obfuscated Results
+
+When a consultant returns findings referencing obfuscated tokens like `TBL_a1b2c3`, you have two options:
+
+**Option A: Use the decode SQL file (no server access needed)**
+
+Open the `_CONFIDENTIAL_DECODE.sql` file generated alongside the report. It contains the full obfuscation map in a temp table with ready-to-run queries:
+
+```sql
+-- 1. Run the script in SSMS (creates #ObfuscationMap)
+-- 2. Decode a specific token:
+SELECT * FROM #ObfuscationMap WHERE ObfuscatedName = N'TBL_a1b2c3';
+-- 3. See full map:
+SELECT * FROM #ObfuscationMap ORDER BY ServerName, ObjectType, OriginalName;
+```
+
+**Option B: Query the map table on prod servers**
+
+If you used `-ObfuscationMapTable` to persist the map on each server:
+
+```sql
+-- Decode a single token
+SELECT ObjectType, OriginalName, ObfuscatedName
+FROM dbo.DiagObfMap
+WHERE ObfuscatedName = N'TBL_a1b2c3';
+
+-- Full map for this server
+SELECT ObjectType, OriginalName, ObfuscatedName
+FROM dbo.DiagObfMap
+ORDER BY ObjectType, OriginalName;
+
+-- Decode across servers (linked servers)
+SELECT 'PROD-SQL01' AS [Server], ObjectType, OriginalName, ObfuscatedName
+FROM [PROD-SQL01].master.dbo.DiagObfMap
+UNION ALL
+SELECT 'PROD-SQL02', ObjectType, OriginalName, ObfuscatedName
+FROM [PROD-SQL02].master.dbo.DiagObfMap
+ORDER BY [Server], ObjectType, OriginalName;
+```
+
+**Key points:**
+- The seed makes hashes **deterministic** — the same name produces the same token across servers and runs, so findings are cross-referenceable
+- The map table **appends** on each run (no data loss from prior runs)
+- The `_CONFIDENTIAL_DECODE.sql` file is standalone — no server access needed to decode tokens
+- Without the seed, the map, or access to the server, obfuscated tokens cannot be reversed
+
 ### Custom Analysis
 
 ```sql
