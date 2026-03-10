@@ -36,11 +36,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.19.2026.03.09 (Major.Minor.YYYY.MM.DD)
+Version:    2.20.2026.03.10 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.15.2026.03.05 - Peak hours plan cache warning (#184), NORECOMPUTE+ON PARTITIONS
+History:    2.20.2026.03.10 - 9 RFCs: @CommandLogRetentionDays param (#251), TRENDING @Help
+                            topic (#243), ObjectId/StatsId in ExtendedInfo (#250), heartbeat
+                            column cache (#245), PERSIST_SAMPLE_INADEQUATE warning (#246),
+                            forced plan filter (#244, #249), container OOMKill warning (#247),
+                            per-signal breakdown in @ReturnDetailedResults (#252)
+            2.15.2026.03.05 - Peak hours plan cache warning (#184), NORECOMPUTE+ON PARTITIONS
                             syntax fix (#215), @Help completeness for all 66 parameters (#212, #213)
             2.14.2026.03.04 - Bulk resolution: 42 issues — safety guards, warnings, discovery
                             tie-breaker, parameter validation, empty partition skip, backup
@@ -585,6 +590,7 @@ ALTER PROCEDURE
     @ExposeProgressToAllSessions nvarchar(1) = N'N', /*Y = create ##sp_StatUpdate_Progress global temp table (SECURITY NOTE: visible to ALL sessions on server). N = disabled (use @ProgressLogInterval for secure monitoring)*/
     @CleanupOrphanedRuns nvarchar(1) = N'Y', /*Y = mark orphaned SP_STATUPDATE_START entries (no END) as KILLED. v1.9: Default changed from N to Y*/
     @OrphanedRunThresholdHours int = 48, /*#148: Hours before a START entry with no END is considered orphaned. Default 48h to accommodate multi-day maintenance runs.*/
+    @CommandLogRetentionDays int = 90, /*#251: Days of CommandLog history to scan for adaptive sampling, P2c skip estimation, and long-running stat detection. Default 90. Lower values reduce scan time on large CommandLog tables.*/
 
     /*
     ============================================================================
@@ -645,8 +651,8 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.19.2026.03.09',
-        @procedure_version_date datetime = '20260309',
+        @procedure_version varchar(20) = '2.20.2026.03.10',
+        @procedure_version_date datetime = '20260310',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -851,8 +857,10 @@ BEGIN
                     THEN N'max concurrent parallel workers (#181). Before joining queue, counts active sessions. If >= limit, exits cleanly (StopReason=MAX_WORKERS, return 0). NULL = unlimited. Use to prevent blocking storms on OLTP systems.'
                     WHEN N'@DeadWorkerTimeoutMinutes'
                     THEN N'parallel mode: consider worker dead if no progress for N minutes (default 15). Uses LastStatCompletedAt heartbeat column for accurate per-stat tracking. Units: minutes (same as @MaxAGWaitMinutes). Only applies when @StatsInParallel=Y.'
+                    WHEN N'@CommandLogRetentionDays'
+                    THEN N'days of CommandLog history to scan for adaptive sampling, P2c skip estimation, and long-running stat detection. Lower values reduce I/O on large CommandLog tables. (#251)'
                     WHEN N'@Help'
-                    THEN N'1 = show this help information. Named topics: SAMPLING = sampling priority order documentation.'
+                    THEN N'1 = show this help information. Named topics: SAMPLING = sampling priority order, TRENDING = CommandLog trend queries.'
                     WHEN N'@Version'
                     THEN N'OUTPUT: returns procedure version string'
                     WHEN N'@VersionDate'
@@ -955,6 +963,7 @@ BEGIN
                     WHEN N'@MaxSecondsPerStat' THEN N'NULL (disabled), 1-N seconds'
                     WHEN N'@PersistSampleMinRows' THEN N'NULL (no floor), 1-N rows'
                     WHEN N'@OrphanedRunThresholdHours' THEN N'1-N hours'
+                    WHEN N'@CommandLogRetentionDays' THEN N'1-N days'
                     WHEN N'@MaxWorkers' THEN N'NULL (unlimited), 1-N workers'
                     WHEN N'@DeadWorkerTimeoutMinutes' THEN N'NULL, 1-N minutes'
                     WHEN N'@ReturnDetailedResults' THEN N'0, 1'
@@ -1115,6 +1124,8 @@ BEGIN
                     THEN N'NULL'
                     WHEN N'@OrphanedRunThresholdHours'
                     THEN N'48'
+                    WHEN N'@CommandLogRetentionDays'
+                    THEN N'90'
                     WHEN N'@Version'
                     THEN N'OUTPUT'
                     WHEN N'@VersionDate'
@@ -1370,7 +1381,69 @@ BEGIN
 
         SELECT
             note = N'@PersistSamplePercent = Y persists the explicit sample rate in the stats header (SQL 2016+ / TF 2371). Future auto-updates use the persisted rate instead of SQL Server auto-sample.'
-        UNION ALL SELECT N'Available @Help topics: 1 (or Y) = full parameter help, SAMPLING = this topic.';
+        UNION ALL SELECT N'Available @Help topics: 1 (or Y) = full parameter help, SAMPLING = this topic, TRENDING = CommandLog trend queries.';
+
+        RETURN;
+    END;
+
+    /*
+    ============================================================================
+    @Help = 'TRENDING' topic (#243)
+    Canned CommandLog queries for cross-run stat trending
+    ============================================================================
+    */
+    IF @Help = N'TRENDING'
+    BEGIN
+        SELECT
+            query_name = q.query_name,
+            description = q.description,
+            sql_text = q.sql_text
+        FROM
+        (
+            VALUES
+                (N'Per-Stat Cross-Run Trend',
+                 N'P95 duration and avg modifications at update time for each statistic across recent runs',
+                 N'SELECT
+    cl.DatabaseName,
+    cl.SchemaName,
+    cl.ObjectName AS TableName,
+    cl.StatisticsName,
+    COUNT(*) AS RunCount,
+    CONVERT(decimal(10,1), AVG(DATEDIFF(MILLISECOND, cl.StartTime, cl.EndTime) / 1000.0)) AS AvgDurationSec,
+    CONVERT(decimal(10,1),
+        PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY DATEDIFF(MILLISECOND, cl.StartTime, cl.EndTime) / 1000.0)
+        OVER (PARTITION BY cl.DatabaseName, cl.SchemaName, cl.ObjectName, cl.StatisticsName)
+    ) AS P95DurationSec,
+    AVG(cl.ExtendedInfo.value(''(/ExtendedInfo/ModificationCounter)[1]'', ''bigint'')) AS AvgModsAtUpdate
+FROM dbo.CommandLog AS cl
+WHERE cl.CommandType = N''UPDATE_STATISTICS''
+  AND cl.EndTime IS NOT NULL
+  AND cl.ErrorNumber IS NULL
+  AND cl.StartTime >= DATEADD(DAY, -30, SYSDATETIME())
+GROUP BY cl.DatabaseName, cl.SchemaName, cl.ObjectName, cl.StatisticsName
+ORDER BY AvgDurationSec DESC;'),
+
+                (N'Per-Database Run Summary',
+                 N'Aggregate run health per database: completion rate, avg stats/run, failure rate',
+                 N'SELECT
+    cl.DatabaseName,
+    COUNT(DISTINCT cl.ExtendedInfo.value(''(/ExtendedInfo/RunLabel)[1]'', ''nvarchar(100)'')) AS DistinctRuns,
+    COUNT(*) AS TotalStatUpdates,
+    SUM(CASE WHEN cl.ErrorNumber IS NULL THEN 1 ELSE 0 END) AS Succeeded,
+    SUM(CASE WHEN cl.ErrorNumber IS NOT NULL THEN 1 ELSE 0 END) AS Failed,
+    CONVERT(decimal(5,1), SUM(CASE WHEN cl.ErrorNumber IS NULL THEN 1 ELSE 0 END) * 100.0 / NULLIF(COUNT(*), 0)) AS SuccessPct,
+    CONVERT(decimal(10,1), AVG(DATEDIFF(MILLISECOND, cl.StartTime, cl.EndTime) / 1000.0)) AS AvgDurationSec
+FROM dbo.CommandLog AS cl
+WHERE cl.CommandType = N''UPDATE_STATISTICS''
+  AND cl.EndTime IS NOT NULL
+  AND cl.StartTime >= DATEADD(DAY, -30, SYSDATETIME())
+GROUP BY cl.DatabaseName
+ORDER BY TotalStatUpdates DESC;')
+        ) AS q (query_name, description, sql_text);
+
+        SELECT
+            note = N'Copy and run these queries against the database containing your CommandLog table. Adjust the DATEADD(-30) window as needed.'
+        UNION ALL SELECT N'Available @Help topics: 1 (or Y) = full parameter help, SAMPLING = sampling priority order, TRENDING = this topic.';
 
         RETURN;
     END;
@@ -3952,10 +4025,39 @@ BEGIN
     BEGIN
         SET @is_container_memory = 1;
         DECLARE @host_ram_gb bigint = @hw_memory_mb / 1024;
-        RAISERROR(N'WARNING: Container detected — physical_memory_kb reflects host RAM (%I64d GB), not the container memory limit. Container memory limit may be significantly lower. Check cgroup limits or sys.dm_os_process_memory for actual SQL memory usage. (#208)', 10, 1, @host_ram_gb) WITH NOWAIT;
-        SET @warnings += N'CONTAINER_MEMORY: physical_memory_kb reflects host RAM ('
-            + CONVERT(nvarchar(20), @host_ram_gb)
-            + N' GB); container cgroup limit may be lower — check sys.dm_os_process_memory; ';
+        DECLARE @process_rss_mb bigint = @process_memory_kb / 1024;
+        DECLARE @container_warn nvarchar(2000) =
+            N'WARNING: Container detected — OOMKill risk. Host RAM: '
+            + CONVERT(nvarchar(20), @host_ram_gb) + N' GB, SQL process RSS: '
+            + CONVERT(nvarchar(20), @process_rss_mb) + N' MB. '
+            + N'Configure max server memory based on container cgroup limit, not host RAM.'
+            + CASE WHEN @visible_schedulers <> @hw_cpu_count
+                   THEN N' CPU mismatch: ' + CONVERT(nvarchar(10), @visible_schedulers)
+                        + N' visible schedulers vs ' + CONVERT(nvarchar(10), @hw_cpu_count)
+                        + N' host cores — verify --cpus container flag.'
+                   ELSE N''
+              END
+            + N' (#208, #247)';
+        RAISERROR(@container_warn, 10, 1) WITH NOWAIT;
+        SET @warnings += N'CONTAINER_MEMORY: OOMKill risk — host RAM '
+            + CONVERT(nvarchar(20), @host_ram_gb) + N' GB, process RSS '
+            + CONVERT(nvarchar(20), @process_rss_mb) + N' MB; configure max server memory from cgroup limit; ';
+    END;
+
+    /* #251: Advisory — suggest index on CommandLog.StartTime when retention window is large */
+    IF  @commandlog_exists = 1
+    AND @CommandLogRetentionDays > 30
+    AND NOT EXISTS (
+        SELECT 1
+        FROM sys.indexes AS i
+        INNER JOIN sys.index_columns AS ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+        INNER JOIN sys.columns AS c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+        WHERE i.object_id = OBJECT_ID(N'dbo.CommandLog')
+        AND   c.name = N'StartTime'
+        AND   ic.key_ordinal = 1
+    )
+    BEGIN
+        RAISERROR(N'INFO: @CommandLogRetentionDays=%d — consider adding an index on dbo.CommandLog(StartTime) for faster history lookups. (#251)', 10, 1, @CommandLogRetentionDays) WITH NOWAIT;
     END;
 
     /*
@@ -4235,6 +4337,7 @@ BEGIN
                     /* Cleanup */
                     @CleanupOrphanedRuns AS CleanupOrphanedRuns,
                     @OrphanedRunThresholdHours AS OrphanedRunThresholdHours,
+                    @CommandLogRetentionDays AS CommandLogRetentionDays,
 
                     /* Meta / diagnostic (#242) */
                     @Execute AS [Execute],
@@ -4553,7 +4656,7 @@ BEGIN
     IF EXISTS (SELECT 1 FROM sys.database_query_store_options WHERE actual_state IN (1, 2))
     BEGIN
         DECLARE @fp_count INT = 0;
-        SELECT @fp_count = COUNT(*) FROM sys.query_store_plan WHERE is_forced_plan = 1;
+        SELECT @fp_count = COUNT(*) FROM sys.query_store_plan WHERE is_forced_plan = 1 AND force_failure_count = 0;
         IF @fp_count > 0
             RAISERROR(N'[sp_StatUpdate] INFO: %d forced plan(s) in Query Store. Use @QueryStorePriority=''Y'' to prioritize affected stats.', 0, 1, @fp_count) WITH NOWAIT;
     END;
@@ -8157,7 +8260,7 @@ OPTION (RECOMPILE);';
             AND   cl.StatisticsName = @current_stat_name
             AND   cl.EndTime IS NOT NULL
             AND   cl.ErrorNumber IS NULL
-            AND   cl.StartTime >= DATEADD(DAY, -90, SYSDATETIME()); /* last 90 days */
+            AND   cl.StartTime >= DATEADD(DAY, -@CommandLogRetentionDays, SYSDATETIME()); /* #251: parameterized retention */
 
             /* Skip if history exists AND estimated exceeds both the per-stat cap AND remaining window */
             IF  @p2c_estimated_seconds IS NOT NULL
@@ -8396,6 +8499,24 @@ OPTION (RECOMPILE);';
                 SELECT @persisted_pct_msg = CONVERT(integer, @current_persisted_sample_percent);
                 RAISERROR(N'  Note: Respecting persisted sample %d%% via RESAMPLE', 10, 1, @persisted_pct_msg) WITH NOWAIT;
             END;
+        END
+        /* #246: Warn when persisted sample rate produces too few rows for quality histograms */
+        ELSE IF @effective_sample_percent IS NULL
+        AND     @current_persisted_sample_percent IS NOT NULL
+        AND     @is_long_running_stat = 0
+        AND     @PersistSampleMinRows IS NOT NULL
+        AND     @absolute_sampled_rows IS NOT NULL
+        AND     @absolute_sampled_rows < @PersistSampleMinRows
+        BEGIN
+            DECLARE @p246_pct int = CONVERT(integer, @current_persisted_sample_percent);
+            DECLARE @p246_msg nvarchar(500) =
+                N'  WARNING: Persisted sample ' + CONVERT(nvarchar(10), @p246_pct)
+                + N'% yields ~' + CONVERT(nvarchar(20), @absolute_sampled_rows)
+                + N' rows (below @PersistSampleMinRows=' + CONVERT(nvarchar(20), @PersistSampleMinRows)
+                + N'). RESAMPLE skipped — using SQL Server auto-sample instead. (#246)';
+            RAISERROR(@p246_msg, 10, 1) WITH NOWAIT;
+            SET @warnings += N'PERSIST_SAMPLE_INADEQUATE: [' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name
+                + N'] persisted ' + CONVERT(nvarchar(10), @p246_pct) + N'% yields ' + CONVERT(nvarchar(20), @absolute_sampled_rows) + N' rows; ';
         END;
 
         /*
@@ -8903,7 +9024,7 @@ OPTION (RECOMPILE);';
                 IF  @StatsInParallel = N'Y'
                 AND @claimed_table_database IS NOT NULL
                 AND OBJECT_ID(N'dbo.QueueStatistic', N'U') IS NOT NULL
-                AND EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic') AND name = N'LastStatCompletedAt')
+                AND @has_heartbeat_col = 1
                 BEGIN
                     BEGIN TRY
                         EXEC sp_executesql
@@ -8941,6 +9062,8 @@ OPTION (RECOMPILE);';
                         @current_extended_info =
                         (
                             SELECT
+                                @current_object_id AS ObjectId,
+                                @current_stats_id AS StatsId,
                                 @current_modification_counter AS ModificationCounter,
                                 CASE
                                     WHEN @current_row_count > 0
@@ -9113,6 +9236,7 @@ OPTION (RECOMPILE);';
                           INNER JOIN ' + QUOTENAME(@current_database) + N'.sys.query_store_query_text AS qsqt
                               ON qsqt.query_text_id = qsq.query_text_id
                           WHERE qsp.is_forced_plan = 1
+                          AND qsp.force_failure_count = 0
                           AND CHARINDEX(@tbl COLLATE DATABASE_DEFAULT,
                                         qsqt.query_sql_text COLLATE DATABASE_DEFAULT) > 0';
                     EXEC sp_executesql @qs168_sql,
@@ -9797,7 +9921,27 @@ OPTION (RECOMPILE);';
             NoRecompute = stp.no_recompute,
             IsIncremental = stp.is_incremental,
             HasFilter = stp.has_filter,
-            QSPriorityBoost = stp.qs_priority_boost
+            QSPriorityBoost = stp.qs_priority_boost,
+            /* #252: Per-signal breakdown — helps identify which threshold triggered each stat */
+            ModPctOfThreshold = CASE
+                WHEN ISNULL(@ModificationThreshold, 0) > 0
+                THEN CONVERT(decimal(10, 1), stp.modification_counter * 100.0 / @ModificationThreshold)
+                ELSE NULL
+            END,
+            DaysStalePctOfThreshold = CASE
+                WHEN @DaysStaleThreshold IS NOT NULL AND @DaysStaleThreshold > 0
+                THEN CONVERT(decimal(10, 1), stp.days_stale * 100.0 / @DaysStaleThreshold)
+                ELSE NULL
+            END,
+            FilteredDriftRatio = stp.filtered_drift_ratio,
+            PriorityRank = ROW_NUMBER() OVER (ORDER BY stp.priority),
+            IsNearThreshold = CONVERT(bit, CASE
+                WHEN ISNULL(@ModificationThreshold, 0) > 0
+                AND  stp.modification_counter >= @ModificationThreshold * 0.8
+                AND  stp.modification_counter < @ModificationThreshold
+                THEN 1
+                ELSE 0
+            END)
         FROM #stats_to_process AS stp
         ORDER BY stp.priority;
     END;
