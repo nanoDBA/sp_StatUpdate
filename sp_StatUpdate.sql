@@ -1670,6 +1670,8 @@ ORDER BY TotalStatUpdates DESC;')
         @current_page_count bigint = NULL,
         @current_persisted_sample_percent float = NULL,
         @absolute_sampled_rows bigint = NULL, /*P1c: computed actual sampled rows from @current_row_count * @current_persisted_sample_percent*/
+        @p246_pct int = NULL,
+        @p246_msg nvarchar(500) = NULL,
         @current_histogram_steps int = NULL,
         @current_partition_number integer = NULL,
         @current_forwarded_records bigint = NULL,
@@ -8508,8 +8510,8 @@ OPTION (RECOMPILE);';
         AND     @absolute_sampled_rows IS NOT NULL
         AND     @absolute_sampled_rows < @PersistSampleMinRows
         BEGIN
-            DECLARE @p246_pct int = CONVERT(integer, @current_persisted_sample_percent);
-            DECLARE @p246_msg nvarchar(500) =
+            SET @p246_pct = CONVERT(integer, @current_persisted_sample_percent);
+            SET @p246_msg =
                 N'  WARNING: Persisted sample ' + CONVERT(nvarchar(10), @p246_pct)
                 + N'% yields ~' + CONVERT(nvarchar(20), @absolute_sampled_rows)
                 + N' rows (below @PersistSampleMinRows=' + CONVERT(nvarchar(20), @PersistSampleMinRows)
