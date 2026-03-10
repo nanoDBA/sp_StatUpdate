@@ -224,6 +224,7 @@ BEGIN
                 (N'W3', N'WARNING',  N'STALE_BACKLOG',         N'Persistent backlog of unprocessed qualifying stats'),
                 (N'W4', N'WARNING',  N'OVERLAPPING_RUNS',      N'Multiple runs active simultaneously'),
                 (N'W5', N'WARNING',  N'QS_NOT_EFFECTIVE',      N'Query Store priority enabled but no QS data captured'),
+                (N'W6', N'WARNING',  N'EXCESSIVE_OVERHEAD',    N'Discovery/environment checks consuming disproportionate time vs actual UPDATE STATISTICS'),
                 (N'I1', N'INFO',     N'RUN_HEALTH',            N'Completion rate, duration trend, StopReason distribution'),
                 (N'I2', N'INFO',     N'PARAMETER_HISTORY',     N'How parameters changed across runs'),
                 (N'I3', N'INFO',     N'TOP_TABLES',            N'Tables consuming the most maintenance time'),
@@ -518,8 +519,8 @@ BEGIN
                     IsQSRun         bit             NOT NULL DEFAULT 0,
                     DiagVersion     varchar(20)     NOT NULL,
 
-                    CONSTRAINT PK_StatUpdateDiagHistory PRIMARY KEY CLUSTERED (SnapshotID),
-                    INDEX IX_StatUpdateDiagHistory_RunLabel UNIQUE NONCLUSTERED (RunLabel)
+                    CONSTRAINT PK_StatUpdateDiagHistory PRIMARY KEY CLUSTERED (SnapshotID) WITH (DATA_COMPRESSION = PAGE),
+                    INDEX IX_StatUpdateDiagHistory_RunLabel UNIQUE NONCLUSTERED (RunLabel) WITH (DATA_COMPRESSION = PAGE)
                 );
             ';
 
@@ -1645,6 +1646,103 @@ BEGIN
         );
 
         RAISERROR(N'  [WARNING] W5: Query Store not effective', 10, 1) WITH NOWAIT;
+    END;
+
+    /* ======================================================================
+       W6: EXCESSIVE OVERHEAD — discovery/checks consuming disproportionate time
+       Wall clock time vs. actual UPDATE STATISTICS time.
+       When overhead > 40% of wall clock, parameter changes may be adding cost.
+       ====================================================================== */
+    IF @stat_update_count > 0
+    BEGIN
+        DECLARE
+            @w6_overhead_runs int = 0,
+            @w6_worst_pct decimal(5,1) = 0,
+            @w6_worst_label nvarchar(100) = N'',
+            @w6_detail nvarchar(2000) = N'';
+
+        ;WITH run_overhead AS
+        (
+            SELECT
+                r.RunLabel,
+                r.DurationSeconds,
+                r.StatsProcessed,
+                stat_seconds = CONVERT(decimal(10,1), ISNULL(su_agg.TotalStatMs, 0) / 1000.0),
+                overhead_pct = CASE
+                    WHEN r.DurationSeconds > 0
+                    THEN CONVERT(decimal(5,1), (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100)
+                    ELSE 0
+                END
+            FROM #runs AS r
+            LEFT JOIN
+            (
+                SELECT
+                    su.RunLabel,
+                    TotalStatMs = SUM(ISNULL(su.DurationMs, 0))
+                FROM #stat_updates AS su
+                WHERE su.EndTime IS NOT NULL
+                GROUP BY su.RunLabel
+            ) AS su_agg ON su_agg.RunLabel = r.RunLabel
+            WHERE r.IsKilled = 0
+            AND   r.DurationSeconds > 10  /* skip trivial runs */
+            AND   r.StatsProcessed >= 5   /* need enough stats for meaningful ratio */
+        )
+        SELECT
+            @w6_overhead_runs = COUNT(*),
+            @w6_worst_pct = MAX(ro.overhead_pct)
+        FROM run_overhead AS ro
+        WHERE ro.overhead_pct > 40;
+
+        /* Get the label of the worst-overhead run */
+        IF @w6_overhead_runs > 0
+        BEGIN
+            ;WITH run_overhead2 AS
+            (
+                SELECT
+                    r.RunLabel,
+                    overhead_pct = CASE
+                        WHEN r.DurationSeconds > 0
+                        THEN CONVERT(decimal(5,1), (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100)
+                        ELSE 0
+                    END
+                FROM #runs AS r
+                LEFT JOIN
+                (
+                    SELECT su.RunLabel, TotalStatMs = SUM(ISNULL(su.DurationMs, 0))
+                    FROM #stat_updates AS su WHERE su.EndTime IS NOT NULL GROUP BY su.RunLabel
+                ) AS su_agg ON su_agg.RunLabel = r.RunLabel
+                WHERE r.IsKilled = 0 AND r.DurationSeconds > 10 AND r.StatsProcessed >= 5
+            )
+            SELECT TOP (1) @w6_worst_label = ro2.RunLabel
+            FROM run_overhead2 AS ro2
+            ORDER BY ro2.overhead_pct DESC;
+        END;
+
+        IF @w6_overhead_runs > 0
+        BEGIN
+            SET @w6_detail =
+                CONVERT(nvarchar(10), @w6_overhead_runs) + N' run(s) spent >40% of wall-clock time on overhead (discovery, environment checks, per-stat validations) '
+                + N'rather than actual UPDATE STATISTICS. Worst: ' + @w6_worst_label
+                + N' at ' + CONVERT(nvarchar(10), @w6_worst_pct) + N'% overhead.';
+
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES
+            (
+                N'WARNING', N'EXCESSIVE_OVERHEAD',
+                N'Discovery and environment checks consuming disproportionate time vs actual stat updates',
+                @w6_detail,
+                N'Review recent parameter changes — newly enabled features (@CollectHeapForwarding, @GroupByJoinPattern, @QueryStorePriority) add discovery overhead. '
+                    + N'Consider @StagedDiscovery=N for legacy fast-path, reduce @CommandLogRetentionDays, or check whether CommandLog table needs a StartTime index.',
+                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @Debug = 1; /* Review per-phase timing in debug output */',
+                33
+            );
+
+            DECLARE @w6_msg nvarchar(500) =
+                N'  [WARNING] W6: Excessive overhead — ' + CONVERT(nvarchar(10), @w6_overhead_runs)
+                + N' run(s) with >40%% overhead (worst: ' + @w6_worst_label
+                + N' at ' + CONVERT(nvarchar(10), @w6_worst_pct) + N'%%)';
+            RAISERROR(@w6_msg, 10, 1) WITH NOWAIT;
+        END;
     END;
 
     /* ======================================================================
