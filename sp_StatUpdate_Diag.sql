@@ -36,9 +36,11 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.09.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.09.3 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.09.1 - RunLabel dedup prevents PK violation on duplicate START entries (#216).
+History:    2026.03.09.2 - I8 silent failure: inserts INFO recommendation when no QS CPU data exists (#239).
+                         @SingleResultSet=1 auto-promotes @ExpertMode=1 for stable ResultSetID contract (#236).
+            2026.03.09.1 - RunLabel dedup prevents PK violation on duplicate START entries (#216).
                          Watermark gap detection resets when CommandLog archived (#232).
                          I5 VERSION_HISTORY implemented (was documented but missing).
                          I8 QS_PERFORMANCE_TREND: per-stat per-execution CPU trend.
@@ -139,7 +141,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.09.2',
+        @procedure_version varchar(20) = '2026.03.09.3',
         @procedure_version_date datetime = '20260309';
 
     SET @Version = @procedure_version;
@@ -195,7 +197,7 @@ BEGIN
                     N'0, 1', N'0'),
                 (N'@Debug',                    N'bit',      N'Verbose diagnostic output — shows intermediate temp table counts and timing',
                     N'0, 1', N'0'),
-                (N'@SingleResultSet',          N'bit',      N'Collapse all result sets into one with columns (ResultSetID, ResultSetName, RowNum, RowData). RowData is JSON. Enables INSERT...EXEC capture in automation.',
+                (N'@SingleResultSet',          N'bit',      N'Collapse all result sets into one with columns (ResultSetID, ResultSetName, RowNum, RowData). RowData is JSON. Enables INSERT...EXEC capture in automation. Auto-promotes @ExpertMode=1 so ResultSetIDs 1-13 are always present.',
                     N'0, 1', N'0'),
                 (N'@Version',                  N'varchar(20)', N'OUTPUT: returns procedure version string (e.g., 2026.03.04)',
                     N'OUTPUT', N'OUTPUT'),
@@ -432,6 +434,15 @@ BEGIN
     END;
 
     DECLARE @expert_int integer = CONVERT(integer, @ExpertMode);
+
+    /* #236: @SingleResultSet=1 auto-promotes @ExpertMode=1 so automation always gets RS 1-13. */
+    IF @SingleResultSet = 1 AND @ExpertMode = 0
+    BEGIN
+        SET @ExpertMode = 1;
+        SET @expert_int = 1;
+        RAISERROR(N'Note: @SingleResultSet=1 auto-enabled @ExpertMode=1 for stable ResultSetID contract (1-13).', 10, 1) WITH NOWAIT;
+    END;
+
     RAISERROR(N'sp_StatUpdate_Diag v%s', 10, 1, @procedure_version) WITH NOWAIT;
     RAISERROR(N'CommandLog: %s', 10, 1, @commandlog_ref) WITH NOWAIT;
     RAISERROR(N'Analysis window: %i days', 10, 1, @DaysBack) WITH NOWAIT;
@@ -2126,7 +2137,12 @@ BEGIN
             (
                 N'INFO',
                 N'QS_PERFORMANCE_TREND',
-                N'Insufficient data for per-execution CPU trend analysis. Need 2+ statistics appearing in 2+ runs with Query Store data.',
+                N'Insufficient data for per-execution CPU trend analysis. Need 2+ statistics appearing in 2+ runs with Query Store data.'
+                    + CASE
+                        WHEN (SELECT COUNT(DISTINCT su2.RunLabel) FROM #stat_updates AS su2 WHERE su2.QSTotalCpuMs IS NOT NULL AND su2.QSTotalCpuMs > 0) < 2
+                        THEN N' Only ' + CONVERT(nvarchar(10), (SELECT COUNT(DISTINCT su2.RunLabel) FROM #stat_updates AS su2 WHERE su2.QSTotalCpuMs IS NOT NULL AND su2.QSTotalCpuMs > 0)) + N' QS-enabled run(s) found; need 2+ for comparison.'
+                        ELSE N' QS data exists across runs, but individual stats appear only once each.'
+                    END,
                 N'Tracked ' + CONVERT(nvarchar(10), @i8_total_tracked) + N' statistics with 2+ appearances. At least 2 are needed for trend analysis.',
                 N'Run sp_StatUpdate with @QueryStorePriority=Y across multiple maintenance windows to build up comparison data.',
                 N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStorePriority = N''Y'';',
@@ -2177,6 +2193,21 @@ BEGIN
 
             RAISERROR(N'  [INFO] I8: QS performance trend computed', 10, 1) WITH NOWAIT;
         END;
+    END
+    ELSE
+    BEGIN
+        /* #239: No QS CPU data at all — explain why I8/RS13 are empty instead of silent skip. */
+        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+        VALUES (
+            N'INFO', N'QS_PERFORMANCE_TREND',
+            N'No Query Store CPU data found in any run. RS 13 (QS Performance Correlation) will be empty.',
+            N'0 of ' + CONVERT(nvarchar(10), (SELECT COUNT(*) FROM #runs))
+                + N' runs contained Query Store CPU metrics. Ensure @QueryStorePriority=Y and Query Store is enabled/READ_WRITE.',
+            N'Enable QS prioritization: EXEC sp_StatUpdate @QueryStorePriority = N''Y'', @QueryStoreMetric = N''CPU''.',
+            N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStorePriority = N''Y'';',
+            73
+        );
+        RAISERROR(N'  [INFO] I8: no Query Store CPU data available', 10, 1) WITH NOWAIT;
     END;
 
     RAISERROR(N'', 10, 1) WITH NOWAIT;
