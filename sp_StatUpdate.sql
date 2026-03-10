@@ -36,7 +36,7 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.20.2026.03.10 (Major.Minor.YYYY.MM.DD)
+Version:    2.21.2026.03.10 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
@@ -651,7 +651,7 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.20.2026.03.10',
+        @procedure_version varchar(20) = '2.21.2026.03.10',
         @procedure_version_date datetime = '20260310',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -5820,7 +5820,7 @@ OPTION (RECOMPILE);';
                     END;
 
                     /* #190: Check if @QueryStoreRecentHours exceeds QS retention.
-                       SQL 2022+ uses retention_period_in_days; SQL 2019 uses stale_query_threshold_days. */
+                       Uses stale_query_threshold_days from sys.database_query_store_options. */
                     DECLARE @qs_retention_days int;
                     SELECT @qs_retention_days = stale_query_threshold_days
                     FROM sys.database_query_store_options;
@@ -5834,33 +5834,61 @@ OPTION (RECOMPILE);';
                     END;
 
                     /*
-                    PERF: Batch Query Store enrichment (Issue #4)
-                    Single query with GROUP BY instead of CROSS APPLY per row.
-                    Changes O(n) QS queries to O(1) batched query.
+                    FIX #271: Plan XML table extraction for QS enrichment.
+                    Previous approach joined on qsq.object_id (the MODULE id for stored
+                    procs/functions) to #stat_candidates.object_id (the TABLE id from
+                    sys.stats). These are different domains — the join produced zero
+                    matches for all workload types (ad-hoc, ORM, stored proc).
+                    Now we parse plan XML to find which tables each QS plan references.
                     */
 
                     /* Initialize qs_priority_boost to 0 for all rows first */
                     UPDATE #stat_candidates SET qs_priority_boost = 0;
 
-                    /* Batch-fetch QS data for all relevant object_ids at once */
-                    ;WITH QSData AS (
-                        SELECT
-                            qsq.object_id,
-                            COUNT_BIG(DISTINCT qsp.plan_id) AS plan_count,
-                            SUM(qsrs.count_executions) AS total_executions,
-                            SUM(qsrs.avg_cpu_time * qsrs.count_executions) / 1000 AS total_cpu_ms,
-                            SUM(qsrs.avg_duration * qsrs.count_executions) / 1000 AS total_duration_ms,
-                            SUM(CONVERT(bigint, qsrs.avg_logical_io_reads * qsrs.count_executions)) AS total_logical_reads,
-                            MAX(qsrs.last_execution_time) AS last_execution
-                        FROM sys.query_store_query AS qsq
-                        JOIN sys.query_store_plan AS qsp ON qsp.query_id = qsq.query_id
-                        JOIN sys.query_store_runtime_stats AS qsrs ON qsrs.plan_id = qsp.plan_id
+                    /* Step 1: Extract table references from QS plans in the time window.
+                       Step 2: Filter to only tables we have stat candidates for.
+                       Step 3: Aggregate runtime stats per table object_id. */
+                    ;WITH PlanTableRefs AS (
+                        SELECT DISTINCT
+                            qsp.plan_id,
+                            PARSENAME(ref.value(''@Schema'',  ''sysname''), 1) AS ref_schema,
+                            PARSENAME(ref.value(''@Table'',   ''sysname''), 1) AS ref_table
+                        FROM sys.query_store_plan AS qsp
+                        JOIN sys.query_store_runtime_stats AS qsrs
+                            ON qsrs.plan_id = qsp.plan_id
                         JOIN sys.query_store_runtime_stats_interval AS qsrsi
                             ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
-                        WHERE qsq.object_id IN (SELECT DISTINCT object_id FROM #stat_candidates)
-                        AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
-                        GROUP BY qsq.object_id
-                        HAVING SUM(qsrs.count_executions) > 0
+                        CROSS APPLY (SELECT TRY_CONVERT(xml, qsp.query_plan)) AS x(plan_xml)
+                        CROSS APPLY x.plan_xml.nodes(''//*:Object'') AS t(ref)
+                        WHERE qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+                          AND x.plan_xml IS NOT NULL
+                          AND ref.value(''@Table'', ''sysname'') IS NOT NULL
+                    ),
+                    FilteredRefs AS (
+                        SELECT DISTINCT ptr.plan_id, sc.object_id
+                        FROM PlanTableRefs AS ptr
+                        JOIN (SELECT DISTINCT object_id, schema_name, table_name
+                              FROM #stat_candidates) AS sc
+                            ON sc.schema_name = ptr.ref_schema COLLATE DATABASE_DEFAULT
+                            AND sc.table_name = ptr.ref_table COLLATE DATABASE_DEFAULT
+                    ),
+                    QSByTable AS (
+                        SELECT
+                            fr.object_id,
+                            COUNT_BIG(DISTINCT fr.plan_id) AS plan_count,
+                            SUM(qsrs2.count_executions) AS total_executions,
+                            SUM(qsrs2.avg_cpu_time * qsrs2.count_executions) / 1000 AS total_cpu_ms,
+                            SUM(qsrs2.avg_duration * qsrs2.count_executions) / 1000 AS total_duration_ms,
+                            SUM(CONVERT(bigint, qsrs2.avg_logical_io_reads * qsrs2.count_executions)) AS total_logical_reads,
+                            MAX(qsrs2.last_execution_time) AS last_execution
+                        FROM FilteredRefs AS fr
+                        JOIN sys.query_store_runtime_stats AS qsrs2
+                            ON qsrs2.plan_id = fr.plan_id
+                        JOIN sys.query_store_runtime_stats_interval AS qsrsi2
+                            ON qsrsi2.runtime_stats_interval_id = qsrs2.runtime_stats_interval_id
+                        WHERE qsrsi2.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+                        GROUP BY fr.object_id
+                        HAVING SUM(qsrs2.count_executions) > 0
                     )
                     UPDATE sc
                     SET
@@ -5884,7 +5912,7 @@ OPTION (RECOMPILE);';
                                 ELSE 0
                             END
                     FROM #stat_candidates AS sc
-                    INNER JOIN QSData AS qs ON qs.object_id = sc.object_id;
+                    INNER JOIN QSByTable AS qs ON qs.object_id = sc.object_id;
                 END;
 
                 SET @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
@@ -6089,6 +6117,71 @@ OPTION (RECOMPILE);';
                 @discovery_sql = N'
             USE ' + QUOTENAME(@CurrentDatabaseName) + N';
 
+        /* FIX #271: Pre-compute QS plan-to-table mapping via plan XML extraction.
+           Only populated when @QueryStorePriority = Y and QS is enabled. */
+        IF OBJECT_ID(N''tempdb..#qs_table_stats'') IS NOT NULL
+            DROP TABLE #qs_table_stats;
+
+        CREATE TABLE #qs_table_stats (
+            table_object_id int NOT NULL PRIMARY KEY,
+            plan_count bigint NULL,
+            total_executions bigint NULL,
+            total_cpu_ms bigint NULL,
+            total_duration_ms bigint NULL,
+            total_logical_reads bigint NULL,
+            last_execution datetime2(3) NULL
+        );
+
+        IF @QueryStorePriority_param = N''Y''
+        AND EXISTS (SELECT 1 FROM sys.database_query_store_options WHERE actual_state IN (1, 2))
+        BEGIN
+            ;WITH PlanTableRefs AS (
+                SELECT DISTINCT
+                    qsp.plan_id,
+                    PARSENAME(ref.value(''@Schema'', ''sysname''), 1) AS ref_schema,
+                    PARSENAME(ref.value(''@Table'',  ''sysname''), 1) AS ref_table
+                FROM sys.query_store_plan AS qsp
+                JOIN sys.query_store_runtime_stats AS qsrs
+                    ON qsrs.plan_id = qsp.plan_id
+                JOIN sys.query_store_runtime_stats_interval AS qsrsi
+                    ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
+                CROSS APPLY (SELECT TRY_CONVERT(xml, qsp.query_plan)) AS x(plan_xml)
+                CROSS APPLY x.plan_xml.nodes(''//*:Object'') AS t(ref)
+                WHERE qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+                  AND x.plan_xml IS NOT NULL
+                  AND ref.value(''@Table'', ''sysname'') IS NOT NULL
+            ),
+            FilteredRefs AS (
+                SELECT DISTINCT ptr.plan_id,
+                    o2.object_id AS table_object_id
+                FROM PlanTableRefs AS ptr
+                JOIN sys.objects AS o2
+                    ON o2.name = ptr.ref_table COLLATE DATABASE_DEFAULT
+                JOIN sys.schemas AS s2
+                    ON s2.schema_id = o2.schema_id
+                    AND s2.name = ptr.ref_schema COLLATE DATABASE_DEFAULT
+                WHERE OBJECTPROPERTY(o2.object_id, N''IsUserTable'') = 1
+                   OR o2.type = N''V''
+            )
+            INSERT INTO #qs_table_stats
+            SELECT
+                fr.table_object_id,
+                COUNT_BIG(DISTINCT fr.plan_id),
+                SUM(qsrs2.count_executions),
+                SUM(qsrs2.avg_cpu_time * qsrs2.count_executions) / 1000,
+                SUM(qsrs2.avg_duration * qsrs2.count_executions) / 1000,
+                SUM(CONVERT(bigint, qsrs2.avg_logical_io_reads * qsrs2.count_executions)),
+                MAX(qsrs2.last_execution_time)
+            FROM FilteredRefs AS fr
+            JOIN sys.query_store_runtime_stats AS qsrs2
+                ON qsrs2.plan_id = fr.plan_id
+            JOIN sys.query_store_runtime_stats_interval AS qsrsi2
+                ON qsrsi2.runtime_stats_interval_id = qsrs2.runtime_stats_interval_id
+            WHERE qsrsi2.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+            GROUP BY fr.table_object_id
+            HAVING SUM(qsrs2.count_executions) > 0;
+        END;
+
         SELECT
             database_name = DB_NAME(),
             schema_name = OBJECT_SCHEMA_NAME(s.object_id),
@@ -6241,66 +6334,13 @@ OPTION (RECOMPILE);';
             AND   p.index_id IN (0, 1)
         ) AS pgs
         /*
-        QUERY STORE CROSS-REFERENCE: Find plans that reference this object''s statistics.
-        This identifies stats that are actively used by the query optimizer.
-        Only runs the join if @QueryStorePriority_param = ''Y'' to avoid overhead.
-
-        Query Store must be enabled on the database for this to return data.
-        We use sys.query_store_plan to find plans, then aggregate resource consumption
-        from sys.query_store_runtime_stats.
-
-        RESOURCE METRICS (following sp_QuickieStore patterns):
-        - total_cpu_ms: Total CPU consumption (avg_cpu_time is microseconds, * count / 1000 = ms)
-        - total_duration_ms: Total elapsed time
-        - total_logical_reads: Total I/O operations
-
-        These help prioritize stats causing the most resource consumption, not just
-        the most frequently executed. A single 10-second query matters more than
-        1000 1-millisecond queries.
-
-        Note: We match by object_id since Query Store tracks plans by object, not by
-        individual statistic. A stat on a hot table will be prioritized even if
-        we can''t determine exactly which stat column the plan used.
+        FIX #271: QS enrichment via plan XML table extraction (legacy path).
+        Previous OUTER APPLY joined on qsq.object_id (MODULE id) to s.object_id
+        (TABLE id) — different domains, zero matches for all workloads.
+        Now uses pre-computed #qs_table_stats temp table populated from plan XML.
         */
-        OUTER APPLY
-        (
-            /*
-            OPTIMIZED JOIN ORDER: Filter by object_id FIRST through sys.query_store_query,
-            then join to plans. This dramatically reduces intermediate result set size
-            on databases with large Query Store catalogs.
-            */
-            SELECT
-                plan_count = COUNT_BIG(DISTINCT qsp.plan_id),
-                total_executions = SUM(qsrs.count_executions),
-                /* CPU time: avg_cpu_time is in microseconds, convert to milliseconds */
-                total_cpu_ms = SUM(qsrs.avg_cpu_time * qsrs.count_executions) / 1000,
-                /* Duration: avg_duration is in microseconds, convert to milliseconds */
-                total_duration_ms = SUM(qsrs.avg_duration * qsrs.count_executions) / 1000,
-                /* Logical reads: direct sum of avg * count */
-                total_logical_reads = SUM(CONVERT(bigint, qsrs.avg_logical_io_reads * qsrs.count_executions)),
-                last_execution = MAX(qsrs.last_execution_time)
-            FROM sys.query_store_query AS qsq  /* Filter by object_id FIRST */
-            JOIN sys.query_store_plan AS qsp
-              ON qsp.query_id = qsq.query_id
-            JOIN sys.query_store_runtime_stats AS qsrs
-              ON qsrs.plan_id = qsp.plan_id
-            JOIN sys.query_store_runtime_stats_interval AS qsrsi
-              ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
-            WHERE qsq.object_id = s.object_id  /* Early filter reduces join cardinality */
-            AND   @QueryStorePriority_param = N''Y''
-            AND   qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
-            /*
-            Check Query Store is enabled and readable before querying.
-            actual_state: 0=OFF, 1=READ_ONLY, 2=READ_WRITE, 3=ERROR
-            Only query if state is READ_ONLY (1) or READ_WRITE (2).
-            */
-            AND   EXISTS
-                  (
-                      SELECT 1
-                      FROM sys.database_query_store_options AS qso
-                      WHERE qso.actual_state IN (1, 2)
-                  )
-        ) AS qs_stats
+        LEFT JOIN #qs_table_stats AS qs_stats
+            ON qs_stats.table_object_id = s.object_id
         WHERE (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
         AND   (
                   OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
