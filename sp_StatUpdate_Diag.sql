@@ -1253,8 +1253,13 @@ BEGIN
 
                 EXECUTE sp_executesql @map_sql;
 
-                DECLARE @map_table_msg nvarchar(200) = N'  Obfuscation map saved to ' + @map_safe_name;
-                RAISERROR(@map_table_msg, 10, 1) WITH NOWAIT;
+                SET @map_safe_name = N'  Obfuscation map saved to ' + @map_safe_name;
+                RAISERROR(@map_safe_name, 10, 1) WITH NOWAIT;
+
+                RAISERROR(N'', 10, 1) WITH NOWAIT;
+                RAISERROR(N'=== Decode obfuscated tokens ===', 10, 1) WITH NOWAIT;
+                RAISERROR(N'SELECT ObjectType, OriginalName, ObfuscatedName', 10, 1) WITH NOWAIT;
+                RAISERROR(N'FROM %s WHERE ObfuscatedName = N''<paste_token_here>'';', 10, 1, @ObfuscationMapTable) WITH NOWAIT;
             END;
         END;
 
