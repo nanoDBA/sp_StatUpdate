@@ -1713,7 +1713,8 @@ ORDER BY TotalStatUpdates DESC;')
         @current_end_time datetime2(7) = NULL,
         @current_error_number integer = NULL,
         @current_error_message nvarchar(max) = NULL,
-        @current_extended_info xml = NULL;
+        @current_extended_info xml = NULL,
+        @current_commandlog_id integer = NULL;
 
     /*
     Output message helpers
@@ -8976,6 +8977,47 @@ OPTION (RECOMPILE);';
                 CONTINUE;
             END;
 
+            /*
+            Pre-execution INSERT to CommandLog (Ola Hallengren two-phase pattern):
+            INSERT with NULL EndTime before execution, UPDATE EndTime after completion.
+            This lets you monitor in-progress stats via: SELECT * FROM dbo.CommandLog WHERE EndTime IS NULL;
+            */
+            SET @current_commandlog_id = NULL;
+            IF  @LogToTable = N'Y'
+            AND @commandlog_exists = 1
+            BEGIN
+                BEGIN TRY
+                    INSERT INTO
+                        dbo.CommandLog
+                    (
+                        DatabaseName,
+                        SchemaName,
+                        ObjectName,
+                        ObjectType,
+                        StatisticsName,
+                        Command,
+                        CommandType,
+                        StartTime
+                    )
+                    VALUES
+                    (
+                        @current_database,
+                        @current_schema_name,
+                        @current_table_name,
+                        N'U',
+                        @current_stat_name,
+                        @current_command,
+                        @current_command_type,
+                        @current_start_time
+                    );
+                    SET @current_commandlog_id = SCOPE_IDENTITY();
+                END TRY
+                BEGIN CATCH
+                    SET @log_error_msg = LEFT(ERROR_MESSAGE(), 3900);
+                    RAISERROR(N'  WARNING: Failed to log start to CommandLog (%s). Continuing execution.', 10, 1, @log_error_msg) WITH NOWAIT;
+                END CATCH;
+            END;
+
             /* #163 (P2): Deadlock retry — up to 3 total attempts with exponential backoff on error 1205.
                ROWLOCK+READPAST skips locked rows but cannot prevent Sch-M conflicts when multiple
                workers update the same stat simultaneously. Retry loop handles that residual race. */
@@ -9090,11 +9132,14 @@ OPTION (RECOMPILE);';
                 RAISERROR(@progress_msg, 10, 1) WITH NOWAIT;
 
                 /*
-                Log to CommandLog
+                Update CommandLog with success (two-phase pattern: pre-exec INSERT already done above).
+                Rows with NULL EndTime are visible to other sessions during execution — query with:
+                  SELECT * FROM dbo.CommandLog WHERE EndTime IS NULL AND CommandType = 'UPDATE_STATISTICS';
                 */
                 BEGIN TRY
                 IF  @LogToTable = N'Y'
                 AND @commandlog_exists = 1
+                AND @current_commandlog_id IS NOT NULL
                 BEGIN
                     /*
                     Build ExtendedInfo XML for CommandLog.
@@ -9183,37 +9228,11 @@ OPTION (RECOMPILE);';
                     IF LEN(@current_command) > 4000
                         RAISERROR(N'  Note: UPDATE STATISTICS command is %d chars — may truncate on older CommandLog schemas with nvarchar(4000).', 10, 1, @current_command) WITH NOWAIT;
 
-                    INSERT INTO
-                        dbo.CommandLog
-                    (
-                        DatabaseName,
-                        SchemaName,
-                        ObjectName,
-                        ObjectType,
-                        StatisticsName,
-                        Command,
-                        CommandType,
-                        StartTime,
-                        EndTime,
-                        ErrorNumber,
-                        ErrorMessage,
-                        ExtendedInfo
-                    )
-                    VALUES
-                    (
-                        @current_database,
-                        @current_schema_name,
-                        @current_table_name,
-                        N'U',
-                        @current_stat_name,
-                        @current_command,
-                        @current_command_type,
-                        @current_start_time,
-                        @current_end_time,
-                        0,
-                        NULL,
-                        @current_extended_info
-                    );
+                    UPDATE dbo.CommandLog
+                    SET EndTime = @current_end_time,
+                        ErrorNumber = 0,
+                        ExtendedInfo = @current_extended_info
+                    WHERE ID = @current_commandlog_id;
 
                     /*
                     Progress logging at interval (for Agent job monitoring).
@@ -9259,9 +9278,9 @@ OPTION (RECOMPILE);';
                 END;
                 END TRY
                 BEGIN CATCH
-                    /* CommandLog INSERT failure is non-fatal: stat update succeeded. Log warning only. */
+                    /* CommandLog UPDATE failure is non-fatal: stat update succeeded. Log warning only. */
                     SET @log_error_msg = LEFT(ERROR_MESSAGE(), 3900);
-                    RAISERROR(N'  WARNING: Failed to log success to CommandLog (%s). Stat update succeeded.', 10, 1, @log_error_msg) WITH NOWAIT;
+                    RAISERROR(N'  WARNING: Failed to update CommandLog (%s). Stat update succeeded.', 10, 1, @log_error_msg) WITH NOWAIT;
                 END CATCH;
 
                 /*
@@ -9330,41 +9349,18 @@ OPTION (RECOMPILE);';
                 END;
 
                 /*
-                Log error to CommandLog
+                Update CommandLog with error (two-phase pattern: pre-exec INSERT already done above)
                 */
                 IF  @LogToTable = N'Y'
                 AND @commandlog_exists = 1
+                AND @current_commandlog_id IS NOT NULL
                 BEGIN
                     BEGIN TRY
-                        INSERT INTO
-                            dbo.CommandLog
-                        (
-                            DatabaseName,
-                            SchemaName,
-                            ObjectName,
-                            ObjectType,
-                            StatisticsName,
-                            Command,
-                            CommandType,
-                            StartTime,
-                            EndTime,
-                            ErrorNumber,
-                            ErrorMessage
-                        )
-                        VALUES
-                        (
-                            @current_database,
-                            @current_schema_name,
-                            @current_table_name,
-                            N'U',
-                            @current_stat_name,
-                            @current_command,
-                            @current_command_type,
-                            @current_start_time,
-                            @current_end_time,
-                            @current_error_number,
-                            @current_error_message
-                        );
+                        UPDATE dbo.CommandLog
+                        SET EndTime = @current_end_time,
+                            ErrorNumber = @current_error_number,
+                            ErrorMessage = @current_error_message
+                        WHERE ID = @current_commandlog_id;
                     END TRY
                     BEGIN CATCH
                         SELECT @log_error_msg = LEFT(ERROR_MESSAGE(), 3900);
