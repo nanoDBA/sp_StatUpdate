@@ -36,9 +36,13 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.10.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.10.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.10.1 - @GradeOverrides and @GradeWeights parameters for Executive Dashboard.
+History:    2026.03.10.2 - RS 13 forced plan awareness (#292): ForcedPlanCount column, PlanTrend
+                         distinguishes 'MORE PLANS (forced plan at risk)' from generic proliferation.
+                         I8 recommendation warns when degrading stats have forced plans.
+                         Cross-database sys.query_store_plan lookup (graceful on QS-disabled DBs).
+            2026.03.10.1 - @GradeOverrides and @GradeWeights parameters for Executive Dashboard.
                          Force grades (RELIABILITY=A), exclude categories (SPEED=IGNORE),
                          or change weights (COMPLETION=50, auto-normalized to 100%).
                          I6 QS_EFFICACY: graceful message when QS runs exist but no CPU data
@@ -153,7 +157,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.10.1',
+        @procedure_version varchar(20) = '2026.03.10.2',
         @procedure_version_date datetime = '20260310';
 
     SET @Version = @procedure_version;
@@ -248,7 +252,7 @@ BEGIN
                 (N'I5', N'INFO/WARNING', N'VERSION_HISTORY',    N'sp_StatUpdate versions used across analysis window. WARNING if multiple versions detected (version skew).'),
                 (N'I6', N'INFO',     N'QS_EFFICACY',           N'Query Store prioritization effectiveness — what % of high-workload stats get serviced early'),
                 (N'I7', N'INFO',     N'QS_INFLECTION',         N'Before/after comparison when sort order changed to Query Store-based prioritization'),
-                (N'I8', N'INFO',     N'QS_PERFORMANCE_TREND',  N'Per-stat per-execution query CPU trend — are queries getting faster after stat updates?')
+                (N'I8', N'INFO',     N'QS_PERFORMANCE_TREND',  N'Per-stat per-execution query CPU trend — are queries getting faster after stat updates? Detects forced plans at risk (#292).')
         ) AS v (check_id, severity, category, description);
 
         /* Result set 3: Result set order */
@@ -1248,7 +1252,7 @@ BEGIN
                 SELECT RunLabel = CONVERT(nvarchar(100), NULL), StartTime = CONVERT(datetime2(3), NULL), SortStrategy = CONVERT(nvarchar(20), NULL), StatsFound = CONVERT(int, NULL), StatsProcessed = CONVERT(int, NULL), CompletionPct = CONVERT(decimal(5,1), NULL), HighCpuInFirstQuartilePct = CONVERT(decimal(5,1), NULL), MinutesToHighCpuComplete = CONVERT(decimal(10,1), NULL), WorkloadCoveragePct = CONVERT(decimal(5,1), NULL), AvgSecPerStat = CONVERT(decimal(10,1), NULL), StopReason = CONVERT(nvarchar(50), NULL), DeltaVsPrior = CONVERT(nvarchar(100), NULL) WHERE 1 = 0;
                 SELECT WorkloadRank = CONVERT(bigint, NULL), DatabaseName = CONVERT(sysname, NULL), SchemaName = CONVERT(sysname, NULL), TableName = CONVERT(sysname, NULL), StatisticsName = CONVERT(sysname, NULL), ProcessingPosition = CONVERT(int, NULL), TotalQueryCpuMs = CONVERT(bigint, NULL), TotalExecutions = CONVERT(bigint, NULL), PlanCount = CONVERT(int, NULL), UpdateDurationMs = CONVERT(int, NULL), QualifyReason = CONVERT(nvarchar(100), NULL) WHERE 1 = 0;
                 /* RS 13 empty schema */
-                SELECT DatabaseName = CONVERT(sysname, NULL), SchemaName = CONVERT(sysname, NULL), TableName = CONVERT(sysname, NULL), StatisticsName = CONVERT(sysname, NULL), Appearances = CONVERT(bigint, NULL), FirstRunDate = CONVERT(datetime2(3), NULL), LastRunDate = CONVERT(datetime2(3), NULL), FirstCpuMs = CONVERT(bigint, NULL), LastCpuMs = CONVERT(bigint, NULL), CpuChangePct = CONVERT(decimal(10,1), NULL), CpuTrend = CONVERT(nvarchar(20), NULL), FirstCpuPerExec = CONVERT(decimal(18,4), NULL), LastCpuPerExec = CONVERT(decimal(18,4), NULL), CpuPerExecChangePct = CONVERT(decimal(10,1), NULL), FirstExecs = CONVERT(bigint, NULL), LastExecs = CONVERT(bigint, NULL), FirstPlans = CONVERT(int, NULL), LastPlans = CONVERT(int, NULL), PlanTrend = CONVERT(nvarchar(50), NULL) WHERE 1 = 0;
+                SELECT DatabaseName = CONVERT(sysname, NULL), SchemaName = CONVERT(sysname, NULL), TableName = CONVERT(sysname, NULL), StatisticsName = CONVERT(sysname, NULL), Appearances = CONVERT(bigint, NULL), FirstRunDate = CONVERT(datetime2(3), NULL), LastRunDate = CONVERT(datetime2(3), NULL), FirstCpuMs = CONVERT(bigint, NULL), LastCpuMs = CONVERT(bigint, NULL), CpuChangePct = CONVERT(decimal(10,1), NULL), CpuTrend = CONVERT(nvarchar(20), NULL), FirstCpuPerExec = CONVERT(decimal(18,4), NULL), LastCpuPerExec = CONVERT(decimal(18,4), NULL), CpuPerExecChangePct = CONVERT(decimal(10,1), NULL), FirstExecs = CONVERT(bigint, NULL), LastExecs = CONVERT(bigint, NULL), FirstPlans = CONVERT(int, NULL), LastPlans = CONVERT(int, NULL), ForcedPlanCount = CONVERT(int, NULL), PlanTrend = CONVERT(nvarchar(50), NULL) WHERE 1 = 0;
             END;
         END
         ELSE
@@ -1444,6 +1448,92 @@ BEGIN
         RAISERROR(N'DEBUG: #stat_updates sample (top 5)', 10, 1) WITH NOWAIT;
         SELECT TOP (5) * FROM #stat_updates ORDER BY StartTime DESC;
     END;
+
+    /*
+    ============================================================================
+    FORCED PLAN INVENTORY (#292): Lightweight cross-database lookup for forced plans
+    on objects appearing in QS correlation data. Feeds RS 13 ForcedPlanCount column,
+    I8 forced-plan-at-risk recommendation, and enhanced PlanTrend labels.
+    ============================================================================
+    */
+    CREATE TABLE #forced_plans
+    (
+        DatabaseName sysname NOT NULL,
+        ObjectName sysname NOT NULL,
+        ForcedPlanCount integer NOT NULL DEFAULT 0,
+        CONSTRAINT PK_forced_plans PRIMARY KEY CLUSTERED (DatabaseName, ObjectName)
+    );
+
+    BEGIN TRY
+        DECLARE
+            @fp_db sysname,
+            @fp_sql nvarchar(max);
+
+        DECLARE fp_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT DISTINCT su.DatabaseName
+            FROM #stat_updates AS su
+            WHERE su.QSTotalCpuMs IS NOT NULL
+            AND   su.QSTotalCpuMs > 0;
+
+        OPEN fp_cursor;
+        FETCH NEXT FROM fp_cursor INTO @fp_db;
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            /* Query each database's QS catalog for forced plans on objects in our data set.
+               Joins query_store_plan -> query_store_query -> sys.objects to map plan->object_id.
+               TRY/CATCH per-database: if QS is disabled or DB is inaccessible, skip silently. */
+            SET @fp_sql = N'
+                BEGIN TRY
+                    INSERT INTO #forced_plans (DatabaseName, ObjectName, ForcedPlanCount)
+                    SELECT
+                        @db_name,
+                        o.name,
+                        COUNT_BIG(*)
+                    FROM ' + QUOTENAME(@fp_db) + N'.sys.query_store_plan AS qsp
+                    INNER JOIN ' + QUOTENAME(@fp_db) + N'.sys.query_store_query AS qsq
+                        ON qsq.query_id = qsp.query_id
+                    INNER JOIN ' + QUOTENAME(@fp_db) + N'.sys.objects AS o
+                        ON o.object_id = qsq.object_id
+                    WHERE qsp.is_forced_plan = 1
+                    AND   o.name IN (SELECT DISTINCT su2.ObjectName FROM #stat_updates AS su2 WHERE su2.DatabaseName = @db_name AND su2.QSTotalCpuMs IS NOT NULL)
+                    GROUP BY o.name;
+                END TRY
+                BEGIN CATCH
+                    /* QS disabled, DB offline, permissions — skip silently */
+                END CATCH;';
+
+            EXECUTE sys.sp_executesql @fp_sql, N'@db_name sysname', @db_name = @fp_db;
+
+            IF @Debug = 1
+            BEGIN
+                DECLARE @fp_count_msg nvarchar(200) = N'  Forced plans in ' + @fp_db + N': '
+                    + CONVERT(nvarchar(10), ISNULL((SELECT SUM(ForcedPlanCount) FROM #forced_plans WHERE DatabaseName = @fp_db), 0))
+                    + N' across '
+                    + CONVERT(nvarchar(10), (SELECT COUNT(*) FROM #forced_plans WHERE DatabaseName = @fp_db))
+                    + N' object(s)';
+                RAISERROR(@fp_count_msg, 10, 1) WITH NOWAIT;
+            END;
+
+            FETCH NEXT FROM fp_cursor INTO @fp_db;
+        END;
+
+        CLOSE fp_cursor;
+        DEALLOCATE fp_cursor;
+    END TRY
+    BEGIN CATCH
+        /* Graceful fallback: #forced_plans stays empty, RS 13 works without it */
+        DECLARE @fp_error nvarchar(4000) = ERROR_MESSAGE();
+
+        IF CURSOR_STATUS('local', 'fp_cursor') >= 0
+        BEGIN
+            CLOSE fp_cursor;
+            DEALLOCATE fp_cursor;
+        END;
+
+        IF @Debug = 1
+            RAISERROR(N'  Forced plan lookup failed (non-fatal): %s', 10, 1, @fp_error) WITH NOWAIT;
+    END CATCH;
 
     /*
     ============================================================================
@@ -2451,6 +2541,20 @@ BEGIN
         END
         ELSE
         BEGIN
+            /* #292: Count forced plans on objects with degrading CPU trend */
+            DECLARE @i8_forced_at_risk integer = ISNULL((
+                SELECT SUM(fp.ForcedPlanCount)
+                FROM #forced_plans AS fp
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM #stat_updates AS su
+                    WHERE su.DatabaseName = fp.DatabaseName
+                    AND   su.ObjectName = fp.ObjectName
+                    AND   su.QSTotalCpuMs IS NOT NULL
+                    AND   su.QSTotalCpuMs > 0
+                )
+            ), 0);
+
             INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
             VALUES
             (
@@ -2467,6 +2571,10 @@ BEGIN
                         + CONVERT(nvarchar(10), @i8_degrading_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
                         + N' tracked statistics show higher per-execution CPU (avg '
                         + CONVERT(nvarchar(10), @i8_avg_delta_pct) + N'% change).'
+                        + CASE WHEN @i8_forced_at_risk > 0
+                            THEN N' WARNING: ' + CONVERT(nvarchar(10), @i8_forced_at_risk) + N' forced plan(s) exist on affected tables — stat updates may have triggered forced plan abandonment.'
+                            ELSE N''
+                        END
                     ELSE N'Per-execution query CPU stable across updates: '
                         + CONVERT(nvarchar(10), @i8_stable_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
                         + N' tracked statistics show consistent per-execution CPU. '
@@ -2477,10 +2585,18 @@ BEGIN
                     + N' statistics appearing in 2+ runs (per-execution CPU). Improving: ' + CONVERT(nvarchar(10), @i8_improving_count)
                     + N'. Stable: ' + CONVERT(nvarchar(10), @i8_stable_count)
                     + N'. Degrading: ' + CONVERT(nvarchar(10), @i8_degrading_count)
-                    + N'. Avg per-exec CPU change: ' + CONVERT(nvarchar(10), @i8_avg_delta_pct) + N'%.',
+                    + N'. Avg per-exec CPU change: ' + CONVERT(nvarchar(10), @i8_avg_delta_pct) + N'%.'
+                    + CASE WHEN @i8_forced_at_risk > 0
+                        THEN N' Forced plans at risk: ' + CONVERT(nvarchar(10), @i8_forced_at_risk) + N'.'
+                        ELSE N''
+                    END,
                 CASE
                     WHEN @i8_improving_count > @i8_degrading_count
                     THEN N'Statistics maintenance is contributing to query performance improvements. The stat updates are helping the optimizer choose better plans.'
+                    WHEN @i8_degrading_count > @i8_improving_count AND @i8_forced_at_risk > 0
+                    THEN N'CRITICAL: Forced plans on degrading tables may have been invalidated by stat updates. '
+                        + N'Check sys.query_store_plan for is_forced_plan=1 with force_failure_count > 0. '
+                        + N'A forced plan that fails reverts to optimizer choice — often a regression.'
                     WHEN @i8_degrading_count > @i8_improving_count
                     THEN N'Stat updates are not correlating with improved query performance. Check for plan regressions, forced plans, or parameter sensitivity.'
                     ELSE N'Stat updates are maintaining stable query performance. This is expected for well-maintained databases.'
@@ -3837,47 +3953,53 @@ BEGIN
             GROUP BY DatabaseName, SchemaName, ObjectName, StatisticsName
         )
         SELECT TOP (@TopN)
-            DatabaseName,
-            SchemaName,
-            TableName               = ObjectName,
-            StatisticsName,
-            Appearances,
-            FirstRunDate,
-            LastRunDate,
-            FirstCpuMs,
-            LastCpuMs,
-            CpuChangePct            = CASE WHEN FirstCpuMs > 0
-                                           THEN CONVERT(decimal(10, 1), (LastCpuMs - FirstCpuMs) * 100.0 / FirstCpuMs)
+            fl.DatabaseName,
+            fl.SchemaName,
+            TableName               = fl.ObjectName,
+            fl.StatisticsName,
+            fl.Appearances,
+            fl.FirstRunDate,
+            fl.LastRunDate,
+            fl.FirstCpuMs,
+            fl.LastCpuMs,
+            CpuChangePct            = CASE WHEN fl.FirstCpuMs > 0
+                                           THEN CONVERT(decimal(10, 1), (fl.LastCpuMs - fl.FirstCpuMs) * 100.0 / fl.FirstCpuMs)
                                            ELSE NULL
                                       END,
-            FirstCpuPerExec         = CONVERT(decimal(10, 2), FirstCpuPerExec),
-            LastCpuPerExec          = CONVERT(decimal(10, 2), LastCpuPerExec),
-            CpuPerExecChangePct     = CASE WHEN FirstCpuPerExec > 0
-                                           THEN CONVERT(decimal(10, 1), (LastCpuPerExec - FirstCpuPerExec) * 100.0 / FirstCpuPerExec)
+            FirstCpuPerExec         = CONVERT(decimal(10, 2), fl.FirstCpuPerExec),
+            LastCpuPerExec          = CONVERT(decimal(10, 2), fl.LastCpuPerExec),
+            CpuPerExecChangePct     = CASE WHEN fl.FirstCpuPerExec > 0
+                                           THEN CONVERT(decimal(10, 1), (fl.LastCpuPerExec - fl.FirstCpuPerExec) * 100.0 / fl.FirstCpuPerExec)
                                            ELSE NULL
                                       END,
             CpuTrend                = CASE
-                                          WHEN FirstCpuPerExec > 0 AND LastCpuPerExec < FirstCpuPerExec * 0.95 THEN N'IMPROVING'
-                                          WHEN FirstCpuPerExec > 0 AND LastCpuPerExec > FirstCpuPerExec * 1.05 THEN N'DEGRADING'
+                                          WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec < fl.FirstCpuPerExec * 0.95 THEN N'IMPROVING'
+                                          WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec > fl.FirstCpuPerExec * 1.05 THEN N'DEGRADING'
                                           ELSE N'STABLE'
                                       END,
-            FirstExecs,
-            LastExecs,
-            FirstPlans,
-            LastPlans,
+            fl.FirstExecs,
+            fl.LastExecs,
+            fl.FirstPlans,
+            fl.LastPlans,
+            ForcedPlanCount         = ISNULL(fp.ForcedPlanCount, 0),
             PlanTrend               = CASE
-                                          WHEN LastPlans > FirstPlans THEN N'MORE PLANS (possible regression)'
-                                          WHEN LastPlans < FirstPlans THEN N'FEWER PLANS (consolidating)'
+                                          WHEN fl.LastPlans > fl.FirstPlans AND ISNULL(fp.ForcedPlanCount, 0) > 0
+                                              THEN N'MORE PLANS (forced plan at risk)'
+                                          WHEN fl.LastPlans > fl.FirstPlans THEN N'MORE PLANS (possible regression)'
+                                          WHEN fl.LastPlans < fl.FirstPlans THEN N'FEWER PLANS (consolidating)'
                                           ELSE N'STABLE'
                                       END
-        FROM first_last
+        FROM first_last AS fl
+        LEFT JOIN #forced_plans AS fp
+            ON fp.DatabaseName = fl.DatabaseName
+            AND fp.ObjectName = fl.ObjectName
         ORDER BY
             CASE
-                WHEN FirstCpuPerExec > 0 AND LastCpuPerExec < FirstCpuPerExec * 0.95 THEN 1
-                WHEN FirstCpuPerExec > 0 AND LastCpuPerExec > FirstCpuPerExec * 1.05 THEN 2
+                WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec < fl.FirstCpuPerExec * 0.95 THEN 1
+                WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec > fl.FirstCpuPerExec * 1.05 THEN 2
                 ELSE 3
             END,
-            ISNULL(FirstCpuMs, 0) DESC;
+            ISNULL(fl.FirstCpuMs, 0) DESC;
     END
     ELSE IF @ExpertMode = 1
     BEGIN
@@ -3917,9 +4039,18 @@ BEGIN
                                              WHEN fl2.FirstCpuPerExec > 0 AND fl2.LastCpuPerExec < fl2.FirstCpuPerExec * 0.95 THEN N'IMPROVING'
                                              WHEN fl2.FirstCpuPerExec > 0 AND fl2.LastCpuPerExec > fl2.FirstCpuPerExec * 1.05 THEN N'DEGRADING'
                                              ELSE N'STABLE'
+                                         END,
+                    ForcedPlanCount     = fl2.ForcedPlanCount,
+                    PlanTrend           = CASE
+                                             WHEN fl2.LastPlans > fl2.FirstPlans AND fl2.ForcedPlanCount > 0
+                                                 THEN N'MORE PLANS (forced plan at risk)'
+                                             WHEN fl2.LastPlans > fl2.FirstPlans THEN N'MORE PLANS (possible regression)'
+                                             WHEN fl2.LastPlans < fl2.FirstPlans THEN N'FEWER PLANS (consolidating)'
+                                             ELSE N'STABLE'
                                          END
                 FROM (SELECT fl.DatabaseName, fl.SchemaName, fl.ObjectName, fl.StatisticsName,
-                             fl.Appearances, fl.FirstCpuMs, fl.LastCpuMs, fl.FirstCpuPerExec, fl.LastCpuPerExec) AS fl2
+                             fl.Appearances, fl.FirstCpuMs, fl.LastCpuMs, fl.FirstCpuPerExec, fl.LastCpuPerExec,
+                             fl.FirstPlans, fl.LastPlans, fl.ForcedPlanCount) AS fl2
                 FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
             )
         FROM
@@ -3930,12 +4061,16 @@ BEGIN
                 FirstCpuMs      = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalCpuMs END),
                 LastCpuMs       = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.QSTotalCpuMs END),
                 FirstCpuPerExec = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.cpu_per_exec END),
-                LastCpuPerExec  = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.cpu_per_exec END)
+                LastCpuPerExec  = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.cpu_per_exec END),
+                FirstPlans      = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSPlanCount END),
+                LastPlans       = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.QSPlanCount END),
+                ForcedPlanCount = MAX(ISNULL(fp.ForcedPlanCount, 0))
             FROM
             (
                 SELECT
                     su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName,
                     su.QSTotalCpuMs,
+                    su.QSPlanCount,
                     cpu_per_exec = CONVERT(decimal(18, 4), su.QSTotalCpuMs * 1.0 / NULLIF(su.QSTotalExecutions, 0)),
                     rn  = ROW_NUMBER() OVER (
                               PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
@@ -3949,6 +4084,9 @@ BEGIN
                 WHERE su.QSTotalCpuMs IS NOT NULL AND su.QSTotalCpuMs > 0
                 AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
             ) AS su_fl
+            LEFT JOIN #forced_plans AS fp
+                ON fp.DatabaseName = su_fl.DatabaseName
+                AND fp.ObjectName = su_fl.ObjectName
             WHERE su_fl.cnt >= 2
             GROUP BY su_fl.DatabaseName, su_fl.SchemaName, su_fl.ObjectName, su_fl.StatisticsName
             ORDER BY MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalCpuMs END) DESC
