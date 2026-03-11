@@ -160,7 +160,7 @@ BEGIN
     */
     DECLARE
         @procedure_version varchar(20) = '2026.03.11',
-        @procedure_version_date datetime = '20260310';
+        @procedure_version_date datetime = '20260311';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
