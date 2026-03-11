@@ -36,9 +36,11 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.10.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.11 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.10.2 - RS 13 forced plan awareness (#292): ForcedPlanCount column, PlanTrend
+History:    2026.03.11   - Fix empty-data RS 3 schema mismatch (#304): 7 columns → 17 columns
+                         matching production RS 3 (Run Health Summary).
+            2026.03.10.2 - RS 13 forced plan awareness (#292): ForcedPlanCount column, PlanTrend
                          distinguishes 'MORE PLANS (forced plan at risk)' from generic proliferation.
                          I8 recommendation warns when degrading stats have forced plans.
                          Cross-database sys.query_store_plan lookup (graceful on QS-disabled DBs).
@@ -157,7 +159,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.10.2',
+        @procedure_version varchar(20) = '2026.03.11',
         @procedure_version_date datetime = '20260310';
 
     SET @Version = @procedure_version;
@@ -1239,8 +1241,8 @@ BEGIN
             SELECT Severity, Category, Finding, Evidence, Recommendation, ExampleCall FROM #recommendations ORDER BY SortPriority, FindingID;
             IF @ExpertMode = 1
             BEGIN
-                /* RS 3-12 empty schemas for ExpertMode */
-                SELECT [Status] = N'NO_DATA', TotalRuns = 0, CompletedRuns = 0, CompletionPct = 0, AvgDurationSec = 0, HealthScore = 0, Trend = N'N/A';
+                /* RS 3-12 empty schemas for ExpertMode — must match production column lists */
+                SELECT TotalRuns = CONVERT(bigint, 0), CompletedRuns = CONVERT(bigint, 0), KilledRuns = CONVERT(bigint, 0), CompletionPct = CONVERT(decimal(5,1), 0), TimeLimitedRuns = CONVERT(bigint, 0), NaturalEndRuns = CONVERT(bigint, 0), AvgDurationSec = CONVERT(bigint, NULL), AvgStatsProcessed = CONVERT(bigint, NULL), AvgStatsRemaining = CONVERT(bigint, NULL), TotalStatUpdates = CONVERT(bigint, 0), TotalFailedUpdates = CONVERT(bigint, 0), AnalysisWindowDays = CONVERT(int, @DaysBack), StopReasonDistribution = CONVERT(nvarchar(max), NULL), HealthScore = CONVERT(int, NULL), QSRunCount = CONVERT(bigint, 0), AvgWorkloadCoveragePct = CONVERT(decimal(5,1), NULL), LatestHighCpuFirstQuartilePct = CONVERT(decimal(5,1), NULL);
                 SELECT * FROM #runs WHERE 1 = 0;
                 SELECT * FROM #stat_updates WHERE 1 = 0;
                 SELECT * FROM #stat_updates WHERE 1 = 0;
