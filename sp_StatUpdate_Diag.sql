@@ -36,9 +36,11 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.11 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.13 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.11   - Fix empty-data RS 3 schema mismatch (#304): 7 columns → 17 columns
+History:    2026.03.13   - Fix RS 12 WorkloadRank always=1 in SingleResultSet mode (#280).
+                         - Fix RS 11 DeltaVsPrior missing minutes-to-critical delta in SingleResultSet mode (#282).
+            2026.03.11   - Fix empty-data RS 3 schema mismatch (#304): 7 columns → 17 columns
                          matching production RS 3 (Run Health Summary).
             2026.03.10.2 - RS 13 forced plan awareness (#292): ForcedPlanCount column, PlanTrend
                          distinguishes 'MORE PLANS (forced plan at risk)' from generic proliferation.
@@ -159,8 +161,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.11',
-        @procedure_version_date datetime = '20260311';
+        @procedure_version varchar(20) = '2026.03.13',
+        @procedure_version_date datetime = '20260313';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -3825,12 +3827,24 @@ BEGIN
                         THEN CONVERT(nvarchar(10), CONVERT(integer, dr.CompletionPct - dr.prior_completion)) + N'% completion'
                         ELSE N'0% completion'
                     END
+                    + CASE
+                        WHEN dr.prior_minutes IS NOT NULL AND dr.MinutesToHighCpuComplete IS NOT NULL
+                        THEN N', ' + CASE
+                            WHEN dr.MinutesToHighCpuComplete < dr.prior_minutes
+                            THEN N'-' + CONVERT(nvarchar(10), CONVERT(integer, dr.prior_minutes - dr.MinutesToHighCpuComplete)) + N'min to critical'
+                            WHEN dr.MinutesToHighCpuComplete > dr.prior_minutes
+                            THEN N'+' + CONVERT(nvarchar(10), CONVERT(integer, dr.MinutesToHighCpuComplete - dr.prior_minutes)) + N'min to critical'
+                            ELSE N'0min to critical'
+                        END
+                        ELSE N''
+                    END
                 END + N'"'
                 + N'}'
         FROM (
             SELECT
                 e.*,
-                prior_completion = LAG(e.CompletionPct) OVER (ORDER BY e.StartTime)
+                prior_completion = LAG(e.CompletionPct) OVER (ORDER BY e.StartTime),
+                prior_minutes    = LAG(e.MinutesToHighCpuComplete) OVER (ORDER BY e.StartTime)
             FROM #qs_efficacy AS e
             WHERE e.StartTime >= DATEADD(DAY, -@EfficacyDetailDays, GETDATE())
         ) AS dr;
@@ -3876,18 +3890,26 @@ BEGIN
             RowNum        = ROW_NUMBER() OVER (ORDER BY ISNULL(su.QSTotalCpuMs, 0) DESC, su.ID),
             RowData       = (
                 SELECT
-                    WorkloadRank        = ROW_NUMBER() OVER (ORDER BY ISNULL(su2.QSTotalCpuMs, 0) DESC, su2.ID),
+                    WorkloadRank        = ranked.WorkloadRank,
                     DatabaseName        = su2.DatabaseName,
                     SchemaName          = su2.SchemaName,
                     TableName           = su2.ObjectName,
                     StatisticsName      = su2.StatisticsName,
-                    ProcessingPosition  = ISNULL(su2.ProcessingPosition, ROW_NUMBER() OVER (ORDER BY su2.ID)),
+                    ProcessingPosition  = ISNULL(su2.ProcessingPosition, ranked.WorkloadRank),
                     TotalQueryCpuMs     = su2.QSTotalCpuMs,
                     TotalExecutions     = su2.QSTotalExecutions,
                     PlanCount           = su2.QSPlanCount,
                     UpdateDurationMs    = su2.DurationMs,
                     QualifyReason       = su2.QualifyReason
                 FROM #stat_updates AS su2
+                CROSS APPLY (
+                    SELECT WorkloadRank = COUNT_BIG(*) + 1
+                    FROM #stat_updates AS su3
+                    WHERE su3.RunLabel = su2.RunLabel
+                    AND   (su3.ErrorNumber = 0 OR su3.ErrorNumber IS NULL)
+                    AND   (ISNULL(su3.QSTotalCpuMs, 0) > ISNULL(su2.QSTotalCpuMs, 0)
+                           OR (ISNULL(su3.QSTotalCpuMs, 0) = ISNULL(su2.QSTotalCpuMs, 0) AND su3.ID < su2.ID))
+                ) AS ranked
                 WHERE su2.RunLabel = su.RunLabel
                 AND   su2.ID = su.ID
                 FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
