@@ -36,11 +36,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.21.2026.03.10 (Major.Minor.YYYY.MM.DD)
+Version:    2.22.2026.03.20 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.21.2026.03.10 - Fix Phase 6 QS object_id domain mismatch (#271): replaced broken
+History:    2.22.2026.03.20 - 7 issues: AscendingKeyBoost SEQUENCE+datetime detection (#277),
+                            CE QUERY_OPTIMIZER_HOTFIXES + LEGACY_CE override (#298),
+                            APC awareness for forced plan warning (#301), low sample rate
+                            warning (#281), @StopByTime overshoot warning (#333), cursor-to-
+                            set-based conversions (#317), gate per-stat forced plan check (#288).
+            2.21.2026.03.10 - Fix Phase 6 QS object_id domain mismatch (#271): replaced broken
                             module-id join with plan XML table extraction + PARSENAME bracket
                             stripping. Both staged and legacy discovery paths fixed.
             2.20.2026.03.10 - 9 RFCs: @CommandLogRetentionDays param (#251), TRENDING @Help
@@ -491,7 +496,7 @@ ALTER PROCEDURE
     @IncludeIndexedViews nvarchar(1) = N'N', /*Y = include statistics on indexed views (sys.stats on views with clustered index). N = user tables only (default). UPDATE STATISTICS on indexed views is valid SQL. (#49)*/
     @SkipTablesWithColumnstore nchar(1) = N'N', /*Y = skip tables that have a nonclustered columnstore index (type 5 or 6 in sys.indexes). Use when plan stability is paramount - updating rowstore stats on NCCI tables may change batch mode execution plans.*/
     @TemporalCoSchedule nvarchar(1) = N'Y', /*Y = when a system-versioned temporal table qualifies, also schedule history table stats. Prevents cross-table cardinality inconsistency for FOR SYSTEM_TIME queries. N = independent scheduling. (#201)*/
-    @AscendingKeyBoost nvarchar(1) = N'Y', /*Y = identity/ascending key columns qualify with any modifications, bypassing normal threshold (#143). Detects via sys.identity_columns on leading stat column. N = normal threshold only.*/
+    @AscendingKeyBoost nvarchar(1) = N'Y', /*Y = ascending key columns qualify with any modifications, bypassing normal threshold (#143/#277). Detects identity columns, SEQUENCE defaults, and datetime-family leading columns. N = normal threshold only.*/
 
     /*
     ============================================================================
@@ -654,8 +659,8 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.21.2026.03.10',
-        @procedure_version_date datetime = '20260310',
+        @procedure_version varchar(20) = '2.22.2026.03.20',
+        @procedure_version_date datetime = '20260320',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -851,7 +856,7 @@ BEGIN
                     WHEN N'@TemporalCoSchedule'
                     THEN N'Y = when a system-versioned temporal table qualifies, also schedule its history table stats (#201). Prevents cardinality inconsistency for FOR SYSTEM_TIME queries that join current + history tables. N = independent scheduling.'
                     WHEN N'@AscendingKeyBoost'
-                    THEN N'Y = identity/ascending key columns qualify with any modifications, bypassing normal threshold (#143). Detects via sys.identity_columns on the stat''s leading column. Prevents histogram staleness for insert-heavy tables. N = normal threshold only.'
+                    THEN N'Y = ascending key columns qualify with any modifications, bypassing normal threshold (#143/#277). Detects identity columns (sys.identity_columns), SEQUENCE defaults (NEXT VALUE FOR), and datetime-family leading columns (date, datetime, datetime2, etc.). Prevents histogram staleness for insert-heavy tables. N = normal threshold only.'
                     WHEN N'@CheckPermissionsOnly'
                     THEN N'Y = check required permissions (VIEW ANY DATABASE, VIEW DATABASE STATE, INSERT on CommandLog) and report missing ones. No stats updates are executed. Diagnostic mode.'
                     WHEN N'@StatsInParallel'
@@ -5216,25 +5221,36 @@ OPTION (RECOMPILE);';
 
                 RAISERROR(N'    Compat Level: %d, CE Version: %d', 10, 1, @db_compat_level, @db_ce_version) WITH NOWAIT;
 
-                /* Check database-scoped configurations (SQL 2016+) */
+                /* Check database-scoped configurations (SQL 2016+) (#298) */
                 IF @sql_major_version >= 13
                 BEGIN
+                    DECLARE @db_qo_hotfixes bit = 0;
+
                     SET @db_env_sql = N'
-                        SELECT @legacy_ce_out = CASE WHEN value = 1 THEN 1 ELSE 0 END
+                        SELECT @legacy_ce_out = MAX(CASE WHEN name = N''LEGACY_CARDINALITY_ESTIMATION'' AND value = 1 THEN 1 ELSE 0 END),
+                               @qo_hotfixes_out = MAX(CASE WHEN name = N''QUERY_OPTIMIZER_HOTFIXES'' AND value = 1 THEN 1 ELSE 0 END)
                         FROM ' + QUOTENAME(@CurrentDatabaseName) + N'.sys.database_scoped_configurations
-                        WHERE name = N''LEGACY_CARDINALITY_ESTIMATION'';';
+                        WHERE name IN (N''LEGACY_CARDINALITY_ESTIMATION'', N''QUERY_OPTIMIZER_HOTFIXES'');';
 
                     BEGIN TRY
                         EXEC sp_executesql @db_env_sql,
-                            N'@legacy_ce_out bit OUTPUT',
-                            @legacy_ce_out = @db_legacy_ce OUTPUT;
+                            N'@legacy_ce_out bit OUTPUT, @qo_hotfixes_out bit OUTPUT',
+                            @legacy_ce_out = @db_legacy_ce OUTPUT,
+                            @qo_hotfixes_out = @db_qo_hotfixes OUTPUT;
                     END TRY
                     BEGIN CATCH
-                        SET @db_legacy_ce = 0; /* Ignore errors - db might not support this */
+                        SET @db_legacy_ce = 0;
+                        SET @db_qo_hotfixes = 0;
                     END CATCH;
 
                     IF @db_legacy_ce = 1
+                    BEGIN
+                        SET @db_ce_version = 70; /* Override CE version when legacy CE is forced via db-scoped config */
                         RAISERROR(N'    Note: LEGACY_CARDINALITY_ESTIMATION=ON (CE forced to 70)', 10, 1) WITH NOWAIT;
+                    END;
+
+                    IF @db_qo_hotfixes = 1
+                        RAISERROR(N'    Note: QUERY_OPTIMIZER_HOTFIXES=ON (optimizer fixes enabled for this database)', 10, 1) WITH NOWAIT;
                 END;
 
                 /* Note if CE version differs from what compat level suggests due to trace flags */
@@ -5513,22 +5529,17 @@ OPTION (RECOMPILE);';
                 BEGIN
                     DECLARE @missing_count int = @phase1_count - @phase2_count;
                     RAISERROR(N''    Note: %d stats have no properties (never updated)'', 10, 1, @missing_count) WITH NOWAIT;
-                    /* v2.3: Log specific Phase 1→2 losses (stats with no dm_db_stats_properties data) */
-                    DECLARE @phase_loss_msg nvarchar(4000);
-                    DECLARE phase_loss_cursor CURSOR LOCAL FAST_FORWARD FOR
-                        SELECT N''  Phase 1→2 loss: '' + QUOTENAME(schema_name) + N''.'' + QUOTENAME(table_name) + N''.'' + QUOTENAME(stat_name)
-                        FROM #stat_candidates
-                        WHERE modification_counter IS NULL
-                        ORDER BY schema_name, table_name, stat_name;
-                    OPEN phase_loss_cursor;
-                    FETCH NEXT FROM phase_loss_cursor INTO @phase_loss_msg;
-                    WHILE @@FETCH_STATUS = 0
-                    BEGIN
-                        RAISERROR(@phase_loss_msg, 10, 1) WITH NOWAIT;
-                        FETCH NEXT FROM phase_loss_cursor INTO @phase_loss_msg;
-                    END;
-                    CLOSE phase_loss_cursor;
-                    DEALLOCATE phase_loss_cursor;
+                    /* #317: Log Phase 1→2 losses using set-based aggregation instead of cursor */
+                    DECLARE @phase_loss_all nvarchar(4000) =
+                        STUFF((
+                            SELECT CHAR(13) + CHAR(10) + N''  Phase 1→2 loss: '' + QUOTENAME(schema_name) + N''.'' + QUOTENAME(table_name) + N''.'' + QUOTENAME(stat_name)
+                            FROM #stat_candidates
+                            WHERE modification_counter IS NULL
+                            ORDER BY schema_name, table_name, stat_name
+                            FOR XML PATH(N''''), TYPE
+                        ).value(N''.'', N''nvarchar(4000)''), 1, 2, N'''');
+                    IF @phase_loss_all IS NOT NULL
+                        RAISERROR(@phase_loss_all, 10, 1) WITH NOWAIT;
                 END;
 
                 /*
@@ -5627,14 +5638,41 @@ OPTION (RECOMPILE);';
                     FROM #stat_candidates AS sc
                     WHERE sc.qualifies = 0
                     AND   sc.modification_counter > 0
-                    AND   EXISTS (
-                        SELECT 1
-                        FROM sys.stats_columns AS stc
-                        JOIN sys.identity_columns AS ic
-                          ON ic.object_id = stc.object_id AND ic.column_id = stc.column_id
-                        WHERE stc.object_id = sc.object_id
-                        AND   stc.stats_id = sc.stats_id
-                        AND   stc.stats_column_id = 1
+                    AND   (
+                        /* Identity columns */
+                        EXISTS (
+                            SELECT 1
+                            FROM sys.stats_columns AS stc
+                            JOIN sys.identity_columns AS ic
+                              ON ic.object_id = stc.object_id AND ic.column_id = stc.column_id
+                            WHERE stc.object_id = sc.object_id
+                            AND   stc.stats_id = sc.stats_id
+                            AND   stc.stats_column_id = 1
+                        )
+                        /* #277: SEQUENCE default constraints on leading column */
+                        OR EXISTS (
+                            SELECT 1
+                            FROM sys.stats_columns AS stc
+                            JOIN sys.columns AS c
+                              ON c.object_id = stc.object_id AND c.column_id = stc.column_id
+                            JOIN sys.default_constraints AS dc
+                              ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
+                            WHERE stc.object_id = sc.object_id
+                            AND   stc.stats_id = sc.stats_id
+                            AND   stc.stats_column_id = 1
+                            AND   dc.definition LIKE N''%%NEXT VALUE FOR%%''
+                        )
+                        /* #277: Datetime-family leading columns (naturally ascending) */
+                        OR EXISTS (
+                            SELECT 1
+                            FROM sys.stats_columns AS stc
+                            JOIN sys.columns AS c
+                              ON c.object_id = stc.object_id AND c.column_id = stc.column_id
+                            WHERE stc.object_id = sc.object_id
+                            AND   stc.stats_id = sc.stats_id
+                            AND   stc.stats_column_id = 1
+                            AND   c.system_type_id IN (40, 41, 42, 43, 58, 61) /* date, time, datetime2, datetimeoffset, smalldatetime, datetime */
+                        )
                     );
 
                     SET @ascending_rescued = @@ROWCOUNT;
@@ -6470,18 +6508,42 @@ OPTION (RECOMPILE);';
                       OR ISNULL(DATEDIFF(HOUR, sp.last_updated, SYSDATETIME()), 999999) >= @HoursStaleThreshold_param
                   )
               )
-              /* #143: Ascending key boost - identity column stats with any modifications bypass thresholds */
+              /* #143/#277: Ascending key boost - identity/SEQUENCE/datetime stats with any modifications bypass thresholds */
         OR    (
                   @AscendingKeyBoost_param = N''Y''
                   AND ISNULL(sp.modification_counter, 0) > 0
-                  AND EXISTS (
-                      SELECT 1
-                      FROM sys.stats_columns AS stc
-                      JOIN sys.identity_columns AS ic
-                        ON ic.object_id = stc.object_id AND ic.column_id = stc.column_id
-                      WHERE stc.object_id = s.object_id
-                      AND   stc.stats_id = s.stats_id
-                      AND   stc.stats_column_id = 1
+                  AND (
+                      EXISTS (
+                          SELECT 1
+                          FROM sys.stats_columns AS stc
+                          JOIN sys.identity_columns AS ic
+                            ON ic.object_id = stc.object_id AND ic.column_id = stc.column_id
+                          WHERE stc.object_id = s.object_id
+                          AND   stc.stats_id = s.stats_id
+                          AND   stc.stats_column_id = 1
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM sys.stats_columns AS stc
+                          JOIN sys.columns AS c
+                            ON c.object_id = stc.object_id AND c.column_id = stc.column_id
+                          JOIN sys.default_constraints AS dc
+                            ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id
+                          WHERE stc.object_id = s.object_id
+                          AND   stc.stats_id = s.stats_id
+                          AND   stc.stats_column_id = 1
+                          AND   dc.definition LIKE N''%%NEXT VALUE FOR%%''
+                      )
+                      OR EXISTS (
+                          SELECT 1
+                          FROM sys.stats_columns AS stc
+                          JOIN sys.columns AS c
+                            ON c.object_id = stc.object_id AND c.column_id = stc.column_id
+                          WHERE stc.object_id = s.object_id
+                          AND   stc.stats_id = s.stats_id
+                          AND   stc.stats_column_id = 1
+                          AND   c.system_type_id IN (40, 41, 42, 43, 58, 61)
+                      )
                   )
               )
               ) /* End of threshold logic wrapper - ensures table/exclusion filters apply to both OR and AND modes */
@@ -6956,19 +7018,19 @@ OPTION (RECOMPILE);';
         For each database, query Query Store to find which tables commonly
         appear in the same queries (proxy for join relationships).
         */
+        /* #317: Converted from join_cursor to WHILE loop */
         DECLARE
             @current_join_db sysname,
-            @join_sql nvarchar(max);
+            @join_sql nvarchar(max),
+            @join_db_idx int;
 
-        DECLARE join_cursor CURSOR LOCAL FAST_FORWARD FOR
-            SELECT DISTINCT database_name
-            FROM #stats_to_process;
+        DECLARE @join_db_list TABLE (idx int IDENTITY(1,1) PRIMARY KEY, database_name sysname NOT NULL);
+        INSERT INTO @join_db_list (database_name) SELECT DISTINCT database_name FROM #stats_to_process;
+        SELECT @join_db_idx = MIN(idx) FROM @join_db_list;
 
-        OPEN join_cursor;
-        FETCH NEXT FROM join_cursor INTO @current_join_db;
-
-        WHILE @@FETCH_STATUS = 0
+        WHILE @join_db_idx IS NOT NULL
         BEGIN
+            SELECT @current_join_db = database_name FROM @join_db_list WHERE idx = @join_db_idx;
             /*
             SIMPLIFIED APPROACH:
             1. Get distinct object_ids from our discovered stats for this database
@@ -7027,11 +7089,8 @@ OPTION (RECOMPILE);';
                 END;
             END CATCH;
 
-            FETCH NEXT FROM join_cursor INTO @current_join_db;
+            SELECT @join_db_idx = MIN(idx) FROM @join_db_list WHERE idx > @join_db_idx;
         END;
-
-        CLOSE join_cursor;
-        DEALLOCATE join_cursor;
 
         /* Apply join groups to discovered stats (only for objects found in Query Store) */
         IF EXISTS (SELECT 1 FROM @join_groups)
@@ -7094,21 +7153,20 @@ OPTION (RECOMPILE);';
     AND @mode = N'DISCOVERY'
     AND EXISTS (SELECT 1 FROM #stats_to_process WHERE temporal_type = 2)
     BEGIN
+        /* #317: Converted from temporal_cursor to WHILE loop */
         DECLARE
             @temporal_db sysname,
             @temporal_sql nvarchar(max),
-            @temporal_coscheduled int = 0;
+            @temporal_coscheduled int = 0,
+            @temporal_db_idx int;
 
-        DECLARE temporal_cursor CURSOR LOCAL FAST_FORWARD FOR
-            SELECT DISTINCT database_name
-            FROM #stats_to_process
-            WHERE temporal_type = 2;
+        DECLARE @temporal_db_list TABLE (idx int IDENTITY(1,1) PRIMARY KEY, database_name sysname NOT NULL);
+        INSERT INTO @temporal_db_list (database_name) SELECT DISTINCT database_name FROM #stats_to_process WHERE temporal_type = 2;
+        SELECT @temporal_db_idx = MIN(idx) FROM @temporal_db_list;
 
-        OPEN temporal_cursor;
-        FETCH NEXT FROM temporal_cursor INTO @temporal_db;
-
-        WHILE @@FETCH_STATUS = 0
+        WHILE @temporal_db_idx IS NOT NULL
         BEGIN
+            SELECT @temporal_db = database_name FROM @temporal_db_list WHERE idx = @temporal_db_idx;
             /*
             For each database with temporal tables in the result set,
             find history table stats that aren't already scheduled.
@@ -7191,11 +7249,8 @@ OPTION (RECOMPILE);';
                 END;
             END CATCH;
 
-            FETCH NEXT FROM temporal_cursor INTO @temporal_db;
+            SELECT @temporal_db_idx = MIN(idx) FROM @temporal_db_list WHERE idx > @temporal_db_idx;
         END;
-
-        CLOSE temporal_cursor;
-        DEALLOCATE temporal_cursor;
 
         IF @temporal_coscheduled > 0
         BEGIN
@@ -8566,6 +8621,26 @@ OPTION (RECOMPILE);';
         END;
 
         /*
+        #281: Warn when effective sample rate would produce too few rows for a meaningful histogram.
+        Threshold: sampled rows < 1000 (too few for SQL Server's 200-step histogram).
+        Only fires for explicit or adaptive sample rates, not auto or FULLSCAN.
+        */
+        IF  @effective_sample_percent IS NOT NULL
+        AND @effective_sample_percent < 100
+        AND @current_row_count > 0
+        AND (@effective_sample_percent * @current_row_count / 100) < 1000
+        BEGIN
+            DECLARE @p281_sampled_rows bigint = @effective_sample_percent * @current_row_count / 100;
+            DECLARE @p281_msg nvarchar(1000) =
+                N'  WARNING: SAMPLE ' + CONVERT(nvarchar(10), @effective_sample_percent)
+                + N'%% on ' + QUOTENAME(@current_schema_name) + N'.' + QUOTENAME(@current_table_name)
+                + N'.' + QUOTENAME(@current_stat_name)
+                + N' yields ~' + CONVERT(nvarchar(20), @p281_sampled_rows)
+                + N' rows — may be too few for meaningful histogram. Consider higher sample or FULLSCAN. (#281)';
+            RAISERROR(@p281_msg, 10, 1) WITH NOWAIT;
+        END;
+
+        /*
         Incremental statistics: ON PARTITIONS()
         Only applies to incremental stats on partitioned tables.
         Query sys.dm_db_incremental_stats_properties to find stale partitions.
@@ -9289,7 +9364,11 @@ OPTION (RECOMPILE);';
                 suboptimal. This gives the DBA immediate per-stat visibility — the end-of-run
                 summary (#32) still provides the aggregate count for monitoring automation.
                 Wrapped in TRY/CATCH: silently skipped when QS is disabled on the database.
+                #288: Gated on @QueryStorePriority — per-stat QS check is expensive (dynamic SQL per stat).
+                The startup check (Check 1) and end-of-run aggregate (Check 3) remain unconditional.
                 */
+                IF @QueryStorePriority = N'Y'
+                BEGIN
                 BEGIN TRY
                     DECLARE @qs168_count int = 0, @qs168_sql nvarchar(max), @qs168_msg nvarchar(1000);
                     SET @qs168_sql =
@@ -9320,6 +9399,7 @@ OPTION (RECOMPILE);';
                     END;
                 END TRY
                 BEGIN CATCH /* QS not enabled or not accessible on this database — skip */ END CATCH;
+                END; /* IF @QueryStorePriority = N'Y' (#288) */
 
             END TRY
             BEGIN CATCH
@@ -9648,6 +9728,29 @@ OPTION (RECOMPILE);';
         RAISERROR(N'Note: %d stats remain. Re-run sp_StatUpdate to continue.', 10, 1, @remaining_stats) WITH NOWAIT;
     END;
 
+    /* #333: Post-run overshoot warning when @StopByTime was specified */
+    IF  @StopByTime IS NOT NULL
+    AND @Execute = N'Y'
+    BEGIN
+        DECLARE
+            @p333_stop_time time(0) = CONVERT(time(0), @StopByTime),
+            @p333_now time(0) = CONVERT(time(0), SYSDATETIME()),
+            @p333_overshoot_sec int;
+
+        SET @p333_overshoot_sec = DATEDIFF(SECOND, @p333_stop_time, @p333_now);
+
+        /* Only warn if overshoot > 30 seconds (avoid noise from sub-second overruns) */
+        IF @p333_overshoot_sec > 30
+        BEGIN
+            DECLARE @p333_msg nvarchar(500) =
+                N'WARNING: Run exceeded @StopByTime (' + @StopByTime + N') by '
+                + CONVERT(nvarchar(10), @p333_overshoot_sec) + N' seconds. '
+                + N'Consider setting @MaxSecondsPerStat to guard against large-table overshoot. (#333)';
+            RAISERROR(@p333_msg, 10, 1) WITH NOWAIT;
+            SET @warnings += N'STOPBYTIME_OVERSHOOT: ' + CONVERT(nvarchar(10), @p333_overshoot_sec) + N's past ' + @StopByTime + N'; ';
+        END;
+    END;
+
     RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
 
     /*
@@ -9720,8 +9823,26 @@ OPTION (RECOMPILE);';
                 IF ISNULL(@qs_forced_count, 0) > 0
                 BEGIN
                     SET @qs_forced_total = @qs_forced_total + @qs_forced_count;
+
+                    /* #301: Check AUTOMATIC_PLAN_CORRECTION (SQL 2017+) to soften the warning */
+                    DECLARE @apc_enabled bit = 0;
+                    BEGIN TRY
+                        DECLARE @apc_sql nvarchar(max) = N'
+                            SELECT @apc_out = CASE WHEN desired_state = 1 THEN 1 ELSE 0 END
+                            FROM ' + QUOTENAME(@qs_check_db) + N'.sys.database_automatic_tuning_options
+                            WHERE name = N''FORCE_LAST_GOOD_PLAN'';';
+                        EXEC sp_executesql @apc_sql,
+                            N'@apc_out bit OUTPUT',
+                            @apc_out = @apc_enabled OUTPUT;
+                    END TRY
+                    BEGIN CATCH
+                        SET @apc_enabled = 0; /* DMV not available (pre-2017) or not accessible */
+                    END CATCH;
+
                     SET @qs_forced_details = @qs_forced_details
-                        + @qs_check_db + N'(' + CONVERT(nvarchar(10), @qs_forced_count) + N') ';
+                        + @qs_check_db + N'(' + CONVERT(nvarchar(10), @qs_forced_count)
+                        + CASE WHEN @apc_enabled = 1 THEN N',APC' ELSE N'' END
+                        + N') ';
                 END;
             END TRY
             BEGIN CATCH
