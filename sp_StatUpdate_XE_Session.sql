@@ -17,6 +17,7 @@ To view:    See queries at bottom of this script
 
 Created: 2026-01-28 for sp_StatUpdate troubleshooting (#8)
 Updated: 2026-02-12 v2.0 - Added starting events for during-execution visibility
+Updated: 2026-03-19 v2.1 - Dynamic map_key resolution for wait_type predicates (#290)
 */
 
 -- Drop existing session if present
@@ -26,126 +27,176 @@ BEGIN
 END;
 GO
 
--- Create the XE session
+/*
+    Resolve wait_type map_key values dynamically from sys.dm_xe_map_values.
+    These numeric values are version-specific — hardcoding them caused silent
+    no-op filtering on mismatched SQL Server versions (#290).
+*/
+DECLARE @wait_types TABLE (wait_name NVARCHAR(60), map_key INT);
+
+INSERT INTO @wait_types (wait_name, map_key)
+SELECT map_value, map_key
+FROM sys.dm_xe_map_values
+WHERE name = N'wait_types'
+AND   map_value IN (
+    N'LCK_M_SCH_S',      /* schema stability lock */
+    N'LCK_M_SCH_M',      /* schema modification lock */
+    N'LCK_M_U',          /* update lock */
+    N'LCK_M_X',          /* exclusive lock */
+    N'PAGEIOLATCH_SH',   /* shared page I/O latch */
+    N'PAGEIOLATCH_EX',   /* exclusive page I/O latch */
+    N'CXPACKET',         /* parallel query waits */
+    N'NETWORK_IO'        /* client waiting (shown as ASYNC_NETWORK_IO in DMVs) */
+);
+
+/* Pre-flight: warn about any wait types not found on this version */
+DECLARE @missing NVARCHAR(500) = N'';
+DECLARE @expected TABLE (wait_name NVARCHAR(60));
+INSERT INTO @expected (wait_name) VALUES
+    (N'LCK_M_SCH_S'), (N'LCK_M_SCH_M'), (N'LCK_M_U'), (N'LCK_M_X'),
+    (N'PAGEIOLATCH_SH'), (N'PAGEIOLATCH_EX'), (N'CXPACKET'), (N'NETWORK_IO');
+
+SELECT @missing = @missing + e.wait_name + N', '
+FROM @expected AS e
+LEFT JOIN @wait_types AS w ON w.wait_name = e.wait_name
+WHERE w.map_key IS NULL;
+
+IF LEN(@missing) > 0
+BEGIN
+    SET @missing = LEFT(@missing, LEN(@missing) - 1);
+    DECLARE @warn NVARCHAR(4000) = N'Warning: wait types not found in sys.dm_xe_map_values on this SQL Server version: ' + @missing
+        + N'. Wait event filtering will exclude these types.';
+    RAISERROR(@warn, 10, 1) WITH NOWAIT;
+END;
+
+/* Build the wait_type predicate dynamically */
+DECLARE @wait_predicate NVARCHAR(1000) = N'';
+DECLARE @wk INT, @wn NVARCHAR(60);
+
+DECLARE wait_cur CURSOR LOCAL FAST_FORWARD FOR
+    SELECT map_key, wait_name FROM @wait_types ORDER BY map_key;
+OPEN wait_cur;
+FETCH NEXT FROM wait_cur INTO @wk, @wn;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    IF @wait_predicate <> N''
+        SET @wait_predicate = @wait_predicate + N'
+            OR ';
+    SET @wait_predicate = @wait_predicate + N'wait_type = ' + CONVERT(NVARCHAR(10), @wk)
+        + N'    /* ' + @wn + N' */';
+    FETCH NEXT FROM wait_cur INTO @wk, @wn;
+END;
+CLOSE wait_cur;
+DEALLOCATE wait_cur;
+
+/* If no wait types resolved at all, use a FALSE predicate so the event is harmless */
+IF @wait_predicate = N''
+BEGIN
+    RAISERROR(N'Warning: No wait types resolved. Wait event will capture nothing.', 10, 1) WITH NOWAIT;
+    SET @wait_predicate = N'wait_type = -1 /* no wait types resolved */';
+END;
+
+/* Build and execute the full CREATE EVENT SESSION DDL */
+DECLARE @sql NVARCHAR(MAX) = N'
 CREATE EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER
 
--- Capture UPDATE STATISTICS command START (for during-execution visibility)
+/* Capture UPDATE STATISTICS command START (for during-execution visibility) */
 ADD EVENT sqlserver.sp_statement_starting
 (
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text)
     WHERE (
-        sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N'%UPDATE STATISTICS%')
+        sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N''%UPDATE STATISTICS%'')
     )
 ),
 
--- Capture UPDATE STATISTICS command COMPLETION (duration, CPU, reads)
+/* Capture UPDATE STATISTICS command COMPLETION (duration, CPU, reads) */
 ADD EVENT sqlserver.sp_statement_completed
 (
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text, sqlserver.query_hash)
     WHERE (
-        sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N'%UPDATE STATISTICS%')
-        OR sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N'%sp_StatUpdate%')
+        sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N''%UPDATE STATISTICS%'')
+        OR sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N''%sp_StatUpdate%'')
     )
 ),
 
--- Capture errors during execution
+/* Capture errors during execution */
 ADD EVENT sqlserver.error_reported
 (
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text)
     WHERE (
         severity >= 11
-        OR error_number = 1222  -- Lock timeout
-        OR error_number = 1205  -- Deadlock victim
-        OR error_number = 3621  -- Statement aborted
-        OR error_number = 8115  -- Arithmetic overflow
+        OR error_number = 1222  /* Lock timeout */
+        OR error_number = 1205  /* Deadlock victim */
+        OR error_number = 3621  /* Statement aborted */
+        OR error_number = 8115  /* Arithmetic overflow */
     )
 ),
 
--- Capture wait statistics for blocking/performance issues
--- Note: XE predicates require numeric map_key values for wait_type
--- Query sys.dm_xe_map_values WHERE name = 'wait_types' to find values
-/* BUG-11 IMPORTANT: Verify wait_type map_key values for YOUR SQL Server version before use.
-   The numeric values below are version-specific and may differ across SQL Server releases.
-   Run this query on your target SQL Server instance to confirm the correct map_key values:
-
-   SELECT map_key, map_value FROM sys.dm_xe_map_values
-   WHERE name = N'wait_types'
-   AND map_value IN (N'LCK_M_SCH_S', N'LCK_M_SCH_M', N'LCK_M_U', N'LCK_M_X',
-                     N'PAGEIOLATCH_SH', N'PAGEIOLATCH_EX', N'CXPACKET', N'ASYNC_NETWORK_IO');
-
-   If the map_key values differ from what is configured below, update the WHERE clause in
-   the sqlos.wait_completed event accordingly. Incorrect values will silently capture nothing.
-*/
+/* Capture wait statistics for blocking/performance issues */
+/* map_key values resolved dynamically from sys.dm_xe_map_values (#290) */
 ADD EVENT sqlos.wait_completed
 (
     ACTION (sqlserver.session_id, sqlserver.database_name)
     WHERE (
-        duration > 1000000  -- > 1 second (in microseconds)
+        duration > 1000000  /* > 1 second (in microseconds) */
         AND (
-               wait_type = 1    -- LCK_M_SCH_S (schema stability lock)
-            OR wait_type = 2    -- LCK_M_SCH_M (schema modification lock)
-            OR wait_type = 4    -- LCK_M_U (update lock)
-            OR wait_type = 5    -- LCK_M_X (exclusive lock)
-            OR wait_type = 66   -- PAGEIOLATCH_SH (shared page I/O latch)
-            OR wait_type = 68   -- PAGEIOLATCH_EX (exclusive page I/O latch)
-            OR wait_type = 281  -- CXPACKET (parallel query waits)
-            OR wait_type = 187  -- NETWORK_IO (client waiting)
+               ' + @wait_predicate + N'
         )
     )
 ),
 
--- Capture long-running statement START (> 0 filter = all, correlate with completed)
+/* Capture UPDATE STATISTICS statement START (sql_statement level) */
 ADD EVENT sqlserver.sql_statement_starting
 (
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text)
     WHERE (
-        sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N'%UPDATE STATISTICS%')
+        sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N''%UPDATE STATISTICS%'')
     )
 ),
 
--- Capture long-running UPDATE STATISTICS COMPLETION (> 10 seconds)
--- BUG-10 fix: added UPDATE STATISTICS filter to prevent non-stats long queries from
--- flooding the ring buffer and evicting relevant events (ALLOW_SINGLE_EVENT_LOSS mode).
+/* Capture long-running UPDATE STATISTICS COMPLETION (> 10 seconds) */
 ADD EVENT sqlserver.sql_statement_completed
 (
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text, sqlserver.plan_handle)
-    WHERE duration > 10000000  -- > 10 seconds (in microseconds)
-    AND sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N'%UPDATE STATISTICS%')
+    WHERE duration > 10000000  /* > 10 seconds (in microseconds) */
+    AND sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N''%UPDATE STATISTICS%'')
 ),
 
--- Capture lock escalation (common during large stat scans)
+/* Capture lock escalation (common during large stat scans) */
 ADD EVENT sqlserver.lock_escalation
 (
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text)
 ),
 
--- Capture query timeouts and cancellations (attention = client cancel or timeout)
+/* Capture query timeouts and cancellations (attention = client cancel or timeout) */
 ADD EVENT sqlserver.attention
 (
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text)
 ),
 
--- Capture deadlocks involving stat maintenance
+/* Capture deadlocks involving stat maintenance */
 ADD EVENT sqlserver.xml_deadlock_report
 (
     ACTION (sqlserver.session_id)
 )
 
--- Output to ring buffer (in-memory, no file needed)
+/* Output to ring buffer (in-memory, no file needed) */
 ADD TARGET package0.ring_buffer
 (
-    SET max_memory = 8192  -- 8 MB ring buffer (increased for starting + completed events)
+    SET max_memory = 8192  /* 8 MB ring buffer (increased for starting + completed events) */
 )
 
 WITH (
     MAX_MEMORY = 8192 KB,
     EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS,
     MAX_DISPATCH_LATENCY = 5 SECONDS,
-    STARTUP_STATE = OFF  -- Don't auto-start on SQL Server restart
-);
+    STARTUP_STATE = OFF  /* Don''t auto-start on SQL Server restart */
+);';
+
+EXEC sp_executesql @sql;
 GO
 
-RAISERROR(N'XE session [sp_StatUpdate_Monitor] created.', 10, 1) WITH NOWAIT;
+RAISERROR(N'XE session [sp_StatUpdate_Monitor] created with dynamically resolved wait_type map_keys.', 10, 1) WITH NOWAIT;
 RAISERROR(N'To start: ALTER EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER STATE = START;', 10, 1) WITH NOWAIT;
 GO
 
