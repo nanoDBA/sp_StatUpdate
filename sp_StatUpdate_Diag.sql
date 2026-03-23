@@ -56,10 +56,10 @@ History:    2026.03.23   - NULL RunLabel fix for legacy CommandLog entries (ISNU
                            W6 memory pressure guidance (#285), dashboard non-QS scoring (#267),
                            ExpertMode=0 workload context (#270).
                          Phase 5: AG secondary replica detection (#296), RS 3 ReplicaRole column,
-                           15 new tests (162 → 177).
+                           15 new tests (162 -> 177).
             2026.03.13   - Fix RS 12 WorkloadRank always=1 in SingleResultSet mode (#280).
                          - Fix RS 11 DeltaVsPrior missing minutes-to-critical delta in SingleResultSet mode (#282).
-            2026.03.11   - Fix empty-data RS 3 schema mismatch (#304): 7 columns → 17 columns
+            2026.03.11   - Fix empty-data RS 3 schema mismatch (#304): 7 columns -> 17 columns
                          matching production RS 3 (Run Health Summary).
             2026.03.10.2 - RS 13 forced plan awareness (#292): ForcedPlanCount column, PlanTrend
                          distinguishes 'MORE PLANS (forced plan at risk)' from generic proliferation.
@@ -560,7 +560,7 @@ BEGIN
         AND   TRY_CONVERT(integer, p.val_str) >= 0;
     END;
 
-    /* Apply IGNORE → weight=0, weight=0 → IGNORE (they are equivalent) */
+    /* Apply IGNORE -> weight=0, weight=0 -> IGNORE (they are equivalent) */
     IF @override_completion  = 'X' SET @weight_completion  = 0;
     IF @override_reliability = 'X' SET @weight_reliability = 0;
     IF @override_speed       = 'X' SET @weight_speed       = 0;
@@ -1866,10 +1866,10 @@ BEGIN
         CASE WHEN recent_w.parallel_mode = prior_w.parallel_mode
             THEN N'Throughput degraded: recent avg ' + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), recent_w.avg_sec))
                 + N' sec/stat vs. prior ' + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), prior_w.avg_sec))
-                + N' sec/stat (' + CONVERT(nvarchar(10), CONVERT(integer, (recent_w.avg_sec / prior_w.avg_sec - 1) * 100))
+                + N' sec/stat (' + CONVERT(nvarchar(20), CONVERT(bigint, CASE WHEN recent_w.avg_sec / prior_w.avg_sec > 1000 THEN 99900 ELSE (recent_w.avg_sec / prior_w.avg_sec - 1) * 100 END))
                 + N'% slower)'
             ELSE N'Throughput changed but parallelism mode also changed (StatsInParallel: '
-                + prior_w.parallel_mode + N' → ' + recent_w.parallel_mode
+                + prior_w.parallel_mode + N' -> ' + recent_w.parallel_mode
                 + N'). Recent avg ' + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), recent_w.avg_sec))
                 + N' sec/stat vs. prior ' + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), prior_w.avg_sec))
                 + N' sec/stat -- not directly comparable.'
@@ -3149,8 +3149,8 @@ BEGIN
     END;
 
     /* Populate dashboard rows.
-       Override logic: IGNORE → Grade='-', Score=0, headline prefixed '[IGNORED]'.
-       Forced grade → use forced grade/score, headline prefixed '[OVERRIDE: X]', detail shows actual score.
+       Override logic: IGNORE -> Grade='-', Score=0, headline prefixed '[IGNORED]'.
+       Forced grade -> use forced grade/score, headline prefixed '[OVERRIDE: X]', detail shows actual score.
        OVERALL appends '[Overrides active]' when any override is in effect. */
     INSERT INTO #executive_dashboard (Category, Grade, Score, Headline, Detail, Trend, SortOrder)
     VALUES
