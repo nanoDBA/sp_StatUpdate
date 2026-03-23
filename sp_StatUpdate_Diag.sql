@@ -145,7 +145,7 @@ ALTER PROCEDURE
     @DaysBack integer = 30,                     /* history window in days */
     @CommandLogDatabase sysname = NULL,          /* NULL = current DB */
     @Obfuscate bit = 0,                         /* 0 = real names, 1 = hashed names */
-    @ObfuscationSeed nvarchar(128) = NULL,       /* salt for HASHBYTES — makes tokens unpredictable without seed */
+    @ObfuscationSeed nvarchar(128) = NULL,       /* salt for HASHBYTES -- makes tokens unpredictable without seed */
     @ObfuscationMapTable sysname = NULL,          /* persist obfuscation map to this table (auto-creates if missing) */
     @LongRunningMinutes integer = 10,            /* threshold for "long-running stat" detection */
     @FailureThreshold integer = 3,               /* same stat failing N+ times = CRITICAL */
@@ -200,7 +200,7 @@ BEGIN
         FROM
         (
             VALUES
-                (N'@DaysBack',                 N'integer',  N'History window in days — how far back to scan CommandLog',
+                (N'@DaysBack',                 N'integer',  N'History window in days -- how far back to scan CommandLog',
                     N'1-3650', N'30'),
                 (N'@CommandLogDatabase',        N'sysname',  N'Database containing dbo.CommandLog table. NULL = current database context.',
                     N'NULL, database name (e.g., DBATools, master)', N'NULL (current database)'),
@@ -228,13 +228,13 @@ BEGIN
                     N'0, 1', N'0'),
                 (N'@SkipHistory',             N'bit',      N'1 = Skip reading/writing dbo.StatUpdateDiagHistory persistent table. Useful for transient installs, testing, or when you do not want permanent tables created.',
                     N'0, 1', N'0'),
-                (N'@GradeOverrides',         N'nvarchar(500)', N'Force dashboard grades or ignore categories. Comma-separated CATEGORY=VALUE pairs. Categories: COMPLETION, RELIABILITY, SPEED, WORKLOAD. Values: A/B/C/D/F (force grade) or IGNORE (exclude from OVERALL). Example: ''RELIABILITY=A, SPEED=IGNORE'' — forces Reliability to A, excludes Speed from the overall score.',
+                (N'@GradeOverrides',         N'nvarchar(500)', N'Force dashboard grades or ignore categories. Comma-separated CATEGORY=VALUE pairs. Categories: COMPLETION, RELIABILITY, SPEED, WORKLOAD. Values: A/B/C/D/F (force grade) or IGNORE (exclude from OVERALL). Example: ''RELIABILITY=A, SPEED=IGNORE'' -- forces Reliability to A, excludes Speed from the overall score.',
                     N'NULL, comma-separated pairs (e.g., ''RELIABILITY=A'', ''SPEED=IGNORE, WORKLOAD=B'')', N'NULL'),
                 (N'@GradeWeights',           N'nvarchar(500)', N'Custom category weights for OVERALL score. Comma-separated CATEGORY=WEIGHT pairs. Integers, auto-normalized to sum to 100%. Omitted categories keep default weight. Weight of 0 = same as IGNORE. Defaults: COMPLETION=30, RELIABILITY=25, SPEED=20, WORKLOAD=25.',
                     N'NULL, comma-separated pairs (e.g., ''COMPLETION=50'', ''COMPLETION=40, WORKLOAD=40, SPEED=20'')', N'NULL'),
                 (N'@Help',                     N'bit',      N'Show this help output and return immediately',
                     N'0, 1', N'0'),
-                (N'@Debug',                    N'bit',      N'Verbose diagnostic output — shows intermediate temp table counts and timing',
+                (N'@Debug',                    N'bit',      N'Verbose diagnostic output -- shows intermediate temp table counts and timing',
                     N'0, 1', N'0'),
                 (N'@SingleResultSet',          N'bit',      N'Collapse all result sets into one with columns (ResultSetID, ResultSetName, RowNum, RowData). RowData is JSON. Enables INSERT...EXEC capture in automation. Auto-promotes @ExpertMode=1 so ResultSetIDs 1-13 are always present.',
                     N'0, 1', N'0'),
@@ -269,9 +269,9 @@ BEGIN
                 (N'I3', N'INFO',     N'TOP_TABLES',            N'Tables consuming the most maintenance time'),
                 (N'I4', N'INFO',     N'UNUSED_FEATURES',       N'Available features not being used'),
                 (N'I5', N'INFO/WARNING', N'VERSION_HISTORY',    N'sp_StatUpdate versions used across analysis window. WARNING if multiple versions detected (version skew).'),
-                (N'I6', N'INFO',     N'QS_EFFICACY',           N'Query Store prioritization effectiveness — what % of high-workload stats get serviced early'),
+                (N'I6', N'INFO',     N'QS_EFFICACY',           N'Query Store prioritization effectiveness -- what % of high-workload stats get serviced early'),
                 (N'I7', N'INFO',     N'QS_INFLECTION',         N'Before/after comparison when sort order changed to Query Store-based prioritization'),
-                (N'I8', N'INFO',     N'QS_PERFORMANCE_TREND',  N'Per-stat per-execution query CPU trend — are queries getting faster after stat updates? Detects forced plans at risk (#292).')
+                (N'I8', N'INFO',     N'QS_PERFORMANCE_TREND',  N'Per-stat per-execution query CPU trend -- are queries getting faster after stat updates? Detects forced plans at risk (#292).')
         ) AS v (check_id, severity, category, description);
 
         /* Result set 3: Result set order */
@@ -364,11 +364,11 @@ BEGIN
         (
             VALUES
                 (N'Obfuscation',
-                 N'@Obfuscate=1 replaces names with MD5 hashes (e.g., DB_a1b2c3, TBL_d4e5f6). Prefixes preserved for readability. Map is result set 8 in multi-result-set mode (excluded from @SingleResultSet=1 to prevent leaking real names). Use @ObfuscationMapTable to persist the map on prod. Use @ObfuscationSeed to salt hashes — makes tokens stable across servers with the same seed but unpredictable without it.'),
+                 N'@Obfuscate=1 replaces names with MD5 hashes (e.g., DB_a1b2c3, TBL_d4e5f6). Prefixes preserved for readability. Map is result set 8 in multi-result-set mode (excluded from @SingleResultSet=1 to prevent leaking real names). Use @ObfuscationMapTable to persist the map on prod. Use @ObfuscationSeed to salt hashes -- makes tokens stable across servers with the same seed but unpredictable without it.'),
                 (N'Killed Run Detection',
                  N'Two detection methods: (1) SP_STATUPDATE_START without matching SP_STATUPDATE_END = orphaned run, (2) SP_STATUPDATE_END with StopReason=KILLED = cleaned up by @CleanupOrphanedRuns. Both trigger C1 CRITICAL.'),
                 (N'Throughput Trend (C4)',
-                 N'Compares average seconds-per-stat in the recent @ThroughputWindowDays against the prior window of equal length. If recent average is >50% worse, triggers C4 CRITICAL. Data-dependent — requires sufficient runs in both windows.'),
+                 N'Compares average seconds-per-stat in the recent @ThroughputWindowDays against the prior window of equal length. If recent average is >50% worse, triggers C4 CRITICAL. Data-dependent -- requires sufficient runs in both windows.'),
                 (N'Overlapping Runs (W4)',
                  N'Detects concurrent sp_StatUpdate executions by checking for overlapping StartTime/EndTime ranges. Excludes killed runs to prevent false positives from orphan-cleanup END records.'),
                 (N'SingleResultSet Mode',
@@ -378,7 +378,7 @@ BEGIN
                 (N'PowerShell Wrapper',
                  N'Invoke-StatUpdateDiag.ps1 runs sp_StatUpdate_Diag across multiple servers in parallel, detects version skew and parameter inconsistencies, and generates Markdown/HTML/JSON reports. Use -Obfuscate for safe sharing.'),
                 (N'Automation / Stable Result Sets',
-                 N'The number of result sets varies by @ExpertMode (2 vs 12-13) and @Obfuscate (shifts RS9). For automation, use @SingleResultSet=1 — it wraps all output into one table with a stable ResultSetID column (values 1-13). This makes INSERT...EXEC reliable regardless of parameter combinations.')
+                 N'The number of result sets varies by @ExpertMode (2 vs 12-13) and @Obfuscate (shifts RS9). For automation, use @SingleResultSet=1 -- it wraps all output into one table with a stable ResultSetID column (values 1-13). This makes INSERT...EXEC reliable regardless of parameter combinations.')
         ) AS notes (topic, detail);
 
         RETURN;
@@ -395,7 +395,7 @@ BEGIN
         RETURN;
     END;
 
-    /* #296: AG secondary replica detection — warn that CommandLog may reflect primary-side maintenance only */
+    /* #296: AG secondary replica detection -- warn that CommandLog may reflect primary-side maintenance only */
     DECLARE @ag_replica_role nvarchar(20) = NULL;
     BEGIN TRY
         SELECT TOP (1)
@@ -409,10 +409,10 @@ BEGIN
         ORDER BY ars.role;
 
         IF @ag_replica_role = N'SECONDARY'
-            RAISERROR(N'WARNING: Running on AG secondary replica — CommandLog data may reflect primary-side maintenance only.', 10, 1) WITH NOWAIT;
+            RAISERROR(N'WARNING: Running on AG secondary replica -- CommandLog data may reflect primary-side maintenance only.', 10, 1) WITH NOWAIT;
     END TRY
     BEGIN CATCH
-        /* Non-AG instances don''t have the DMV — silently ignore */
+        /* Non-AG instances don''t have the DMV -- silently ignore */
         SET @ag_replica_role = NULL;
     END CATCH;
 
@@ -570,7 +570,7 @@ BEGIN
     DECLARE @weight_sum decimal(10, 2) = @weight_completion + @weight_reliability + @weight_speed + @weight_workload;
 
     IF @has_overrides = 1 AND @weight_sum = 0
-        SET @errors = @errors + N'All categories are IGNOREd or have weight 0 — cannot compute OVERALL score. ';
+        SET @errors = @errors + N'All categories are IGNOREd or have weight 0 -- cannot compute OVERALL score. ';
 
     IF @weight_sum > 0
     BEGIN
@@ -619,12 +619,23 @@ BEGIN
 
     DECLARE @expert_int integer = CONVERT(integer, @ExpertMode);
 
-    /* #236: @SingleResultSet=1 auto-promotes @ExpertMode=1 so automation always gets RS 1-13. */
-    IF @SingleResultSet = 1 AND @ExpertMode = 0
+    /* #236: @SingleResultSet=1 auto-promotes @ExpertMode=1 so automation always gets RS 1-13.
+       Also forces @SkipHistory=1 because INSERT...EXEC callers cannot write to persistent tables
+       (SQL Server nested transaction limitation). */
+    IF @SingleResultSet = 1
     BEGIN
-        SET @ExpertMode = 1;
-        SET @expert_int = 1;
-        RAISERROR(N'Note: @SingleResultSet=1 auto-enabled @ExpertMode=1 for stable ResultSetID contract (1-13).', 10, 1) WITH NOWAIT;
+        IF @ExpertMode = 0
+        BEGIN
+            SET @ExpertMode = 1;
+            SET @expert_int = 1;
+            RAISERROR(N'Note: @SingleResultSet=1 auto-enabled @ExpertMode=1 for stable ResultSetID contract (1-13).', 10, 1) WITH NOWAIT;
+        END;
+
+        IF @SkipHistory = 0
+        BEGIN
+            SET @SkipHistory = 1;
+            RAISERROR(N'Note: @SingleResultSet=1 auto-enabled @SkipHistory=1 (INSERT...EXEC cannot write persistent tables).', 10, 1) WITH NOWAIT;
+        END;
     END;
 
     RAISERROR(N'sp_StatUpdate_Diag v%s', 10, 1, @procedure_version) WITH NOWAIT;
@@ -660,7 +671,7 @@ BEGIN
 
     /*
     ============================================================================
-    PERSISTENT HISTORY TABLE (incremental — skip XML re-parsing on repeat runs)
+    PERSISTENT HISTORY TABLE (incremental -- skip XML re-parsing on repeat runs)
 
     Inspired by sp_Blitz / sp_PressureDetector baseline tables. The first run
     parses all CommandLog XML. Subsequent runs only parse new rows (ID > max
@@ -756,9 +767,9 @@ BEGIN
 
             IF @cl_max_id > 0 AND @history_max_id > @cl_max_id
             BEGIN
-                RAISERROR(N'  WARNING: History watermark (%i) exceeds CommandLog max ID (%i). Resetting watermark — CommandLog may have been archived.', 10, 1,
+                RAISERROR(N'  WARNING: History watermark (%i) exceeds CommandLog max ID (%i). Resetting watermark -- CommandLog may have been archived.', 10, 1,
                     @history_max_id, @cl_max_id) WITH NOWAIT;
-                SET @history_max_id = 0;    /* #240: reset to 0, not @cl_max_id — NOT EXISTS dedup guard prevents duplicates */
+                SET @history_max_id = 0;    /* #240: reset to 0, not @cl_max_id -- NOT EXISTS dedup guard prevents duplicates */
             END;
 
             RAISERROR(N'  History table: %s (%i snapshots, watermark ID %i)', 10, 1,
@@ -873,9 +884,9 @@ BEGIN
 
             IF @cl_max_id_cache > 0 AND @cache_watermark > @cl_max_id_cache
             BEGIN
-                RAISERROR(N'  WARNING: Cache watermark (%i) exceeds CommandLog max ID (%i). Resetting — CommandLog may have been archived.', 10, 1,
+                RAISERROR(N'  WARNING: Cache watermark (%i) exceeds CommandLog max ID (%i). Resetting -- CommandLog may have been archived.', 10, 1,
                     @cache_watermark, @cl_max_id_cache) WITH NOWAIT;
-                SET @cache_watermark = 0;    /* #312: reset to 0, not @cl_max_id_cache — NOT EXISTS dedup guard prevents duplicates */
+                SET @cache_watermark = 0;    /* #312: reset to 0, not @cl_max_id_cache -- NOT EXISTS dedup guard prevents duplicates */
             END;
 
             RAISERROR(N'  Cache table: %s (watermark ID %i)', 10, 1, @cache_ref, @cache_watermark) WITH NOWAIT;
@@ -1028,7 +1039,8 @@ BEGIN
         GroupByJoinPattern, FilteredStatsMode, BatchLimit, FailFast, IsKilled
     )
     SELECT
-        run_label           = s.ExtendedInfo.value(N''(Parameters/RunLabel)[1]'', N''nvarchar(100)''),
+        run_label           = ISNULL(s.ExtendedInfo.value(N''(Parameters/RunLabel)[1]'', N''nvarchar(100)''),
+                                     N''legacy_'' + CONVERT(nvarchar(20), s.ID)),
         start_time          = s.StartTime,
         end_time            = e.EndTime,
         duration_seconds    = DATEDIFF(SECOND, s.StartTime, e.EndTime),
@@ -1076,7 +1088,7 @@ BEGIN
         @days_back = @DaysBack,
         @orphan_minutes = @OrphanedRunThresholdMinutes;
 
-    /* #216: Dedup — keep only the most recent START per RunLabel */
+    /* #216: Dedup -- keep only the most recent START per RunLabel */
     WITH dupes AS (
         SELECT *, ROW_NUMBER() OVER (PARTITION BY RunLabel ORDER BY StartTime DESC) AS rn
         FROM #runs
@@ -1282,7 +1294,7 @@ BEGIN
             FROM #recommendations ORDER BY SortPriority, FindingID;
             IF @ExpertMode = 1
             BEGIN
-                /* RS 3-12 empty schemas for ExpertMode — must match production column lists */
+                /* RS 3-12 empty schemas for ExpertMode -- must match production column lists */
                 SELECT TotalRuns = CONVERT(bigint, 0), CompletedRuns = CONVERT(bigint, 0), KilledRuns = CONVERT(bigint, 0), CompletionPct = CONVERT(decimal(5,1), 0), TimeLimitedRuns = CONVERT(bigint, 0), NaturalEndRuns = CONVERT(bigint, 0), AvgDurationSec = CONVERT(bigint, NULL), AvgStatsProcessed = CONVERT(bigint, NULL), AvgStatsRemaining = CONVERT(bigint, NULL), TotalStatUpdates = CONVERT(bigint, 0), TotalFailedUpdates = CONVERT(bigint, 0), AnalysisWindowDays = CONVERT(int, @DaysBack), StopReasonDistribution = CONVERT(nvarchar(max), NULL), HealthScore = CONVERT(int, NULL), QSRunCount = CONVERT(bigint, 0), AvgWorkloadCoveragePct = CONVERT(decimal(5,1), NULL), LatestHighCpuFirstQuartilePct = CONVERT(decimal(5,1), NULL), ReplicaRole = CONVERT(nvarchar(20), NULL);
                 SELECT * FROM #runs WHERE 1 = 0;
                 SELECT * FROM #stat_updates WHERE 1 = 0;
@@ -1381,7 +1393,7 @@ BEGIN
         /* Also snapshot databases from #runs.
            BUG-09: Known keywords (USER_DATABASES, SYSTEM_DATABASES, ALL_DATABASES) are left
            unobfuscated because they contain no sensitive names. For comma-separated lists,
-           the entire string is hashed as one unit — individual database names within the list
+           the entire string is hashed as one unit -- individual database names within the list
            cannot be reverse-mapped to their per-stat-update obfuscated counterparts. This is
            a known limitation; the obfuscation map entry for such runs is marked "(multi-DB list)". */
         INSERT INTO #obfuscation_map (ObjectType, OriginalName, ObfuscatedName)
@@ -1411,7 +1423,7 @@ BEGIN
             END
         FROM #stat_updates AS su;
 
-        /* Obfuscate #runs.Databases — skip known keywords (BUG-09: they contain no sensitive names) */
+        /* Obfuscate #runs.Databases -- skip known keywords (BUG-09: they contain no sensitive names) */
         UPDATE r
         SET r.[Databases] = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + r.[Databases]), 2), 6)
         FROM #runs AS r
@@ -1468,10 +1480,17 @@ BEGIN
                     INSERT INTO ' + @map_safe_name + N' (ObjectType, OriginalName, ObfuscatedName)
                     SELECT ObjectType, OriginalName, ObfuscatedName FROM #obfuscation_map;';
 
-                EXECUTE sp_executesql @map_sql;
+                BEGIN TRY
+                    EXECUTE sp_executesql @map_sql;
 
-                SET @map_safe_name = N'  Obfuscation map saved to ' + @map_safe_name;
-                RAISERROR(@map_safe_name, 10, 1) WITH NOWAIT;
+                    SET @map_safe_name = N'  Obfuscation map saved to ' + @map_safe_name;
+                    RAISERROR(@map_safe_name, 10, 1) WITH NOWAIT;
+                END TRY
+                BEGIN CATCH
+                    /* INSERT...EXEC context prevents writes to persistent tables.
+                       This is expected when caller does INSERT INTO #t EXEC sp_StatUpdate_Diag @SingleResultSet=1. */
+                    RAISERROR(N'  WARNING: Could not write to @ObfuscationMapTable (INSERT...EXEC context). Run without INSERT...EXEC to persist the map.', 10, 1) WITH NOWAIT;
+                END CATCH;
 
                 RAISERROR(N'', 10, 1) WITH NOWAIT;
                 RAISERROR(N'=== Decode obfuscated tokens ===', 10, 1) WITH NOWAIT;
@@ -1525,7 +1544,10 @@ BEGIN
         BEGIN
             /* Query each database's QS catalog for forced plans on objects in our data set.
                Joins query_store_plan -> query_store_query -> sys.objects to map plan->object_id.
+               Skip if database doesn't exist (common with test data or obfuscated names).
                TRY/CATCH per-database: if QS is disabled or DB is inaccessible, skip silently. */
+            IF DB_ID(@fp_db) IS NOT NULL
+            BEGIN
             SET @fp_sql = N'
                 BEGIN TRY
                     INSERT INTO #forced_plans (DatabaseName, ObjectName, ForcedPlanCount)
@@ -1543,7 +1565,7 @@ BEGIN
                     GROUP BY o.name;
                 END TRY
                 BEGIN CATCH
-                    /* QS disabled, DB offline, permissions — skip silently */
+                    /* QS disabled, DB offline, permissions -- skip silently */
                 END CATCH;';
 
             EXECUTE sys.sp_executesql @fp_sql, N'@db_name sysname', @db_name = @fp_db;
@@ -1557,6 +1579,7 @@ BEGIN
                     + N' object(s)';
                 RAISERROR(@fp_count_msg, 10, 1) WITH NOWAIT;
             END;
+            END; /* END IF DB_ID(@fp_db) IS NOT NULL */
 
             FETCH NEXT FROM fp_cursor INTO @fp_db;
         END;
@@ -1638,7 +1661,7 @@ BEGIN
             / NULLIF(SUM(oc.TotalCpuMs) OVER (), 0))
     FROM object_cpu AS oc;
 
-    /* #259: Mark volatile stats — QSTotalCpuMs varies > 10x across runs */
+    /* #259: Mark volatile stats -- QSTotalCpuMs varies > 10x across runs */
     ;WITH stat_volatility AS
     (
         SELECT
@@ -1839,7 +1862,7 @@ BEGIN
                 + prior_w.parallel_mode + N' → ' + recent_w.parallel_mode
                 + N'). Recent avg ' + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), recent_w.avg_sec))
                 + N' sec/stat vs. prior ' + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), prior_w.avg_sec))
-                + N' sec/stat — not directly comparable.'
+                + N' sec/stat -- not directly comparable.'
         END,
         N'Recent window: ' + CONVERT(nvarchar(10), recent_w.run_count) + N' runs averaging '
             + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), recent_w.avg_sec)) + N' sec/stat'
@@ -2028,7 +2051,7 @@ BEGIN
         WHERE r.IsKilled = 0
         AND   r.StatsRemaining > 0
         AND   r.StatsFound > 0
-        AND   r.StatsRemaining * 1.0 / NULLIF(r.StatsFound, 0) > 0.5;  /* BUG-04 fix: match EXISTS guard — only include runs with >50% remaining */
+        AND   r.StatsRemaining * 1.0 / NULLIF(r.StatsFound, 0) > 0.5;  /* BUG-04 fix: match EXISTS guard -- only include runs with >50% remaining */
 
         RAISERROR(N'  [WARNING] W3: Stale-stats backlog detected', 10, 1) WITH NOWAIT;
     END;
@@ -2096,7 +2119,7 @@ BEGIN
         ELSE IF @w5_qs_data_runs < @w5_qs_runs
             AND @w5_qs_data_runs * 100.0 / @w5_qs_runs BETWEEN 10 AND 90
         BEGIN
-            /* #274: Partial QS data — may have transitioned to READ_ONLY */
+            /* #274: Partial QS data -- may have transitioned to READ_ONLY */
             INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
             VALUES
             (
@@ -2111,12 +2134,12 @@ BEGIN
                 N'ALTER DATABASE [YourDB] SET QUERY_STORE (MAX_STORAGE_SIZE_MB = 2048);',
                 35
             );
-            RAISERROR(N'  [WARNING] W5: Partial QS data — possible READ_ONLY transition', 10, 1) WITH NOWAIT;
+            RAISERROR(N'  [WARNING] W5: Partial QS data -- possible READ_ONLY transition', 10, 1) WITH NOWAIT;
         END;
     END;
 
     /* ======================================================================
-       W6: EXCESSIVE OVERHEAD — discovery/checks consuming disproportionate time
+       W6: EXCESSIVE OVERHEAD -- discovery/checks consuming disproportionate time
        Wall clock time vs. actual UPDATE STATISTICS time.
        When overhead > 40% of wall clock, parameter changes may be adding cost.
        ====================================================================== */
@@ -2198,7 +2221,7 @@ BEGIN
                 N'WARNING', N'EXCESSIVE_OVERHEAD',
                 N'Discovery and environment checks consuming disproportionate time vs actual stat updates',
                 @w6_detail,
-                N'Review recent parameter changes — newly enabled features (@CollectHeapForwarding, @GroupByJoinPattern, @QueryStorePriority) add discovery overhead. '
+                N'Review recent parameter changes -- newly enabled features (@CollectHeapForwarding, @GroupByJoinPattern, @QueryStorePriority) add discovery overhead. '
                     + N'Consider @StagedDiscovery=N for legacy fast-path, reduce @CommandLogRetentionDays, or check whether CommandLog table needs a StartTime index. '
                     + N'If SQL Server is under memory pressure (check sys.dm_os_memory_brokers, sys.dm_os_process_memory), high overhead may indicate page cache eviction during stat scans.',
                 N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @Debug = 1; /* Review per-phase timing in debug output */',
@@ -2206,7 +2229,7 @@ BEGIN
             );
 
             DECLARE @w6_msg nvarchar(500) =
-                N'  [WARNING] W6: Excessive overhead — ' + CONVERT(nvarchar(10), @w6_overhead_runs)
+                N'  [WARNING] W6: Excessive overhead -- ' + CONVERT(nvarchar(10), @w6_overhead_runs)
                 + N' run(s) with >40%% overhead (worst: ' + @w6_worst_label
                 + N' at ' + CONVERT(nvarchar(10), @w6_worst_pct) + N'%%)';
             RAISERROR(@w6_msg, 10, 1) WITH NOWAIT;
@@ -2373,7 +2396,7 @@ BEGIN
     END;
 
     /* ======================================================================
-       I5: VERSION_HISTORY — sp_StatUpdate versions used across analysis window
+       I5: VERSION_HISTORY -- sp_StatUpdate versions used across analysis window
        ====================================================================== */
     IF @run_count > 0
     BEGIN
@@ -2460,7 +2483,7 @@ BEGIN
        BUG-D fix: QS-specific metrics (HighCpuInFirstQuartilePct, MinutesToHighCpuComplete,
        WorkloadCoveragePct, AvgPositionTop10) are only computed for runs with actual QS data.
        Non-QS runs get NULL for these columns to prevent random first-quartile noise.
-       BUG-A fix: WorkloadCoveragePct uses honest denominator — for completed runs = 100%,
+       BUG-A fix: WorkloadCoveragePct uses honest denominator -- for completed runs = 100%,
        for incomplete runs, extrapolates total CPU from processed stats' average. */
     ;WITH stat_positions AS
     (
@@ -2508,7 +2531,7 @@ BEGIN
             /* Average position of top-10 CPU stats (only those with QS data) */
             avg_pos_top10 = AVG(CASE WHEN sp.cpu_rank <= 10 AND sp.QSTotalCpuMs > 0 THEN CONVERT(decimal(10, 1), sp.processing_pos) END),
             stat_count = COUNT_BIG(*),
-            /* Count of stats with actual QS data — used to detect non-QS runs */
+            /* Count of stats with actual QS data -- used to detect non-QS runs */
             qs_stat_count = SUM(CASE WHEN sp.QSTotalCpuMs > 0 THEN 1 ELSE 0 END)
         FROM stat_positions AS sp
         INNER JOIN #runs AS r
@@ -2774,7 +2797,7 @@ BEGIN
     END;
 
     /* ======================================================================
-       I8: QS_PERFORMANCE_TREND — Are queries actually getting faster after stat updates?
+       I8: QS_PERFORMANCE_TREND -- Are queries actually getting faster after stat updates?
        BUG-B fix: Normalize to per-execution CPU (QSTotalCpuMs / QSTotalExecutions).
        Raw QSTotalCpuMs is cumulative from Query Store and always grows as more
        queries execute. Per-execution CPU shows actual plan efficiency changes.
@@ -2893,7 +2916,7 @@ BEGIN
                         + CONVERT(nvarchar(10), @i8_improving_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
                         + N' tracked statistics show lower per-execution CPU (avg '
                         + CONVERT(nvarchar(10), ABS(@i8_avg_delta_pct)) + N'% reduction).'
-                    /* #276: Improve-then-regress pattern — CPU improved at some point but regressed back */
+                    /* #276: Improve-then-regress pattern -- CPU improved at some point but regressed back */
                     WHEN @i8_regressed_count > 0 AND @i8_regressed_count >= @i8_degrading_count
                     THEN N'Per-execution query CPU improved then regressed: '
                         + CONVERT(nvarchar(10), @i8_regressed_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
@@ -2908,7 +2931,7 @@ BEGIN
                         + N' tracked statistics show higher per-execution CPU (avg '
                         + CONVERT(nvarchar(10), @i8_avg_delta_pct) + N'% change).'
                         + CASE WHEN @i8_forced_at_risk > 0
-                            THEN N' WARNING: ' + CONVERT(nvarchar(10), @i8_forced_at_risk) + N' forced plan(s) exist on affected tables — stat updates may have triggered forced plan abandonment.'
+                            THEN N' WARNING: ' + CONVERT(nvarchar(10), @i8_forced_at_risk) + N' forced plan(s) exist on affected tables -- stat updates may have triggered forced plan abandonment.'
                             ELSE N''
                         END
                     ELSE N'Per-execution query CPU stable across updates: '
@@ -2934,12 +2957,12 @@ BEGIN
                     WHEN @i8_improving_count > @i8_degrading_count
                     THEN N'Statistics maintenance is contributing to query performance improvements. The stat updates are helping the optimizer choose better plans.'
                     WHEN @i8_regressed_count > 0 AND @i8_regressed_count >= @i8_degrading_count
-                    THEN N'Some statistics improved then regressed — possible external workload shift, schema change, or parameter sniffing. '
+                    THEN N'Some statistics improved then regressed -- possible external workload shift, schema change, or parameter sniffing. '
                         + N'Check RS 13 for specific stats and correlate with deployment or workload changes.'
                     WHEN @i8_degrading_count > @i8_improving_count AND @i8_forced_at_risk > 0
                     THEN N'CRITICAL: Forced plans on degrading tables may have been invalidated by stat updates. '
                         + N'Check sys.query_store_plan for is_forced_plan=1 with force_failure_count > 0. '
-                        + N'A forced plan that fails reverts to optimizer choice — often a regression.'
+                        + N'A forced plan that fails reverts to optimizer choice -- often a regression.'
                     WHEN @i8_degrading_count > @i8_improving_count
                     THEN N'Stat updates are not correlating with improved query performance. Check for plan regressions, forced plans, or parameter sensitivity.'
                     ELSE N'Stat updates are maintaining stable query performance. This is expected for well-maintained databases.'
@@ -2953,7 +2976,7 @@ BEGIN
     END
     ELSE
     BEGIN
-        /* #239: No QS CPU data at all — explain why I8/RS13 are empty instead of silent skip. */
+        /* #239: No QS CPU data at all -- explain why I8/RS13 are empty instead of silent skip. */
         INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
         VALUES (
             N'INFO', N'QS_PERFORMANCE_TREND',
@@ -2973,18 +2996,18 @@ BEGIN
 
     /*
     ============================================================================
-    EXECUTIVE DASHBOARD — Letter grades (A-F) with plain English headlines.
+    EXECUTIVE DASHBOARD -- Letter grades (A-F) with plain English headlines.
     Inspired by sp_Blitz priority system. Always returned as RS 1.
 
     Grading scale (each category scored 0-100):
       A = 90-100   B = 75-89   C = 60-74   D = 40-59   F = 0-39
 
     Categories:
-      1. Overall        — composite of all other categories
-      2. Completion      — are all qualifying stats getting updated?
-      3. Reliability     — how often do runs complete without failures or kills?
-      4. Speed           — throughput (seconds per stat) + time to critical stats
-      5. Workload Focus  — are the highest-impact stats prioritized? (QS runs)
+      1. Overall        -- composite of all other categories
+      2. Completion      -- are all qualifying stats getting updated?
+      3. Reliability     -- how often do runs complete without failures or kills?
+      4. Speed           -- throughput (seconds per stat) + time to critical stats
+      5. Workload Focus  -- are the highest-impact stats prioritized? (QS runs)
     ============================================================================
     */
     RAISERROR(N'Computing executive dashboard...', 10, 1) WITH NOWAIT;
@@ -3013,7 +3036,7 @@ BEGIN
             ELSE 20
         END;
 
-        /* #238: If majority of runs hit TIME_LIMIT, cap completion score —
+        /* #238: If majority of runs hit TIME_LIMIT, cap completion score --
            a 95% avg looks great but means nothing if the window is too short */
         DECLARE @tl_run_pct decimal(5, 1) = @time_limit_runs * 100.0 / @run_count;
 
@@ -3034,7 +3057,7 @@ BEGIN
         SET @score_reliability = 100
             - CONVERT(integer, ISNULL(@kill_pct, 0) * 3)     /* heavy penalty for killed runs */
             - CONVERT(integer, ISNULL(@fail_pct, 0) * 2)     /* moderate penalty for failures */
-            - CONVERT(integer, ISNULL(@tl_pct, 0) * 1.5);    /* C3 is CRITICAL — stronger penalty for chronic time limit exhaustion */
+            - CONVERT(integer, ISNULL(@tl_pct, 0) * 1.5);    /* C3 is CRITICAL -- stronger penalty for chronic time limit exhaustion */
 
         IF @score_reliability < 0 SET @score_reliability = 0;
         IF @score_reliability > 100 SET @score_reliability = 100;
@@ -3072,7 +3095,7 @@ BEGIN
     END
     ELSE IF @run_count >= 10
     BEGIN
-        /* #267: No QS runs but enough data to know — grade D (35) indicating missing feature */
+        /* #267: No QS runs but enough data to know -- grade D (35) indicating missing feature */
         SET @score_workload = 35;
     END;
 
@@ -3156,7 +3179,7 @@ BEGIN
                          + N' of ' + CONVERT(nvarchar(10), @run_count) + N' runs hit the time limit.'
                 WHEN @score_completion >= 75 THEN N'Most statistics are being updated, but some are consistently left behind.'
                 WHEN @score_completion >= 60 AND @tl_run_pct >= 50.0
-                    THEN N'Maintenance window is too short — ' + CONVERT(nvarchar(10), @time_limit_runs)
+                    THEN N'Maintenance window is too short -- ' + CONVERT(nvarchar(10), @time_limit_runs)
                          + N' of ' + CONVERT(nvarchar(10), @run_count) + N' runs hit the time limit before finishing.'
                 WHEN @score_completion >= 60 THEN N'A significant portion of statistics are not being reached within the maintenance window.'
                 WHEN @score_completion >= 40 THEN N'Less than half of qualifying statistics are being updated. Increase time limit or reduce scope.'
@@ -4021,7 +4044,7 @@ BEGIN
 
     /*
     ============================================================================
-    RESULT SET 10: EFFICACY TREND (Weekly, broad window — @ExpertMode = 1 only)
+    RESULT SET 10: EFFICACY TREND (Weekly, broad window -- @ExpertMode = 1 only)
     ============================================================================
     */
     IF @ExpertMode = 1 AND @SingleResultSet = 0
@@ -4217,7 +4240,7 @@ BEGIN
 
     /*
     ============================================================================
-    RESULT SET 11: EFFICACY DETAIL (Per-run, close-up window — @ExpertMode = 1 only)
+    RESULT SET 11: EFFICACY DETAIL (Per-run, close-up window -- @ExpertMode = 1 only)
     ============================================================================
     */
     IF @ExpertMode = 1 AND @SingleResultSet = 0
@@ -4326,7 +4349,7 @@ BEGIN
 
     /*
     ============================================================================
-    RESULT SET 12: HIGH-CPU STAT POSITIONS (Most Recent Run — @ExpertMode = 1 only)
+    RESULT SET 12: HIGH-CPU STAT POSITIONS (Most Recent Run -- @ExpertMode = 1 only)
     ============================================================================
     */
     IF @ExpertMode = 1 AND @SingleResultSet = 0
@@ -4431,7 +4454,7 @@ BEGIN
 
     /*
     ============================================================================
-    RESULT SET 13: QS PERFORMANCE CORRELATION (Per-stat CPU trend — @ExpertMode = 1 only)
+    RESULT SET 13: QS PERFORMANCE CORRELATION (Per-stat CPU trend -- @ExpertMode = 1 only)
     Shows how Query Store CPU metrics change for each statistic across runs.
     Leadership takeaway: "Are the queries actually getting faster after we update these statistics?"
     ============================================================================
