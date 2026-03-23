@@ -36,9 +36,13 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.20 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.23 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.20   - 26-issue bulk resolution across 5 phases:
+History:    2026.03.23   - NULL RunLabel fix for legacy CommandLog entries (ISNULL fallback).
+                         - INSERT...EXEC safety: auto @SkipHistory=1, DB_ID guard, TRY/CATCH on map write.
+                         - @ObfuscationMapTable dedup (NOT EXISTS prevents duplicate rows on repeated runs).
+                         - Em dash removal (~60 occurrences) for PowerShell 5.1 compatibility.
+            2026.03.20   - 26-issue bulk resolution across 5 phases:
                          Phase 1: Cache watermark sentinel fix (#312), C4 parallelism-aware (#306).
                          Phase 2: ObjectId/StatsId extraction (#268), RS 2 Summary (#283),
                            RS 7 StatsInParallel (#287), RS 12 WorkloadRankPct/CumulativeCpuPct (#262),
@@ -176,8 +180,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.20',
-        @procedure_version_date datetime = '20260320';
+        @procedure_version varchar(20) = '2026.03.23',
+        @procedure_version_date datetime = '20260323';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
