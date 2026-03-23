@@ -208,7 +208,7 @@ BEGIN
                     N'0, 1', N'0'),
                 (N'@ObfuscationSeed',          N'nvarchar(128)', N'Salt prepended to names before hashing. Makes tokens unpredictable without the seed but deterministic across runs/servers with the same seed. NULL = unsalted (backward compatible).',
                     N'NULL, any string up to 128 chars', N'NULL'),
-                (N'@ObfuscationMapTable',      N'sysname',  N'Persist obfuscation map to this table (auto-creates if missing, appends if exists). Enables saving the map on prod while exporting only obfuscated results. Requires @Obfuscate=1.',
+                (N'@ObfuscationMapTable',      N'sysname',  N'Persist obfuscation map to this table (auto-creates if missing, merges new entries on subsequent runs). Enables saving the map on prod while exporting only obfuscated results. Requires @Obfuscate=1.',
                     N'NULL, table name (e.g., dbo.DiagMap, tempdb.dbo.diag_map)', N'NULL'),
                 (N'@LongRunningMinutes',        N'integer',  N'Stats taking longer than this (in minutes) are flagged in W2 check and Long-Running Statistics result set',
                     N'1-N minutes', N'10'),
@@ -1478,7 +1478,13 @@ BEGIN
                     END;
 
                     INSERT INTO ' + @map_safe_name + N' (ObjectType, OriginalName, ObfuscatedName)
-                    SELECT ObjectType, OriginalName, ObfuscatedName FROM #obfuscation_map;';
+                    SELECT m.ObjectType, m.OriginalName, m.ObfuscatedName
+                    FROM #obfuscation_map AS m
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM ' + @map_safe_name + N' AS t
+                        WHERE t.OriginalName = m.OriginalName
+                        AND   t.ObjectType   = m.ObjectType
+                    );';
 
                 BEGIN TRY
                     EXECUTE sp_executesql @map_sql;
