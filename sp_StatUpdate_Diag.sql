@@ -41,6 +41,13 @@ Version:    2026.03.23 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.
 History:    2026.03.23   - NULL RunLabel fix for legacy CommandLog entries (ISNULL fallback).
                          - INSERT...EXEC safety: auto @SkipHistory=1, DB_ID guard, TRY/CATCH on map write.
                          - @ObfuscationMapTable dedup (NOT EXISTS prevents duplicate rows on repeated runs).
+                         - Arithmetic overflow fix: nvarchar(10) widened to nvarchar(20) for decimal/ratio conversions.
+                         - Unicode arrow (U+2192) replaced with ASCII '->'.
+                         - Enhanced @Debug=1: timing at every stage, effective parameter echo, temp table row
+                           counts and samples (#qs_efficacy, #executive_dashboard, #recommendations severity
+                           breakdown), CommandLog date range, legacy label count, execution summary.
+                         - Enhanced @Help=1: grading scale docs, prerequisites/limitations, grade override
+                           examples, version history (9 result sets, was 5).
                          - Em dash removal (~60 occurrences) for PowerShell 5.1 compatibility.
             2026.03.20   - 26-issue bulk resolution across 5 phases:
                          Phase 1: Cache watermark sentinel fix (#312), C4 parallelism-aware (#306).
@@ -185,6 +192,10 @@ BEGIN
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
+
+    /* Debug timing baseline */
+    DECLARE @debug_timer datetime2(3) = SYSDATETIME();
+    DECLARE @debug_elapsed_ms integer;
 
     /*
     ============================================================================
@@ -384,6 +395,104 @@ BEGIN
                 (N'Automation / Stable Result Sets',
                  N'The number of result sets varies by @ExpertMode (2 vs 12-13) and @Obfuscate (shifts RS9). For automation, use @SingleResultSet=1 -- it wraps all output into one table with a stable ResultSetID column (values 1-13). This makes INSERT...EXEC reliable regardless of parameter combinations.')
         ) AS notes (topic, detail);
+
+        /* Result set 6: Grading Scale */
+        SELECT
+            help_topic = N'Grading Scale',
+            grade = grade,
+            score_range = score_range,
+            meaning = meaning
+        FROM
+        (
+            VALUES
+                (N'A', N'90-100', N'Excellent -- statistics maintenance is healthy and effective'),
+                (N'B', N'75-89',  N'Good -- minor improvements possible but no urgent issues'),
+                (N'C', N'60-74',  N'Fair -- noticeable gaps or inefficiencies that deserve attention'),
+                (N'D', N'40-59',  N'Poor -- significant problems impacting maintenance quality'),
+                (N'F', N'0-39',   N'Failing -- critical issues requiring immediate action')
+        ) AS v (grade, score_range, meaning);
+
+        SELECT
+            help_topic = N'Grading Scale',
+            category = category,
+            default_weight = default_weight,
+            what_it_measures = what_it_measures
+        FROM
+        (
+            VALUES
+                (N'COMPLETION',  N'30%', N'What percentage of qualifying stats get updated each run'),
+                (N'RELIABILITY', N'25%', N'Absence of killed runs, failures, and orphaned entries'),
+                (N'SPEED',       N'20%', N'Average seconds per stat update -- are updates fast enough'),
+                (N'WORKLOAD',    N'25%', N'Are high-CPU stats prioritized early (requires @QueryStorePriority=Y)')
+        ) AS v (category, default_weight, what_it_measures);
+
+        /* Result set 7: Prerequisites and Known Limitations */
+        SELECT
+            help_topic = N'Prerequisites and Limitations',
+            topic = topic,
+            detail = detail
+        FROM
+        (
+            VALUES
+                (N'SQL Server Version',
+                 N'Requires SQL Server 2016+ (STRING_SPLIT dependency).  Best on 2017+ for STRING_AGG.'),
+                (N'CommandLog Table',
+                 N'Requires dbo.CommandLog from Ola Hallengren''s Maintenance Solution.  sp_StatUpdate writes SP_STATUPDATE_START, SP_STATUPDATE_END, and UPDATE_STATISTICS entries.  No CommandLog = no diagnostics.'),
+                (N'sp_StatUpdate Version',
+                 N'Full feature support requires sp_StatUpdate v2.16+ (ProcessingPosition in ExtendedInfo for RS 12).  QS efficacy requires @QueryStorePriority=Y runs.  Legacy runs (pre-RunLabel) are supported with synthetic labels.'),
+                (N'INSERT...EXEC Limitation',
+                 N'@SingleResultSet=1 auto-enables @SkipHistory=1 because SQL Server''s INSERT...EXEC creates an implicit transaction that prevents persistent table writes.  @ObfuscationMapTable writes are attempted but may silently fail in this context.'),
+                (N'Obfuscation Map Security',
+                 N'@SingleResultSet=1 excludes the obfuscation map from RowData to prevent leaking real names in the unified output.  Use @ObfuscationMapTable to persist the map separately.'),
+                (N'WORKLOAD Grade Without QS',
+                 N'If no runs use @QueryStorePriority=Y, the WORKLOAD category scores a neutral 50/100 (grade C).  Enable QS prioritization for meaningful workload grades.')
+        ) AS v (topic, detail);
+
+        /* Result set 8: Additional Examples */
+        SELECT
+            help_topic = N'Grade Override Examples',
+            example_name = example_name,
+            example_description = example_description,
+            example_code = example_code
+        FROM
+        (
+            VALUES
+                (
+                    N'Override Reliability Grade',
+                    N'Force Reliability to A (you know the killed runs are from planned maintenance)',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @GradeOverrides = N''RELIABILITY=A'';'
+                ),
+                (
+                    N'Ignore Workload (No QS)',
+                    N'Exclude Workload from Overall score when QS is not used',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @GradeOverrides = N''WORKLOAD=IGNORE'';'
+                ),
+                (
+                    N'Custom Weights',
+                    N'Weight Completion and Reliability heavily, reduce Speed importance',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @GradeWeights = N''COMPLETION=40, RELIABILITY=35, SPEED=5, WORKLOAD=20'';'
+                ),
+                (
+                    N'Combined Override + Weights',
+                    N'Force Reliability=A and reweight remaining categories',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @GradeOverrides = N''RELIABILITY=A'', @GradeWeights = N''COMPLETION=50, SPEED=25, WORKLOAD=25'';'
+                )
+        ) AS v (example_name, example_description, example_code);
+
+        /* Result set 9: Version History */
+        SELECT
+            help_topic = N'Version History',
+            version_date = version_date,
+            changes = changes
+        FROM
+        (
+            VALUES
+                (N'2026.03.23', N'NULL RunLabel fix, INSERT...EXEC safety, ObfuscationMapTable dedup, nvarchar overflow fixes, enhanced debug output, improved @Help'),
+                (N'2026.03.20', N'26-issue bulk resolution: workload impact, check improvements, AG detection, 15 new tests'),
+                (N'2026.03.13', N'RS 12 WorkloadRank fix, RS 11 DeltaVsPrior fix in SingleResultSet mode'),
+                (N'2026.03.11', N'Empty-data RS 3 schema mismatch fix'),
+                (N'2026.03.09', N'RunLabel dedup, QS efficacy, executive dashboard, persistent history')
+        ) AS v (version_date, changes);
 
         RETURN;
     END;
@@ -665,6 +774,34 @@ BEGIN
             + N', WORKLOAD=' + CONVERT(nvarchar(10), CONVERT(integer, @weight_workload * 100))
             + N' (sum=100)';
         RAISERROR(@weight_msg, 10, 1) WITH NOWAIT;
+    END;
+
+    IF @Debug = 1
+    BEGIN
+        SET @debug_elapsed_ms = DATEDIFF(MILLISECOND, @debug_timer, SYSDATETIME());
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(N'DEBUG: === Effective Parameters ===', 10, 1) WITH NOWAIT;
+        RAISERROR(N'DEBUG: @DaysBack=%i  @LongRunningMinutes=%i  @FailureThreshold=%i', 10, 1, @DaysBack, @LongRunningMinutes, @FailureThreshold) WITH NOWAIT;
+        RAISERROR(N'DEBUG: @TimeLimitExhaustionPct=%i  @ThroughputWindowDays=%i  @TopN=%i', 10, 1, @TimeLimitExhaustionPct, @ThroughputWindowDays, @TopN) WITH NOWAIT;
+
+        DECLARE @debug_efficacy_days integer = ISNULL(@EfficacyDaysBack, @DaysBack);
+        DECLARE @debug_efficacy_detail integer = ISNULL(@EfficacyDetailDays, 14);
+        RAISERROR(N'DEBUG: @EfficacyDaysBack=%i (resolved)  @EfficacyDetailDays=%i (resolved)', 10, 1, @debug_efficacy_days, @debug_efficacy_detail) WITH NOWAIT;
+
+        DECLARE @debug_expert integer = CONVERT(integer, @ExpertMode);
+        DECLARE @debug_skip integer = CONVERT(integer, @SkipHistory);
+        DECLARE @debug_single integer = CONVERT(integer, @SingleResultSet);
+        DECLARE @debug_obf integer = CONVERT(integer, @Obfuscate);
+        RAISERROR(N'DEBUG: @ExpertMode=%i  @SkipHistory=%i  @SingleResultSet=%i  @Obfuscate=%i', 10, 1, @debug_expert, @debug_skip, @debug_single, @debug_obf) WITH NOWAIT;
+
+        DECLARE @debug_w_comp integer = CONVERT(integer, @weight_completion * 100);
+        DECLARE @debug_w_rel  integer = CONVERT(integer, @weight_reliability * 100);
+        DECLARE @debug_w_spd  integer = CONVERT(integer, @weight_speed * 100);
+        DECLARE @debug_w_wl   integer = CONVERT(integer, @weight_workload * 100);
+        RAISERROR(N'DEBUG: Weights: COMPLETION=%i%%  RELIABILITY=%i%%  SPEED=%i%%  WORKLOAD=%i%%',
+            10, 1, @debug_w_comp, @debug_w_rel, @debug_w_spd, @debug_w_wl) WITH NOWAIT;
+        RAISERROR(N'DEBUG: Initialization complete (%i ms)', 10, 1, @debug_elapsed_ms) WITH NOWAIT;
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
     END;
 
     /* BUG-07: orphan threshold now a named constant (was hardcoded 60 minutes).
@@ -1104,6 +1241,18 @@ BEGIN
 
     RAISERROR(N'  Runs found: %i (killed: %i)', 10, 1, @run_count, @killed_count) WITH NOWAIT;
 
+    IF @Debug = 1
+    BEGIN
+        SET @debug_elapsed_ms = DATEDIFF(MILLISECOND, @debug_timer, SYSDATETIME());
+        DECLARE @debug_min_start nvarchar(30) = CONVERT(nvarchar(30), (SELECT MIN(StartTime) FROM #runs), 120);
+        DECLARE @debug_max_start nvarchar(30) = CONVERT(nvarchar(30), (SELECT MAX(StartTime) FROM #runs), 120);
+        DECLARE @debug_legacy_count integer = (SELECT COUNT_BIG(*) FROM #runs WHERE RunLabel LIKE N'legacy_%');
+        RAISERROR(N'DEBUG: #runs date range: %s to %s', 10, 1, @debug_min_start, @debug_max_start) WITH NOWAIT;
+        IF @debug_legacy_count > 0
+            RAISERROR(N'DEBUG: #runs with synthetic legacy labels: %i (pre-RunLabel CommandLog entries)', 10, 1, @debug_legacy_count) WITH NOWAIT;
+        RAISERROR(N'DEBUG: Run extraction complete (%i ms)', 10, 1, @debug_elapsed_ms) WITH NOWAIT;
+    END;
+
     /*
     ============================================================================
     DATA EXTRACTION: Populate #stat_updates from UPDATE_STATISTICS entries
@@ -1254,6 +1403,19 @@ BEGIN
     DECLARE @stat_update_count integer = (SELECT COUNT_BIG(*) FROM #stat_updates);
 
     RAISERROR(N'  Stat updates found: %i', 10, 1, @stat_update_count) WITH NOWAIT;
+
+    IF @Debug = 1
+    BEGIN
+        SET @debug_elapsed_ms = DATEDIFF(MILLISECOND, @debug_timer, SYSDATETIME());
+        DECLARE @debug_failed_stats integer = (SELECT COUNT_BIG(*) FROM #stat_updates WHERE ErrorNumber > 0);
+        DECLARE @debug_null_runlabel integer = (SELECT COUNT_BIG(*) FROM #stat_updates WHERE RunLabel IS NULL);
+        DECLARE @debug_distinct_dbs integer = (SELECT COUNT(DISTINCT DatabaseName) FROM #stat_updates);
+        DECLARE @debug_distinct_tables integer = (SELECT COUNT(DISTINCT DatabaseName + N'.' + SchemaName + N'.' + ObjectName) FROM #stat_updates);
+        RAISERROR(N'DEBUG: #stat_updates: %i failed, %i NULL RunLabel, %i databases, %i distinct tables', 10, 1,
+            @debug_failed_stats, @debug_null_runlabel, @debug_distinct_dbs, @debug_distinct_tables) WITH NOWAIT;
+        RAISERROR(N'DEBUG: Stat extraction complete (%i ms)', 10, 1, @debug_elapsed_ms) WITH NOWAIT;
+    END;
+
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     /*
@@ -1864,21 +2026,21 @@ BEGIN
         CASE WHEN recent_w.parallel_mode = prior_w.parallel_mode THEN N'CRITICAL' ELSE N'INFO' END,
         N'DEGRADING_THROUGHPUT',
         CASE WHEN recent_w.parallel_mode = prior_w.parallel_mode
-            THEN N'Throughput degraded: recent avg ' + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), recent_w.avg_sec))
-                + N' sec/stat vs. prior ' + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), prior_w.avg_sec))
+            THEN N'Throughput degraded: recent avg ' + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), recent_w.avg_sec))
+                + N' sec/stat vs. prior ' + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), prior_w.avg_sec))
                 + N' sec/stat (' + CONVERT(nvarchar(20), CONVERT(bigint, CASE WHEN recent_w.avg_sec / prior_w.avg_sec > 1000 THEN 99900 ELSE (recent_w.avg_sec / prior_w.avg_sec - 1) * 100 END))
                 + N'% slower)'
             ELSE N'Throughput changed but parallelism mode also changed (StatsInParallel: '
                 + prior_w.parallel_mode + N' -> ' + recent_w.parallel_mode
-                + N'). Recent avg ' + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), recent_w.avg_sec))
-                + N' sec/stat vs. prior ' + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), prior_w.avg_sec))
+                + N'). Recent avg ' + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), recent_w.avg_sec))
+                + N' sec/stat vs. prior ' + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), prior_w.avg_sec))
                 + N' sec/stat -- not directly comparable.'
         END,
         N'Recent window: ' + CONVERT(nvarchar(10), recent_w.run_count) + N' runs averaging '
-            + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), recent_w.avg_sec)) + N' sec/stat'
+            + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), recent_w.avg_sec)) + N' sec/stat'
             + N' (StatsInParallel=' + recent_w.parallel_mode + N'). '
             + N'Prior window: ' + CONVERT(nvarchar(10), prior_w.run_count) + N' runs averaging '
-            + CONVERT(nvarchar(10), CONVERT(decimal(10, 1), prior_w.avg_sec)) + N' sec/stat'
+            + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), prior_w.avg_sec)) + N' sec/stat'
             + N' (StatsInParallel=' + prior_w.parallel_mode + N'). '
             + N'Comparison window: ' + CONVERT(nvarchar(10), @ThroughputWindowDays) + N' days.',
         N'Possible causes: (1) Table growth increasing update cost, '
@@ -1999,9 +2161,9 @@ BEGIN
         N'LONG_RUNNING_STATS',
         N'Stat consistently slow: ' + su.DatabaseName + N'.'
             + su.SchemaName + N'.' + su.ObjectName + N'.' + su.StatisticsName,  /* BUG-03 fix: was missing SchemaName */
-        N'Avg duration: ' + CONVERT(nvarchar(10), AVG(su.DurationMs) / 1000.0)
-            + N' sec across ' + CONVERT(nvarchar(10), COUNT_BIG(*))
-            + N' updates. Max size: ' + CONVERT(nvarchar(10), MAX(ISNULL(su.SizeMB, 0))) + N' MB'
+        N'Avg duration: ' + CONVERT(nvarchar(20), CONVERT(decimal(10,1), AVG(su.DurationMs) / 1000.0))
+            + N' sec across ' + CONVERT(nvarchar(20), COUNT_BIG(*))
+            + N' updates. Max size: ' + CONVERT(nvarchar(20), MAX(ISNULL(su.SizeMB, 0))) + N' MB'
             + N'. Avg rows: ' + CONVERT(nvarchar(20), AVG(su.RowCount_))
             + CASE WHEN MAX(wi.ImpactScore) >= 0.90
                 THEN N'. HIGH IMPACT: workload rank top ' + CONVERT(nvarchar(10), CONVERT(int, (1.0 - ISNULL(MAX(wi.ImpactScore), 0)) * 100)) + N'%'
@@ -2618,6 +2780,14 @@ BEGIN
     DECLARE @qs_run_count integer = (SELECT COUNT_BIG(*) FROM #qs_efficacy WHERE IsQSRun = 1);
     RAISERROR(N'  Efficacy rows: %i (QS runs: %i)', 10, 1, @qs_efficacy_count, @qs_run_count) WITH NOWAIT;
 
+    IF @Debug = 1 AND @qs_efficacy_count > 0
+    BEGIN
+        SET @debug_elapsed_ms = DATEDIFF(MILLISECOND, @debug_timer, SYSDATETIME());
+        RAISERROR(N'DEBUG: #qs_efficacy sample (top 5)', 10, 1) WITH NOWAIT;
+        SELECT TOP (5) * FROM #qs_efficacy ORDER BY StartTime DESC;
+        RAISERROR(N'DEBUG: QS efficacy computation complete (%i ms)', 10, 1, @debug_elapsed_ms) WITH NOWAIT;
+    END;
+
     /* ======================================================================
        I6: QS_EFFICACY - Query Store prioritization effectiveness
        ====================================================================== */
@@ -2696,7 +2866,7 @@ BEGIN
                         ELSE N''
                     END,
                 N'Avg high-CPU-in-first-quartile: ' + CONVERT(nvarchar(10), @i6_avg_q1_pct) + N'%. '
-                    + N'Avg minutes to complete top-10: ' + CONVERT(nvarchar(10), @i6_avg_minutes) + N'. '
+                    + N'Avg minutes to complete top-10: ' + CONVERT(nvarchar(20), @i6_avg_minutes) + N'. '
                     + N'Avg workload coverage: ' + CONVERT(nvarchar(10), @i6_avg_workload) + N'%. '
                     + N'Across ' + CONVERT(nvarchar(10), @i6_run_count) + N' QS-priority run(s).'
                     + CASE WHEN @i6_estimated_no_qs_min IS NOT NULL
@@ -2780,7 +2950,7 @@ BEGIN
             N'INFO',
             N'QS_INFLECTION',
             N'Configuration change detected ('
-                + CONVERT(nvarchar(10), @inflection_date, 120) + N'): High-workload stats moved from '
+                + CONVERT(nvarchar(20), @inflection_date, 120) + N'): High-workload stats moved from '
                 + CASE WHEN ISNULL(@pre_q1_pct, 0) < 50 THEN N'bottom-half' ELSE N'mid-range' END
                 + N' to first-quartile processing.'
                 + CASE WHEN @pre_minutes IS NOT NULL AND @post_minutes IS NOT NULL AND @pre_minutes > @post_minutes
@@ -2925,7 +3095,7 @@ BEGIN
                     THEN N'Per-execution query CPU improving after stat updates: '
                         + CONVERT(nvarchar(10), @i8_improving_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
                         + N' tracked statistics show lower per-execution CPU (avg '
-                        + CONVERT(nvarchar(10), ABS(@i8_avg_delta_pct)) + N'% reduction).'
+                        + CONVERT(nvarchar(20), ABS(@i8_avg_delta_pct)) + N'% reduction).'
                     /* #276: Improve-then-regress pattern -- CPU improved at some point but regressed back */
                     WHEN @i8_regressed_count > 0 AND @i8_regressed_count >= @i8_degrading_count
                     THEN N'Per-execution query CPU improved then regressed: '
@@ -2939,7 +3109,7 @@ BEGIN
                     THEN N'Per-execution query CPU not improving: '
                         + CONVERT(nvarchar(10), @i8_degrading_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
                         + N' tracked statistics show higher per-execution CPU (avg '
-                        + CONVERT(nvarchar(10), @i8_avg_delta_pct) + N'% change).'
+                        + CONVERT(nvarchar(20), @i8_avg_delta_pct) + N'% change).'
                         + CASE WHEN @i8_forced_at_risk > 0
                             THEN N' WARNING: ' + CONVERT(nvarchar(10), @i8_forced_at_risk) + N' forced plan(s) exist on affected tables -- stat updates may have triggered forced plan abandonment.'
                             ELSE N''
@@ -2958,7 +3128,7 @@ BEGIN
                         THEN N'. Improved-then-regressed: ' + CONVERT(nvarchar(10), @i8_regressed_count)
                         ELSE N''
                     END
-                    + N'. Avg per-exec CPU change: ' + CONVERT(nvarchar(10), @i8_avg_delta_pct) + N'%.'
+                    + N'. Avg per-exec CPU change: ' + CONVERT(nvarchar(20), @i8_avg_delta_pct) + N'%.'
                     + CASE WHEN @i8_forced_at_risk > 0
                         THEN N' Forced plans at risk: ' + CONVERT(nvarchar(10), @i8_forced_at_risk) + N'.'
                         ELSE N''
@@ -3002,6 +3172,17 @@ BEGIN
 
     RAISERROR(N'', 10, 1) WITH NOWAIT;
     RAISERROR(N'Diagnostic checks complete.', 10, 1) WITH NOWAIT;
+
+    IF @Debug = 1
+    BEGIN
+        SET @debug_elapsed_ms = DATEDIFF(MILLISECOND, @debug_timer, SYSDATETIME());
+        DECLARE @debug_crit integer = (SELECT COUNT_BIG(*) FROM #recommendations WHERE Severity = N'CRITICAL');
+        DECLARE @debug_warn integer = (SELECT COUNT_BIG(*) FROM #recommendations WHERE Severity = N'WARNING');
+        DECLARE @debug_info integer = (SELECT COUNT_BIG(*) FROM #recommendations WHERE Severity = N'INFO');
+        RAISERROR(N'DEBUG: #recommendations: %i CRITICAL, %i WARNING, %i INFO', 10, 1, @debug_crit, @debug_warn, @debug_info) WITH NOWAIT;
+        RAISERROR(N'DEBUG: Diagnostic checks complete (%i ms)', 10, 1, @debug_elapsed_ms) WITH NOWAIT;
+    END;
+
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     /*
@@ -3232,12 +3413,12 @@ BEGIN
              WHEN @override_speed IN ('A','B','C','D','F') THEN N'[OVERRIDE: ' + @override_speed + N'] '
              ELSE N'' END
             + CASE
-                WHEN @score_speed >= 90 THEN N'Statistics are being updated very quickly (' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'<1') + N' sec/stat average).'
-                WHEN @score_speed >= 75 THEN N'Update speed is good at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat average.'
-                WHEN @score_speed >= 60 THEN N'Update speed is moderate at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat. Consider parallel mode or adaptive sampling.'
-                ELSE N'Updates are slow at ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'?') + N' sec/stat. Investigate I/O, table sizes, and sample rates.'
+                WHEN @score_speed >= 90 THEN N'Statistics are being updated very quickly (' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'<1') + N' sec/stat average).'
+                WHEN @score_speed >= 75 THEN N'Update speed is good at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat average.'
+                WHEN @score_speed >= 60 THEN N'Update speed is moderate at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat. Consider parallel mode or adaptive sampling.'
+                ELSE N'Updates are slow at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat. Investigate I/O, table sizes, and sample rates.'
             END,
-        N'Average seconds per stat update: ' + ISNULL(CONVERT(nvarchar(10), @avg_sec_per_stat), N'N/A')
+        N'Average seconds per stat update: ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'N/A')
             + N'. Average run duration: ' + ISNULL(CONVERT(nvarchar(10), (SELECT AVG(DurationSeconds) / 60 FROM #runs WHERE IsKilled = 0)), N'N/A') + N' minutes.'
             + CASE WHEN @override_speed IN ('A','B','C','D','F') THEN N' (actual score: ' + CONVERT(nvarchar(10), @score_speed) + N')' ELSE N'' END,
         NULL,
@@ -3414,6 +3595,14 @@ BEGIN
         ) AS wi_stats
         WHERE rec.Severity IN (N'CRITICAL', N'WARNING')
         AND   wi_stats.high_impact_count > 0;
+    END;
+
+    IF @Debug = 1
+    BEGIN
+        SET @debug_elapsed_ms = DATEDIFF(MILLISECOND, @debug_timer, SYSDATETIME());
+        RAISERROR(N'DEBUG: #executive_dashboard contents', 10, 1) WITH NOWAIT;
+        SELECT * FROM #executive_dashboard;
+        RAISERROR(N'DEBUG: Dashboard computation complete (%i ms)', 10, 1, @debug_elapsed_ms) WITH NOWAIT;
     END;
 
     /*
@@ -4293,9 +4482,9 @@ BEGIN
                                                   WHEN dr.prior_minutes IS NOT NULL AND dr.MinutesToHighCpuComplete IS NOT NULL
                                                   THEN N', ' + CASE
                                                       WHEN dr.MinutesToHighCpuComplete < dr.prior_minutes
-                                                      THEN N'-' + CONVERT(nvarchar(10), CONVERT(integer, dr.prior_minutes - dr.MinutesToHighCpuComplete)) + N'min to critical'
+                                                      THEN N'-' + CONVERT(nvarchar(20), CONVERT(integer, dr.prior_minutes - dr.MinutesToHighCpuComplete)) + N'min to critical'
                                                       WHEN dr.MinutesToHighCpuComplete > dr.prior_minutes
-                                                      THEN N'+' + CONVERT(nvarchar(10), CONVERT(integer, dr.MinutesToHighCpuComplete - dr.prior_minutes)) + N'min to critical'
+                                                      THEN N'+' + CONVERT(nvarchar(20), CONVERT(integer, dr.MinutesToHighCpuComplete - dr.prior_minutes)) + N'min to critical'
                                                       ELSE N'0min to critical'
                                                   END
                                                   ELSE N''
@@ -4321,9 +4510,9 @@ BEGIN
                 + N',"StatsProcessed":' + ISNULL(CONVERT(nvarchar(10), dr.StatsProcessed), N'null')
                 + N',"CompletionPct":' + ISNULL(CONVERT(nvarchar(10), dr.CompletionPct), N'null')
                 + N',"HighCpuInFirstQuartilePct":' + ISNULL(CONVERT(nvarchar(10), dr.HighCpuInFirstQuartilePct), N'null')
-                + N',"MinutesToHighCpuComplete":' + ISNULL(CONVERT(nvarchar(10), dr.MinutesToHighCpuComplete), N'null')
+                + N',"MinutesToHighCpuComplete":' + ISNULL(CONVERT(nvarchar(20), dr.MinutesToHighCpuComplete), N'null')
                 + N',"WorkloadCoveragePct":' + ISNULL(CONVERT(nvarchar(10), dr.WorkloadCoveragePct), N'null')
-                + N',"AvgSecPerStat":' + ISNULL(CONVERT(nvarchar(10), dr.AvgSecPerStat), N'null')
+                + N',"AvgSecPerStat":' + ISNULL(CONVERT(nvarchar(20), dr.AvgSecPerStat), N'null')
                 + N',"StopReason":' + CASE WHEN dr.StopReason IS NULL THEN N'null' ELSE N'"' + dr.StopReason + N'"' END
                 + N',"DeltaVsPrior":"' + CASE
                     WHEN dr.prior_completion IS NULL THEN N'(first run in window)'
@@ -4338,9 +4527,9 @@ BEGIN
                         WHEN dr.prior_minutes IS NOT NULL AND dr.MinutesToHighCpuComplete IS NOT NULL
                         THEN N', ' + CASE
                             WHEN dr.MinutesToHighCpuComplete < dr.prior_minutes
-                            THEN N'-' + CONVERT(nvarchar(10), CONVERT(integer, dr.prior_minutes - dr.MinutesToHighCpuComplete)) + N'min to critical'
+                            THEN N'-' + CONVERT(nvarchar(20), CONVERT(integer, dr.prior_minutes - dr.MinutesToHighCpuComplete)) + N'min to critical'
                             WHEN dr.MinutesToHighCpuComplete > dr.prior_minutes
-                            THEN N'+' + CONVERT(nvarchar(10), CONVERT(integer, dr.MinutesToHighCpuComplete - dr.prior_minutes)) + N'min to critical'
+                            THEN N'+' + CONVERT(nvarchar(20), CONVERT(integer, dr.MinutesToHighCpuComplete - dr.prior_minutes)) + N'min to critical'
                             ELSE N'0min to critical'
                         END
                         ELSE N''
@@ -4676,6 +4865,20 @@ BEGIN
     END;
 
     DROP TABLE IF EXISTS #single_rs;
+
+    IF @Debug = 1
+    BEGIN
+        SET @debug_elapsed_ms = DATEDIFF(MILLISECOND, @debug_timer, SYSDATETIME());
+        DECLARE @debug_rec_count integer;
+        SELECT @debug_rec_count = COUNT_BIG(*) FROM #recommendations;
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(N'DEBUG: === Execution Summary ===', 10, 1) WITH NOWAIT;
+        RAISERROR(N'DEBUG: Total elapsed: %i ms', 10, 1, @debug_elapsed_ms) WITH NOWAIT;
+        RAISERROR(N'DEBUG: Runs: %i  Stat updates: %i  Recommendations: %i',
+            10, 1, @run_count, @stat_update_count, @debug_rec_count) WITH NOWAIT;
+        RAISERROR(N'DEBUG: QS efficacy rows: %i  Workload impact objects: %i',
+            10, 1, @qs_efficacy_count, @workload_impact_count) WITH NOWAIT;
+    END;
 
     /*
     ============================================================================
