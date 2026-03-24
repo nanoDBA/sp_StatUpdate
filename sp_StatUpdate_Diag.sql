@@ -36,9 +36,13 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.23 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.23.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.23   - NULL RunLabel fix for legacy CommandLog entries (ISNULL fallback).
+History:    2026.03.23.1 - I10 RECOMMENDED_CONFIG: synthesized parameter set based on diagnostic
+                           findings and parameter history.  Preserves safeguards from prior runs,
+                           adjusts flagged parameters, suggests untracked safeguards (@MinTempdbFreeMB,
+                           @MaxConsecutiveFailures, @MaxAGRedoQueueMB).
+            2026.03.23   - NULL RunLabel fix for legacy CommandLog entries (ISNULL fallback).
                          - INSERT...EXEC safety: auto @SkipHistory=1, DB_ID guard, TRY/CATCH on map write.
                          - @ObfuscationMapTable dedup (NOT EXISTS prevents duplicate rows on repeated runs).
                          - Arithmetic overflow fix: nvarchar(10) widened to nvarchar(20) for decimal/ratio conversions.
@@ -187,7 +191,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.23',
+        @procedure_version varchar(20) = '2026.03.23.1',
         @procedure_version_date datetime = '20260323';
 
     SET @Version = @procedure_version;
@@ -286,7 +290,8 @@ BEGIN
                 (N'I5', N'INFO/WARNING', N'VERSION_HISTORY',    N'sp_StatUpdate versions used across analysis window. WARNING if multiple versions detected (version skew).'),
                 (N'I6', N'INFO',     N'QS_EFFICACY',           N'Query Store prioritization effectiveness -- what % of high-workload stats get serviced early'),
                 (N'I7', N'INFO',     N'QS_INFLECTION',         N'Before/after comparison when sort order changed to Query Store-based prioritization'),
-                (N'I8', N'INFO',     N'QS_PERFORMANCE_TREND',  N'Per-stat per-execution query CPU trend -- are queries getting faster after stat updates? Detects forced plans at risk (#292).')
+                (N'I8', N'INFO',     N'QS_PERFORMANCE_TREND',  N'Per-stat per-execution query CPU trend -- are queries getting faster after stat updates? Detects forced plans at risk (#292).'),
+                (N'I10', N'INFO',    N'RECOMMENDED_CONFIG',    N'Synthesized parameter set balancing immediate fixes, long-term safeguards, and historical parameter usage.  Based on diagnostic findings and parameter change history.')
         ) AS v (check_id, severity, category, description);
 
         /* Result set 3: Result set order */
@@ -3168,6 +3173,211 @@ BEGIN
             73
         );
         RAISERROR(N'  [INFO] I8: no Query Store CPU data available', 10, 1) WITH NOWAIT;
+    END;
+
+    /* ======================================================================
+       I10: RECOMMENDED CONFIGURATION -- Synthesize a single parameter set
+       based on diagnostic findings, parameter history, and safeguards.
+       Baseline: latest completed (non-killed) run.  Adjustments driven by
+       which checks fired (C1-C4, W1-W6).  Safeguards from any historical
+       run are preserved even if dropped in the latest run.
+       ====================================================================== */
+    RAISERROR(N'Building recommended configuration (I10)...', 10, 1) WITH NOWAIT;
+
+    BEGIN
+        /* ---- Baseline: latest completed (non-killed) run ---- */
+        DECLARE @rc_baseline nvarchar(100) = (
+            SELECT TOP (1) RunLabel
+            FROM #runs
+            WHERE IsKilled = 0
+            ORDER BY StartTime DESC
+        );
+
+        /* Fall back to latest run if every run was killed */
+        IF @rc_baseline IS NULL
+            SET @rc_baseline = (SELECT TOP (1) RunLabel FROM #runs ORDER BY StartTime DESC);
+
+        IF @rc_baseline IS NOT NULL
+        BEGIN
+            DECLARE
+                @rc_databases       nvarchar(max),
+                @rc_timelimit       integer,
+                @rc_sort            nvarchar(50),
+                @rc_qs_pri          nvarchar(1),
+                @rc_mod_thresh      bigint,
+                @rc_long_min        integer,
+                @rc_long_pct        integer,
+                @rc_parallel        nvarchar(1),
+                @rc_group_join      nvarchar(1),
+                @rc_filtered_mode   nvarchar(10),
+                @rc_fail_fast       bit,
+                @rc_call            nvarchar(1000),
+                @rc_rationale       nvarchar(2000) = N'',
+                @rc_safeguards      nvarchar(500);
+
+            SELECT
+                @rc_databases     = ISNULL([Databases], N'USER_DATABASES'),
+                @rc_timelimit     = TimeLimit,
+                @rc_sort          = SortOrder,
+                @rc_qs_pri        = QueryStorePriority,
+                @rc_mod_thresh    = ModificationThreshold,
+                @rc_long_min      = LongRunningThresholdMinutes,
+                @rc_long_pct      = LongRunningSamplePercent,
+                @rc_parallel      = StatsInParallel,
+                @rc_group_join    = GroupByJoinPattern,
+                @rc_filtered_mode = FilteredStatsMode,
+                @rc_fail_fast     = FailFast
+            FROM #runs
+            WHERE RunLabel = @rc_baseline;
+
+            /* ---- Adjust based on fired checks ---- */
+
+            /* C3: Time limit exhaustion -- increase if short */
+            IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'TIME_LIMIT_EXHAUSTION')
+            BEGIN
+                IF @rc_timelimit IS NULL OR @rc_timelimit < 3600
+                    SET @rc_timelimit = 18000;
+                ELSE IF @rc_timelimit < 18000
+                    SET @rc_timelimit = CASE
+                        WHEN @rc_timelimit * 2 > 28800 THEN 28800
+                        ELSE @rc_timelimit * 2
+                    END;
+                SET @rc_rationale += N'TimeLimit adjusted (C3: time-limit exhaustion). ';
+            END;
+
+            /* Ensure a sane minimum time limit even without C3 */
+            IF @rc_timelimit IS NOT NULL AND @rc_timelimit < 3600
+            BEGIN
+                SET @rc_timelimit = 18000;
+                SET @rc_rationale += N'TimeLimit raised from <1h to 5h (too short for workload). ';
+            END;
+
+            /* W5: QS not effective -- revert to MODIFICATION_COUNTER */
+            IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'QS_NOT_EFFECTIVE')
+            BEGIN
+                SET @rc_sort   = N'MODIFICATION_COUNTER';
+                SET @rc_qs_pri = N'N';
+                SET @rc_rationale += N'QS disabled (W5: no QS data captured). ';
+            END;
+
+            /* W1a: Always recommend tiered thresholds */
+            /* (no variable needed -- hardcoded as 1 in output) */
+
+            /* W2: Long-running stats -- tighten adaptive sampling */
+            IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'LONG_RUNNING_STATS')
+            BEGIN
+                SET @rc_long_min = CASE
+                    WHEN @rc_long_min IS NULL THEN 10
+                    WHEN @rc_long_min > 10    THEN 10
+                    ELSE @rc_long_min
+                END;
+
+                /* 5% for 100M+ row tables, 10% otherwise */
+                IF EXISTS (
+                    SELECT 1 FROM #stat_updates
+                    WHERE DurationMs > @LongRunningMinutes * 60 * 1000
+                    AND   ErrorNumber = 0
+                    AND   RowCount_ > 100000000
+                )
+                    SET @rc_long_pct = 5;
+                ELSE
+                    SET @rc_long_pct = ISNULL(@rc_long_pct, 10);
+
+                SET @rc_rationale += N'Adaptive sampling tightened to '
+                    + CONVERT(nvarchar(10), @rc_long_min) + N'min/'
+                    + CONVERT(nvarchar(10), @rc_long_pct) + N'% (W2: slow stats). ';
+            END
+            ELSE IF @rc_long_min IS NULL
+            BEGIN
+                /* Preventive: suggest enabling even without current slow stats */
+                SET @rc_long_min = 15;
+                SET @rc_long_pct = ISNULL(@rc_long_pct, 10);
+            END;
+
+            /* W3: Stale backlog -- suggest parallel if not already on */
+            IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'STALE_BACKLOG')
+            AND ISNULL(@rc_parallel, N'N') = N'N'
+            BEGIN
+                SET @rc_parallel = N'Y';
+                SET @rc_rationale += N'Parallel enabled (W3: persistent backlog). ';
+            END;
+
+            /* ---- Preserve features from historical runs ---- */
+            IF @rc_group_join IS NULL
+            AND EXISTS (SELECT 1 FROM #runs WHERE GroupByJoinPattern = N'Y')
+            BEGIN
+                SET @rc_group_join = N'Y';
+                SET @rc_rationale += N'@GroupByJoinPattern restored from prior runs. ';
+            END;
+
+            IF @rc_filtered_mode IS NULL
+            AND EXISTS (
+                SELECT 1 FROM #runs
+                WHERE FilteredStatsMode IS NOT NULL
+                AND   FilteredStatsMode <> N'INCLUDE'
+            )
+            BEGIN
+                SET @rc_filtered_mode = (
+                    SELECT TOP (1) FilteredStatsMode
+                    FROM #runs
+                    WHERE FilteredStatsMode IS NOT NULL
+                    AND   FilteredStatsMode <> N'INCLUDE'
+                    ORDER BY StartTime DESC
+                );
+                SET @rc_rationale += N'@FilteredStatsMode=' + @rc_filtered_mode + N' restored from prior runs. ';
+            END;
+
+            /* ---- Build the EXEC call ---- */
+            SET @rc_call = N'EXECUTE dbo.sp_StatUpdate'
+                + NCHAR(13) + NCHAR(10) + N'    @Databases = N''' + @rc_databases + N''''
+                + NCHAR(13) + NCHAR(10) + N'  , @TimeLimit = ' + CONVERT(nvarchar(10), ISNULL(@rc_timelimit, 18000))
+                + NCHAR(13) + NCHAR(10) + N'  , @SortOrder = N''' + ISNULL(@rc_sort, N'MODIFICATION_COUNTER') + N''''
+                + NCHAR(13) + NCHAR(10) + N'  , @TieredThresholds = 1'
+                + NCHAR(13) + NCHAR(10) + N'  , @ModificationThreshold = ' + CONVERT(nvarchar(20), ISNULL(@rc_mod_thresh, 5000))
+                + NCHAR(13) + NCHAR(10) + N'  , @CleanupOrphanedRuns = N''Y''';
+
+            IF ISNULL(@rc_qs_pri, N'N') = N'Y'
+                SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @QueryStorePriority = N''Y''';
+
+            IF @rc_long_min IS NOT NULL
+                SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @LongRunningThresholdMinutes = ' + CONVERT(nvarchar(10), @rc_long_min)
+                    + NCHAR(13) + NCHAR(10) + N'  , @LongRunningSamplePercent = ' + CONVERT(nvarchar(10), ISNULL(@rc_long_pct, 10));
+
+            IF ISNULL(@rc_parallel, N'N') = N'Y'
+                SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @StatsInParallel = N''Y''';
+
+            IF ISNULL(@rc_group_join, N'N') = N'Y'
+                SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @GroupByJoinPattern = N''Y''';
+
+            IF @rc_filtered_mode IS NOT NULL AND @rc_filtered_mode <> N'INCLUDE'
+                SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @FilteredStatsMode = N''' + @rc_filtered_mode + N'''';
+
+            SET @rc_call += N';';
+
+            /* ---- Safeguard parameters (not tracked in CommandLog) ---- */
+            SET @rc_safeguards = N'Also consider safeguards not tracked in CommandLog: @MinTempdbFreeMB = 500, @MaxConsecutiveFailures = 5';
+
+            IF @ag_replica_role = N'PRIMARY'
+                SET @rc_safeguards += N', @MaxAGRedoQueueMB = 1024';
+
+            SET @rc_safeguards += N'.';
+
+            /* ---- Insert the recommendation ---- */
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES (
+                N'INFO',
+                N'RECOMMENDED_CONFIG',
+                N'Recommended parameter set based on ' + CONVERT(nvarchar(10), (SELECT COUNT(*) FROM #runs))
+                    + N' run(s) and ' + CONVERT(nvarchar(10), (SELECT COUNT(*) FROM #recommendations))
+                    + N' diagnostic finding(s)',
+                LEFT(@rc_rationale + @rc_safeguards, 2000),
+                N'Balanced configuration: preserves safeguards from prior runs, adjusts parameters flagged by diagnostics, and applies best-practice defaults.  Review @TimeLimit for your maintenance window.',
+                @rc_call,
+                5
+            );
+
+            RAISERROR(N'  [INFO] I10: Recommended configuration built', 10, 1) WITH NOWAIT;
+        END;
     END;
 
     RAISERROR(N'', 10, 1) WITH NOWAIT;
