@@ -10716,6 +10716,12 @@ OPTION (RECOMPILE);';
 
         SET @p333_overshoot_sec = DATEDIFF(SECOND, @p333_stop_time, @p333_now);
 
+        /* If stop time wrapped to tomorrow (e.g., start 20:00, stop 05:00),
+           the DATEDIFF is large positive but the run hasn't actually overshot.
+           Real overshoot cannot exceed total run duration. */
+        IF @p333_overshoot_sec > DATEDIFF(SECOND, @start_time, SYSDATETIME())
+            SET @p333_overshoot_sec = @p333_overshoot_sec - 86400;
+
         /* Only warn if overshoot > 30 seconds (avoid noise from sub-second overruns) */
         IF @p333_overshoot_sec > 30
         BEGIN
