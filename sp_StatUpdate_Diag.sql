@@ -3300,10 +3300,19 @@ BEGIN
             BEGIN
                 SET @rc_parallel = N'Y';
                 SET @rc_rationale += N'Parallel enabled (W3: persistent backlog). ';
+
+                /* @StatsInParallel and @GroupByJoinPattern are mutually exclusive */
+                IF ISNULL(@rc_group_join, N'N') = N'Y'
+                BEGIN
+                    SET @rc_group_join = N'N';
+                    SET @rc_rationale += N'@GroupByJoinPattern dropped (mutually exclusive with parallel). ';
+                END;
             END;
 
             /* ---- Preserve features from historical runs ---- */
+            /* @GroupByJoinPattern: only restore if parallel is NOT being recommended */
             IF @rc_group_join IS NULL
+            AND ISNULL(@rc_parallel, N'N') = N'N'
             AND EXISTS (SELECT 1 FROM #runs WHERE GroupByJoinPattern = N'Y')
             BEGIN
                 SET @rc_group_join = N'Y';
