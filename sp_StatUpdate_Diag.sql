@@ -36,9 +36,20 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.23.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.24 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.23.1 - I10 RECOMMENDED_CONFIG: synthesized parameter set based on diagnostic
+History:    2026.03.24   - Mop-up awareness: #runs gets MopUpTriggered/MopUpFound/MopUpProcessed
+                           from SP_STATUPDATE_END summary XML.  RS4 Run Detail includes mop-up columns.
+                           W1d recommendation: suggest @MopUpPass when runs complete early (<50% of
+                           TimeLimit used).  I10 RECOMMENDED_CONFIG includes @MopUpPass when W1d fires.
+                           Fix: split #runs INSERT dynamic SQL to avoid nvarchar(4000) literal truncation.
+                         - GB throughput metrics: TotalGB computed from per-stat PageCount aggregation.
+                           RS3 Run Health Summary: AvgTotalGB, AvgGBPerMin.
+                           RS4 Run Detail: TotalGB, GBPerMin per run.
+                           RS10 Efficacy Trend: AvgGBPerMin per week.
+                           C4 DEGRADING_THROUGHPUT: Evidence includes GB/min for both windows.
+                           Dashboard SPEED: headlines include GB/min and GB/run volume context.
+            2026.03.23.1 - I10 RECOMMENDED_CONFIG: synthesized parameter set based on diagnostic
                            findings and parameter history.  Preserves safeguards from prior runs,
                            adjusts flagged parameters, suggests untracked safeguards (@MinTempdbFreeMB,
                            @MaxConsecutiveFailures, @MaxAGRedoQueueMB).
@@ -191,8 +202,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.23.1',
-        @procedure_version_date datetime = '20260323';
+        @procedure_version varchar(20) = '2026.03.24',
+        @procedure_version_date datetime = '20260324';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -1078,8 +1089,13 @@ BEGIN
         FilteredStatsMode nvarchar(10) NULL,
         BatchLimit integer NULL,
         FailFast bit NULL,
+        /* Mop-up pass (v2.24+, from END record) */
+        MopUpTriggered bit NULL,
+        MopUpFound integer NULL,
+        MopUpProcessed integer NULL,
         /* Computed */
         IsKilled bit NOT NULL DEFAULT 0,
+        TotalGB decimal(10, 2) NULL, /* sum of PageCount * 8KB for succeeded stats in this run */
 
         CONSTRAINT PK_runs PRIMARY KEY NONCLUSTERED (RunLabel)
     );
@@ -1182,7 +1198,8 @@ BEGIN
         [Version], [Databases], TimeLimit, ModificationThreshold, TieredThresholds,
         ThresholdLogic, SortOrder, QueryStorePriority, StatisticsSample,
         StatsInParallel, Preset, LongRunningThresholdMinutes, LongRunningSamplePercent,
-        GroupByJoinPattern, FilteredStatsMode, BatchLimit, FailFast, IsKilled
+        GroupByJoinPattern, FilteredStatsMode, BatchLimit, FailFast,
+        MopUpTriggered, MopUpFound, MopUpProcessed, IsKilled
     )
     SELECT
         run_label           = ISNULL(s.ExtendedInfo.value(N''(Parameters/RunLabel)[1]'', N''nvarchar(100)''),
@@ -1195,8 +1212,11 @@ BEGIN
         stats_processed     = e.ExtendedInfo.value(N''(Summary/StatsProcessed)[1]'', N''int''),
         stats_succeeded     = e.ExtendedInfo.value(N''(Summary/StatsSucceeded)[1]'', N''int''),
         stats_failed        = e.ExtendedInfo.value(N''(Summary/StatsFailed)[1]'', N''int''),
-        stats_remaining     = e.ExtendedInfo.value(N''(Summary/StatsRemaining)[1]'', N''int''),
-        [version]           = s.ExtendedInfo.value(N''(Parameters/Version)[1]'', N''nvarchar(20)''),
+        stats_remaining     = e.ExtendedInfo.value(N''(Summary/StatsRemaining)[1]'', N''int'')
+    ';
+
+    SET @sql = @sql + N'
+      , [version]           = s.ExtendedInfo.value(N''(Parameters/Version)[1]'', N''nvarchar(20)''),
         [databases]         = s.ExtendedInfo.value(N''(Parameters/Databases)[1]'', N''nvarchar(max)''),
         time_limit          = s.ExtendedInfo.value(N''(Parameters/TimeLimit)[1]'', N''int''),
         mod_threshold       = s.ExtendedInfo.value(N''(Parameters/ModificationThreshold)[1]'', N''bigint''),
@@ -1213,6 +1233,9 @@ BEGIN
         filtered_mode       = s.ExtendedInfo.value(N''(Parameters/FilteredStatsMode)[1]'', N''nvarchar(10)''),
         batch_limit         = s.ExtendedInfo.value(N''(Parameters/BatchLimit)[1]'', N''int''),
         fail_fast           = s.ExtendedInfo.value(N''(Parameters/FailFast)[1]'', N''bit''),
+        mop_up_triggered    = e.ExtendedInfo.value(N''(Summary/MopUpTriggered)[1]'', N''bit''),
+        mop_up_found        = e.ExtendedInfo.value(N''(Summary/MopUpFound)[1]'', N''int''),
+        mop_up_processed    = e.ExtendedInfo.value(N''(Summary/MopUpProcessed)[1]'', N''int''),
         is_killed           = CASE
                                   WHEN e.ID IS NULL THEN 1
                                   WHEN e.ExtendedInfo.value(N''(Summary/StopReason)[1]'', N''nvarchar(50)'') = N''KILLED'' THEN 1
@@ -1466,7 +1489,7 @@ BEGIN
             IF @ExpertMode = 1
             BEGIN
                 /* RS 3-12 empty schemas for ExpertMode -- must match production column lists */
-                SELECT TotalRuns = CONVERT(bigint, 0), CompletedRuns = CONVERT(bigint, 0), KilledRuns = CONVERT(bigint, 0), CompletionPct = CONVERT(decimal(5,1), 0), TimeLimitedRuns = CONVERT(bigint, 0), NaturalEndRuns = CONVERT(bigint, 0), AvgDurationSec = CONVERT(bigint, NULL), AvgStatsProcessed = CONVERT(bigint, NULL), AvgStatsRemaining = CONVERT(bigint, NULL), TotalStatUpdates = CONVERT(bigint, 0), TotalFailedUpdates = CONVERT(bigint, 0), AnalysisWindowDays = CONVERT(int, @DaysBack), StopReasonDistribution = CONVERT(nvarchar(max), NULL), HealthScore = CONVERT(int, NULL), QSRunCount = CONVERT(bigint, 0), AvgWorkloadCoveragePct = CONVERT(decimal(5,1), NULL), LatestHighCpuFirstQuartilePct = CONVERT(decimal(5,1), NULL), ReplicaRole = CONVERT(nvarchar(20), NULL);
+                SELECT TotalRuns = CONVERT(bigint, 0), CompletedRuns = CONVERT(bigint, 0), KilledRuns = CONVERT(bigint, 0), CompletionPct = CONVERT(decimal(5,1), 0), TimeLimitedRuns = CONVERT(bigint, 0), NaturalEndRuns = CONVERT(bigint, 0), AvgDurationSec = CONVERT(bigint, NULL), AvgStatsProcessed = CONVERT(bigint, NULL), AvgStatsRemaining = CONVERT(bigint, NULL), TotalStatUpdates = CONVERT(bigint, 0), TotalFailedUpdates = CONVERT(bigint, 0), AnalysisWindowDays = CONVERT(int, @DaysBack), StopReasonDistribution = CONVERT(nvarchar(max), NULL), HealthScore = CONVERT(int, NULL), QSRunCount = CONVERT(bigint, 0), AvgWorkloadCoveragePct = CONVERT(decimal(5,1), NULL), LatestHighCpuFirstQuartilePct = CONVERT(decimal(5,1), NULL), AvgTotalGB = CONVERT(decimal(10,2), NULL), AvgGBPerMin = CONVERT(decimal(10,2), NULL), ReplicaRole = CONVERT(nvarchar(20), NULL);
                 SELECT * FROM #runs WHERE 1 = 0;
                 SELECT * FROM #stat_updates WHERE 1 = 0;
                 SELECT * FROM #stat_updates WHERE 1 = 0;
@@ -1474,7 +1497,7 @@ BEGIN
                 SELECT * FROM #runs WHERE 1 = 0;
                 IF @Obfuscate = 1 SELECT * FROM #obfuscation_map;
                 /* RS 10-12 empty schemas */
-                SELECT WeekStart = CONVERT(date, NULL), WeekLabel = CONVERT(nvarchar(5), NULL), RunCount = CONVERT(bigint, NULL), SortStrategy = CONVERT(nvarchar(20), NULL), HighCpuFirstQuartilePct = CONVERT(decimal(5,1), NULL), AvgMinutesToHighCpu = CONVERT(decimal(10,1), NULL), WorkloadCoveragePct = CONVERT(decimal(5,1), NULL), CompletionPct = CONVERT(decimal(5,1), NULL), AvgSecPerStat = CONVERT(decimal(10,1), NULL), TrendDirection = CONVERT(nvarchar(20), NULL), Top5ConcentrationPct = CONVERT(decimal(5,1), NULL) WHERE 1 = 0;
+                SELECT WeekStart = CONVERT(date, NULL), WeekLabel = CONVERT(nvarchar(5), NULL), RunCount = CONVERT(bigint, NULL), SortStrategy = CONVERT(nvarchar(20), NULL), HighCpuFirstQuartilePct = CONVERT(decimal(5,1), NULL), AvgMinutesToHighCpu = CONVERT(decimal(10,1), NULL), WorkloadCoveragePct = CONVERT(decimal(5,1), NULL), CompletionPct = CONVERT(decimal(5,1), NULL), AvgSecPerStat = CONVERT(decimal(10,1), NULL), AvgGBPerMin = CONVERT(decimal(10,2), NULL), TrendDirection = CONVERT(nvarchar(20), NULL), Top5ConcentrationPct = CONVERT(decimal(5,1), NULL) WHERE 1 = 0;
                 SELECT RunLabel = CONVERT(nvarchar(100), NULL), StartTime = CONVERT(datetime2(3), NULL), SortStrategy = CONVERT(nvarchar(20), NULL), StatsFound = CONVERT(int, NULL), StatsProcessed = CONVERT(int, NULL), CompletionPct = CONVERT(decimal(5,1), NULL), HighCpuInFirstQuartilePct = CONVERT(decimal(5,1), NULL), MinutesToHighCpuComplete = CONVERT(decimal(10,1), NULL), WorkloadCoveragePct = CONVERT(decimal(5,1), NULL), AvgSecPerStat = CONVERT(decimal(10,1), NULL), StopReason = CONVERT(nvarchar(50), NULL), DeltaVsPrior = CONVERT(nvarchar(100), NULL) WHERE 1 = 0;
                 SELECT WorkloadRank = CONVERT(bigint, NULL), DatabaseName = CONVERT(sysname, NULL), SchemaName = CONVERT(sysname, NULL), TableName = CONVERT(sysname, NULL), StatisticsName = CONVERT(sysname, NULL), ProcessingPosition = CONVERT(int, NULL), TotalQueryCpuMs = CONVERT(bigint, NULL), TotalExecutions = CONVERT(bigint, NULL), PlanCount = CONVERT(int, NULL), UpdateDurationMs = CONVERT(int, NULL), QualifyReason = CONVERT(nvarchar(100), NULL), WorkloadRankPct = CONVERT(decimal(5,1), NULL), CumulativeCpuPct = CONVERT(decimal(5,1), NULL) WHERE 1 = 0;
                 /* RS 13 empty schema */
@@ -1868,6 +1891,24 @@ BEGIN
     IF @Debug = 1
         RAISERROR(N'  Workload impact: %i objects with QS data', 10, 1, @workload_impact_count) WITH NOWAIT;
 
+    /* Compute per-run data volume from stat-level page counts (PageCount * 8KB).
+       Fallback: aggregate from per-stat ExtendedInfo when summary TotalPagesProcessed is absent (pre-v2.24 runs). */
+    UPDATE r
+    SET r.TotalGB = COALESCE(
+        su_vol.total_gb,
+        CONVERT(decimal(10, 2), 0)
+    )
+    FROM #runs AS r
+    LEFT JOIN (
+        SELECT
+            su.RunLabel,
+            total_gb = CONVERT(decimal(10, 2), SUM(ISNULL(su.PageCount, 0)) * 8.0 / 1024.0 / 1024.0)
+        FROM #stat_updates AS su
+        WHERE su.ErrorNumber = 0
+        GROUP BY su.RunLabel
+    ) AS su_vol ON su_vol.RunLabel = r.RunLabel
+    WHERE r.IsKilled = 0;
+
     /*
     ============================================================================
     DIAGNOSTIC CHECKS
@@ -2010,6 +2051,11 @@ BEGIN
                 WHEN r.StatsProcessed > 0
                 THEN r.DurationSeconds * 1.0 / r.StatsProcessed
                 ELSE NULL
+            END,
+            gb_per_min = CASE
+                WHEN r.DurationSeconds > 0 AND r.TotalGB IS NOT NULL
+                THEN CONVERT(decimal(10, 2), r.TotalGB / (r.DurationSeconds / 60.0))
+                ELSE NULL
             END
         FROM #runs AS r
         WHERE r.IsKilled = 0
@@ -2021,6 +2067,7 @@ BEGIN
             window_label,
             parallel_mode,
             avg_sec = AVG(avg_sec_per_stat),
+            avg_gb_min = AVG(gb_per_min),
             run_count = COUNT_BIG(*)
         FROM throughput_windows
         GROUP BY window_label, parallel_mode
@@ -2043,9 +2090,11 @@ BEGIN
         END,
         N'Recent window: ' + CONVERT(nvarchar(10), recent_w.run_count) + N' runs averaging '
             + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), recent_w.avg_sec)) + N' sec/stat'
+            + CASE WHEN recent_w.avg_gb_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), recent_w.avg_gb_min) + N' GB/min)' ELSE N'' END
             + N' (StatsInParallel=' + recent_w.parallel_mode + N'). '
             + N'Prior window: ' + CONVERT(nvarchar(10), prior_w.run_count) + N' runs averaging '
             + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), prior_w.avg_sec)) + N' sec/stat'
+            + CASE WHEN prior_w.avg_gb_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), prior_w.avg_gb_min) + N' GB/min)' ELSE N'' END
             + N' (StatsInParallel=' + prior_w.parallel_mode + N'). '
             + N'Comparison window: ' + CONVERT(nvarchar(10), @ThroughputWindowDays) + N' days.',
         N'Possible causes: (1) Table growth increasing update cost, '
@@ -2155,6 +2204,49 @@ BEGIN
             );
         END;
     END;
+
+    /* W1d: Runs complete early but @MopUpPass not enabled */
+    IF EXISTS (
+            SELECT 1
+            FROM #runs AS r
+            WHERE r.StopReason IN (N'COMPLETED', N'NATURAL_END')
+            AND   r.TimeLimit IS NOT NULL
+            AND   r.DurationSeconds IS NOT NULL
+            AND   r.DurationSeconds < r.TimeLimit * 0.5 /* used less than half the time budget */
+            AND   ISNULL(r.MopUpTriggered, 0) = 0
+            AND   r.StatsInParallel = N'N'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM #runs
+            WHERE ISNULL(MopUpTriggered, 0) = 1
+        )
+        BEGIN
+            DECLARE
+                @w1d_avg_pct int,
+                @w1d_count int;
+
+            SELECT
+                @w1d_avg_pct = AVG(CASE WHEN r.TimeLimit > 0 THEN r.DurationSeconds * 100 / r.TimeLimit ELSE NULL END),
+                @w1d_count = COUNT(*)
+            FROM #runs AS r
+            WHERE r.StopReason IN (N'COMPLETED', N'NATURAL_END')
+            AND   r.TimeLimit IS NOT NULL
+            AND   r.DurationSeconds IS NOT NULL
+            AND   r.DurationSeconds < r.TimeLimit * 0.5
+            AND   ISNULL(r.MopUpTriggered, 0) = 0
+            AND   r.StatsInParallel = N'N';
+
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES
+            (
+                N'INFO', N'UNUSED_FEATURES',
+                N'Runs complete early -- mop-up pass could use remaining time',
+                CONVERT(nvarchar(10), @w1d_count) + N' run(s) completed using only ~' + CONVERT(nvarchar(10), @w1d_avg_pct) + N'% of the time budget.  The remaining time is wasted.',
+                N'@MopUpPass = N''Y'' enables a second broad sweep after the priority pass finishes, catching any stat with modification_counter > 0 that did not qualify under tiered thresholds.',
+                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @TimeLimit = 7200, @MopUpPass = N''Y'', @MopUpMinRemainingSeconds = 120;',
+                50
+            );
+        END;
 
     /* ======================================================================
        W2: LONG-RUNNING INDIVIDUAL STATS
@@ -3361,6 +3453,15 @@ BEGIN
             IF @rc_filtered_mode IS NOT NULL AND @rc_filtered_mode <> N'INCLUDE'
                 SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @FilteredStatsMode = N''' + @rc_filtered_mode + N'''';
 
+            /* Add @MopUpPass if runs consistently complete early and it's not already enabled */
+            IF EXISTS (
+                SELECT 1 FROM #recommendations
+                WHERE Category = N'UNUSED_FEATURES'
+                AND   Finding LIKE N'%mop-up%'
+            )
+            AND ISNULL(@rc_parallel, N'N') = N'N'
+                SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @MopUpPass = N''Y''';
+
             SET @rc_call += N';';
 
             /* ---- Safeguard parameters (not tracked in CommandLog) ---- */
@@ -3479,6 +3580,13 @@ BEGIN
         DECLARE @avg_sec_per_stat decimal(10, 1) = (
             SELECT AVG(CONVERT(decimal(10, 1), r.DurationSeconds * 1.0 / r.StatsProcessed))
             FROM #runs AS r WHERE r.IsKilled = 0 AND r.StatsProcessed > 0
+        );
+        DECLARE @avg_total_gb decimal(10, 2) = (
+            SELECT AVG(r.TotalGB) FROM #runs AS r WHERE r.IsKilled = 0 AND r.TotalGB IS NOT NULL
+        );
+        DECLARE @avg_gb_per_min decimal(10, 2) = (
+            SELECT AVG(CASE WHEN r.DurationSeconds > 0 THEN CONVERT(decimal(10, 2), r.TotalGB / (r.DurationSeconds / 60.0)) ELSE NULL END)
+            FROM #runs AS r WHERE r.IsKilled = 0 AND r.TotalGB IS NOT NULL AND r.DurationSeconds > 0
         );
         SET @score_speed = CASE
             WHEN @avg_sec_per_stat <= 0.5 THEN 100
@@ -3632,12 +3740,17 @@ BEGIN
              WHEN @override_speed IN ('A','B','C','D','F') THEN N'[OVERRIDE: ' + @override_speed + N'] '
              ELSE N'' END
             + CASE
-                WHEN @score_speed >= 90 THEN N'Statistics are being updated very quickly (' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'<1') + N' sec/stat average).'
-                WHEN @score_speed >= 75 THEN N'Update speed is good at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat average.'
-                WHEN @score_speed >= 60 THEN N'Update speed is moderate at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat. Consider parallel mode or adaptive sampling.'
-                ELSE N'Updates are slow at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat. Investigate I/O, table sizes, and sample rates.'
+                WHEN @score_speed >= 90 THEN N'Statistics are being updated very quickly (' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'<1') + N' sec/stat average'
+                    + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N', ' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min' ELSE N'' END + N').'
+                WHEN @score_speed >= 75 THEN N'Update speed is good at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat average'
+                    + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min)' ELSE N'' END + N'.'
+                WHEN @score_speed >= 60 THEN N'Update speed is moderate at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat'
+                    + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min)' ELSE N'' END + N'. Consider parallel mode or adaptive sampling.'
+                ELSE N'Updates are slow at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat'
+                    + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min)' ELSE N'' END + N'. Investigate I/O, table sizes, and sample rates.'
             END,
         N'Average seconds per stat update: ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'N/A')
+            + CASE WHEN @avg_total_gb IS NOT NULL THEN N'. Average data volume: ' + CONVERT(nvarchar(20), @avg_total_gb) + N' GB/run (' + ISNULL(CONVERT(nvarchar(20), @avg_gb_per_min), N'N/A') + N' GB/min)' ELSE N'' END
             + N'. Average run duration: ' + ISNULL(CONVERT(nvarchar(10), (SELECT AVG(DurationSeconds) / 60 FROM #runs WHERE IsKilled = 0)), N'N/A') + N' minutes.'
             + CASE WHEN @override_speed IN ('A','B','C','D','F') THEN N' (actual score: ' + CONVERT(nvarchar(10), @score_speed) + N')' ELSE N'' END,
         NULL,
@@ -3965,6 +4078,8 @@ BEGIN
             QSRunCount = (SELECT COUNT_BIG(*) FROM #qs_efficacy WHERE IsQSRun = 1),
             AvgWorkloadCoveragePct = (SELECT AVG(WorkloadCoveragePct) FROM #qs_efficacy WHERE IsQSRun = 1),
             LatestHighCpuFirstQuartilePct = (SELECT TOP (1) HighCpuInFirstQuartilePct FROM #qs_efficacy WHERE IsQSRun = 1 ORDER BY StartTime DESC),
+            AvgTotalGB = (SELECT AVG(r2.TotalGB) FROM #runs AS r2 WHERE r2.IsKilled = 0 AND r2.TotalGB IS NOT NULL),
+            AvgGBPerMin = (SELECT AVG(CASE WHEN r2.DurationSeconds > 0 THEN CONVERT(decimal(10, 2), r2.TotalGB / (r2.DurationSeconds / 60.0)) ELSE NULL END) FROM #runs AS r2 WHERE r2.IsKilled = 0 AND r2.TotalGB IS NOT NULL AND r2.DurationSeconds > 0),
             ReplicaRole = @ag_replica_role;
     END
     ELSE IF @ExpertMode = 1
@@ -4006,6 +4121,8 @@ BEGIN
                     QSRunCount = (SELECT COUNT_BIG(*) FROM #qs_efficacy WHERE IsQSRun = 1),
                     AvgWorkloadCoveragePct = (SELECT AVG(WorkloadCoveragePct) FROM #qs_efficacy WHERE IsQSRun = 1),
                     LatestHighCpuFirstQuartilePct = (SELECT TOP (1) HighCpuInFirstQuartilePct FROM #qs_efficacy WHERE IsQSRun = 1 ORDER BY StartTime DESC),
+                    AvgTotalGB = (SELECT AVG(r2.TotalGB) FROM #runs AS r2 WHERE r2.IsKilled = 0 AND r2.TotalGB IS NOT NULL),
+                    AvgGBPerMin = (SELECT AVG(CASE WHEN r2.DurationSeconds > 0 THEN CONVERT(decimal(10, 2), r2.TotalGB / (r2.DurationSeconds / 60.0)) ELSE NULL END) FROM #runs AS r2 WHERE r2.IsKilled = 0 AND r2.TotalGB IS NOT NULL AND r2.DurationSeconds > 0),
                     ReplicaRole = @ag_replica_role
                 FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
             );
@@ -4046,6 +4163,12 @@ BEGIN
             r.StatsInParallel,
             r.Preset,
             r.LongRunningThresholdMinutes,
+            r.MopUpTriggered,
+            r.MopUpFound,
+            r.MopUpProcessed,
+            r.TotalGB,
+            GBPerMin = CASE WHEN r.DurationSeconds > 0 AND r.TotalGB IS NOT NULL
+                THEN CONVERT(decimal(10, 2), r.TotalGB / (r.DurationSeconds / 60.0)) ELSE NULL END,
             WorkloadCoveragePct = e.WorkloadCoveragePct,
             HighCpuInFirstQuartilePct = e.HighCpuInFirstQuartilePct,
             MinutesToHighCpuComplete = e.MinutesToHighCpuComplete
@@ -4090,6 +4213,12 @@ BEGIN
                     StatsInParallel         = r2.StatsInParallel,
                     Preset                  = r2.Preset,
                     LongRunningThresholdMinutes = r2.LongRunningThresholdMinutes,
+                    MopUpTriggered          = r2.MopUpTriggered,
+                    MopUpFound              = r2.MopUpFound,
+                    MopUpProcessed          = r2.MopUpProcessed,
+                    TotalGB                 = r2.TotalGB,
+                    GBPerMin                = CASE WHEN r2.DurationSeconds > 0 AND r2.TotalGB IS NOT NULL
+                                                THEN CONVERT(decimal(10, 2), r2.TotalGB / (r2.DurationSeconds / 60.0)) ELSE NULL END,
                     WorkloadCoveragePct     = e2.WorkloadCoveragePct,
                     HighCpuInFirstQuartilePct = e2.HighCpuInFirstQuartilePct,
                     MinutesToHighCpuComplete = e2.MinutesToHighCpuComplete
@@ -4499,9 +4628,12 @@ BEGIN
                 e.CompletionPct,
                 e.AvgSecPerStat,
                 e.SortOrder,
-                rc.Top5CpuPct
+                rc.Top5CpuPct,
+                GBPerMin = CASE WHEN r.DurationSeconds > 0 AND r.TotalGB IS NOT NULL
+                    THEN CONVERT(decimal(10, 2), r.TotalGB / (r.DurationSeconds / 60.0)) ELSE NULL END
             FROM #qs_efficacy AS e
             LEFT JOIN run_concentration AS rc ON rc.RunLabel = e.RunLabel
+            LEFT JOIN #runs AS r ON r.RunLabel = e.RunLabel
             WHERE e.StartTime >= DATEADD(DAY, -@EfficacyDaysBack, GETDATE())
         ),
         weekly_agg AS
@@ -4519,6 +4651,7 @@ BEGIN
                 WorkloadCoveragePct     = AVG(w.WorkloadCoveragePct),
                 CompletionPct           = AVG(w.CompletionPct),
                 AvgSecPerStat           = AVG(w.AvgSecPerStat),
+                AvgGBPerMin             = AVG(w.GBPerMin),
                 Top5ConcentrationPct    = AVG(w.Top5CpuPct)  /* #269 */
             FROM weekly_data AS w
             GROUP BY week_start
@@ -4545,6 +4678,7 @@ BEGIN
             WorkloadCoveragePct     = wr.WorkloadCoveragePct,
             CompletionPct           = wr.CompletionPct,
             AvgSecPerStat           = wr.AvgSecPerStat,
+            AvgGBPerMin             = wr.AvgGBPerMin,
             TrendDirection          = CASE
                                           WHEN wr.prior_composite IS NULL THEN N'N/A'
                                           WHEN wr.RunCount < 2 OR ISNULL(wr.prior_run_count, 0) < 2 THEN N'INSUFFICIENT_DATA'
@@ -4591,9 +4725,12 @@ BEGIN
                 e.WorkloadCoveragePct,
                 e.CompletionPct,
                 e.AvgSecPerStat,
-                rc.Top5CpuPct
+                rc.Top5CpuPct,
+                GBPerMin = CASE WHEN r.DurationSeconds > 0 AND r.TotalGB IS NOT NULL
+                    THEN CONVERT(decimal(10, 2), r.TotalGB / (r.DurationSeconds / 60.0)) ELSE NULL END
             FROM #qs_efficacy AS e
             LEFT JOIN run_concentration_s AS rc ON rc.RunLabel = e.RunLabel
+            LEFT JOIN #runs AS r ON r.RunLabel = e.RunLabel
             WHERE e.StartTime >= DATEADD(DAY, -@EfficacyDaysBack, GETDATE())
         ),
         weekly_agg_s AS
@@ -4611,6 +4748,7 @@ BEGIN
                 WorkloadCoveragePct     = AVG(w.WorkloadCoveragePct),
                 CompletionPct           = AVG(w.CompletionPct),
                 AvgSecPerStat           = AVG(w.AvgSecPerStat),
+                AvgGBPerMin             = AVG(w.GBPerMin),
                 Top5ConcentrationPct    = AVG(w.Top5CpuPct)  /* #269 */
             FROM weekly_data_s AS w
             GROUP BY week_start
@@ -4643,6 +4781,7 @@ BEGIN
                     WorkloadCoveragePct     = wr.WorkloadCoveragePct,
                     CompletionPct           = wr.CompletionPct,
                     AvgSecPerStat           = wr.AvgSecPerStat,
+                    AvgGBPerMin             = wr.AvgGBPerMin,
                     TrendDirection          = CASE
                                                   WHEN wr.prior_composite IS NULL THEN N'N/A'
                                                   WHEN wr.RunCount < 2 OR ISNULL(wr.prior_run_count, 0) < 2 THEN N'INSUFFICIENT_DATA'
