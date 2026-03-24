@@ -164,6 +164,22 @@ EXEC dbo.sp_StatUpdate
 -- ETL checks: SELECT * FROM dbo.StatUpdateNotify WHERE RunLabel = ...
 ```
 
+### Mop-Up Pass (Use Remaining Time)
+
+```sql
+-- 2-hour window: priority pass first, then broad sweep with remaining time
+EXEC dbo.sp_StatUpdate
+    @Databases = N'USER_DATABASES',
+    @TimeLimit = 7200,
+    @MopUpPass = N'Y',
+    @MopUpMinRemainingSeconds = 120;
+```
+
+The priority pass applies your configured thresholds and sort order.  If it completes
+with time to spare, the mop-up pass discovers every stat with `modification_counter > 0`
+that wasn't already updated in this run and processes them by modification count descending.
+Requires `@LogToTable = 'Y'` and `@Execute = 'Y'`.  Not compatible with `@StatsInParallel`.
+
 ## Parameter Reference
 
 Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operational notes.
@@ -776,6 +792,7 @@ Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and lo
 
 ## Version History
 
+- **2.24.2026.0324** - Staged discovery hardening: Phase 1 early exit, ratio-based Phase 2 fallback, Phase 5 NULL page count detection, Phase 3 defensive validation.  Legacy QS consistency: removed parameter mutation, added retention warning + debug timing.  Phase 3/6 row count reporting.  New: `@MopUpPass` -- after priority pass completes, broad sweep of any stats with `modification_counter > 0` using remaining `@TimeLimit`.  Skips recently-updated stats via CommandLog.  `@MopUpMinRemainingSeconds` (default 60) controls minimum time budget.
 - **2.23.2026.0324** - New: `@QueryStoreTopPlans` (default 500) limits XML plan parsing to top N plans by metric, dramatically reducing Phase 6 overhead on large QS catalogs. Early bail-out skips Phase 6 entirely when QS has no recent runtime stats. Both staged and legacy discovery paths.
 - **2.22.2026.0320** - 7 issues: AscendingKeyBoost SEQUENCE+datetime detection, CE QUERY_OPTIMIZER_HOTFIXES, APC awareness, low sample rate warning, @StopByTime overshoot warning, cursor-to-set-based conversions, gated per-stat forced plan check.
 - **Diag 2026.03.23.1** - I10 RECOMMENDED_CONFIG: diagnostic tool now synthesizes a single recommended `EXEC sp_StatUpdate` call based on findings, parameter history, and safeguards. Handles @StatsInParallel/@GroupByJoinPattern mutual exclusion.
