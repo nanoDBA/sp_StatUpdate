@@ -9102,9 +9102,9 @@ OPTION (RECOMPILE);';
             SET @p246_pct = CONVERT(integer, @current_persisted_sample_percent);
             SET @p246_msg =
                 N'  WARNING: Persisted sample ' + CONVERT(nvarchar(10), @p246_pct)
-                + N'% yields ~' + CONVERT(nvarchar(20), @absolute_sampled_rows)
+                + N'%% yields ~' + CONVERT(nvarchar(20), @absolute_sampled_rows)
                 + N' rows (below @PersistSampleMinRows=' + CONVERT(nvarchar(20), @PersistSampleMinRows)
-                + N'). RESAMPLE skipped — using SQL Server auto-sample instead. (#246)';
+                + N'). RESAMPLE skipped -- using SQL Server auto-sample instead. (#246)';
             RAISERROR(@p246_msg, 10, 1) WITH NOWAIT;
             SET @warnings += N'PERSIST_SAMPLE_INADEQUATE: [' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name
                 + N'] persisted ' + CONVERT(nvarchar(10), @p246_pct) + N'% yields ' + CONVERT(nvarchar(20), @absolute_sampled_rows) + N' rows; ';
@@ -9126,7 +9126,7 @@ OPTION (RECOMPILE);';
                 + N'%% on ' + QUOTENAME(@current_schema_name) + N'.' + QUOTENAME(@current_table_name)
                 + N'.' + QUOTENAME(@current_stat_name)
                 + N' yields ~' + CONVERT(nvarchar(20), @p281_sampled_rows)
-                + N' rows — may be too few for meaningful histogram. Consider higher sample or FULLSCAN. (#281)';
+                + N' rows -- may be too few for meaningful histogram.  Consider higher sample or FULLSCAN. (#281)';
             RAISERROR(@p281_msg, 10, 1) WITH NOWAIT;
         END;
 
@@ -10359,6 +10359,14 @@ OPTION (RECOMPILE);';
                         MaxModificationCounter = MAX(stp.modification_counter)
                     FROM #stats_to_process AS stp
                     WHERE stp.processed = 0
+                    AND   NOT EXISTS (
+                              SELECT 1
+                              FROM dbo.QueueStatistic AS qs
+                              WHERE qs.QueueID = @queue_id
+                              AND   qs.DatabaseName = stp.database_name
+                              AND   qs.SchemaName = stp.schema_name
+                              AND   qs.ObjectName = stp.table_name
+                          )
                     GROUP BY
                         stp.database_name,
                         stp.schema_name,
