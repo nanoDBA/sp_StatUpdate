@@ -36,11 +36,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.24.2026.03.24 (Major.Minor.YYYY.MM.DD)
+Version:    2.25.2026.03.24 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.24.2026.03.24 - Staged discovery hardening: Phase 1 early exit, ratio-based Phase 2
+History:    2.25.2026.03.24 - @MopUpPass + @StatsInParallel compatibility: removed mutual
+                            exclusion.  First worker to finish runs mop-up discovery under
+                            applock, populates QueueStatistic with mop-up tables; all workers
+                            then claim and process them via the normal parallel queue.  Lazy
+                            per-table discovery for workers that lack local stat metadata.
+            2.24.2026.03.24 - Staged discovery hardening: Phase 1 early exit, ratio-based Phase 2
                             fallback (<1% enrichment triggers legacy), Phase 5 NULL page count
                             detection, Phase 3 defensive validation.  Legacy QS consistency:
                             removed parameter mutation, added retention warning + debug timing.
@@ -558,7 +563,7 @@ ALTER PROCEDURE
     @SortOrder nvarchar(50) = N'MODIFICATION_COUNTER', /*priority: MODIFICATION_COUNTER, DAYS_STALE, RANDOM, PAGE_COUNT, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED*/
     @DelayBetweenStats integer = NULL, /*seconds to wait between stats updates. Use during OLTP hours to reduce contention; NULL = no delay*/
     @MaxConsecutiveFailures integer = NULL, /*stop after N consecutive failures (prevents cascading issues from shared resource problems). NULL = no limit*/
-    @MopUpPass nvarchar(1) = N'N', /*Y = after priority pass completes, use remaining TimeLimit for a broad sweep of any stats with modification_counter > 0 that were not updated in this run.  Skips stats recently updated (CommandLog check).  Requires @TimeLimit and @LogToTable = Y.  Ignored in parallel mode.*/
+    @MopUpPass nvarchar(1) = N'N', /*Y = after priority pass completes, use remaining TimeLimit for a broad sweep of any stats with modification_counter > 0 that were not updated in this run.  Skips stats recently updated (CommandLog check).  Requires @TimeLimit and @LogToTable = Y.  In parallel mode, first worker to finish populates QueueStatistic with mop-up tables; all workers then claim and process them normally.*/
     @MopUpMinRemainingSeconds int = 60, /*minimum seconds remaining after priority pass to trigger mop-up.  Prevents thrashing on a short tail.*/
     @MaxAGRedoQueueMB integer = NULL, /*AG primary only: pause stats when any secondary redo queue exceeds this MB. NULL = disabled. Checks dm_hadr_database_replica_states before each stat update.*/
     @MaxAGWaitMinutes integer = 10, /*max minutes to wait for AG redo queue to drain before stopping (stop reason: AG_REDO_QUEUE). Only used when @MaxAGRedoQueueMB is set.*/
@@ -673,7 +678,7 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.24.2026.03.24',
+        @procedure_version varchar(20) = '2.25.2026.03.24',
         @procedure_version_date datetime = '20260324',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -1383,7 +1388,7 @@ BEGIN
                  N'Discovery filters (@Tables, @ExcludeTables, @ExcludeStatistics, @TargetNorecompute, @FilteredStatsMode) are combined with AND logic. Example: @Tables=N''dbo.Orders'', @ExcludeStatistics=N''_WA_Sys%%'' processes only non-auto-created stats on dbo.Orders. To process "all stats on table A PLUS specific stats on table B", run two separate invocations. Note: @Statistics triggers DIRECT mode (skips discovery entirely) and cannot be combined with @Tables.'),
                 /* v2.24: Mop-up pass */
                 (N'Mop-Up Pass',
-                 N'@MopUpPass=N''Y'' enables a second broad sweep after the priority pass completes, using any remaining @TimeLimit.  The priority pass applies your configured thresholds and sort order.  If it finishes with time to spare (>= @MopUpMinRemainingSeconds, default 60), the mop-up pass discovers every stat with modification_counter > 0 that was NOT already updated in this run (checked via CommandLog), ordered by modification_counter DESC.  This catches low-priority stats that didn''t qualify under tiered thresholds.  Requires @LogToTable=N''Y'' (for CommandLog lookback), @Execute=N''Y'', and a @TimeLimit.  Not compatible with @StatsInParallel.  The mop-up pass reuses the same process loop -- stop reasons, AG redo checks, tempdb checks, and progress logging all apply normally.')
+                 N'@MopUpPass=N''Y'' enables a second broad sweep after the priority pass completes, using any remaining @TimeLimit.  The priority pass applies your configured thresholds and sort order.  If it finishes with time to spare (>= @MopUpMinRemainingSeconds, default 60), the mop-up pass discovers every stat with modification_counter > 0 that was NOT already updated in this run (checked via CommandLog), ordered by modification_counter DESC.  This catches low-priority stats that didn''t qualify under tiered thresholds.  Requires @LogToTable=N''Y'' (for CommandLog lookback), @Execute=N''Y'', and a @TimeLimit.  Compatible with @StatsInParallel -- the first worker to finish populates the shared QueueStatistic table with mop-up tables; all workers then claim and process them normally via the parallel queue.  The mop-up pass reuses the same process loop -- stop reasons, AG redo checks, tempdb checks, and progress logging all apply normally.')
         ) AS note_data
         (
             topic,
@@ -1789,7 +1794,9 @@ ORDER BY TotalStatUpdates DESC;')
         @mop_up_done bit = 0, /* v2.24: prevents mop-up re-entry after GOTO */
         @in_mop_up bit = 0, /* v2.24: set during mop-up pass for QualifyReason tagging */
         @mop_up_stats_found int = 0, /* v2.24: mop-up candidates discovered */
-        @mop_up_stats_processed int = 0; /* v2.24: mop-up stats processed (for summary XML) */
+        @mop_up_stats_processed int = 0, /* v2.24: mop-up stats processed (for summary XML) */
+        @mop_lock_result int = NULL, /* v2.24: parallel mop-up app lock result */
+        @mop_lock_resource nvarchar(255) = NULL; /* v2.24: parallel mop-up app lock name */
 
     /*
     Counters
@@ -3613,20 +3620,6 @@ ORDER BY TotalStatUpdates DESC;')
         SELECT
             error_message =
                 N'@MopUpPass requires @TimeLimit to be set (need a time budget to sweep against).',
-            error_severity = 16;
-    END;
-
-    IF @MopUpPass = N'Y' AND @StatsInParallel = N'Y'
-    BEGIN
-        INSERT INTO
-            @errors
-        (
-            error_message,
-            error_severity
-        )
-        SELECT
-            error_message =
-                N'@MopUpPass is not supported with @StatsInParallel = Y. Each parallel worker manages its own queue.',
             error_severity = 16;
     END;
 
@@ -8542,6 +8535,166 @@ OPTION (RECOMPILE);';
                             @claimed_table_schema,
                             @claimed_table_name) WITH NOWAIT;
                     END;
+
+                    /*
+                    Parallel mop-up: lazy per-table discovery.
+                    When a worker claims a table that doesn't exist in its local
+                    #stats_to_process (added to QueueStatistic by another worker's
+                    mop-up discovery), discover per-stat rows for just this table.
+                    */
+                    IF NOT EXISTS (
+                        SELECT 1 FROM #stats_to_process AS stp
+                        WHERE stp.database_name = @claimed_table_database
+                        AND   stp.object_id = @claimed_table_object_id
+                    )
+                    BEGIN
+                        DECLARE @lazy_mop_sql nvarchar(max);
+                        SET @lazy_mop_sql = N'
+                        USE ' + QUOTENAME(@claimed_table_database) + N';
+                        SELECT
+                            database_name = DB_NAME(),
+                            schema_name = OBJECT_SCHEMA_NAME(s.object_id),
+                            table_name = OBJECT_NAME(s.object_id),
+                            stat_name = s.name,
+                            object_id = s.object_id,
+                            stats_id = s.stats_id,
+                            no_recompute = s.no_recompute,
+                            is_incremental = s.is_incremental,
+                            is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
+                            is_heap = CASE WHEN EXISTS (SELECT 1 FROM sys.indexes AS ix WHERE ix.object_id = s.object_id AND ix.index_id = 0) THEN 1 ELSE 0 END,
+                            auto_created = s.auto_created,
+                            modification_counter = ISNULL(sp.modification_counter, 0),
+                            row_count = ISNULL(sp.rows, 0),
+                            days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
+                            page_count = ISNULL(pgs.total_pages, 0),
+                            persisted_sample_percent = sp.persisted_sample_percent,
+                            histogram_steps = sp.steps,
+                            has_filter = s.has_filter,
+                            filter_definition = s.filter_definition,
+                            unfiltered_rows = sp.unfiltered_rows,
+                            qs_plan_count = CONVERT(int, NULL),
+                            qs_total_executions = CONVERT(bigint, NULL),
+                            qs_total_cpu_ms = CONVERT(bigint, NULL),
+                            qs_total_duration_ms = CONVERT(bigint, NULL),
+                            qs_total_logical_reads = CONVERT(bigint, NULL),
+                            qs_last_execution = CONVERT(datetime2, NULL),
+                            qs_priority_boost = CONVERT(bigint, 0),
+                            is_published = ISNULL(t.is_published, 0),
+                            is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
+                            temporal_type = ISNULL(t.temporal_type, 0),
+                            priority = ROW_NUMBER() OVER (ORDER BY ISNULL(sp.modification_counter, 0) DESC, s.stats_id ASC)
+                        FROM sys.stats AS s
+                        JOIN sys.objects AS o ON o.object_id = s.object_id
+                        LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
+                        CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+                        OUTER APPLY (
+                            SELECT total_pages = SUM(p.used_page_count)
+                            FROM sys.dm_db_partition_stats AS p
+                            WHERE p.object_id = s.object_id AND p.index_id IN (0, 1)
+                        ) AS pgs
+                        WHERE s.object_id = @object_id_param
+                        AND   ISNULL(sp.modification_counter, 0) > 0
+                        AND   (@TargetNorecompute_param = N''BOTH''
+                               OR (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
+                               OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1))
+                        AND   NOT EXISTS (
+                            SELECT 1 FROM dbo.CommandLog AS cl
+                            WHERE cl.CommandType = N''UPDATE_STATISTICS''
+                            AND   cl.DatabaseName = DB_NAME() COLLATE DATABASE_DEFAULT
+                            AND   cl.SchemaName = OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT
+                            AND   cl.ObjectName = OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT
+                            AND   cl.StatisticsName = s.name COLLATE DATABASE_DEFAULT
+                            AND   cl.StartTime >= @start_time_param
+                            AND   cl.ErrorNumber = 0
+                        )
+                        ORDER BY priority
+                        OPTION (RECOMPILE);';
+
+                        DECLARE @lazy_mop_found int = 0;
+
+                        BEGIN TRY
+                            INSERT INTO #stats_to_process
+                            (
+                                database_name, schema_name, table_name, stat_name, object_id, stats_id,
+                                no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created,
+                                modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
+                                has_filter, filter_definition, unfiltered_rows,
+                                qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
+                                qs_total_logical_reads, qs_last_execution, qs_priority_boost,
+                                is_published, is_tracked_by_cdc, temporal_type, priority
+                            )
+                            EXECUTE sys.sp_executesql
+                                @lazy_mop_sql,
+                                N'@object_id_param int, @TargetNorecompute_param nvarchar(10), @start_time_param datetime2(7)',
+                                @object_id_param = @claimed_table_object_id,
+                                @TargetNorecompute_param = @TargetNorecompute,
+                                @start_time_param = @start_time;
+
+                            SET @lazy_mop_found = ROWCOUNT_BIG();
+
+                            IF @lazy_mop_found > 0
+                            BEGIN
+                                SET @total_stats = @total_stats + @lazy_mop_found;
+                                SET @mop_up_stats_found = @mop_up_stats_found + @lazy_mop_found;
+                                SET @in_mop_up = 1;
+
+                                IF @Debug = 1
+                                    RAISERROR(N'  Lazy mop-up: discovered %d stats for %s.%s.%s', 10, 1,
+                                        @lazy_mop_found, @claimed_table_database, @claimed_table_schema, @claimed_table_name) WITH NOWAIT;
+                            END
+                            ELSE
+                            BEGIN
+                                /* No qualifying stats -- updated between mop-up discovery and claim.
+                                   Mark table complete and release so next iteration claims a new table. */
+                                UPDATE qs
+                                SET    qs.TableEndTime = SYSDATETIME(),
+                                       qs.StatsUpdated = 0,
+                                       qs.StatsFailed = 0,
+                                       qs.StatsSkipped = 0
+                                FROM dbo.QueueStatistic AS qs
+                                WHERE qs.QueueID = @queue_id
+                                AND   qs.DatabaseName = @claimed_table_database
+                                AND   qs.SchemaName = @claimed_table_schema
+                                AND   qs.ObjectName = @claimed_table_name;
+
+                                SELECT
+                                    @claimed_table_database = NULL,
+                                    @claimed_table_schema = NULL,
+                                    @claimed_table_name = NULL,
+                                    @claimed_table_object_id = NULL;
+
+                                IF @Debug = 1
+                                    RAISERROR(N'  Lazy mop-up: 0 stats for %s.%s -- skipping table', 10, 1,
+                                        @claimed_table_schema, @claimed_table_name) WITH NOWAIT;
+                            END;
+                        END TRY
+                        BEGIN CATCH
+                            IF @Debug = 1
+                            BEGIN
+                                DECLARE @lazy_err nvarchar(500) = ERROR_MESSAGE();
+                                RAISERROR(N'  Lazy mop-up warning (%s.%s): %s', 10, 1,
+                                    @claimed_table_schema, @claimed_table_name, @lazy_err) WITH NOWAIT;
+                            END;
+
+                            /* Release claim on error */
+                            UPDATE qs
+                            SET    qs.TableEndTime = SYSDATETIME(),
+                                   qs.StatsUpdated = 0,
+                                   qs.StatsFailed = 0,
+                                   qs.StatsSkipped = 0
+                            FROM dbo.QueueStatistic AS qs
+                            WHERE qs.QueueID = @queue_id
+                            AND   qs.DatabaseName = @claimed_table_database
+                            AND   qs.SchemaName = @claimed_table_schema
+                            AND   qs.ObjectName = @claimed_table_name;
+
+                            SELECT
+                                @claimed_table_database = NULL,
+                                @claimed_table_schema = NULL,
+                                @claimed_table_name = NULL,
+                                @claimed_table_object_id = NULL;
+                        END CATCH;
+                    END;
                 END;
                 ELSE
                 BEGIN
@@ -10002,19 +10155,22 @@ OPTION (RECOMPILE);';
 
     Triggers when:
       - @MopUpPass = 'Y'
-      - Priority pass completed normally (COMPLETED or NATURAL_END)
+      - Priority pass completed (COMPLETED, NATURAL_END, or PARALLEL_COMPLETE)
       - Remaining time >= @MopUpMinRemainingSeconds
       - @LogToTable = 'Y' and CommandLog exists (needed to skip recent updates)
-      - Not parallel mode
+
+    In parallel mode, the first worker to finish uses sp_getapplock to serialize
+    mop-up discovery.  It populates QueueStatistic with mop-up tables so all
+    workers can claim them via the normal parallel queue.  Workers that did not
+    run discovery use lazy per-table discovery when claiming mop-up tables.
     */
     IF  @MopUpPass = N'Y'
     AND @mop_up_done = 0
-    AND @stop_reason IN (N'COMPLETED', N'NATURAL_END')
+    AND @stop_reason IN (N'COMPLETED', N'NATURAL_END', N'PARALLEL_COMPLETE')
     AND @TimeLimit IS NOT NULL
     AND (DATEDIFF(SECOND, @start_time, SYSDATETIME()) + @MopUpMinRemainingSeconds) <= @TimeLimit
     AND @LogToTable = N'Y'
     AND @commandlog_exists = 1
-    AND @StatsInParallel = N'N'
     AND @Execute = N'Y'
     BEGIN
         SET @mop_up_done = 1;
@@ -10027,172 +10183,426 @@ OPTION (RECOMPILE);';
             @mop_up_db_idx int,
             @mop_up_db sysname;
 
-        RAISERROR(N'', 10, 1) WITH NOWAIT;
-        RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
-        RAISERROR(N' Mop-Up Pass: %d seconds remaining -- broad sweep of modified stats', 10, 1, @mop_up_remaining_seconds) WITH NOWAIT;
-        RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
-        RAISERROR(N'', 10, 1) WITH NOWAIT;
-
         /*
-        Iterate over the same databases from discovery.
-        For each, find stats with modification_counter > 0 that were NOT:
-          (a) already in #stats_to_process (Phase A candidates -- hit or miss)
-          (b) updated in CommandLog since @start_time (parallel peer safety)
-        Order by modification_counter DESC (simple, high-impact first).
+        ====================================================================
+        PARALLEL MOP-UP: Serialize discovery, populate shared queue
+        ====================================================================
         */
-        DECLARE @mop_up_db_list TABLE (idx int IDENTITY(1,1) PRIMARY KEY, database_name sysname NOT NULL);
-        INSERT INTO @mop_up_db_list (database_name) SELECT DISTINCT database_name FROM #stats_to_process;
-
-        /* Also include databases from @tmpDatabases that had 0 candidates in Phase A */
-        INSERT INTO @mop_up_db_list (database_name)
-        SELECT td.DatabaseName
-        FROM @tmpDatabases AS td
-        WHERE td.Selected = 1
-        AND NOT EXISTS (SELECT 1 FROM @mop_up_db_list AS ml WHERE ml.database_name = td.DatabaseName);
-
-        SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list;
-
-        WHILE @mop_up_db_idx IS NOT NULL
+        IF @StatsInParallel = N'Y'
         BEGIN
-            SELECT @mop_up_db = database_name FROM @mop_up_db_list WHERE idx = @mop_up_db_idx;
+            SET @mop_lock_resource = N'sp_StatUpdate_MopUp_' + CONVERT(nvarchar(10), @queue_id);
 
-            SET @mop_up_sql = N'
-            USE ' + QUOTENAME(@mop_up_db) + N';
+            /* Non-blocking try -- check if we can be the mop-up leader */
+            EXEC @mop_lock_result = sp_getapplock
+                @Resource = @mop_lock_resource,
+                @LockMode = N'Exclusive',
+                @LockOwner = N'Session',
+                @LockTimeout = 0;
 
-            SELECT
-                database_name = DB_NAME(),
-                schema_name = OBJECT_SCHEMA_NAME(s.object_id),
-                table_name = OBJECT_NAME(s.object_id),
-                stat_name = s.name,
-                object_id = s.object_id,
-                stats_id = s.stats_id,
-                no_recompute = s.no_recompute,
-                is_incremental = s.is_incremental,
-                is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
-                is_heap = CASE WHEN EXISTS (SELECT 1 FROM sys.indexes AS ix WHERE ix.object_id = s.object_id AND ix.index_id = 0) THEN 1 ELSE 0 END,
-                auto_created = s.auto_created,
-                modification_counter = ISNULL(sp.modification_counter, 0),
-                row_count = ISNULL(sp.rows, 0),
-                days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
-                page_count = ISNULL(pgs.total_pages, 0),
-                persisted_sample_percent = sp.persisted_sample_percent,
-                histogram_steps = sp.steps,
-                has_filter = s.has_filter,
-                filter_definition = s.filter_definition,
-                unfiltered_rows = sp.unfiltered_rows,
-                qs_plan_count = CONVERT(int, NULL),
-                qs_total_executions = CONVERT(bigint, NULL),
-                qs_total_cpu_ms = CONVERT(bigint, NULL),
-                qs_total_duration_ms = CONVERT(bigint, NULL),
-                qs_total_logical_reads = CONVERT(bigint, NULL),
-                qs_last_execution = CONVERT(datetime2, NULL),
-                qs_priority_boost = CONVERT(bigint, 0),
-                is_published = ISNULL(t.is_published, 0),
-                is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
-                temporal_type = ISNULL(t.temporal_type, 0),
-                priority = ROW_NUMBER() OVER (ORDER BY ISNULL(sp.modification_counter, 0) DESC, s.object_id ASC, s.stats_id ASC)
-            FROM sys.stats AS s
-            JOIN sys.objects AS o ON o.object_id = s.object_id
-            LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
-            CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
-            OUTER APPLY (
-                SELECT total_pages = SUM(p.used_page_count)
-                FROM sys.dm_db_partition_stats AS p
-                WHERE p.object_id = s.object_id AND p.index_id IN (0, 1)
-            ) AS pgs
-            WHERE ISNULL(sp.modification_counter, 0) > 0
-            AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
-                   OR (o.type = N''V'' AND @IncludeSystemObjects_param = N''Y''))
-            AND   (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
-            AND   o.type NOT IN (N''ET'', N''S'')
-            /* NORECOMPUTE filter */
-            AND   (
-                      (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
-                   OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
-                   OR @TargetNorecompute_param = N''BOTH''
-                  )
-            /* Skip stats already in Phase A (whether processed or not) */
-            AND   NOT EXISTS (
-                SELECT 1 FROM #stats_to_process AS stp
-                WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
-                AND   stp.object_id = s.object_id
-                AND   stp.stats_id = s.stats_id
-            )
-            /* Skip stats updated in CommandLog during this run (parallel peer safety) */
-            AND   NOT EXISTS (
-                SELECT 1 FROM dbo.CommandLog AS cl
-                WHERE cl.CommandType = N''UPDATE_STATISTICS''
-                AND   cl.DatabaseName = DB_NAME() COLLATE DATABASE_DEFAULT
-                AND   cl.SchemaName = OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT
-                AND   cl.ObjectName = OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT
-                AND   cl.StatisticsName = s.name COLLATE DATABASE_DEFAULT
-                AND   cl.StartTime >= @start_time_param
-                AND   cl.ErrorNumber = 0
-            )
-            ORDER BY priority
-            OPTION (RECOMPILE);';
+            IF @mop_lock_result >= 0
+            BEGIN
+                /* WE ARE THE MOP-UP LEADER -- run full discovery */
+                RAISERROR(N'', 10, 1) WITH NOWAIT;
+                RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                RAISERROR(N' Mop-Up Pass (parallel leader): %d seconds remaining', 10, 1, @mop_up_remaining_seconds) WITH NOWAIT;
+                RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                RAISERROR(N'', 10, 1) WITH NOWAIT;
 
-            SET @mop_up_params = N'
-                @IncludeSystemObjects_param nvarchar(1),
-                @TargetNorecompute_param nvarchar(10),
-                @start_time_param datetime2(7)';
+                DECLARE @mop_up_db_list TABLE (idx int IDENTITY(1,1) PRIMARY KEY, database_name sysname NOT NULL);
+                INSERT INTO @mop_up_db_list (database_name) SELECT DISTINCT database_name FROM #stats_to_process;
 
-            BEGIN TRY
-                INSERT INTO #stats_to_process
-                (
-                    database_name, schema_name, table_name, stat_name, object_id, stats_id,
-                    no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created,
-                    modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
-                    has_filter, filter_definition, unfiltered_rows,
-                    qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
-                    qs_total_logical_reads, qs_last_execution, qs_priority_boost,
-                    is_published, is_tracked_by_cdc, temporal_type, priority
-                )
-                EXECUTE sys.sp_executesql
-                    @mop_up_sql,
-                    @mop_up_params,
-                    @IncludeSystemObjects_param = @IncludeSystemObjects,
-                    @TargetNorecompute_param = @TargetNorecompute,
-                    @start_time_param = @start_time;
-            END TRY
-            BEGIN CATCH
-                IF @Debug = 1
+                INSERT INTO @mop_up_db_list (database_name)
+                SELECT td.DatabaseName
+                FROM @tmpDatabases AS td
+                WHERE td.Selected = 1
+                AND NOT EXISTS (SELECT 1 FROM @mop_up_db_list AS ml WHERE ml.database_name = td.DatabaseName);
+
+                SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list;
+
+                WHILE @mop_up_db_idx IS NOT NULL
                 BEGIN
-                    DECLARE @mop_up_err nvarchar(500) = ERROR_MESSAGE();
-                    RAISERROR(N'  Mop-up discovery warning (%s): %s', 10, 1, @mop_up_db, @mop_up_err) WITH NOWAIT;
+                    SELECT @mop_up_db = database_name FROM @mop_up_db_list WHERE idx = @mop_up_db_idx;
+
+                    SET @mop_up_sql = N'
+                    USE ' + QUOTENAME(@mop_up_db) + N';
+
+                    SELECT
+                        database_name = DB_NAME(),
+                        schema_name = OBJECT_SCHEMA_NAME(s.object_id),
+                        table_name = OBJECT_NAME(s.object_id),
+                        stat_name = s.name,
+                        object_id = s.object_id,
+                        stats_id = s.stats_id,
+                        no_recompute = s.no_recompute,
+                        is_incremental = s.is_incremental,
+                        is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
+                        is_heap = CASE WHEN EXISTS (SELECT 1 FROM sys.indexes AS ix WHERE ix.object_id = s.object_id AND ix.index_id = 0) THEN 1 ELSE 0 END,
+                        auto_created = s.auto_created,
+                        modification_counter = ISNULL(sp.modification_counter, 0),
+                        row_count = ISNULL(sp.rows, 0),
+                        days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
+                        page_count = ISNULL(pgs.total_pages, 0),
+                        persisted_sample_percent = sp.persisted_sample_percent,
+                        histogram_steps = sp.steps,
+                        has_filter = s.has_filter,
+                        filter_definition = s.filter_definition,
+                        unfiltered_rows = sp.unfiltered_rows,
+                        qs_plan_count = CONVERT(int, NULL),
+                        qs_total_executions = CONVERT(bigint, NULL),
+                        qs_total_cpu_ms = CONVERT(bigint, NULL),
+                        qs_total_duration_ms = CONVERT(bigint, NULL),
+                        qs_total_logical_reads = CONVERT(bigint, NULL),
+                        qs_last_execution = CONVERT(datetime2, NULL),
+                        qs_priority_boost = CONVERT(bigint, 0),
+                        is_published = ISNULL(t.is_published, 0),
+                        is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
+                        temporal_type = ISNULL(t.temporal_type, 0),
+                        priority = ROW_NUMBER() OVER (ORDER BY ISNULL(sp.modification_counter, 0) DESC, s.object_id ASC, s.stats_id ASC)
+                    FROM sys.stats AS s
+                    JOIN sys.objects AS o ON o.object_id = s.object_id
+                    LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
+                    CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+                    OUTER APPLY (
+                        SELECT total_pages = SUM(p.used_page_count)
+                        FROM sys.dm_db_partition_stats AS p
+                        WHERE p.object_id = s.object_id AND p.index_id IN (0, 1)
+                    ) AS pgs
+                    WHERE ISNULL(sp.modification_counter, 0) > 0
+                    AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
+                           OR (o.type = N''V'' AND @IncludeSystemObjects_param = N''Y''))
+                    AND   (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
+                    AND   o.type NOT IN (N''ET'', N''S'')
+                    AND   (
+                              (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
+                           OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
+                           OR @TargetNorecompute_param = N''BOTH''
+                          )
+                    AND   NOT EXISTS (
+                        SELECT 1 FROM #stats_to_process AS stp
+                        WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
+                        AND   stp.object_id = s.object_id
+                        AND   stp.stats_id = s.stats_id
+                    )
+                    AND   NOT EXISTS (
+                        SELECT 1 FROM dbo.CommandLog AS cl
+                        WHERE cl.CommandType = N''UPDATE_STATISTICS''
+                        AND   cl.DatabaseName = DB_NAME() COLLATE DATABASE_DEFAULT
+                        AND   cl.SchemaName = OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT
+                        AND   cl.ObjectName = OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT
+                        AND   cl.StatisticsName = s.name COLLATE DATABASE_DEFAULT
+                        AND   cl.StartTime >= @start_time_param
+                        AND   cl.ErrorNumber = 0
+                    )
+                    ORDER BY priority
+                    OPTION (RECOMPILE);';
+
+                    SET @mop_up_params = N'
+                        @IncludeSystemObjects_param nvarchar(1),
+                        @TargetNorecompute_param nvarchar(10),
+                        @start_time_param datetime2(7)';
+
+                    BEGIN TRY
+                        INSERT INTO #stats_to_process
+                        (
+                            database_name, schema_name, table_name, stat_name, object_id, stats_id,
+                            no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created,
+                            modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
+                            has_filter, filter_definition, unfiltered_rows,
+                            qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
+                            qs_total_logical_reads, qs_last_execution, qs_priority_boost,
+                            is_published, is_tracked_by_cdc, temporal_type, priority
+                        )
+                        EXECUTE sys.sp_executesql
+                            @mop_up_sql,
+                            @mop_up_params,
+                            @IncludeSystemObjects_param = @IncludeSystemObjects,
+                            @TargetNorecompute_param = @TargetNorecompute,
+                            @start_time_param = @start_time;
+                    END TRY
+                    BEGIN CATCH
+                        IF @Debug = 1
+                        BEGIN
+                            DECLARE @mop_up_err nvarchar(500) = ERROR_MESSAGE();
+                            RAISERROR(N'  Mop-up discovery warning (%s): %s', 10, 1, @mop_up_db, @mop_up_err) WITH NOWAIT;
+                        END;
+                    END CATCH;
+
+                    SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list WHERE idx > @mop_up_db_idx;
                 END;
-            END CATCH;
 
-            SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list WHERE idx > @mop_up_db_idx;
-        END;
+                SET @mop_up_found = (SELECT COUNT(*) FROM #stats_to_process WHERE processed = 0);
 
-        /* Count new mop-up candidates */
-        SET @mop_up_found = (SELECT COUNT(*) FROM #stats_to_process WHERE processed = 0);
+                IF @mop_up_found > 0
+                BEGIN
+                    /* Populate QueueStatistic with mop-up tables */
+                    DECLARE @phase_a_max_priority int = ISNULL(
+                        (SELECT MAX(qs.TablePriority) FROM dbo.QueueStatistic AS qs WHERE qs.QueueID = @queue_id),
+                        0
+                    );
 
-        IF @mop_up_found > 0
-        BEGIN
-            /* Update total stats count to include mop-up candidates */
-            SET @total_stats = @total_stats + @mop_up_found;
-            SET @stop_reason = NULL;
-            SET @in_mop_up = 1;
-            SET @mop_up_stats_found = @mop_up_found;
+                    INSERT INTO dbo.QueueStatistic
+                    (
+                        QueueID, DatabaseName, SchemaName, ObjectName, ObjectID,
+                        TablePriority, StatsCount, MaxModificationCounter
+                    )
+                    SELECT
+                        QueueID = @queue_id,
+                        DatabaseName = stp.database_name,
+                        SchemaName = stp.schema_name,
+                        ObjectName = stp.table_name,
+                        ObjectID = stp.object_id,
+                        TablePriority = @phase_a_max_priority + ROW_NUMBER() OVER (
+                            ORDER BY MAX(stp.modification_counter) DESC,
+                                     stp.object_id ASC
+                        ),
+                        StatsCount = COUNT_BIG(*),
+                        MaxModificationCounter = MAX(stp.modification_counter)
+                    FROM #stats_to_process AS stp
+                    WHERE stp.processed = 0
+                    GROUP BY
+                        stp.database_name,
+                        stp.schema_name,
+                        stp.table_name,
+                        stp.object_id;
 
-            /* Snapshot pre-mop-up processed count so we can calculate mop-up delta in summary */
-            SET @mop_up_stats_processed = @stats_processed;
+                    DECLARE @mop_tables_queued int = ROWCOUNT_BIG();
 
-            RAISERROR(N'Mop-up: found %d additional stats with modifications (ordered by modification_counter DESC)', 10, 1, @mop_up_found) WITH NOWAIT;
-            RAISERROR(N'', 10, 1) WITH NOWAIT;
-            RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
-            RAISERROR(N' Processing Mop-Up Statistics', 10, 1) WITH NOWAIT;
-            RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
-            RAISERROR(N'', 10, 1) WITH NOWAIT;
+                    /* Release lock -- other workers can now see mop-up rows */
+                    EXEC sp_releaseapplock @Resource = @mop_lock_resource, @LockOwner = N'Session';
 
-            /* Re-enter the process loop -- it reads from #stats_to_process WHERE processed = 0 */
-            GOTO ProcessLoop;
+                    RAISERROR(N'Mop-up: found %d stats across %d tables -- queued for parallel processing', 10, 1, @mop_up_found, @mop_tables_queued) WITH NOWAIT;
+                    RAISERROR(N'', 10, 1) WITH NOWAIT;
+                    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                    RAISERROR(N' Processing Mop-Up Statistics (parallel)', 10, 1) WITH NOWAIT;
+                    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                    RAISERROR(N'', 10, 1) WITH NOWAIT;
+
+                    SET @total_stats = @total_stats + @mop_up_found;
+                    SET @stop_reason = NULL;
+                    SET @in_mop_up = 1;
+                    SET @mop_up_stats_found = @mop_up_found;
+                    SET @mop_up_stats_processed = @stats_processed;
+
+                    SELECT
+                        @claimed_table_database = NULL,
+                        @claimed_table_schema = NULL,
+                        @claimed_table_name = NULL,
+                        @claimed_table_object_id = NULL;
+
+                    GOTO ProcessLoop;
+                END
+                ELSE
+                BEGIN
+                    EXEC sp_releaseapplock @Resource = @mop_lock_resource, @LockOwner = N'Session';
+                    RAISERROR(N'Mop-up: no additional stats found with modifications.  All stats are current.', 10, 1) WITH NOWAIT;
+                END;
+            END
+            ELSE
+            BEGIN
+                /* ANOTHER WORKER IS THE MOP-UP LEADER -- wait for them to finish discovery */
+                RAISERROR(N'Mop-up: waiting for leader to finish discovery...', 10, 1) WITH NOWAIT;
+
+                EXEC @mop_lock_result = sp_getapplock
+                    @Resource = @mop_lock_resource,
+                    @LockMode = N'Exclusive',
+                    @LockOwner = N'Session',
+                    @LockTimeout = 60000;
+
+                IF @mop_lock_result >= 0
+                    EXEC sp_releaseapplock @Resource = @mop_lock_resource, @LockOwner = N'Session';
+
+                /* Check if mop-up tables were added to QueueStatistic */
+                DECLARE @mop_up_queued int = 0;
+                SELECT @mop_up_queued = COUNT(*)
+                FROM dbo.QueueStatistic AS qs
+                WHERE qs.QueueID = @queue_id
+                AND   qs.TableStartTime IS NULL
+                AND   qs.TableEndTime IS NULL;
+
+                IF @mop_up_queued > 0
+                BEGIN
+                    RAISERROR(N'Mop-up: joining mop-up pass (%d tables unclaimed)', 10, 1, @mop_up_queued) WITH NOWAIT;
+                    RAISERROR(N'', 10, 1) WITH NOWAIT;
+                    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                    RAISERROR(N' Processing Mop-Up Statistics (parallel follower)', 10, 1) WITH NOWAIT;
+                    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                    RAISERROR(N'', 10, 1) WITH NOWAIT;
+
+                    SET @stop_reason = NULL;
+                    SET @in_mop_up = 1;
+
+                    SELECT
+                        @claimed_table_database = NULL,
+                        @claimed_table_schema = NULL,
+                        @claimed_table_name = NULL,
+                        @claimed_table_object_id = NULL;
+
+                    GOTO ProcessLoop;
+                END
+                ELSE
+                BEGIN
+                    RAISERROR(N'Mop-up: leader found no additional stats.', 10, 1) WITH NOWAIT;
+                END;
+            END;
         END
         ELSE
         BEGIN
-            RAISERROR(N'Mop-up: no additional stats found with modifications.  All stats are current.', 10, 1) WITH NOWAIT;
+            /*
+            ====================================================================
+            SERIAL MOP-UP: Original single-worker path
+            ====================================================================
+            */
+            RAISERROR(N'', 10, 1) WITH NOWAIT;
+            RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+            RAISERROR(N' Mop-Up Pass: %d seconds remaining -- broad sweep of modified stats', 10, 1, @mop_up_remaining_seconds) WITH NOWAIT;
+            RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+            RAISERROR(N'', 10, 1) WITH NOWAIT;
+
+            DECLARE @mop_up_db_list_s TABLE (idx int IDENTITY(1,1) PRIMARY KEY, database_name sysname NOT NULL);
+            INSERT INTO @mop_up_db_list_s (database_name) SELECT DISTINCT database_name FROM #stats_to_process;
+
+            INSERT INTO @mop_up_db_list_s (database_name)
+            SELECT td.DatabaseName
+            FROM @tmpDatabases AS td
+            WHERE td.Selected = 1
+            AND NOT EXISTS (SELECT 1 FROM @mop_up_db_list_s AS ml WHERE ml.database_name = td.DatabaseName);
+
+            SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list_s;
+
+            WHILE @mop_up_db_idx IS NOT NULL
+            BEGIN
+                SELECT @mop_up_db = database_name FROM @mop_up_db_list_s WHERE idx = @mop_up_db_idx;
+
+                SET @mop_up_sql = N'
+                USE ' + QUOTENAME(@mop_up_db) + N';
+
+                SELECT
+                    database_name = DB_NAME(),
+                    schema_name = OBJECT_SCHEMA_NAME(s.object_id),
+                    table_name = OBJECT_NAME(s.object_id),
+                    stat_name = s.name,
+                    object_id = s.object_id,
+                    stats_id = s.stats_id,
+                    no_recompute = s.no_recompute,
+                    is_incremental = s.is_incremental,
+                    is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
+                    is_heap = CASE WHEN EXISTS (SELECT 1 FROM sys.indexes AS ix WHERE ix.object_id = s.object_id AND ix.index_id = 0) THEN 1 ELSE 0 END,
+                    auto_created = s.auto_created,
+                    modification_counter = ISNULL(sp.modification_counter, 0),
+                    row_count = ISNULL(sp.rows, 0),
+                    days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
+                    page_count = ISNULL(pgs.total_pages, 0),
+                    persisted_sample_percent = sp.persisted_sample_percent,
+                    histogram_steps = sp.steps,
+                    has_filter = s.has_filter,
+                    filter_definition = s.filter_definition,
+                    unfiltered_rows = sp.unfiltered_rows,
+                    qs_plan_count = CONVERT(int, NULL),
+                    qs_total_executions = CONVERT(bigint, NULL),
+                    qs_total_cpu_ms = CONVERT(bigint, NULL),
+                    qs_total_duration_ms = CONVERT(bigint, NULL),
+                    qs_total_logical_reads = CONVERT(bigint, NULL),
+                    qs_last_execution = CONVERT(datetime2, NULL),
+                    qs_priority_boost = CONVERT(bigint, 0),
+                    is_published = ISNULL(t.is_published, 0),
+                    is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
+                    temporal_type = ISNULL(t.temporal_type, 0),
+                    priority = ROW_NUMBER() OVER (ORDER BY ISNULL(sp.modification_counter, 0) DESC, s.object_id ASC, s.stats_id ASC)
+                FROM sys.stats AS s
+                JOIN sys.objects AS o ON o.object_id = s.object_id
+                LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
+                CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+                OUTER APPLY (
+                    SELECT total_pages = SUM(p.used_page_count)
+                    FROM sys.dm_db_partition_stats AS p
+                    WHERE p.object_id = s.object_id AND p.index_id IN (0, 1)
+                ) AS pgs
+                WHERE ISNULL(sp.modification_counter, 0) > 0
+                AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
+                       OR (o.type = N''V'' AND @IncludeSystemObjects_param = N''Y''))
+                AND   (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
+                AND   o.type NOT IN (N''ET'', N''S'')
+                AND   (
+                          (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
+                       OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
+                       OR @TargetNorecompute_param = N''BOTH''
+                      )
+                AND   NOT EXISTS (
+                    SELECT 1 FROM #stats_to_process AS stp
+                    WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
+                    AND   stp.object_id = s.object_id
+                    AND   stp.stats_id = s.stats_id
+                )
+                AND   NOT EXISTS (
+                    SELECT 1 FROM dbo.CommandLog AS cl
+                    WHERE cl.CommandType = N''UPDATE_STATISTICS''
+                    AND   cl.DatabaseName = DB_NAME() COLLATE DATABASE_DEFAULT
+                    AND   cl.SchemaName = OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT
+                    AND   cl.ObjectName = OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT
+                    AND   cl.StatisticsName = s.name COLLATE DATABASE_DEFAULT
+                    AND   cl.StartTime >= @start_time_param
+                    AND   cl.ErrorNumber = 0
+                )
+                ORDER BY priority
+                OPTION (RECOMPILE);';
+
+                SET @mop_up_params = N'
+                    @IncludeSystemObjects_param nvarchar(1),
+                    @TargetNorecompute_param nvarchar(10),
+                    @start_time_param datetime2(7)';
+
+                BEGIN TRY
+                    INSERT INTO #stats_to_process
+                    (
+                        database_name, schema_name, table_name, stat_name, object_id, stats_id,
+                        no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created,
+                        modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
+                        has_filter, filter_definition, unfiltered_rows,
+                        qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
+                        qs_total_logical_reads, qs_last_execution, qs_priority_boost,
+                        is_published, is_tracked_by_cdc, temporal_type, priority
+                    )
+                    EXECUTE sys.sp_executesql
+                        @mop_up_sql,
+                        @mop_up_params,
+                        @IncludeSystemObjects_param = @IncludeSystemObjects,
+                        @TargetNorecompute_param = @TargetNorecompute,
+                        @start_time_param = @start_time;
+                END TRY
+                BEGIN CATCH
+                    IF @Debug = 1
+                    BEGIN
+                        DECLARE @mop_up_err_s nvarchar(500) = ERROR_MESSAGE();
+                        RAISERROR(N'  Mop-up discovery warning (%s): %s', 10, 1, @mop_up_db, @mop_up_err_s) WITH NOWAIT;
+                    END;
+                END CATCH;
+
+                SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list_s WHERE idx > @mop_up_db_idx;
+            END;
+
+            SET @mop_up_found = (SELECT COUNT(*) FROM #stats_to_process WHERE processed = 0);
+
+            IF @mop_up_found > 0
+            BEGIN
+                SET @total_stats = @total_stats + @mop_up_found;
+                SET @stop_reason = NULL;
+                SET @in_mop_up = 1;
+                SET @mop_up_stats_found = @mop_up_found;
+                SET @mop_up_stats_processed = @stats_processed;
+
+                RAISERROR(N'Mop-up: found %d additional stats with modifications (ordered by modification_counter DESC)', 10, 1, @mop_up_found) WITH NOWAIT;
+                RAISERROR(N'', 10, 1) WITH NOWAIT;
+                RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                RAISERROR(N' Processing Mop-Up Statistics', 10, 1) WITH NOWAIT;
+                RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                RAISERROR(N'', 10, 1) WITH NOWAIT;
+
+                GOTO ProcessLoop;
+            END
+            ELSE
+            BEGIN
+                RAISERROR(N'Mop-up: no additional stats found with modifications.  All stats are current.', 10, 1) WITH NOWAIT;
+            END;
         END;
     END;
     /*#endregion 19B-MOP-UP */
