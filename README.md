@@ -18,6 +18,7 @@
 | NORECOMPUTE orphans | `@TargetNorecompute = 'Y'` - finds and refreshes them |
 | Large stats that never finish | `@LongRunningThresholdMinutes` - auto-reduce sample rate |
 | Query Store knows what's hot | `@QueryStorePriority = 'Y'` - prioritize by CPU/reads |
+| QS enrichment too slow | `@QueryStoreTopPlans = 200` - parse only top N plans |
 | Cascading failures | `@MaxConsecutiveFailures` - stops after N failures |
 | AG secondary falls behind | `@MaxAGRedoQueueMB` - pauses when redo queue is deep |
 | tempdb pressure during FULLSCAN | `@MinTempdbFreeMB` - checks before each stat update |
@@ -90,10 +91,21 @@ EXEC dbo.sp_StatUpdate
 EXEC dbo.sp_StatUpdate
     @Databases = N'Production',
     @QueryStorePriority = N'Y',
-    @QueryStoreMetric = N'CPU',           -- Or DURATION, READS
+    @QueryStoreMetric = N'CPU',           -- Or DURATION, READS, EXECUTIONS, AVG_CPU
+    @SortOrder = N'QUERY_STORE',
+    @TimeLimit = 3600;
+
+-- Large QS catalog? Limit XML plan parsing to top 200 plans by CPU
+EXEC dbo.sp_StatUpdate
+    @Databases = N'Production',
+    @QueryStorePriority = N'Y',
+    @QueryStoreMetric = N'CPU',
+    @QueryStoreTopPlans = 200,            -- Default 500. NULL = unlimited
     @SortOrder = N'QUERY_STORE',
     @TimeLimit = 3600;
 ```
+
+**Performance note:** Phase 6 (QS enrichment) parses plan XML to find table references. On databases with 10,000+ QS plans, this can take minutes. `@QueryStoreTopPlans` limits XML parsing to the most impactful plans. The proc also skips Phase 6 entirely when QS has no recent runtime stats within `@QueryStoreRecentHours`.
 
 ### NORECOMPUTE Stats Refresh
 
@@ -226,6 +238,7 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operatio
 | `@QueryStoreMetric` | `'CPU'` | `CPU`, `DURATION`, `READS`, `EXECUTIONS`, or `AVG_CPU` |
 | `@QueryStoreMinExecutions` | `100` | Minimum plan executions to boost |
 | `@QueryStoreRecentHours` | `168` | Only consider plans from last N hours |
+| `@QueryStoreTopPlans` | `500` | Max plans to XML-parse for table references. `NULL` = unlimited. Lower values reduce Phase 6 overhead on large QS catalogs (v2.23+) |
 | `@GroupByJoinPattern` | `'Y'` | Update joined tables together (prevents optimization cliffs) |
 
 ### Adaptive Sampling
@@ -387,7 +400,7 @@ Returns 2 result sets:
 | RS | Name | What It Shows |
 |----|------|---------------|
 | 1 | **Executive Dashboard** | A-F letter grades for Overall, Completion, Reliability, Speed, and Workload Focus |
-| 2 | **Recommendations** | Severity-categorized findings with fix-it SQL |
+| 2 | **Recommendations** | Severity-categorized findings with fix-it SQL. Includes I10: a synthesized `EXEC sp_StatUpdate` call tuned to your environment |
 
 Example dashboard output:
 
@@ -725,6 +738,7 @@ Cross-server analysis detects version skew and parameter inconsistencies.
 | INFO | I6 | QS efficacy: "10 of 10 highest-workload stats updated in first 1 minute" |
 | INFO | I7 | QS inflection: before/after comparison when QS prioritization was enabled |
 | INFO | I8 | QS performance trend: per-stat CPU correlation across runs |
+| INFO | I10 | Recommended configuration: synthesized EXEC call based on diagnostic findings |
 
 ### Diag Parameter Reference
 
@@ -762,6 +776,9 @@ Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and lo
 
 ## Version History
 
+- **2.23.2026.0324** - New: `@QueryStoreTopPlans` (default 500) limits XML plan parsing to top N plans by metric, dramatically reducing Phase 6 overhead on large QS catalogs. Early bail-out skips Phase 6 entirely when QS has no recent runtime stats. Both staged and legacy discovery paths.
+- **2.22.2026.0320** - 7 issues: AscendingKeyBoost SEQUENCE+datetime detection, CE QUERY_OPTIMIZER_HOTFIXES, APC awareness, low sample rate warning, @StopByTime overshoot warning, cursor-to-set-based conversions, gated per-stat forced plan check.
+- **Diag 2026.03.23.1** - I10 RECOMMENDED_CONFIG: diagnostic tool now synthesizes a single recommended `EXEC sp_StatUpdate` call based on findings, parameter history, and safeguards. Handles @StatsInParallel/@GroupByJoinPattern mutual exclusion.
 - **2.16.2026.0308** - QS Efficacy Trending + Executive Dashboard. sp_StatUpdate: ProcessingPosition in per-stat ExtendedInfo XML. Diag: @ExpertMode (management vs DBA view), @SkipHistory, persistent StatUpdateDiagHistory table, Executive Dashboard with A-F grades, RS 13 QS Performance Correlation (per-stat CPU trend), I6/I7/I8 checks for QS efficacy/inflection/performance correlation. 13 result sets total. @EfficacyDaysBack, @EfficacyDetailDays parameters. 122 tests.
 - **2.14.2026.0304** - Bulk issue resolution (42 issues). New: @OrphanedRunThresholdHours. AG/safety guards, warnings, discovery improvements. See CLAUDE.md for full details.
 - **2.8.2026.0302** - Comprehensive issue sweep (31 issues resolved). New params: @IncludeIndexedViews, @LogSkippedToCommandLog, @ReturnDetailedResults, @CompletionNotifyTable. Detection: QS forced plan warning, RLS, wide stats, columnstore context, filtered index mismatch, computed columns, Stretch DB skip, log space check. Azure MI vs DB distinction. 12-topic @Help operational notes.
@@ -792,7 +809,7 @@ Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and lo
 - Priority ordering (worst stats first)
 - Time-limited runs with graceful stops
 - NORECOMPUTE targeting
-- Query Store-driven prioritization
+- Query Store-driven prioritization (with tunable plan parsing overhead)
 - Adaptive sampling for problematic stats
 - AG-safe maintenance with redo queue awareness
 - Programmatic access to results via OUTPUT parameters
