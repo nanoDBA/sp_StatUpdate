@@ -36,11 +36,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.22.2026.03.20 (Major.Minor.YYYY.MM.DD)
+Version:    2.23.2026.03.24 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.22.2026.03.20 - 7 issues: AscendingKeyBoost SEQUENCE+datetime detection (#277),
+History:    2.23.2026.03.24 - @QueryStoreTopPlans param (default 500): limits XML plan parsing
+                            to top N plans by metric.  Early bail-out skips Phase 6 entirely
+                            when QS has no recent runtime stats.  Both staged and legacy paths.
+            2.22.2026.03.20 - 7 issues: AscendingKeyBoost SEQUENCE+datetime detection (#277),
                             CE QUERY_OPTIMIZER_HOTFIXES + LEGACY_CE override (#298),
                             APC awareness for forced plan warning (#301), low sample rate
                             warning (#281), @StopByTime overshoot warning (#333), cursor-to-
@@ -515,6 +518,7 @@ ALTER PROCEDURE
     @QueryStoreMetric nvarchar(20) = N'CPU', /*resource metric for priority: CPU (total CPU ms, default), DURATION (elapsed time), READS (logical I/O), EXECUTIONS (count), AVG_CPU (total_cpu_ms/execution_count - favors expensive single-execution queries over frequent cheap ones)*/
     @QueryStoreMinExecutions bigint = 100, /*minimum plan executions to boost priority*/
     @QueryStoreRecentHours integer = 168, /*plans executed in last N hours (default: 7 days). Intentionally short - recent query activity more relevant than 30-day history*/
+    @QueryStoreTopPlans integer = 500, /*max plans to XML-parse for table references.  NULL = unlimited (parse all).  Lower values reduce Phase 6 overhead on large QS catalogs at the cost of potentially missing low-CPU plan references.  Top N selected by @QueryStoreMetric.*/
 
     /*
     ============================================================================
@@ -659,8 +663,8 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.22.2026.03.20',
-        @procedure_version_date datetime = '20260320',
+        @procedure_version varchar(20) = '2.23.2026.03.24',
+        @procedure_version_date datetime = '20260324',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -815,6 +819,8 @@ BEGIN
                     THEN N'minimum plan executions to boost priority (default 100)'
                     WHEN N'@QueryStoreRecentHours'
                     THEN N'only consider plans executed in last N hours (default 168 = 7 days)'
+                    WHEN N'@QueryStoreTopPlans'
+                    THEN N'max query plans to XML-parse for table references during Phase 6 discovery (default 500). NULL = unlimited.  Reduces overhead on large QS catalogs.  Top N selected by @QueryStoreMetric.'
                     WHEN N'@DelayBetweenStats'
                     THEN N'seconds to wait between stats updates (pacing)'
                     WHEN N'@LongRunningThresholdMinutes'
@@ -951,6 +957,7 @@ BEGIN
                     WHEN N'@FilteredStatsStaleFactor' THEN N'0.1-N (ratio of unfiltered/filtered rows)'
                     WHEN N'@QueryStoreMinExecutions' THEN N'1-N (plan execution count floor)'
                     WHEN N'@QueryStoreRecentHours' THEN N'1-N hours'
+                    WHEN N'@QueryStoreTopPlans' THEN N'NULL (unlimited), 1-N (default 500)'
                     WHEN N'@JoinPatternMinExecutions' THEN N'1-N (default 100)'
                     WHEN N'@StatisticsSample' THEN N'NULL, 1-100 (100 = FULLSCAN)'
                     WHEN N'@MaxDOP' THEN N'NULL (server default), 0-N'
@@ -1062,6 +1069,8 @@ BEGIN
                     THEN N'100'
                     WHEN N'@QueryStoreRecentHours'
                     THEN N'168 (7 days)'
+                    WHEN N'@QueryStoreTopPlans'
+                    THEN N'500'
                     WHEN N'@DelayBetweenStats'
                     THEN N'NULL'
                     WHEN N'@LongRunningThresholdMinutes'
@@ -3893,8 +3902,12 @@ ORDER BY TotalStatUpdates DESC;')
         RAISERROR(N'  @QueryStoreMetric        = %s', 10, 1, @QueryStoreMetric) WITH NOWAIT;
         RAISERROR(N'  @QueryStoreMinExecutions = %I64d', 10, 1, @QueryStoreMinExecutions) WITH NOWAIT;
         RAISERROR(N'  @QueryStoreRecentHours   = %d', 10, 1, @QueryStoreRecentHours) WITH NOWAIT;
+        IF @QueryStoreTopPlans IS NOT NULL
+            RAISERROR(N'  @QueryStoreTopPlans      = %d', 10, 1, @QueryStoreTopPlans) WITH NOWAIT;
+        ELSE
+            RAISERROR(N'  @QueryStoreTopPlans      = NULL (unlimited)', 10, 1) WITH NOWAIT;
 
-        /* #189: Pre-run QS READ_ONLY warning — alert DBA before discovery, not after */
+        /* #189: Pre-run QS READ_ONLY warning -- alert DBA before discovery, not after */
         DECLARE @qs_readonly_count int = 0;
         SELECT @qs_readonly_count = COUNT(*)
         FROM @tmpDatabases AS td
@@ -4296,6 +4309,7 @@ ORDER BY TotalStatUpdates DESC;')
                     @QueryStoreMetric AS QueryStoreMetric,
                     @QueryStoreMinExecutions AS QueryStoreMinExecutions,
                     @QueryStoreRecentHours AS QueryStoreRecentHours,
+                    @QueryStoreTopPlans AS QueryStoreTopPlans,
 
                     /* Update behavior */
                     @StatisticsSample AS StatisticsSample,
@@ -5879,7 +5893,7 @@ OPTION (RECOMPILE);';
                     FIX #271: Plan XML table extraction for QS enrichment.
                     Previous approach joined on qsq.object_id (the MODULE id for stored
                     procs/functions) to #stat_candidates.object_id (the TABLE id from
-                    sys.stats). These are different domains — the join produced zero
+                    sys.stats).  These are different domains -- the join produced zero
                     matches for all workload types (ad-hoc, ORM, stored proc).
                     Now we parse plan XML to find which tables each QS plan references.
                     */
@@ -5887,23 +5901,55 @@ OPTION (RECOMPILE);';
                     /* Initialize qs_priority_boost to 0 for all rows first */
                     UPDATE #stat_candidates SET qs_priority_boost = 0;
 
-                    /* Step 1: Extract table references from QS plans in the time window.
-                       Step 2: Filter to only tables we have stat candidates for.
-                       Step 3: Aggregate runtime stats per table object_id. */
-                    ;WITH PlanTableRefs AS (
-                        SELECT DISTINCT
-                            qsp.plan_id,
-                            PARSENAME(ref.value(''@Schema'',  ''sysname''), 1) AS ref_schema,
-                            PARSENAME(ref.value(''@Table'',   ''sysname''), 1) AS ref_table
+                    /*#region PHASE-6-EARLY-BAILOUT */
+                    /* Early bail-out: skip XML parsing if QS has no recent runtime data */
+                    IF NOT EXISTS (
+                        SELECT 1 FROM sys.query_store_runtime_stats_interval
+                        WHERE end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+                    )
+                    BEGIN
+                        IF @Debug_param = 1
+                            RAISERROR(N''    Phase 6: skipped -- no QS runtime stats in last %d hours'', 10, 1, @QueryStoreRecentHours_param) WITH NOWAIT;
+                    END
+                    ELSE
+                    BEGIN
+                    /*#endregion PHASE-6-EARLY-BAILOUT */
+
+                    /*#region PHASE-6-QS-ENRICHMENT */
+                    /* Step 1: Rank plans by @QueryStoreMetric, take TOP N for XML parsing.
+                       Step 2: Extract table references from plan XML.
+                       Step 3: Filter to only tables we have stat candidates for.
+                       Step 4: Aggregate runtime stats per table object_id. */
+                    ;WITH TopPlanIds AS (
+                        SELECT TOP (ISNULL(@QueryStoreTopPlans_param, 2147483647))
+                            qsp.plan_id
                         FROM sys.query_store_plan AS qsp
                         JOIN sys.query_store_runtime_stats AS qsrs
                             ON qsrs.plan_id = qsp.plan_id
                         JOIN sys.query_store_runtime_stats_interval AS qsrsi
                             ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
+                        WHERE qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+                        GROUP BY qsp.plan_id
+                        ORDER BY CASE @QueryStoreMetric_param
+                            WHEN N''CPU''        THEN SUM(qsrs.avg_cpu_time * qsrs.count_executions)
+                            WHEN N''DURATION''    THEN SUM(qsrs.avg_duration * qsrs.count_executions)
+                            WHEN N''READS''       THEN SUM(CONVERT(float, qsrs.avg_logical_io_reads * qsrs.count_executions))
+                            WHEN N''EXECUTIONS''  THEN SUM(CONVERT(float, qsrs.count_executions))
+                            WHEN N''AVG_CPU''     THEN SUM(qsrs.avg_cpu_time * qsrs.count_executions)
+                            ELSE SUM(qsrs.avg_cpu_time * qsrs.count_executions)
+                        END DESC
+                    ),
+                    PlanTableRefs AS (
+                        SELECT DISTINCT
+                            tpi.plan_id,
+                            PARSENAME(ref.value(''@Schema'',  ''sysname''), 1) AS ref_schema,
+                            PARSENAME(ref.value(''@Table'',   ''sysname''), 1) AS ref_table
+                        FROM TopPlanIds AS tpi
+                        JOIN sys.query_store_plan AS qsp
+                            ON qsp.plan_id = tpi.plan_id
                         CROSS APPLY (SELECT TRY_CONVERT(xml, qsp.query_plan)) AS x(plan_xml)
                         CROSS APPLY x.plan_xml.nodes(''//*:Object'') AS t(ref)
-                        WHERE qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
-                          AND x.plan_xml IS NOT NULL
+                        WHERE x.plan_xml IS NOT NULL
                           AND ref.value(''@Table'', ''sysname'') IS NOT NULL
                     ),
                     FilteredRefs AS (
@@ -5955,7 +6001,9 @@ OPTION (RECOMPILE);';
                             END
                     FROM #stat_candidates AS sc
                     INNER JOIN QSByTable AS qs ON qs.object_id = sc.object_id;
-                END;
+                    END; /* ELSE from early bail-out */
+                    /*#endregion PHASE-6-QS-ENRICHMENT */
+                END; /* IF @QueryStorePriority AND QS enabled */
 
                 SET @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
                 IF @Debug_param = 1
@@ -6086,6 +6134,7 @@ OPTION (RECOMPILE);';
                       @SkipTablesWithColumnstore_param nchar(1),
                       @IncludeIndexedViews_param nvarchar(1),
                       @AscendingKeyBoost_param nvarchar(1),
+                      @QueryStoreTopPlans_param integer,
                       @Debug_param bit',
                     @SortOrder_param = @SortOrder,
                     @TargetNorecompute_param = @TargetNorecompute,
@@ -6109,6 +6158,7 @@ OPTION (RECOMPILE);';
                     @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore,
                     @IncludeIndexedViews_param = @IncludeIndexedViews,
                     @AscendingKeyBoost_param = @AscendingKeyBoost,
+                    @QueryStoreTopPlans_param = @QueryStoreTopPlans,
                     @Debug_param = @Debug;
             END; /* End of staged discovery */
 
@@ -6177,20 +6227,47 @@ OPTION (RECOMPILE);';
         IF @QueryStorePriority_param = N''Y''
         AND EXISTS (SELECT 1 FROM sys.database_query_store_options WHERE actual_state IN (1, 2))
         BEGIN
-            ;WITH PlanTableRefs AS (
-                SELECT DISTINCT
-                    qsp.plan_id,
-                    PARSENAME(ref.value(''@Schema'', ''sysname''), 1) AS ref_schema,
-                    PARSENAME(ref.value(''@Table'',  ''sysname''), 1) AS ref_table
+            /* Early bail-out: skip XML parsing if QS has no recent runtime data */
+            IF NOT EXISTS (
+                SELECT 1 FROM sys.query_store_runtime_stats_interval
+                WHERE end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+            )
+            BEGIN
+                /* No recent QS data -- skip enrichment entirely */
+                SET @QueryStorePriority_param = N''N'';
+            END
+            ELSE
+            BEGIN
+            ;WITH TopPlanIds AS (
+                SELECT TOP (ISNULL(@QueryStoreTopPlans_param, 2147483647))
+                    qsp.plan_id
                 FROM sys.query_store_plan AS qsp
                 JOIN sys.query_store_runtime_stats AS qsrs
                     ON qsrs.plan_id = qsp.plan_id
                 JOIN sys.query_store_runtime_stats_interval AS qsrsi
                     ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
+                WHERE qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+                GROUP BY qsp.plan_id
+                ORDER BY CASE @QueryStoreMetric_param
+                    WHEN N''CPU''        THEN SUM(qsrs.avg_cpu_time * qsrs.count_executions)
+                    WHEN N''DURATION''    THEN SUM(qsrs.avg_duration * qsrs.count_executions)
+                    WHEN N''READS''       THEN SUM(CONVERT(float, qsrs.avg_logical_io_reads * qsrs.count_executions))
+                    WHEN N''EXECUTIONS''  THEN SUM(CONVERT(float, qsrs.count_executions))
+                    WHEN N''AVG_CPU''     THEN SUM(qsrs.avg_cpu_time * qsrs.count_executions)
+                    ELSE SUM(qsrs.avg_cpu_time * qsrs.count_executions)
+                END DESC
+            ),
+            PlanTableRefs AS (
+                SELECT DISTINCT
+                    tpi.plan_id,
+                    PARSENAME(ref.value(''@Schema'', ''sysname''), 1) AS ref_schema,
+                    PARSENAME(ref.value(''@Table'',  ''sysname''), 1) AS ref_table
+                FROM TopPlanIds AS tpi
+                JOIN sys.query_store_plan AS qsp
+                    ON qsp.plan_id = tpi.plan_id
                 CROSS APPLY (SELECT TRY_CONVERT(xml, qsp.query_plan)) AS x(plan_xml)
                 CROSS APPLY x.plan_xml.nodes(''//*:Object'') AS t(ref)
-                WHERE qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
-                  AND x.plan_xml IS NOT NULL
+                WHERE x.plan_xml IS NOT NULL
                   AND ref.value(''@Table'', ''sysname'') IS NOT NULL
             ),
             FilteredRefs AS (
@@ -6222,6 +6299,7 @@ OPTION (RECOMPILE);';
             WHERE qsrsi2.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
             GROUP BY fr.table_object_id
             HAVING SUM(qsrs2.count_executions) > 0;
+            END; /* ELSE from early bail-out */
         END;
 
         SELECT
@@ -6659,7 +6737,8 @@ OPTION (RECOMPILE);';
                 @QueryStoreRecentHours_param integer,
                 @SkipTablesWithColumnstore_param nchar(1),
                 @IncludeIndexedViews_param nvarchar(1),
-                @AscendingKeyBoost_param nvarchar(1)';
+                @AscendingKeyBoost_param nvarchar(1),
+                @QueryStoreTopPlans_param integer';
 
         /*
         Execute discovery in target database
@@ -6723,7 +6802,8 @@ OPTION (RECOMPILE);';
                 @QueryStoreRecentHours_param = @QueryStoreRecentHours,
                 @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore,
                 @IncludeIndexedViews_param = @IncludeIndexedViews,
-                @AscendingKeyBoost_param = @AscendingKeyBoost;
+                @AscendingKeyBoost_param = @AscendingKeyBoost,
+                @QueryStoreTopPlans_param = @QueryStoreTopPlans;
 
             END; /* End of legacy discovery (explicit or fallback) */
 
