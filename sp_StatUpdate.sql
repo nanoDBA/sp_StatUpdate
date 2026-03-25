@@ -36,11 +36,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.25.2026.03.24 (Major.Minor.YYYY.MM.DD)
+Version:    2.26.2026.03.25 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.25.2026.03.24 - @MopUpPass + @StatsInParallel compatibility: removed mutual
+History:    2.26.2026.03.25 - fix: @StopByTime HHMM format (e.g., '0500') silently parsed
+                            as midnight by CONVERT(time).  Now normalizes HHMM to HH:MM
+                            and HHMMSS to HH:MM:SS before conversion.
+            2.25.2026.03.24 - @MopUpPass + @StatsInParallel compatibility: removed mutual
                             exclusion.  First worker to finish runs mop-up discovery under
                             applock, populates QueueStatistic with mop-up tables; all workers
                             then claim and process them via the normal parallel queue.  Lazy
@@ -557,7 +560,7 @@ ALTER PROCEDURE
     ============================================================================
     */
     @TimeLimit integer = 3600, /*seconds (default: 1 hour, NULL = unlimited)*/
-    @StopByTime nvarchar(8) = NULL, /*absolute wall-clock stop time (format: HH:MM or HH:MM:SS). Computes remaining seconds from now to specified time today. Overrides @TimeLimit when specified.*/
+    @StopByTime nvarchar(8) = NULL, /*absolute wall-clock stop time (format: HHMM, HH:MM, or HH:MM:SS).  Computes remaining seconds from now to specified time today.  Overrides @TimeLimit when specified.*/
     @MaxSecondsPerStat int = NULL, /*P2c fix (v2.4): When @StopByTime/@TimeLimit is set, check CommandLog history. If estimated duration for a stat exceeds both this cap AND remaining seconds, skip with warning. NULL = no per-stat cap. Only skips if CommandLog history exists (conservative).*/
     @BatchLimit integer = NULL, /*max stats to update per run*/
     @SortOrder nvarchar(50) = N'MODIFICATION_COUNTER', /*priority: MODIFICATION_COUNTER, DAYS_STALE, RANDOM, PAGE_COUNT, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED*/
@@ -678,8 +681,8 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.25.2026.03.24',
-        @procedure_version_date datetime = '20260324',
+        @procedure_version varchar(20) = '2.26.2026.03.25',
+        @procedure_version_date datetime = '20260325',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -876,7 +879,7 @@ BEGIN
                     WHEN N'@PersistSampleMinRows'
                     THEN N'minimum absolute sampled rows before RESAMPLE_PERSIST fires. If row_count * persisted_pct% < this value, RESAMPLE is skipped to avoid low-quality histograms. NULL = no floor check. Default 1000000.'
                     WHEN N'@StopByTime'
-                    THEN N'wall-clock stop time (HH:MM or HH:MM:SS). Computes remaining seconds from now to specified time today and uses as @TimeLimit. Overrides @TimeLimit when specified.'
+                    THEN N'wall-clock stop time (HHMM, HH:MM, or HH:MM:SS).  Computes remaining seconds from now to specified time today and uses as @TimeLimit.  Overrides @TimeLimit when specified.'
                     WHEN N'@SkipTablesWithColumnstore'
                     THEN N'Y = skip tables with nonclustered/clustered columnstore indexes (type 5/6 in sys.indexes). Use when plan stability is critical — updating rowstore stats alongside NCCIs may change batch mode execution plans.'
                     WHEN N'@TemporalCoSchedule'
@@ -988,7 +991,7 @@ BEGIN
                     WHEN N'@MaxGrantPercent' THEN N'NULL (server default), 0.01-100'
                     WHEN N'@UpdateIncremental' THEN N'0, 1'
                     WHEN N'@TimeLimit' THEN N'NULL (unlimited), 1-N seconds'
-                    WHEN N'@StopByTime' THEN N'NULL, HH:MM (e.g., 05:00, 23:59)'
+                    WHEN N'@StopByTime' THEN N'NULL, HHMM or HH:MM (e.g., 0500, 05:00, 23:59)'
                     WHEN N'@BatchLimit' THEN N'NULL (no limit), 1-N stats'
                     WHEN N'@DelayBetweenStats' THEN N'NULL, 1-N seconds'
                     WHEN N'@LongRunningThresholdMinutes' THEN N'NULL (disabled), 1-N minutes'
@@ -2383,6 +2386,17 @@ ORDER BY TotalStatUpdates DESC;')
     */
     IF @StopByTime IS NOT NULL
     BEGIN
+        /* Normalize HHMM to HH:MM (e.g., '0500' -> '05:00').
+           CONVERT(time, '0500') silently parses as 00:00:00, not 05:00:00. */
+        IF  LEN(@StopByTime) = 4
+        AND @StopByTime LIKE N'[0-9][0-9][0-9][0-9]'
+            SET @StopByTime = LEFT(@StopByTime, 2) + N':' + RIGHT(@StopByTime, 2);
+
+        /* Normalize HHMMSS to HH:MM:SS */
+        IF  LEN(@StopByTime) = 6
+        AND @StopByTime LIKE N'[0-9][0-9][0-9][0-9][0-9][0-9]'
+            SET @StopByTime = LEFT(@StopByTime, 2) + N':' + SUBSTRING(@StopByTime, 3, 2) + N':' + RIGHT(@StopByTime, 2);
+
         BEGIN TRY
             DECLARE
                 @stopby_time time(0) = CONVERT(time(0), @StopByTime),
@@ -2870,7 +2884,7 @@ ORDER BY TotalStatUpdates DESC;')
     END;
 
     /*
-    Validate @StopByTime format (HH:MM or HH:MM:SS)
+    Validate @StopByTime format (HHMM, HH:MM, or HH:MM:SS)
     */
     IF @StopByTime IS NOT NULL
     BEGIN
@@ -2886,7 +2900,7 @@ ORDER BY TotalStatUpdates DESC;')
             )
             SELECT
                 error_message =
-                    N'@StopByTime value ''' + @StopByTime + N''' is not a valid time format. Use HH:MM or HH:MM:SS (e.g., ''05:00'' or ''05:00:00'').',
+                    N'@StopByTime value ''' + @StopByTime + N''' is not a valid time format. Use HHMM, HH:MM, or HH:MM:SS (e.g., ''0500'', ''05:00'', or ''05:00:00'').',
                 error_severity = 16;
         END CATCH;
     END;
