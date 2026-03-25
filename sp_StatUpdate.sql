@@ -43,6 +43,14 @@ Version:    2.26.2026.03.25 (Major.Minor.YYYY.MM.DD)
 History:    2.26.2026.03.25 - fix: @StopByTime HHMM format (e.g., '0500') silently parsed
                             as midnight by CONVERT(time).  Now normalizes HHMM to HH:MM
                             and HHMMSS to HH:MM:SS before conversion.
+                            Parallel discovery skip: workers joining an active queue skip
+                            the full 6-phase discovery, relying on lazy per-table discovery
+                            when claiming tables.  Eliminates redundant multi-minute
+                            discovery across parallel workers.
+                            Forced plan check (#32): time-limit guard skips post-run QS
+                            check when past deadline.  Early-out when database has zero
+                            forced plans avoids expensive CHARINDEX scan.  30s LOCK_TIMEOUT
+                            prevents indefinite blocking on QS DMVs.
             2.25.2026.03.24 - @MopUpPass + @StatsInParallel compatibility: removed mutual
                             exclusion.  First worker to finish runs mop-up discovery under
                             applock, populates QueueStatistic with mop-up tables; all workers
@@ -5248,13 +5256,68 @@ OPTION (RECOMPILE);';
     END;
     /*#endregion 15-DIRECT-MODE */
 
+    /*
+    ============================================================================
+    PARALLEL DISCOVERY SKIP (v2.26)
+    ============================================================================
+    In parallel mode, check if a matching queue with work items already exists
+    BEFORE running expensive 6-phase discovery.  If so, skip discovery entirely
+    and rely on lazy per-table discovery when claiming tables from QueueStatistic.
+    Eliminates redundant multi-minute discovery across all parallel workers.
+    */
+    DECLARE @skip_discovery bit = 0;
+
+    IF  @StatsInParallel = N'Y'
+    AND @mode = N'DISCOVERY'
+    AND OBJECT_ID(N'dbo.Queue', N'U') IS NOT NULL
+    AND OBJECT_ID(N'dbo.QueueStatistic', N'U') IS NOT NULL
+    BEGIN
+        /* Build @parameters_string early for queue lookup (same logic as region 18) */
+        SELECT
+            @parameters_string =
+                N'@Databases=' + ISNULL(LTRIM(RTRIM(@Databases)), N'') +
+                N',@Tables=' + ISNULL(LTRIM(RTRIM(@Tables)), N'') +
+                N',@TargetNorecompute=' + ISNULL(LTRIM(RTRIM(@TargetNorecompute)), N'') +
+                N',@ModificationThreshold=' + ISNULL(CONVERT(nvarchar(20), @ModificationThreshold), N'') +
+                N',@MinPageCount=' + ISNULL(CONVERT(nvarchar(20), @MinPageCount), N'') +
+                N',@IncludeSystemObjects=' + ISNULL(LTRIM(RTRIM(@IncludeSystemObjects)), N'') +
+                N',@SortOrder=' + ISNULL(LTRIM(RTRIM(@SortOrder)), N'');
+
+        /* Check if a matching queue has unclaimed work items */
+        SELECT
+            @queue_id = q.QueueID
+        FROM dbo.Queue AS q
+        WHERE q.SchemaName = N'dbo'
+        AND   q.ObjectName = N'sp_StatUpdate'
+        AND   q.Parameters = @parameters_string;
+
+        IF  @queue_id IS NOT NULL
+        AND EXISTS
+            (
+                SELECT
+                    1
+                FROM dbo.QueueStatistic AS qs
+                WHERE qs.QueueID = @queue_id
+                AND   qs.TableEndTime IS NULL
+            )
+        BEGIN
+            SET @skip_discovery = 1;
+            RAISERROR(N'Parallel mode: Active queue found (QueueID = %d) -- skipping redundant discovery.', 10, 1, @queue_id) WITH NOWAIT;
+        END
+        ELSE
+        BEGIN
+            /* No active queue -- reset @queue_id so region 18 creates it normally */
+            SET @queue_id = NULL;
+        END;
+    END;
+
     /*#region 16-DISCOVERY: Mode 2: Staged and legacy discovery */
     /*
     ============================================================================
     MODE 2: DISCOVERY - DMV-based candidate selection
     ============================================================================
     */
-    IF @mode = N'DISCOVERY'
+    IF @mode = N'DISCOVERY' AND @skip_discovery = 0
     BEGIN
         RAISERROR(N'Discovering qualifying statistics via DMV...', 10, 1) WITH NOWAIT;
 
@@ -7623,13 +7686,37 @@ OPTION (RECOMPILE);';
     REPORT DISCOVERED STATISTICS
     ============================================================================
     */
+    IF @skip_discovery = 1
+    BEGIN
+        /* Worker skipped discovery -- get stats count from QueueStatistic */
+        DECLARE @qs_total_stats integer = 0;
+        SELECT
+            @qs_total_stats = ISNULL(SUM(qs.StatsCount), 0)
+        FROM dbo.QueueStatistic AS qs
+        WHERE qs.QueueID = @queue_id
+        AND   qs.TableEndTime IS NULL;
+
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(N'Queue has ~%d stats across unclaimed tables (skipped local discovery).', 10, 1, @qs_total_stats) WITH NOWAIT;
+    END;
+
     DECLARE
         @total_stats integer =
+        CASE WHEN @skip_discovery = 1
+        THEN
+        (
+            SELECT ISNULL(SUM(qs.StatsCount), 0)
+            FROM dbo.QueueStatistic AS qs
+            WHERE qs.QueueID = @queue_id
+            AND   qs.TableEndTime IS NULL
+        )
+        ELSE
         (
             SELECT
                 COUNT_BIG(*)
             FROM #stats_to_process
-        ),
+        )
+        END,
         @norecompute_stats integer =
         (
             SELECT
@@ -7666,17 +7753,20 @@ OPTION (RECOMPILE);';
             WHERE stp.persisted_sample_percent IS NOT NULL
         );
 
-    RAISERROR(N'', 10, 1) WITH NOWAIT;
-    RAISERROR(N'Found %d qualifying statistics:', 10, 1, @total_stats) WITH NOWAIT;
-    RAISERROR(N'  - NORECOMPUTE:      %d', 10, 1, @norecompute_stats) WITH NOWAIT;
-    RAISERROR(N'  - Incremental:      %d', 10, 1, @incremental_stats) WITH NOWAIT;
-    RAISERROR(N'  - On heaps:         %d', 10, 1, @heap_stats) WITH NOWAIT;
-    RAISERROR(N'  - Memory-optimized: %d', 10, 1, @memory_optimized_stats) WITH NOWAIT;
-    RAISERROR(N'  - Persisted sample: %d', 10, 1, @persisted_sample_stats) WITH NOWAIT;
+    IF @skip_discovery = 0
+    BEGIN
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(N'Found %d qualifying statistics:', 10, 1, @total_stats) WITH NOWAIT;
+        RAISERROR(N'  - NORECOMPUTE:      %d', 10, 1, @norecompute_stats) WITH NOWAIT;
+        RAISERROR(N'  - Incremental:      %d', 10, 1, @incremental_stats) WITH NOWAIT;
+        RAISERROR(N'  - On heaps:         %d', 10, 1, @heap_stats) WITH NOWAIT;
+        RAISERROR(N'  - Memory-optimized: %d', 10, 1, @memory_optimized_stats) WITH NOWAIT;
+        RAISERROR(N'  - Persisted sample: %d', 10, 1, @persisted_sample_stats) WITH NOWAIT;
+    END;
 
     /* #147: CDC-tracked tables warning — stats updates can delay CDC capture */
     DECLARE @cdc_stats int = (SELECT COUNT_BIG(*) FROM #stats_to_process WHERE is_tracked_by_cdc = 1);
-    IF @cdc_stats > 0
+    IF @cdc_stats > 0 AND @skip_discovery = 0
     BEGIN
         RAISERROR(N'  - CDC-tracked:      %d (FULLSCAN may delay CDC capture job)', 10, 1, @cdc_stats) WITH NOWAIT;
         SET @warnings += N'CDC_TABLES: ' + CONVERT(nvarchar(10), @cdc_stats) + N' stats on CDC-tracked tables; ';
@@ -7684,7 +7774,7 @@ OPTION (RECOMPILE);';
 
     /* #192: Warn when replicated tables are a majority of candidates */
     DECLARE @replicated_stats int = (SELECT COUNT_BIG(*) FROM #stats_to_process WHERE is_published = 1);
-    IF @replicated_stats > 0 AND @total_stats > 0
+    IF @replicated_stats > 0 AND @total_stats > 0 AND @skip_discovery = 0
     BEGIN
         DECLARE @repl_pct int = @replicated_stats * 100 / @total_stats;
         RAISERROR(N'  - Replicated:       %d (%d%%)', 10, 1, @replicated_stats, @repl_pct) WITH NOWAIT;
@@ -7799,20 +7889,20 @@ OPTION (RECOMPILE);';
         /*
         Build parameters string to identify this run.
         Workers with matching parameters share the same queue.
+        May already be set by the parallel discovery skip check (v2.26).
         */
-        /*
-        Normalize parameter values with TRIM to prevent duplicate queues from
-        whitespace differences (e.g., 'MyDB' vs ' MyDB').
-        */
-        SELECT
-            @parameters_string =
-                N'@Databases=' + ISNULL(LTRIM(RTRIM(@Databases)), N'') +
-                N',@Tables=' + ISNULL(LTRIM(RTRIM(@Tables)), N'') +
-                N',@TargetNorecompute=' + ISNULL(LTRIM(RTRIM(@TargetNorecompute)), N'') +
-                N',@ModificationThreshold=' + ISNULL(CONVERT(nvarchar(20), @ModificationThreshold), N'') +
-                N',@MinPageCount=' + ISNULL(CONVERT(nvarchar(20), @MinPageCount), N'') +
-                N',@IncludeSystemObjects=' + ISNULL(LTRIM(RTRIM(@IncludeSystemObjects)), N'') +
-                N',@SortOrder=' + ISNULL(LTRIM(RTRIM(@SortOrder)), N'');
+        IF @parameters_string = N''
+        BEGIN
+            SELECT
+                @parameters_string =
+                    N'@Databases=' + ISNULL(LTRIM(RTRIM(@Databases)), N'') +
+                    N',@Tables=' + ISNULL(LTRIM(RTRIM(@Tables)), N'') +
+                    N',@TargetNorecompute=' + ISNULL(LTRIM(RTRIM(@TargetNorecompute)), N'') +
+                    N',@ModificationThreshold=' + ISNULL(CONVERT(nvarchar(20), @ModificationThreshold), N'') +
+                    N',@MinPageCount=' + ISNULL(CONVERT(nvarchar(20), @MinPageCount), N'') +
+                    N',@IncludeSystemObjects=' + ISNULL(LTRIM(RTRIM(@IncludeSystemObjects)), N'') +
+                    N',@SortOrder=' + ISNULL(LTRIM(RTRIM(@SortOrder)), N'');
+        END;
 
         BEGIN TRY
             /*
@@ -10759,6 +10849,7 @@ OPTION (RECOMPILE);';
     */
     IF  @Execute = N'Y'
     AND @stats_succeeded > 0
+    AND (@TimeLimit IS NULL OR DATEDIFF(SECOND, @start_time, SYSDATETIME()) < @TimeLimit)
     BEGIN
         DECLARE
             @qs_check_db sysname = NULL,
@@ -10783,20 +10874,44 @@ OPTION (RECOMPILE);';
 
         WHILE @qs_db_idx IS NOT NULL
         BEGIN
+            /* Time guard: skip remaining databases if past @TimeLimit */
+            IF @TimeLimit IS NOT NULL AND DATEDIFF(SECOND, @start_time, SYSDATETIME()) >= @TimeLimit
+            BEGIN
+                IF @Debug = 1
+                    RAISERROR(N'  Forced plan check: skipping remaining databases (time limit reached).', 10, 1) WITH NOWAIT;
+                SET @qs_db_idx = NULL;
+                CONTINUE;
+            END;
+
             SELECT @qs_check_db = database_name
             FROM @qs_databases
             WHERE idx = @qs_db_idx;
 
             BEGIN TRY
                 /*
-                P1 fix (#187): The original join on qsq.object_id = stp.object_id was broken.
-                sys.query_store_query.object_id is the compiled module ID (stored proc/function),
-                NOT the table's object_id. For ad-hoc queries it is always 0, so the join
-                never matched any ad-hoc query plans. Fixed by joining query_store_query_text
-                and checking if the table name appears in the query SQL text via CHARINDEX.
-                This correctly identifies forced plans referencing tables whose stats were updated.
+                v2.26: Early-out when database has zero forced plans.
+                Avoids the expensive CHARINDEX scan entirely.
+                */
+                DECLARE @qs_has_forced int = 0;
+                SET @qs_check_sql = N'
+                    SET LOCK_TIMEOUT 10000;
+                    SELECT @cnt = COUNT(*)
+                    FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan
+                    WHERE is_forced_plan = 1;';
+
+                EXEC sp_executesql @qs_check_sql,
+                    N'@cnt int OUTPUT',
+                    @cnt = @qs_has_forced OUTPUT;
+
+                IF ISNULL(@qs_has_forced, 0) > 0
+                BEGIN
+                /*
+                P1 fix (#187): Filter forced plans first (typically very few), then check
+                if any reference updated tables via CHARINDEX on query text.
+                Uses 30-second LOCK_TIMEOUT to prevent indefinite blocking on QS DMVs.
                 */
                 SET @qs_check_sql = N'
+                    SET LOCK_TIMEOUT 30000;
                     SELECT @cnt = COUNT(DISTINCT qsp.plan_id)
                     FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan AS qsp
                     INNER JOIN ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_query AS qsq
@@ -10841,6 +10956,7 @@ OPTION (RECOMPILE);';
                         + CASE WHEN @apc_enabled = 1 THEN N',APC' ELSE N'' END
                         + N') ';
                 END;
+                END; /* END IF @qs_has_forced > 0 */
             END TRY
             BEGIN CATCH
                 /* Query Store not enabled or not accessible on this database — skip */
