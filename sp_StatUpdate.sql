@@ -36,11 +36,25 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.27.2026.03.26 (Major.Minor.YYYY.MM.DD)
+Version:    2.28.2026.03.26 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.27.2026.03.26 - fix: mop-up discovery referenced dbo.CommandLog without 3-part
+History:    2.28.2026.03.26 - fix: mop-up paths missing 6 scoping filters from main discovery:
+                            @Tables inclusion, @FilteredStatsMode, @SkipTablesWithColumnstore,
+                            @MinPageCount, Stretch Database auto-skip (#55), READ_ONLY filegroup
+                            skip (#65).  Applied to parallel leader, serial, and lazy paths (#360).
+                            fix: mop-up indexed views filter used @IncludeSystemObjects instead
+                            of @IncludeIndexedViews, missing clustered index existence check.
+                            Aligned parallel leader + serial paths with main discovery (#362/#363).
+                            fix: lazy mop-up nvarchar(4000) truncation -- added CAST to
+                            nvarchar(max) on string concatenation (same pattern as other paths) (#358).
+                            fix: @parameters_string missing 12 threshold/filter parameters --
+                            workers with different @ThresholdLogic, @DaysStaleThreshold,
+                            @QueryStoreMetric, etc. could incorrectly share a queue (#359).
+                            fix: mop-up INSERT NOT EXISTS missing COLLATE DATABASE_DEFAULT on
+                            QueueStatistic name comparisons (#361).
+            2.27.2026.03.26 - fix: mop-up discovery referenced dbo.CommandLog without 3-part
                             name after USE <userdb>, causing "Invalid object name" (#354).
                             Added @commandlog_3part variable for all 3 mop-up paths.
                             fix: @parameters_string missing @ExcludeTables, @ExcludeStatistics,
@@ -702,7 +716,7 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.27.2026.03.26',
+        @procedure_version varchar(20) = '2.28.2026.03.26',
         @procedure_version_date datetime = '20260326',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -5300,7 +5314,19 @@ OPTION (RECOMPILE);';
                 N',@SortOrder=' + ISNULL(LTRIM(RTRIM(@SortOrder)), N'') +
                 N',@TieredThresholds=' + ISNULL(CONVERT(nvarchar(5), @TieredThresholds), N'') +
                 N',@FilteredStatsMode=' + ISNULL(LTRIM(RTRIM(@FilteredStatsMode)), N'') +
-                N',@QueryStorePriority=' + ISNULL(LTRIM(RTRIM(@QueryStorePriority)), N'');
+                N',@QueryStorePriority=' + ISNULL(LTRIM(RTRIM(@QueryStorePriority)), N'') +
+                N',@ThresholdLogic=' + ISNULL(LTRIM(RTRIM(@ThresholdLogic)), N'') +
+                N',@DaysStaleThreshold=' + ISNULL(CONVERT(nvarchar(20), @DaysStaleThreshold), N'') +
+                N',@HoursStaleThreshold=' + ISNULL(CONVERT(nvarchar(20), @HoursStaleThreshold), N'') +
+                N',@ModificationPercent=' + ISNULL(CONVERT(nvarchar(20), @ModificationPercent), N'') +
+                N',@AscendingKeyBoost=' + ISNULL(LTRIM(RTRIM(@AscendingKeyBoost)), N'') +
+                N',@FilteredStatsStaleFactor=' + ISNULL(CONVERT(nvarchar(20), @FilteredStatsStaleFactor), N'') +
+                N',@SkipTablesWithColumnstore=' + ISNULL(LTRIM(RTRIM(@SkipTablesWithColumnstore)), N'') +
+                N',@IncludeIndexedViews=' + ISNULL(LTRIM(RTRIM(@IncludeIndexedViews)), N'') +
+                N',@QueryStoreMetric=' + ISNULL(LTRIM(RTRIM(@QueryStoreMetric)), N'') +
+                N',@QueryStoreMinExecutions=' + ISNULL(CONVERT(nvarchar(20), @QueryStoreMinExecutions), N'') +
+                N',@QueryStoreRecentHours=' + ISNULL(CONVERT(nvarchar(20), @QueryStoreRecentHours), N'') +
+                N',@QueryStoreTopPlans=' + ISNULL(CONVERT(nvarchar(20), @QueryStoreTopPlans), N'');
 
         /* Check if a matching queue has unclaimed work items */
         SELECT
@@ -7944,7 +7970,19 @@ OPTION (RECOMPILE);';
                     N',@SortOrder=' + ISNULL(LTRIM(RTRIM(@SortOrder)), N'') +
                     N',@TieredThresholds=' + ISNULL(CONVERT(nvarchar(5), @TieredThresholds), N'') +
                     N',@FilteredStatsMode=' + ISNULL(LTRIM(RTRIM(@FilteredStatsMode)), N'') +
-                    N',@QueryStorePriority=' + ISNULL(LTRIM(RTRIM(@QueryStorePriority)), N'');
+                    N',@QueryStorePriority=' + ISNULL(LTRIM(RTRIM(@QueryStorePriority)), N'') +
+                    N',@ThresholdLogic=' + ISNULL(LTRIM(RTRIM(@ThresholdLogic)), N'') +
+                    N',@DaysStaleThreshold=' + ISNULL(CONVERT(nvarchar(20), @DaysStaleThreshold), N'') +
+                    N',@HoursStaleThreshold=' + ISNULL(CONVERT(nvarchar(20), @HoursStaleThreshold), N'') +
+                    N',@ModificationPercent=' + ISNULL(CONVERT(nvarchar(20), @ModificationPercent), N'') +
+                    N',@AscendingKeyBoost=' + ISNULL(LTRIM(RTRIM(@AscendingKeyBoost)), N'') +
+                    N',@FilteredStatsStaleFactor=' + ISNULL(CONVERT(nvarchar(20), @FilteredStatsStaleFactor), N'') +
+                    N',@SkipTablesWithColumnstore=' + ISNULL(LTRIM(RTRIM(@SkipTablesWithColumnstore)), N'') +
+                    N',@IncludeIndexedViews=' + ISNULL(LTRIM(RTRIM(@IncludeIndexedViews)), N'') +
+                    N',@QueryStoreMetric=' + ISNULL(LTRIM(RTRIM(@QueryStoreMetric)), N'') +
+                    N',@QueryStoreMinExecutions=' + ISNULL(CONVERT(nvarchar(20), @QueryStoreMinExecutions), N'') +
+                    N',@QueryStoreRecentHours=' + ISNULL(CONVERT(nvarchar(20), @QueryStoreRecentHours), N'') +
+                    N',@QueryStoreTopPlans=' + ISNULL(CONVERT(nvarchar(20), @QueryStoreTopPlans), N'');
         END;
 
         BEGIN TRY
@@ -8696,8 +8734,9 @@ OPTION (RECOMPILE);';
                     )
                     BEGIN
                         DECLARE @lazy_mop_sql nvarchar(max);
-                        SET @lazy_mop_sql = N'
-                        USE ' + QUOTENAME(@claimed_table_database) + N';
+                        /* v2.27: CAST first element to nvarchar(max) to prevent 4000 char truncation during concatenation */
+                        SET @lazy_mop_sql = CAST(N'
+                        USE ' AS nvarchar(max)) + QUOTENAME(@claimed_table_database) + N';
                         SELECT
                             database_name = DB_NAME(),
                             schema_name = OBJECT_SCHEMA_NAME(s.object_id),
@@ -8741,9 +8780,36 @@ OPTION (RECOMPILE);';
                         ) AS pgs
                         WHERE s.object_id = @object_id_param
                         AND   ISNULL(sp.modification_counter, 0) > 0
+                        /* v2.28: Object type filter (defense-in-depth, matches main discovery) */
+                        AND   (
+                                  OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
+                               OR @IncludeSystemObjects_param = N''Y''
+                               OR (o.type = N''V'' AND @IncludeIndexedViews_param = N''Y''
+                                   AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
+                              )
+                        AND   (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
+                        AND   o.type NOT IN (N''ET'', N''S'')
                         AND   (@TargetNorecompute_param = N''BOTH''
                                OR (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
                                OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1))
+                        /* v2.28: Table inclusion filter (defense-in-depth) */
+                        AND   (
+                                  @Tables_param IS NULL
+                               OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
+                                  (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                               OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
+                                  (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                              )
+                        /* v2.28: Table exclusion filter (defense-in-depth) */
+                        AND   (
+                                  @ExcludeTables_param IS NULL
+                               OR NOT EXISTS
+                                  (
+                                      SELECT 1
+                                      FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
+                                      WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                                  )
+                              )
                         /* v2.26: Statistics exclusion filter (was missing from lazy mop-up) */
                         AND   (
                                   @ExcludeStatistics_param IS NULL
@@ -8755,6 +8821,39 @@ OPTION (RECOMPILE);';
                                          OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                                   )
                               )
+                        /* v2.27: Filtered stats mode filter */
+                        AND   (
+                                  @FilteredStatsMode_param = N''INCLUDE''
+                               OR @FilteredStatsMode_param = N''PRIORITY''
+                               OR (@FilteredStatsMode_param = N''EXCLUDE'' AND s.has_filter = 0)
+                               OR (@FilteredStatsMode_param = N''ONLY'' AND s.has_filter = 1)
+                              )
+                        /* v2.27: Stretch Database auto-skip (#55, defense-in-depth) */
+                        AND   ISNULL(OBJECTPROPERTY(s.object_id, N''TableHasRemoteDataArchive''), 0) = 0
+                        /* v2.27: Skip tables on READ_ONLY filegroups (#65, defense-in-depth) */
+                        AND   NOT EXISTS
+                              (
+                                  SELECT 1
+                                  FROM sys.indexes AS ri
+                                  JOIN sys.data_spaces AS rds ON rds.data_space_id = ri.data_space_id
+                                  JOIN sys.filegroups AS rfg ON rfg.data_space_id = rds.data_space_id
+                                  WHERE ri.object_id = s.object_id
+                                  AND   ri.index_id IN (0, 1)
+                                  AND   rfg.is_read_only = 1
+                              )
+                        /* v2.27: Skip tables with columnstore indexes (defense-in-depth) */
+                        AND   (
+                                  @SkipTablesWithColumnstore_param = N''N''
+                               OR NOT EXISTS
+                                  (
+                                      SELECT 1
+                                      FROM sys.indexes AS ci
+                                      WHERE ci.object_id = s.object_id
+                                      AND   ci.type IN (5, 6)
+                                  )
+                              )
+                        /* v2.27: Minimum page count filter (defense-in-depth) */
+                        AND   ISNULL(pgs.total_pages, 0) >= @MinPageCount_param
                         AND   NOT EXISTS (
                             SELECT 1 FROM ' + @commandlog_3part + N' AS cl
                             WHERE cl.CommandType = N''UPDATE_STATISTICS''
@@ -8783,10 +8882,17 @@ OPTION (RECOMPILE);';
                             )
                             EXECUTE sys.sp_executesql
                                 @lazy_mop_sql,
-                                N'@object_id_param int, @TargetNorecompute_param nvarchar(10), @ExcludeStatistics_param nvarchar(max), @start_time_param datetime2(7)',
+                                N'@object_id_param int, @IncludeSystemObjects_param nvarchar(1), @IncludeIndexedViews_param nvarchar(1), @TargetNorecompute_param nvarchar(10), @Tables_param nvarchar(max), @ExcludeTables_param nvarchar(max), @ExcludeStatistics_param nvarchar(max), @FilteredStatsMode_param nvarchar(10), @SkipTablesWithColumnstore_param nchar(1), @MinPageCount_param bigint, @start_time_param datetime2(7)',
                                 @object_id_param = @claimed_table_object_id,
+                                @IncludeSystemObjects_param = @IncludeSystemObjects,
+                                @IncludeIndexedViews_param = @IncludeIndexedViews,
                                 @TargetNorecompute_param = @TargetNorecompute,
+                                @Tables_param = @Tables,
+                                @ExcludeTables_param = @ExcludeTables,
                                 @ExcludeStatistics_param = @ExcludeStatistics,
+                                @FilteredStatsMode_param = @FilteredStatsMode,
+                                @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore,
+                                @MinPageCount_param = @MinPageCount,
                                 @start_time_param = @start_time;
 
                             SET @lazy_mop_found = ROWCOUNT_BIG();
@@ -10428,14 +10534,39 @@ OPTION (RECOMPILE);';
                         WHERE p.object_id = s.object_id AND p.index_id IN (0, 1)
                     ) AS pgs
                     WHERE ISNULL(sp.modification_counter, 0) > 0
-                    AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
-                           OR (o.type = N''V'' AND @IncludeSystemObjects_param = N''Y''))
+                    AND   (
+                              OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
+                           OR @IncludeSystemObjects_param = N''Y''
+                           OR (o.type = N''V'' AND @IncludeIndexedViews_param = N''Y''
+                               AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
+                          )
                     AND   (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
                     AND   o.type NOT IN (N''ET'', N''S'')
+                    /* v2.27: Stretch Database auto-skip (#55) */
+                    AND   ISNULL(OBJECTPROPERTY(s.object_id, N''TableHasRemoteDataArchive''), 0) = 0
+                    /* v2.27: Skip tables on READ_ONLY filegroups (#65) */
+                    AND   NOT EXISTS
+                          (
+                              SELECT 1
+                              FROM sys.indexes AS ri
+                              JOIN sys.data_spaces AS rds ON rds.data_space_id = ri.data_space_id
+                              JOIN sys.filegroups AS rfg ON rfg.data_space_id = rds.data_space_id
+                              WHERE ri.object_id = s.object_id
+                              AND   ri.index_id IN (0, 1)
+                              AND   rfg.is_read_only = 1
+                          )
                     AND   (
                               (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
                            OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
                            OR @TargetNorecompute_param = N''BOTH''
+                          )
+                    /* v2.27: Table inclusion filter */
+                    AND   (
+                              @Tables_param IS NULL
+                           OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
+                              (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                           OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
+                              (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
                           )
                     /* v2.26: Table exclusion filter (was missing from mop-up) */
                     AND   (
@@ -10458,6 +10589,26 @@ OPTION (RECOMPILE);';
                                      OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                               )
                           )
+                    /* v2.27: Filtered stats mode filter */
+                    AND   (
+                              @FilteredStatsMode_param = N''INCLUDE''
+                           OR @FilteredStatsMode_param = N''PRIORITY''
+                           OR (@FilteredStatsMode_param = N''EXCLUDE'' AND s.has_filter = 0)
+                           OR (@FilteredStatsMode_param = N''ONLY'' AND s.has_filter = 1)
+                          )
+                    /* v2.27: Skip tables with columnstore indexes */
+                    AND   (
+                              @SkipTablesWithColumnstore_param = N''N''
+                           OR NOT EXISTS
+                              (
+                                  SELECT 1
+                                  FROM sys.indexes AS ci
+                                  WHERE ci.object_id = s.object_id
+                                  AND   ci.type IN (5, 6)
+                              )
+                          )
+                    /* v2.27: Minimum page count filter */
+                    AND   ISNULL(pgs.total_pages, 0) >= @MinPageCount_param
                     AND   NOT EXISTS (
                         SELECT 1 FROM #stats_to_process AS stp
                         WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
@@ -10479,9 +10630,14 @@ OPTION (RECOMPILE);';
 
                     SET @mop_up_params = N'
                         @IncludeSystemObjects_param nvarchar(1),
+                        @IncludeIndexedViews_param nvarchar(1),
                         @TargetNorecompute_param nvarchar(10),
+                        @Tables_param nvarchar(max),
                         @ExcludeTables_param nvarchar(max),
                         @ExcludeStatistics_param nvarchar(max),
+                        @FilteredStatsMode_param nvarchar(10),
+                        @SkipTablesWithColumnstore_param nchar(1),
+                        @MinPageCount_param bigint,
                         @start_time_param datetime2(7)';
 
                     IF @Debug = 1
@@ -10505,9 +10661,14 @@ OPTION (RECOMPILE);';
                             @mop_up_sql,
                             @mop_up_params,
                             @IncludeSystemObjects_param = @IncludeSystemObjects,
+                            @IncludeIndexedViews_param = @IncludeIndexedViews,
                             @TargetNorecompute_param = @TargetNorecompute,
+                            @Tables_param = @Tables,
                             @ExcludeTables_param = @ExcludeTables,
                             @ExcludeStatistics_param = @ExcludeStatistics,
+                            @FilteredStatsMode_param = @FilteredStatsMode,
+                            @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore,
+                            @MinPageCount_param = @MinPageCount,
                             @start_time_param = @start_time;
                     END TRY
                     BEGIN CATCH
@@ -10572,9 +10733,9 @@ OPTION (RECOMPILE);';
                               SELECT 1
                               FROM dbo.QueueStatistic AS qs
                               WHERE qs.QueueID = @queue_id
-                              AND   qs.DatabaseName = stp.database_name
-                              AND   qs.SchemaName = stp.schema_name
-                              AND   qs.ObjectName = stp.table_name
+                              AND   qs.DatabaseName = stp.database_name COLLATE DATABASE_DEFAULT
+                              AND   qs.SchemaName = stp.schema_name COLLATE DATABASE_DEFAULT
+                              AND   qs.ObjectName = stp.table_name COLLATE DATABASE_DEFAULT
                           )
                     GROUP BY
                         stp.database_name,
@@ -10737,14 +10898,39 @@ OPTION (RECOMPILE);';
                     WHERE p.object_id = s.object_id AND p.index_id IN (0, 1)
                 ) AS pgs
                 WHERE ISNULL(sp.modification_counter, 0) > 0
-                AND   (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
-                       OR (o.type = N''V'' AND @IncludeSystemObjects_param = N''Y''))
+                AND   (
+                          OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
+                       OR @IncludeSystemObjects_param = N''Y''
+                       OR (o.type = N''V'' AND @IncludeIndexedViews_param = N''Y''
+                           AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
+                      )
                 AND   (o.is_ms_shipped = 0 OR @IncludeSystemObjects_param = N''Y'')
                 AND   o.type NOT IN (N''ET'', N''S'')
+                /* v2.27: Stretch Database auto-skip (#55) */
+                AND   ISNULL(OBJECTPROPERTY(s.object_id, N''TableHasRemoteDataArchive''), 0) = 0
+                /* v2.27: Skip tables on READ_ONLY filegroups (#65) */
+                AND   NOT EXISTS
+                      (
+                          SELECT 1
+                          FROM sys.indexes AS ri
+                          JOIN sys.data_spaces AS rds ON rds.data_space_id = ri.data_space_id
+                          JOIN sys.filegroups AS rfg ON rfg.data_space_id = rds.data_space_id
+                          WHERE ri.object_id = s.object_id
+                          AND   ri.index_id IN (0, 1)
+                          AND   rfg.is_read_only = 1
+                      )
                 AND   (
                           (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
                        OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
                        OR @TargetNorecompute_param = N''BOTH''
+                      )
+                /* v2.27: Table inclusion filter */
+                AND   (
+                          @Tables_param IS NULL
+                       OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                       OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
                       )
                 /* v2.26: Table exclusion filter (was missing from mop-up) */
                 AND   (
@@ -10767,6 +10953,26 @@ OPTION (RECOMPILE);';
                                  OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                           )
                       )
+                /* v2.27: Filtered stats mode filter */
+                AND   (
+                          @FilteredStatsMode_param = N''INCLUDE''
+                       OR @FilteredStatsMode_param = N''PRIORITY''
+                       OR (@FilteredStatsMode_param = N''EXCLUDE'' AND s.has_filter = 0)
+                       OR (@FilteredStatsMode_param = N''ONLY'' AND s.has_filter = 1)
+                      )
+                /* v2.27: Skip tables with columnstore indexes */
+                AND   (
+                          @SkipTablesWithColumnstore_param = N''N''
+                       OR NOT EXISTS
+                          (
+                              SELECT 1
+                              FROM sys.indexes AS ci
+                              WHERE ci.object_id = s.object_id
+                              AND   ci.type IN (5, 6)
+                          )
+                      )
+                /* v2.27: Minimum page count filter */
+                AND   ISNULL(pgs.total_pages, 0) >= @MinPageCount_param
                 AND   NOT EXISTS (
                     SELECT 1 FROM #stats_to_process AS stp
                     WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
@@ -10788,9 +10994,14 @@ OPTION (RECOMPILE);';
 
                 SET @mop_up_params = N'
                     @IncludeSystemObjects_param nvarchar(1),
+                    @IncludeIndexedViews_param nvarchar(1),
                     @TargetNorecompute_param nvarchar(10),
+                    @Tables_param nvarchar(max),
                     @ExcludeTables_param nvarchar(max),
                     @ExcludeStatistics_param nvarchar(max),
+                    @FilteredStatsMode_param nvarchar(10),
+                    @SkipTablesWithColumnstore_param nchar(1),
+                    @MinPageCount_param bigint,
                     @start_time_param datetime2(7)';
 
                 IF @Debug = 1
@@ -10814,9 +11025,14 @@ OPTION (RECOMPILE);';
                         @mop_up_sql,
                         @mop_up_params,
                         @IncludeSystemObjects_param = @IncludeSystemObjects,
+                        @IncludeIndexedViews_param = @IncludeIndexedViews,
                         @TargetNorecompute_param = @TargetNorecompute,
+                        @Tables_param = @Tables,
                         @ExcludeTables_param = @ExcludeTables,
                         @ExcludeStatistics_param = @ExcludeStatistics,
+                        @FilteredStatsMode_param = @FilteredStatsMode,
+                        @SkipTablesWithColumnstore_param = @SkipTablesWithColumnstore,
+                        @MinPageCount_param = @MinPageCount,
                         @start_time_param = @start_time;
                 END TRY
                 BEGIN CATCH
