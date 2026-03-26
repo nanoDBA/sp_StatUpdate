@@ -2371,7 +2371,7 @@ BEGIN
         DECLARE @w5_qs_data_runs integer = (
             SELECT COUNT(DISTINCT su.RunLabel)
             FROM #stat_updates AS su
-            WHERE su.QSPlanCount > 0
+            WHERE su.QSPlanCount IS NOT NULL /* 0 = enrichment ran (no match), >0 = matched; NULL = skipped */
         );
 
         IF @w5_qs_data_runs = 0
@@ -2382,8 +2382,8 @@ BEGIN
             (
                 N'WARNING', N'QS_NOT_EFFECTIVE',
                 N'Query Store priority enabled but no QS data captured in stat updates',
-                N'@QueryStorePriority = N''Y'' was used but zero stat updates have QSPlanCount > 0. '
-                    + N'This typically means Query Store is disabled, read-only, or has been purged.',
+                N'@QueryStorePriority = N''Y'' was used but QS enrichment did not run in any stat updates (QSPlanCount IS NULL in all). '
+                    + N'This typically means Query Store is disabled, read-only, purged, or has no recent runtime stats.',
                 N'Verify Query Store is enabled and in READ_WRITE mode on target databases: '
                     + N'SELECT name, is_query_store_on FROM sys.databases. '
                     + N'If QS is intentionally disabled, remove @QueryStorePriority to avoid unnecessary overhead. '
@@ -2402,11 +2402,11 @@ BEGIN
             VALUES
             (
                 N'WARNING', N'QS_NOT_EFFECTIVE',
-                N'Query Store data present in only ' + CONVERT(nvarchar(10), @w5_qs_data_runs)
+                N'QS enrichment ran in only ' + CONVERT(nvarchar(10), @w5_qs_data_runs)
                     + N' of ' + CONVERT(nvarchar(10), @w5_qs_runs) + N' QS-priority runs',
                 N'@QueryStorePriority = N''Y'' was used across ' + CONVERT(nvarchar(10), @w5_qs_runs)
-                    + N' runs, but QS data appeared in only ' + CONVERT(nvarchar(10), @w5_qs_data_runs)
-                    + N'. Query Store may have transitioned to READ_ONLY mid-window.',
+                    + N' runs, but QS enrichment only executed in ' + CONVERT(nvarchar(10), @w5_qs_data_runs)
+                    + N'.  Query Store may have transitioned to READ_ONLY or had no recent runtime stats in some runs.',
                 N'Check QS status: SELECT actual_state_desc, query_capture_mode_desc, current_storage_size_mb, max_storage_size_mb FROM sys.database_query_store_options. '
                     + N'If space pressure caused READ_ONLY transition, increase max_storage_size_mb or enable SIZE_BASED_CLEANUP_MODE.',
                 N'ALTER DATABASE [YourDB] SET QUERY_STORE (MAX_STORAGE_SIZE_MB = 2048);',
