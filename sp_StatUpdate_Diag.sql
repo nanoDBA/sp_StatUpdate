@@ -36,9 +36,18 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.24 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.03.26 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.24   - Mop-up awareness: #runs gets MopUpTriggered/MopUpFound/MopUpProcessed
+History:    2026.03.26   - W8 MOPUP_INEFFECTIVE: warn when mop-up consistently finds 0 stats (#347).
+                           W9 LOCK_TIMEOUT_INEFFECTIVE: persistent lock timeout victims (#348).
+                           W10 PARAMETER_CHURN: key parameters changing frequently (#350).
+                           C5 SAMPLE_RATE_DEGRADATION: effective sample rate dropped >50% (#345).
+                           I11 FAILURE_CLUSTERING: dominant error code detection (#346).
+                           I12 QS_COVERAGE_DRIFT: QS plan count dropping >50% week-over-week (#349).
+                           I13 PARALLEL_OPPORTUNITY: serial runs using <40% of TimeLimit (#351).
+                           I14 MOPUP_MISSING_PAGECOUNT: throughput underestimation warning (#342).
+                           I10 mutual exclusion validation guard (#343).
+            2026.03.24   - Mop-up awareness: #runs gets MopUpTriggered/MopUpFound/MopUpProcessed
                            from SP_STATUPDATE_END summary XML.  RS4 Run Detail includes mop-up columns.
                            W1d recommendation: suggest @MopUpPass when runs complete early (<50% of
                            TimeLimit used).  I10 RECOMMENDED_CONFIG includes @MopUpPass when W1d fires.
@@ -202,8 +211,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.24',
-        @procedure_version_date datetime = '20260324';
+        @procedure_version varchar(20) = '2026.03.26',
+        @procedure_version_date datetime = '20260326';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -2626,6 +2635,407 @@ BEGIN
     END;
 
     /* ======================================================================
+       W8: MOP-UP INEFFECTIVENESS (#347)
+       Mop-up consistently finds 0 stats -- discovery overhead with no benefit.
+       ====================================================================== */
+    BEGIN
+        DECLARE @w8_mop_runs integer = 0;
+        DECLARE @w8_mop_empty integer = 0;
+
+        SELECT
+            @w8_mop_runs = COUNT(*),
+            @w8_mop_empty = SUM(CASE WHEN ISNULL(r.MopUpFound, 0) = 0 THEN 1 ELSE 0 END)
+        FROM #runs AS r
+        WHERE r.MopUpTriggered = 1
+        AND   r.IsKilled = 0;
+
+        IF @w8_mop_runs >= 3 AND @w8_mop_empty * 1.0 / @w8_mop_runs >= 0.80
+        BEGIN
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES (
+                N'WARNING',
+                N'MOPUP_INEFFECTIVE',
+                CONVERT(nvarchar(10), @w8_mop_empty) + N' of ' + CONVERT(nvarchar(10), @w8_mop_runs)
+                    + N' mop-up passes found 0 qualifying stats',
+                N'Mop-up adds discovery overhead on every run with no additional coverage.  '
+                    + N'This typically means the priority pass already covers all qualifying stats, '
+                    + N'or thresholds are too aggressive for the mop-up window.',
+                N'Disable @MopUpPass or lower @ModificationThreshold so the priority pass catches more stats.',
+                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @MopUpPass = N''N'';',
+                50
+            );
+
+            RAISERROR(N'  [WARNING] W8: Mop-up ineffective', 10, 1) WITH NOWAIT;
+        END;
+    END;
+
+    /* ======================================================================
+       W9: LOCK TIMEOUT INEFFECTIVENESS (#348)
+       Same stat hits lock timeout across multiple runs.
+       ====================================================================== */
+    BEGIN
+        DECLARE @w9_persistent_count integer;
+        DECLARE @w9_evidence nvarchar(2000);
+
+        ;WITH lock_timeouts AS
+        (
+            SELECT
+                su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName,
+                run_count = COUNT(DISTINCT su.RunLabel)
+            FROM #stat_updates AS su
+            WHERE su.ErrorNumber = 1222
+            GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+            HAVING COUNT(DISTINCT su.RunLabel) >= 3
+        )
+        SELECT @w9_persistent_count = COUNT(*)
+        FROM lock_timeouts;
+
+        IF ISNULL(@w9_persistent_count, 0) > 0
+        BEGIN
+            SET @w9_evidence = STUFF((
+                SELECT TOP (5) N', ' + lt.SchemaName + N'.' + lt.ObjectName + N'.' + lt.StatisticsName
+                    + N' (' + CONVERT(nvarchar(10), lt.run_count) + N' runs)'
+                FROM (
+                    SELECT
+                        su.SchemaName, su.ObjectName, su.StatisticsName,
+                        run_count = COUNT(DISTINCT su.RunLabel)
+                    FROM #stat_updates AS su
+                    WHERE su.ErrorNumber = 1222
+                    GROUP BY su.SchemaName, su.ObjectName, su.StatisticsName
+                    HAVING COUNT(DISTINCT su.RunLabel) >= 3
+                ) AS lt
+                ORDER BY lt.run_count DESC
+                FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N'');
+
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES (
+                N'WARNING',
+                N'LOCK_TIMEOUT_INEFFECTIVE',
+                CONVERT(nvarchar(10), @w9_persistent_count) + N' stat(s) persistently blocked across 3+ runs',
+                N'Persistent lock timeout victims: ' + @w9_evidence,
+                N'Increase @LockTimeout, reschedule to off-peak, or enable @StatsInParallel (workers retry faster).',
+                NULL,
+                50
+            );
+
+            RAISERROR(N'  [WARNING] W9: Persistent lock timeout victims', 10, 1) WITH NOWAIT;
+        END;
+    END;
+
+    /* ======================================================================
+       I11: FAILURE CAUSE CLUSTERING (#346)
+       Cluster failures by ErrorNumber to identify dominant root cause.
+       ====================================================================== */
+    BEGIN
+        DECLARE @i11_total_failures integer;
+        DECLARE @i11_top_error integer;
+        DECLARE @i11_top_count integer;
+        DECLARE @i11_top_pct decimal(5, 1);
+        DECLARE @i11_distinct_errors integer;
+        DECLARE @i11_evidence nvarchar(2000);
+
+        SELECT @i11_total_failures = COUNT(*)
+        FROM #stat_updates
+        WHERE ErrorNumber IS NOT NULL AND ErrorNumber <> 0;
+
+        IF @i11_total_failures >= 5
+        BEGIN
+            SELECT TOP (1)
+                @i11_top_error = ErrorNumber,
+                @i11_top_count = COUNT(*),
+                @i11_top_pct = COUNT(*) * 100.0 / @i11_total_failures
+            FROM #stat_updates
+            WHERE ErrorNumber IS NOT NULL AND ErrorNumber <> 0
+            GROUP BY ErrorNumber
+            ORDER BY COUNT(*) DESC;
+
+            SELECT @i11_distinct_errors = COUNT(DISTINCT ErrorNumber)
+            FROM #stat_updates
+            WHERE ErrorNumber IS NOT NULL AND ErrorNumber <> 0;
+
+            IF @i11_top_pct >= 60.0
+            BEGIN
+                SET @i11_evidence = CONVERT(nvarchar(10), @i11_distinct_errors) + N' distinct error(s) across '
+                    + CONVERT(nvarchar(10), @i11_total_failures) + N' failures.  Error '
+                    + CONVERT(nvarchar(10), @i11_top_error) + N' accounts for '
+                    + CONVERT(nvarchar(10), @i11_top_count) + N' of '
+                    + CONVERT(nvarchar(10), @i11_total_failures) + N' ('
+                    + CONVERT(nvarchar(10), CONVERT(int, @i11_top_pct)) + N'%).  '
+                    + CASE @i11_top_error
+                        WHEN 1222 THEN N'Focus: lock contention -- increase @LockTimeout, enable @StatsInParallel, or reschedule to off-peak.'
+                        WHEN 8152 THEN N'Focus: string truncation -- check extended property or statistic name lengths.'
+                        WHEN 1205 THEN N'Focus: deadlocks -- verify no concurrent index rebuilds or large transactions.'
+                        ELSE N'Focus: investigate error ' + CONVERT(nvarchar(10), @i11_top_error) + N' root cause.'
+                    END;
+
+                INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+                VALUES (
+                    N'INFO',
+                    N'FAILURE_CLUSTERING',
+                    N'Dominant failure cause: Error ' + CONVERT(nvarchar(10), @i11_top_error) + N' ('
+                        + CONVERT(nvarchar(10), CONVERT(int, @i11_top_pct)) + N'% of failures)',
+                    @i11_evidence,
+                    N'Address the dominant error code to resolve the majority of failures.',
+                    NULL,
+                    70
+                );
+
+                RAISERROR(N'  [INFO] I11: Failure cause clustering identified', 10, 1) WITH NOWAIT;
+            END;
+        END;
+    END;
+
+    /* ======================================================================
+       W10: PARAMETER CHURN (#350)
+       Key parameters changing frequently indicates reactive tuning.
+       ====================================================================== */
+    BEGIN
+        DECLARE @w10_run_count integer = (SELECT COUNT(*) FROM #runs WHERE IsKilled = 0);
+
+        IF @w10_run_count >= 5
+        BEGIN
+            DECLARE @w10_changes integer = 0;
+            DECLARE @w10_evidence nvarchar(2000) = N'';
+
+            /* Count distinct values for key parameters */
+            DECLARE @w10_tl_vals integer = (SELECT COUNT(DISTINCT TimeLimit) FROM #runs WHERE IsKilled = 0 AND TimeLimit IS NOT NULL);
+            DECLARE @w10_mt_vals integer = (SELECT COUNT(DISTINCT ModificationThreshold) FROM #runs WHERE IsKilled = 0 AND ModificationThreshold IS NOT NULL);
+            DECLARE @w10_so_vals integer = (SELECT COUNT(DISTINCT SortOrder) FROM #runs WHERE IsKilled = 0 AND SortOrder IS NOT NULL);
+            DECLARE @w10_qsp_vals integer = (SELECT COUNT(DISTINCT QueryStorePriority) FROM #runs WHERE IsKilled = 0 AND QueryStorePriority IS NOT NULL);
+
+            IF @w10_tl_vals >= 3
+            BEGIN
+                SET @w10_changes += 1;
+                SET @w10_evidence += N'@TimeLimit: ' + CONVERT(nvarchar(10), @w10_tl_vals) + N' distinct values. ';
+            END;
+            IF @w10_mt_vals >= 3
+            BEGIN
+                SET @w10_changes += 1;
+                SET @w10_evidence += N'@ModificationThreshold: ' + CONVERT(nvarchar(10), @w10_mt_vals) + N' distinct values. ';
+            END;
+            IF @w10_so_vals >= 3
+            BEGIN
+                SET @w10_changes += 1;
+                SET @w10_evidence += N'@SortOrder: ' + CONVERT(nvarchar(10), @w10_so_vals) + N' distinct values. ';
+            END;
+            IF @w10_qsp_vals >= 2 AND @w10_run_count >= 6
+            BEGIN
+                SET @w10_changes += 1;
+                SET @w10_evidence += N'@QueryStorePriority toggled. ';
+            END;
+
+            IF @w10_changes >= 2
+            BEGIN
+                INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+                VALUES (
+                    N'WARNING',
+                    N'PARAMETER_CHURN',
+                    N'Parameter volatility: ' + CONVERT(nvarchar(10), @w10_changes) + N' key parameter(s) changed frequently across '
+                        + CONVERT(nvarchar(10), @w10_run_count) + N' runs',
+                    @w10_evidence + N'Trend metrics unreliable when configuration changes between runs.',
+                    N'Stabilize parameters for 10+ runs before adjusting.  Use @Preset for consistent configurations.',
+                    N'EXECUTE dbo.sp_StatUpdate @Preset = N''NIGHTLY_MAINTENANCE'', @Databases = N''USER_DATABASES'';',
+                    50
+                );
+
+                RAISERROR(N'  [WARNING] W10: Parameter churn detected', 10, 1) WITH NOWAIT;
+            END;
+        END;
+    END;
+
+    /* ======================================================================
+       C5: SAMPLE RATE DEGRADATION (#345)
+       Effective sample rate dropping silently across runs.
+       ====================================================================== */
+    BEGIN
+        DECLARE @c5_degraded_count integer;
+        DECLARE @c5_evidence nvarchar(2000);
+
+        ;WITH sample_trends AS
+        (
+            SELECT
+                su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName,
+                avg_recent = AVG(CASE WHEN su.StartTime >= DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END),
+                avg_prior  = AVG(CASE WHEN su.StartTime <  DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END),
+                appearances = COUNT(*)
+            FROM #stat_updates AS su
+            WHERE su.EffectiveSamplePct IS NOT NULL
+            AND   su.EffectiveSamplePct > 0
+            AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
+            GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+            HAVING COUNT(*) >= 4
+            AND    AVG(CASE WHEN su.StartTime >= DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END) IS NOT NULL
+            AND    AVG(CASE WHEN su.StartTime <  DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END) IS NOT NULL
+        )
+        SELECT @c5_degraded_count = COUNT(*)
+        FROM sample_trends
+        WHERE avg_recent < avg_prior * 0.5;
+
+        IF ISNULL(@c5_degraded_count, 0) > 0
+        BEGIN
+            SET @c5_evidence = STUFF((
+                SELECT TOP (5) N', ' + st.StatisticsName
+                    + N' (avg ' + CONVERT(nvarchar(10), CONVERT(decimal(5, 1), st.avg_prior))
+                    + N'% -> ' + CONVERT(nvarchar(10), CONVERT(decimal(5, 1), st.avg_recent)) + N'%)'
+                FROM (
+                    SELECT
+                        su.StatisticsName,
+                        avg_recent = AVG(CASE WHEN su.StartTime >= DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END),
+                        avg_prior  = AVG(CASE WHEN su.StartTime <  DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END)
+                    FROM #stat_updates AS su
+                    WHERE su.EffectiveSamplePct IS NOT NULL AND su.EffectiveSamplePct > 0
+                    AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
+                    GROUP BY su.StatisticsName
+                    HAVING COUNT(*) >= 4
+                    AND    AVG(CASE WHEN su.StartTime >= DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END) IS NOT NULL
+                    AND    AVG(CASE WHEN su.StartTime <  DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END) IS NOT NULL
+                ) AS st
+                WHERE st.avg_recent < st.avg_prior * 0.5
+                ORDER BY st.avg_prior / NULLIF(st.avg_recent, 0) DESC
+                FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N'');
+
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES (
+                N'CRITICAL',
+                N'SAMPLE_RATE_DEGRADATION',
+                CONVERT(nvarchar(10), @c5_degraded_count) + N' stat(s) with sample rate dropped >50%',
+                N'Sample rate degradation: ' + ISNULL(@c5_evidence, N'(details unavailable)'),
+                N'Below ~1000 sampled rows, histogram resolution degrades.  Review @LongRunningSamplePercent or increase @TimeLimit.',
+                NULL,
+                20
+            );
+
+            RAISERROR(N'  [CRITICAL] C5: Sample rate degradation detected', 10, 1) WITH NOWAIT;
+        END;
+    END;
+
+    /* ======================================================================
+       I12: QS COVERAGE DRIFT (#349)
+       QS plan count dropping week-over-week while QS priority enabled.
+       ====================================================================== */
+    BEGIN
+        DECLARE @i12_recent_avg decimal(10, 1);
+        DECLARE @i12_prior_avg decimal(10, 1);
+        DECLARE @i12_pct_change decimal(10, 1);
+
+        SELECT
+            @i12_recent_avg = AVG(CASE WHEN su.StartTime >= DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 1), su.QSPlanCount) END),
+            @i12_prior_avg  = AVG(CASE WHEN su.StartTime <  DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 1), su.QSPlanCount) END)
+        FROM #stat_updates AS su
+        INNER JOIN #runs AS r ON r.RunLabel = su.RunLabel
+        WHERE r.QueryStorePriority = N'Y'
+        AND   su.QSPlanCount IS NOT NULL
+        AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL);
+
+        IF @i12_prior_avg IS NOT NULL AND @i12_prior_avg > 0
+        AND @i12_recent_avg IS NOT NULL
+        BEGIN
+            SET @i12_pct_change = (@i12_recent_avg - @i12_prior_avg) * 100.0 / @i12_prior_avg;
+
+            IF @i12_pct_change <= -50.0
+            BEGIN
+                INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+                VALUES (
+                    N'INFO',
+                    N'QS_COVERAGE_DRIFT',
+                    N'Query Store data availability dropped '
+                        + CONVERT(nvarchar(10), CONVERT(int, ABS(@i12_pct_change))) + N'%',
+                    N'Avg plans/stat: ' + CONVERT(nvarchar(10), CONVERT(decimal(5, 1), @i12_prior_avg))
+                        + N' (prior) -> ' + CONVERT(nvarchar(10), CONVERT(decimal(5, 1), @i12_recent_avg))
+                        + N' (recent).  QS catalog may be cleared, CAPTURE_MODE changed, or storage full.',
+                    N'Check: SELECT actual_state_desc, current_storage_size_mb, max_storage_size_mb FROM sys.database_query_store_options.',
+                    NULL,
+                    70
+                );
+
+                RAISERROR(N'  [INFO] I12: QS coverage drift detected', 10, 1) WITH NOWAIT;
+            END;
+        END;
+    END;
+
+    /* ======================================================================
+       I13: PARALLEL OPPORTUNITY (#351)
+       Serial runs completing well under TimeLimit.
+       ====================================================================== */
+    BEGIN
+        DECLARE @i13_serial_count integer;
+        DECLARE @i13_avg_usage_pct decimal(5, 1);
+
+        SELECT
+            @i13_serial_count = COUNT(*),
+            @i13_avg_usage_pct = AVG(CASE WHEN r.TimeLimit > 0 THEN r.DurationSeconds * 100.0 / r.TimeLimit END)
+        FROM #runs AS r
+        WHERE r.IsKilled = 0
+        AND   r.StopReason = N'COMPLETED'
+        AND   ISNULL(r.StatsInParallel, N'N') = N'N'
+        AND   r.TimeLimit IS NOT NULL
+        AND   r.TimeLimit > 0
+        AND   r.DurationSeconds IS NOT NULL;
+
+        IF @i13_serial_count >= 3 AND @i13_avg_usage_pct < 40.0
+        BEGIN
+            /* Only suggest if no overlapping run warnings (W4) */
+            IF NOT EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'OVERLAPPING_RUNS')
+            BEGIN
+                INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+                VALUES (
+                    N'INFO',
+                    N'PARALLEL_OPPORTUNITY',
+                    CONVERT(nvarchar(10), @i13_serial_count) + N' serial run(s) completed using <'
+                        + CONVERT(nvarchar(10), CONVERT(int, @i13_avg_usage_pct)) + N'% of time budget',
+                    CONVERT(nvarchar(10), @i13_serial_count) + N' recent serial runs completed using avg '
+                        + CONVERT(nvarchar(10), CONVERT(int, @i13_avg_usage_pct)) + N'% of @TimeLimit.  '
+                        + N'@StatsInParallel=Y could reduce run time.',
+                    N'Enable parallel mode to process stats concurrently and reduce wall-clock time.',
+                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @StatsInParallel = N''Y'';',
+                    70
+                );
+
+                RAISERROR(N'  [INFO] I13: Parallel opportunity detected', 10, 1) WITH NOWAIT;
+            END;
+        END;
+    END;
+
+    /* ======================================================================
+       I14: MOP-UP MISSING PAGECOUNT (#342)
+       Mop-up stats with NULL PageCount underestimate throughput (GBPerMin).
+       ====================================================================== */
+    BEGIN
+        DECLARE @i14_null_pct decimal(5, 1);
+
+        ;WITH mop_up_runs AS
+        (
+            SELECT r.RunLabel
+            FROM #runs AS r
+            WHERE r.MopUpTriggered = 1
+            AND   r.IsKilled = 0
+        )
+        SELECT @i14_null_pct = CASE WHEN COUNT(*) > 0
+            THEN SUM(CASE WHEN su.PageCount IS NULL THEN 1 ELSE 0 END) * 100.0 / COUNT(*)
+            ELSE 0 END
+        FROM #stat_updates AS su
+        INNER JOIN mop_up_runs AS mr ON mr.RunLabel = su.RunLabel
+        WHERE su.ErrorNumber = 0 OR su.ErrorNumber IS NULL;
+
+        IF ISNULL(@i14_null_pct, 0) >= 20.0
+        BEGIN
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES (
+                N'INFO',
+                N'MOPUP_MISSING_PAGECOUNT',
+                CONVERT(nvarchar(10), CONVERT(int, @i14_null_pct)) + N'% of mop-up stats have NULL PageCount',
+                N'Mop-up lazy discovery may not populate PageCount.  TotalGB and GBPerMin metrics may be underestimated on mop-up-heavy runs.  '
+                    + N'C4 throughput comparisons should be interpreted with caution.',
+                N'This is a known limitation of lazy per-table mop-up discovery.  Throughput metrics are most accurate for priority-pass stats.',
+                NULL,
+                75
+            );
+
+            RAISERROR(N'  [INFO] I14: Mop-up PageCount gaps detected', 10, 1) WITH NOWAIT;
+        END;
+    END;
+
+    /* ======================================================================
        I4: UNUSED FEATURES
        ====================================================================== */
     IF @latest_run_label IS NOT NULL
@@ -3463,6 +3873,13 @@ BEGIN
                 SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @MopUpPass = N''Y''';
 
             SET @rc_call += N';';
+
+            /* #343: Final mutual exclusion validation guard */
+            IF ISNULL(@rc_parallel, N'N') = N'Y' AND ISNULL(@rc_group_join, N'N') = N'Y'
+            BEGIN
+                SET @rc_group_join = N'N';
+                SET @rc_rationale += N'@GroupByJoinPattern cleared (mutually exclusive with @StatsInParallel). ';
+            END;
 
             /* ---- Safeguard parameters (not tracked in CommandLog) ---- */
             SET @rc_safeguards = N'Also consider safeguards not tracked in CommandLog: @MinTempdbFreeMB = 500, @MaxConsecutiveFailures = 5';
