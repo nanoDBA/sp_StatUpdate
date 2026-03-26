@@ -36,11 +36,41 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.29.2026.03.26 (Major.Minor.YYYY.MM.DD)
+Version:    2.34.2026.03.26 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.29.2026.03.26 - fix: replace all em dashes with -- in RAISERROR output (#353).
+History:    2.34.2026.03.26 - enhance: SQL 2022+ plan feedback awareness (#369).
+                            Counts active/pending plan feedback entries per table during
+                            Phase 6 QS enrichment.  Debug warning when stats update may
+                            reset CE/grant/DOP feedback.  ExtendedInfo: QSActiveFeedbackCount.
+            2.33.2026.03.26 - feat: @QueryStoreMetric AVG_MEMORY (#370).
+                            Per-execution memory grant metric (total_memory_grant_kb /
+                            NULLIF(total_executions, 0)).  Surfaces infrequent but
+                            extremely memory-hungry queries.  SQL 2016+, no version gate.
+            2.32.2026.03.26 - feat: log QS write I/O and DOP to ExtendedInfo (#367).
+                            New diagnostic-only columns: qs_total_logical_writes (SUM of
+                            avg_logical_io_writes * count_executions), qs_max_dop (MAX of
+                            last_dop).  ExtendedInfo: QSTotalLogicalWrites, QSMaxDOP.
+                            No new @QueryStoreMetric values -- enrichment only.
+            2.31.2026.03.26 - feat: @QueryStoreMetric PHYSICAL_READS (#365).
+                            Total physical I/O reads (avg_num_physical_io_reads * executions,
+                            SQL 2017+ version-gated).  New column: qs_total_physical_reads.
+                            ExtendedInfo: QSTotalPhysicalReads.  Same REPLACE token pattern.
+            2.30.2026.03.26 - fix: W5 false positive -- Phase 6 QS enrichment now sets
+                            qs_plan_count = 0 (not NULL) when enrichment ran but found no
+                            matching plans.  NULL = enrichment skipped/bailed out.  Allows
+                            diag proc W5 to distinguish "QS healthy, tables not in top plans"
+                            from "QS disabled/broken."  Both staged and legacy paths.
+                            feat: @QueryStoreMetric MEMORY_GRANT and TEMPDB_SPILLS (#364).
+                            MEMORY_GRANT = total memory grant KB (avg_query_max_used_memory *
+                            8KB * executions, SQL 2016+).  TEMPDB_SPILLS = total tempdb pages
+                            (avg_tempdb_space_used * executions, SQL 2017+ version-gated).
+                            New columns: qs_total_memory_grant_kb, qs_total_tempdb_pages in
+                            #stats_to_process, #stat_candidates, #qs_table_stats, ExtendedInfo
+                            XML (QSTotalMemoryGrantKB, QSTotalTempdbPages).  Version-gate uses
+                            REPLACE token pattern for SQL 2016 backward compatibility.
+            2.29.2026.03.26 - fix: replace all em dashes with -- in RAISERROR output (#353).
                             fix: add @MopUpPass, @MopUpMinRemainingSeconds, @QueryStoreTopPlans
                             to ParameterFingerprint CHECKSUM (#338).
                             feat: data volume (GB) in per-stat progress messages when >= 1 MB (#336).
@@ -575,7 +605,7 @@ ALTER PROCEDURE
     ============================================================================
     */
     @QueryStorePriority nvarchar(1) = NULL, /*Y = boost priority for stats on tables actively used by Query Store plans. N = ignore QS data. NULL = default (normalized to N'N' when no preset, or to N'Y' by OLTP_LIGHT preset). P2e fix v2.4: changed from N'N' to NULL to allow presets to override.*/
-    @QueryStoreMetric nvarchar(20) = N'CPU', /*resource metric for priority: CPU (total CPU ms, default), DURATION (elapsed time), READS (logical I/O), EXECUTIONS (count), AVG_CPU (total_cpu_ms/execution_count - favors expensive single-execution queries over frequent cheap ones)*/
+    @QueryStoreMetric nvarchar(20) = N'CPU', /*resource metric for priority: CPU (total CPU ms, default), DURATION (elapsed time), READS (logical I/O), EXECUTIONS (count), AVG_CPU (avg CPU per exec), MEMORY_GRANT (total memory grant KB, SQL 2016+), TEMPDB_SPILLS (total tempdb pages, SQL 2017+), PHYSICAL_READS (total physical I/O reads, SQL 2017+), AVG_MEMORY (avg memory grant KB per execution, SQL 2016+)*/
     @QueryStoreMinExecutions bigint = 100, /*minimum plan executions to boost priority*/
     @QueryStoreRecentHours integer = 168, /*plans executed in last N hours (default: 7 days). Intentionally short - recent query activity more relevant than 30-day history*/
     @QueryStoreTopPlans integer = 500, /*max plans to XML-parse for table references.  NULL = unlimited (parse all).  Lower values reduce Phase 6 overhead on large QS catalogs at the cost of potentially missing low-CPU plan references.  Top N selected by @QueryStoreMetric.*/
@@ -725,7 +755,7 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.29.2026.03.26',
+        @procedure_version varchar(20) = '2.34.2026.03.26',
         @procedure_version_date datetime = '20260326',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -881,7 +911,7 @@ BEGIN
                     WHEN N'@QueryStorePriority'
                     THEN N'Y = prioritize stats used by Query Store plans, N = ignore'
                     WHEN N'@QueryStoreMetric'
-                    THEN N'CPU = total CPU time (default), DURATION = elapsed time, READS = logical I/O, EXECUTIONS = count, AVG_CPU = avg CPU per execution (total_cpu_ms/execution_count, favors expensive single-run queries)'
+                    THEN N'CPU = total CPU time (default), DURATION = elapsed time, READS = logical I/O, EXECUTIONS = count, AVG_CPU = avg CPU per execution, MEMORY_GRANT = total memory grant KB (bad CE -> wrong grants -> spills), TEMPDB_SPILLS = total tempdb pages used (SQL 2017+, direct spill evidence), PHYSICAL_READS = total physical I/O reads (SQL 2017+, wrong join order -> table scans), AVG_MEMORY = avg memory grant KB per execution (surfaces infrequent memory-hungry queries)'
                     WHEN N'@QueryStoreMinExecutions'
                     THEN N'minimum plan executions to boost priority (default 100)'
                     WHEN N'@QueryStoreRecentHours'
@@ -1016,7 +1046,7 @@ BEGIN
                     WHEN N'@Preset' THEN N'NULL, NIGHTLY_MAINTENANCE, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE_AGGRESSIVE'
                     WHEN N'@SortOrder' THEN N'MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED'
                     WHEN N'@FilteredStatsMode' THEN N'INCLUDE, EXCLUDE, ONLY, PRIORITY'
-                    WHEN N'@QueryStoreMetric' THEN N'CPU, DURATION, READS, EXECUTIONS, AVG_CPU'
+                    WHEN N'@QueryStoreMetric' THEN N'CPU, DURATION, READS, EXECUTIONS, AVG_CPU, MEMORY_GRANT, TEMPDB_SPILLS, PHYSICAL_READS, AVG_MEMORY'
                     WHEN N'@ThresholdLogic' THEN N'OR, AND'
                     /* Numeric */
                     WHEN N'@ModificationThreshold' THEN N'0-N (floor for modification_counter)'
@@ -1787,6 +1817,12 @@ ORDER BY TotalStatUpdates DESC;')
         @current_qs_total_cpu_ms bigint = NULL,
         @current_qs_total_duration_ms bigint = NULL,
         @current_qs_total_logical_reads bigint = NULL,
+        @current_qs_total_memory_grant_kb bigint = NULL,
+        @current_qs_total_tempdb_pages bigint = NULL,
+        @current_qs_total_physical_reads bigint = NULL,
+        @current_qs_total_logical_writes bigint = NULL,
+        @current_qs_max_dop smallint = NULL,
+        @current_qs_active_feedback_count int = NULL,
         @current_qs_last_execution datetime2(3) = NULL,
         @current_qs_priority_boost bigint = NULL;
 
@@ -1966,6 +2002,12 @@ ORDER BY TotalStatUpdates DESC;')
         qs_total_cpu_ms bigint NULL, /*total CPU time in ms (avg_cpu_time * count_executions / 1000)*/
         qs_total_duration_ms bigint NULL, /*total elapsed time in ms*/
         qs_total_logical_reads bigint NULL, /*total logical I/O reads*/
+        qs_total_memory_grant_kb bigint NULL, /*total memory grant KB (avg_query_max_used_memory * 8KB * executions)*/
+        qs_total_tempdb_pages bigint NULL, /*total tempdb pages (avg_tempdb_space_used * executions, SQL 2017+)*/
+        qs_total_physical_reads bigint NULL, /*total physical I/O reads (avg_num_physical_io_reads * executions, SQL 2017+)*/
+        qs_total_logical_writes bigint NULL, /*total logical write pages (avg_logical_io_writes * executions, diagnostic only)*/
+        qs_max_dop smallint NULL, /*maximum observed DOP (last_dop, diagnostic only)*/
+        qs_active_feedback_count int NULL, /*SQL 2022+: count of active plan feedback entries (CE/grant/DOP)*/
         qs_last_execution datetime2(3) NULL, /*most recent plan execution*/
         qs_priority_boost bigint NOT NULL DEFAULT 0, /*calculated boost for QS stats*/
         priority integer NOT NULL DEFAULT 0,
@@ -2880,7 +2922,7 @@ ORDER BY TotalStatUpdates DESC;')
     /*
     Validate @QueryStoreMetric
     */
-    IF @QueryStoreMetric NOT IN (N'CPU', N'DURATION', N'READS', N'EXECUTIONS', N'AVG_CPU')
+    IF @QueryStoreMetric NOT IN (N'CPU', N'DURATION', N'READS', N'EXECUTIONS', N'AVG_CPU', N'MEMORY_GRANT', N'TEMPDB_SPILLS', N'PHYSICAL_READS', N'AVG_MEMORY')
     BEGIN
         INSERT INTO
             @errors
@@ -2890,7 +2932,37 @@ ORDER BY TotalStatUpdates DESC;')
         )
         SELECT
             error_message =
-                N'The value for @QueryStoreMetric is not supported. Use CPU, DURATION, READS, EXECUTIONS, or AVG_CPU.',
+                N'The value for @QueryStoreMetric is not supported. Use CPU, DURATION, READS, EXECUTIONS, AVG_CPU, MEMORY_GRANT, TEMPDB_SPILLS, PHYSICAL_READS, or AVG_MEMORY.',
+            error_severity = 16;
+    END;
+
+    /* TEMPDB_SPILLS requires SQL 2017+ (avg_tempdb_space_used added in 14.x) */
+    IF @QueryStoreMetric = N'TEMPDB_SPILLS' AND @sql_major_version < 14
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'@QueryStoreMetric = TEMPDB_SPILLS requires SQL Server 2017 or later (avg_tempdb_space_used not available).',
+            error_severity = 16;
+    END;
+
+    /* PHYSICAL_READS requires SQL 2017+ (avg_num_physical_io_reads added in 14.x) */
+    IF @QueryStoreMetric = N'PHYSICAL_READS' AND @sql_major_version < 14
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'@QueryStoreMetric = PHYSICAL_READS requires SQL Server 2017 or later (avg_num_physical_io_reads not available).',
             error_severity = 16;
     END;
 
@@ -5696,6 +5768,12 @@ OPTION (RECOMPILE);';
                         qs_total_cpu_ms = CONVERT(bigint, NULL),
                         qs_total_duration_ms = CONVERT(bigint, NULL),
                         qs_total_logical_reads = CONVERT(bigint, NULL),
+                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),
+                        qs_total_tempdb_pages = CONVERT(bigint, NULL),
+                        qs_total_physical_reads = CONVERT(bigint, NULL),
+                        qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_max_dop = CONVERT(smallint, NULL),
+                        qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
                         qs_priority_boost = CONVERT(bigint, NULL),
                         is_published = CONVERT(bit, NULL),
@@ -5778,6 +5856,12 @@ OPTION (RECOMPILE);';
                         qs_total_cpu_ms = CONVERT(bigint, NULL),
                         qs_total_duration_ms = CONVERT(bigint, NULL),
                         qs_total_logical_reads = CONVERT(bigint, NULL),
+                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),
+                        qs_total_tempdb_pages = CONVERT(bigint, NULL),
+                        qs_total_physical_reads = CONVERT(bigint, NULL),
+                        qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_max_dop = CONVERT(smallint, NULL),
+                        qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
                         qs_priority_boost = CONVERT(bigint, NULL),
                         is_published = CONVERT(bit, NULL),
@@ -5870,6 +5954,12 @@ OPTION (RECOMPILE);';
                         qs_total_cpu_ms = CONVERT(bigint, NULL),
                         qs_total_duration_ms = CONVERT(bigint, NULL),
                         qs_total_logical_reads = CONVERT(bigint, NULL),
+                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),
+                        qs_total_tempdb_pages = CONVERT(bigint, NULL),
+                        qs_total_physical_reads = CONVERT(bigint, NULL),
+                        qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_max_dop = CONVERT(smallint, NULL),
+                        qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
                         qs_priority_boost = CONVERT(bigint, NULL),
                         is_published = CONVERT(bit, NULL),
@@ -6043,6 +6133,12 @@ OPTION (RECOMPILE);';
                         qs_total_cpu_ms = CONVERT(bigint, NULL),
                         qs_total_duration_ms = CONVERT(bigint, NULL),
                         qs_total_logical_reads = CONVERT(bigint, NULL),
+                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),
+                        qs_total_tempdb_pages = CONVERT(bigint, NULL),
+                        qs_total_physical_reads = CONVERT(bigint, NULL),
+                        qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_max_dop = CONVERT(smallint, NULL),
+                        qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
                         qs_priority_boost = CONVERT(bigint, NULL),
                         is_published = CONVERT(bit, NULL),
@@ -6116,6 +6212,12 @@ OPTION (RECOMPILE);';
                             qs_total_cpu_ms = CONVERT(bigint, NULL),
                             qs_total_duration_ms = CONVERT(bigint, NULL),
                             qs_total_logical_reads = CONVERT(bigint, NULL),
+                            qs_total_memory_grant_kb = CONVERT(bigint, NULL),
+                            qs_total_tempdb_pages = CONVERT(bigint, NULL),
+                            qs_total_physical_reads = CONVERT(bigint, NULL),
+                            qs_total_logical_writes = CONVERT(bigint, NULL),
+                            qs_max_dop = CONVERT(smallint, NULL),
+                            qs_active_feedback_count = CONVERT(int, NULL),
                             qs_last_execution = CONVERT(datetime2, NULL),
                             qs_priority_boost = CONVERT(bigint, NULL),
                             is_published = CONVERT(bit, NULL),
@@ -6179,6 +6281,12 @@ OPTION (RECOMPILE);';
                         qs_total_cpu_ms = CONVERT(bigint, NULL),
                         qs_total_duration_ms = CONVERT(bigint, NULL),
                         qs_total_logical_reads = CONVERT(bigint, NULL),
+                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),
+                        qs_total_tempdb_pages = CONVERT(bigint, NULL),
+                        qs_total_physical_reads = CONVERT(bigint, NULL),
+                        qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_max_dop = CONVERT(smallint, NULL),
+                        qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
                         qs_priority_boost = CONVERT(bigint, NULL),
                         is_published = CONVERT(bit, NULL),
@@ -6203,6 +6311,12 @@ OPTION (RECOMPILE);';
                     qs_total_cpu_ms bigint NULL,
                     qs_total_duration_ms bigint NULL,
                     qs_total_logical_reads bigint NULL,
+                    qs_total_memory_grant_kb bigint NULL,
+                    qs_total_tempdb_pages bigint NULL,
+                    qs_total_physical_reads bigint NULL,
+                    qs_total_logical_writes bigint NULL,
+                    qs_max_dop smallint NULL,
+                    qs_active_feedback_count int NULL,
                     qs_last_execution datetime2 NULL,
                     qs_priority_boost bigint NULL;
 
@@ -6286,6 +6400,10 @@ OPTION (RECOMPILE);';
                             WHEN N''READS''       THEN SUM(CONVERT(float, qsrs.avg_logical_io_reads * qsrs.count_executions))
                             WHEN N''EXECUTIONS''  THEN SUM(CONVERT(float, qsrs.count_executions))
                             WHEN N''AVG_CPU''     THEN SUM(qsrs.avg_cpu_time * qsrs.count_executions)
+                            WHEN N''MEMORY_GRANT'' THEN SUM(CONVERT(float, qsrs.avg_query_max_used_memory * qsrs.count_executions))
+                            WHEN N''TEMPDB_SPILLS'' THEN {{TEMPDB_SPILLS_ORDER}}
+                            WHEN N''PHYSICAL_READS'' THEN {{PHYSICAL_READS_ORDER}}
+                            WHEN N''AVG_MEMORY'' THEN SUM(CONVERT(float, qsrs.avg_query_max_used_memory * qsrs.count_executions)) / NULLIF(SUM(CONVERT(float, qsrs.count_executions)), 0)
                             ELSE SUM(qsrs.avg_cpu_time * qsrs.count_executions)
                         END DESC
                     ),
@@ -6318,6 +6436,11 @@ OPTION (RECOMPILE);';
                             SUM(qsrs2.avg_cpu_time * qsrs2.count_executions) / 1000 AS total_cpu_ms,
                             SUM(qsrs2.avg_duration * qsrs2.count_executions) / 1000 AS total_duration_ms,
                             SUM(CONVERT(bigint, qsrs2.avg_logical_io_reads * qsrs2.count_executions)) AS total_logical_reads,
+                            SUM(CONVERT(bigint, qsrs2.avg_query_max_used_memory * qsrs2.count_executions)) * 8 AS total_memory_grant_kb,
+                            {{TEMPDB_SPILLS_EXPR}} AS total_tempdb_pages,
+                            {{PHYSICAL_READS_EXPR}} AS total_physical_reads,
+                            SUM(CONVERT(bigint, qsrs2.avg_logical_io_writes * qsrs2.count_executions)) AS total_logical_writes,
+                            MAX(qsrs2.last_dop) AS max_dop,
                             MAX(qsrs2.last_execution_time) AS last_execution
                         FROM FilteredRefs AS fr
                         JOIN sys.query_store_runtime_stats AS qsrs2
@@ -6335,6 +6458,11 @@ OPTION (RECOMPILE);';
                         sc.qs_total_cpu_ms = qs.total_cpu_ms,
                         sc.qs_total_duration_ms = qs.total_duration_ms,
                         sc.qs_total_logical_reads = qs.total_logical_reads,
+                        sc.qs_total_memory_grant_kb = qs.total_memory_grant_kb,
+                        sc.qs_total_tempdb_pages = qs.total_tempdb_pages,
+                        sc.qs_total_physical_reads = qs.total_physical_reads,
+                        sc.qs_total_logical_writes = qs.total_logical_writes,
+                        sc.qs_max_dop = qs.max_dop,
                         sc.qs_last_execution = qs.last_execution,
                         sc.qs_priority_boost =
                             CASE
@@ -6345,12 +6473,40 @@ OPTION (RECOMPILE);';
                                          WHEN N''READS'' THEN ISNULL(qs.total_logical_reads, 0) / 1000
                                          WHEN N''EXECUTIONS'' THEN ISNULL(qs.total_executions, 0)
                                          WHEN N''AVG_CPU'' THEN ISNULL(qs.total_cpu_ms, 0) / NULLIF(qs.total_executions, 0) /* avg CPU per execution */
+                                         WHEN N''MEMORY_GRANT'' THEN ISNULL(qs.total_memory_grant_kb, 0)
+                                         WHEN N''TEMPDB_SPILLS'' THEN ISNULL(qs.total_tempdb_pages, 0)
+                                         WHEN N''PHYSICAL_READS'' THEN ISNULL(qs.total_physical_reads, 0)
+                                         WHEN N''AVG_MEMORY'' THEN ISNULL(qs.total_memory_grant_kb, 0) / NULLIF(qs.total_executions, 0)
                                          ELSE ISNULL(qs.total_cpu_ms, 0)
                                      END
                                 ELSE 0
                             END
                     FROM #stat_candidates AS sc
                     INNER JOIN QSByTable AS qs ON qs.object_id = sc.object_id;
+
+                    /* Mark unenriched stats: 0 = enrichment ran, no matching QS plans
+                       (vs NULL = enrichment skipped/bailed out).  Allows diag proc W5
+                       to distinguish "QS healthy, tables not in top plans" from "QS broken." */
+                    UPDATE #stat_candidates SET qs_plan_count = 0 WHERE qs_plan_count IS NULL;
+
+                    /* SQL 2022+ plan feedback awareness (#369):
+                       Count active/pending plan feedback entries per table.
+                       Stats updates may reset CE/grant/DOP feedback. */
+                    IF OBJECT_ID(N''sys.query_store_plan_feedback'') IS NOT NULL
+                    BEGIN
+                        UPDATE sc
+                        SET sc.qs_active_feedback_count = fb.feedback_count
+                        FROM #stat_candidates AS sc
+                        INNER JOIN (
+                            SELECT q.object_id, COUNT(*) AS feedback_count
+                            FROM sys.query_store_plan_feedback AS pf
+                            INNER JOIN sys.query_store_plan AS p ON pf.plan_id = p.plan_id
+                            INNER JOIN sys.query_store_query AS q ON p.query_id = q.query_id
+                            WHERE pf.state_desc IN (N''ACTIVE'', N''PENDING_VALIDATION'')
+                            GROUP BY q.object_id
+                        ) AS fb ON fb.object_id = sc.object_id;
+                    END;
+
                     END; /* ELSE from early bail-out */
                     /*#endregion PHASE-6-QS-ENRICHMENT */
                 END; /* IF @QueryStorePriority AND QS enabled */
@@ -6392,6 +6548,12 @@ OPTION (RECOMPILE);';
                     qs_total_cpu_ms,
                     qs_total_duration_ms,
                     qs_total_logical_reads,
+                    qs_total_memory_grant_kb,
+                    qs_total_tempdb_pages,
+                    qs_total_physical_reads,
+                    qs_total_logical_writes,
+                    qs_max_dop,
+                    qs_active_feedback_count,
                     qs_last_execution,
                     ISNULL(qs_priority_boost, 0) AS qs_priority_boost,
                     is_published,
@@ -6449,6 +6611,30 @@ OPTION (RECOMPILE);';
                         N' OPTION (MAX_GRANT_PERCENT = 25);',
                         N';'); /* Remove hint when NULL or unsupported */
 
+                /* Version-gate TEMPDB_SPILLS: avg_tempdb_space_used added in SQL 2017 (14.x) */
+                SET @staged_sql = REPLACE(@staged_sql, N'{{TEMPDB_SPILLS_EXPR}}',
+                    CASE WHEN @sql_major_version >= 14
+                    THEN N'SUM(CONVERT(bigint, qsrs2.avg_tempdb_space_used * qsrs2.count_executions))'
+                    ELSE N'CONVERT(bigint, 0)'
+                    END);
+                SET @staged_sql = REPLACE(@staged_sql, N'{{TEMPDB_SPILLS_ORDER}}',
+                    CASE WHEN @sql_major_version >= 14
+                    THEN N'SUM(CONVERT(float, qsrs.avg_tempdb_space_used * qsrs.count_executions))'
+                    ELSE N'SUM(CONVERT(float, 0))'
+                    END);
+
+                /* Version-gate PHYSICAL_READS: avg_num_physical_io_reads added in SQL 2017 (14.x) */
+                SET @staged_sql = REPLACE(@staged_sql, N'{{PHYSICAL_READS_EXPR}}',
+                    CASE WHEN @sql_major_version >= 14
+                    THEN N'SUM(CONVERT(bigint, qsrs2.avg_num_physical_io_reads * qsrs2.count_executions))'
+                    ELSE N'CONVERT(bigint, 0)'
+                    END);
+                SET @staged_sql = REPLACE(@staged_sql, N'{{PHYSICAL_READS_ORDER}}',
+                    CASE WHEN @sql_major_version >= 14
+                    THEN N'SUM(CONVERT(float, qsrs.avg_num_physical_io_reads * qsrs.count_executions))'
+                    ELSE N'SUM(CONVERT(float, 0))'
+                    END);
+
                 /*
                 Execute staged discovery and insert results
                 */
@@ -6459,7 +6645,8 @@ OPTION (RECOMPILE);';
                     modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                     has_filter, filter_definition, unfiltered_rows,
                     qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
-                    qs_total_logical_reads, qs_last_execution, qs_priority_boost,
+                    qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_max_dop, qs_active_feedback_count,
+                    qs_last_execution, qs_priority_boost,
                     is_published, is_tracked_by_cdc, temporal_type, priority
                 )
                 EXECUTE sys.sp_executesql
@@ -6573,6 +6760,12 @@ OPTION (RECOMPILE);';
             total_cpu_ms bigint NULL,
             total_duration_ms bigint NULL,
             total_logical_reads bigint NULL,
+            total_memory_grant_kb bigint NULL,
+            total_tempdb_pages bigint NULL,
+            total_physical_reads bigint NULL,
+            total_logical_writes bigint NULL,
+            max_dop smallint NULL,
+            active_feedback_count int NULL,
             last_execution datetime2(3) NULL
         );
 
@@ -6594,6 +6787,7 @@ OPTION (RECOMPILE);';
 
             /* v2.24: Debug timing for legacy QS enrichment */
             DECLARE @legacy_qs_timer datetime2 = SYSDATETIME();
+            DECLARE @qs_enrichment_ran bit = 0;
 
             /* Early bail-out: skip XML parsing if QS has no recent runtime data */
             IF NOT EXISTS (
@@ -6608,6 +6802,7 @@ OPTION (RECOMPILE);';
             END
             ELSE
             BEGIN
+            SET @qs_enrichment_ran = 1;
             ;WITH TopPlanIds AS (
                 SELECT TOP (ISNULL(@QueryStoreTopPlans_param, 2147483647))
                     qsp.plan_id
@@ -6624,6 +6819,10 @@ OPTION (RECOMPILE);';
                     WHEN N''READS''       THEN SUM(CONVERT(float, qsrs.avg_logical_io_reads * qsrs.count_executions))
                     WHEN N''EXECUTIONS''  THEN SUM(CONVERT(float, qsrs.count_executions))
                     WHEN N''AVG_CPU''     THEN SUM(qsrs.avg_cpu_time * qsrs.count_executions)
+                    WHEN N''MEMORY_GRANT'' THEN SUM(CONVERT(float, qsrs.avg_query_max_used_memory * qsrs.count_executions))
+                    WHEN N''TEMPDB_SPILLS'' THEN {{TEMPDB_SPILLS_ORDER_LEGACY}}
+                    WHEN N''PHYSICAL_READS'' THEN {{PHYSICAL_READS_ORDER_LEGACY}}
+                    WHEN N''AVG_MEMORY'' THEN SUM(CONVERT(float, qsrs.avg_query_max_used_memory * qsrs.count_executions)) / NULLIF(SUM(CONVERT(float, qsrs.count_executions)), 0)
                     ELSE SUM(qsrs.avg_cpu_time * qsrs.count_executions)
                 END DESC
             ),
@@ -6660,6 +6859,11 @@ OPTION (RECOMPILE);';
                 SUM(qsrs2.avg_cpu_time * qsrs2.count_executions) / 1000,
                 SUM(qsrs2.avg_duration * qsrs2.count_executions) / 1000,
                 SUM(CONVERT(bigint, qsrs2.avg_logical_io_reads * qsrs2.count_executions)),
+                SUM(CONVERT(bigint, qsrs2.avg_query_max_used_memory * qsrs2.count_executions)) * 8,
+                {{TEMPDB_SPILLS_EXPR_LEGACY}},
+                {{PHYSICAL_READS_EXPR_LEGACY}},
+                SUM(CONVERT(bigint, qsrs2.avg_logical_io_writes * qsrs2.count_executions)),
+                MAX(qsrs2.last_dop),
                 MAX(qsrs2.last_execution_time)
             FROM FilteredRefs AS fr
             JOIN sys.query_store_runtime_stats AS qsrs2
@@ -6677,6 +6881,22 @@ OPTION (RECOMPILE);';
                 DECLARE @legacy_qs_ms int = DATEDIFF(MILLISECOND, @legacy_qs_timer, SYSDATETIME());
                 RAISERROR(N''    Legacy QS: enriched %d tables (%d ms)'', 10, 1, @legacy_qs_count, @legacy_qs_ms) WITH NOWAIT;
             END;
+
+            /* SQL 2022+ plan feedback awareness (#369) */
+            IF OBJECT_ID(N''sys.query_store_plan_feedback'') IS NOT NULL
+            BEGIN
+                UPDATE qs SET qs.active_feedback_count = fb.feedback_count
+                FROM #qs_table_stats AS qs
+                INNER JOIN (
+                    SELECT q.object_id, COUNT(*) AS feedback_count
+                    FROM sys.query_store_plan_feedback AS pf
+                    INNER JOIN sys.query_store_plan AS p ON pf.plan_id = p.plan_id
+                    INNER JOIN sys.query_store_query AS q ON p.query_id = q.query_id
+                    WHERE pf.state_desc IN (N''ACTIVE'', N''PENDING_VALIDATION'')
+                    GROUP BY q.object_id
+                ) AS fb ON fb.object_id = qs.table_object_id;
+            END;
+
             END; /* ELSE from early bail-out */
         END;
 
@@ -6718,12 +6938,18 @@ OPTION (RECOMPILE);';
             has_filter = s.has_filter,
             filter_definition = s.filter_definition,
             unfiltered_rows = sp.unfiltered_rows,
-            /* Query Store priority (NULL if QS disabled or not requested) */
-            qs_plan_count = qs_stats.plan_count,
+            /* Query Store priority (NULL if QS disabled/skipped, 0 if enrichment ran but no match) */
+            qs_plan_count = CASE WHEN @qs_enrichment_ran = 1 THEN ISNULL(qs_stats.plan_count, 0) ELSE qs_stats.plan_count END,
             qs_total_executions = qs_stats.total_executions,
             qs_total_cpu_ms = qs_stats.total_cpu_ms,
             qs_total_duration_ms = qs_stats.total_duration_ms,
             qs_total_logical_reads = qs_stats.total_logical_reads,
+            qs_total_memory_grant_kb = qs_stats.total_memory_grant_kb,
+            qs_total_tempdb_pages = qs_stats.total_tempdb_pages,
+            qs_total_physical_reads = qs_stats.total_physical_reads,
+            qs_total_logical_writes = qs_stats.total_logical_writes,
+            qs_max_dop = qs_stats.max_dop,
+            qs_active_feedback_count = qs_stats.active_feedback_count,
             qs_last_execution = qs_stats.last_execution,
             /*
             Priority boost based on selected metric - uses resource consumption, not just execution count.
@@ -6739,6 +6965,10 @@ OPTION (RECOMPILE);';
                              WHEN N''READS'' THEN ISNULL(qs_stats.total_logical_reads, 0) / 1000 /* scale down */
                              WHEN N''EXECUTIONS'' THEN ISNULL(qs_stats.total_executions, 0)
                              WHEN N''AVG_CPU'' THEN ISNULL(qs_stats.total_cpu_ms, 0) / NULLIF(qs_stats.total_executions, 0) /* avg CPU per execution */
+                             WHEN N''MEMORY_GRANT'' THEN ISNULL(qs_stats.total_memory_grant_kb, 0)
+                             WHEN N''TEMPDB_SPILLS'' THEN ISNULL(qs_stats.total_tempdb_pages, 0)
+                             WHEN N''PHYSICAL_READS'' THEN ISNULL(qs_stats.total_physical_reads, 0)
+                             WHEN N''AVG_MEMORY'' THEN ISNULL(qs_stats.total_memory_grant_kb, 0) / NULLIF(qs_stats.total_executions, 0)
                              ELSE ISNULL(qs_stats.total_cpu_ms, 0) /* default to CPU */
                          END
                     ELSE 0
@@ -6773,6 +7003,10 @@ OPTION (RECOMPILE);';
                                      WHEN N''READS'' THEN ISNULL(qs_stats.total_logical_reads, 0) / 1000
                                      WHEN N''EXECUTIONS'' THEN ISNULL(qs_stats.total_executions, 0)
                                      WHEN N''AVG_CPU'' THEN ISNULL(qs_stats.total_cpu_ms, 0) / NULLIF(qs_stats.total_executions, 0)
+                                     WHEN N''MEMORY_GRANT'' THEN ISNULL(qs_stats.total_memory_grant_kb, 0)
+                                     WHEN N''TEMPDB_SPILLS'' THEN ISNULL(qs_stats.total_tempdb_pages, 0)
+                                     WHEN N''PHYSICAL_READS'' THEN ISNULL(qs_stats.total_physical_reads, 0)
+                                     WHEN N''AVG_MEMORY'' THEN ISNULL(qs_stats.total_memory_grant_kb, 0) / NULLIF(qs_stats.total_executions, 0)
                                      ELSE ISNULL(qs_stats.total_cpu_ms, 0)
                                  END
                             ELSE 0
@@ -6793,6 +7027,10 @@ OPTION (RECOMPILE);';
                                      WHEN N''READS'' THEN ISNULL(qs_stats.total_logical_reads, 0) / 1000
                                      WHEN N''EXECUTIONS'' THEN ISNULL(qs_stats.total_executions, 0)
                                      WHEN N''AVG_CPU'' THEN ISNULL(qs_stats.total_cpu_ms, 0) / NULLIF(qs_stats.total_executions, 0)
+                                     WHEN N''MEMORY_GRANT'' THEN ISNULL(qs_stats.total_memory_grant_kb, 0)
+                                     WHEN N''TEMPDB_SPILLS'' THEN ISNULL(qs_stats.total_tempdb_pages, 0)
+                                     WHEN N''PHYSICAL_READS'' THEN ISNULL(qs_stats.total_physical_reads, 0)
+                                     WHEN N''AVG_MEMORY'' THEN ISNULL(qs_stats.total_memory_grant_kb, 0) / NULLIF(qs_stats.total_executions, 0)
                                      ELSE ISNULL(qs_stats.total_cpu_ms, 0)
                                  END
                             WHEN N''FILTERED_DRIFT''
@@ -7122,6 +7360,31 @@ OPTION (RECOMPILE);';
         /*
         Execute discovery in target database
         */
+
+        /* Version-gate TEMPDB_SPILLS: avg_tempdb_space_used added in SQL 2017 (14.x) */
+        SET @discovery_sql = REPLACE(@discovery_sql, N'{{TEMPDB_SPILLS_EXPR_LEGACY}}',
+            CASE WHEN @sql_major_version >= 14
+            THEN N'SUM(CONVERT(bigint, qsrs2.avg_tempdb_space_used * qsrs2.count_executions))'
+            ELSE N'CONVERT(bigint, 0)'
+            END);
+        SET @discovery_sql = REPLACE(@discovery_sql, N'{{TEMPDB_SPILLS_ORDER_LEGACY}}',
+            CASE WHEN @sql_major_version >= 14
+            THEN N'SUM(CONVERT(float, qsrs.avg_tempdb_space_used * qsrs.count_executions))'
+            ELSE N'SUM(CONVERT(float, 0))'
+            END);
+
+        /* Version-gate PHYSICAL_READS: avg_num_physical_io_reads added in SQL 2017 (14.x) */
+        SET @discovery_sql = REPLACE(@discovery_sql, N'{{PHYSICAL_READS_EXPR_LEGACY}}',
+            CASE WHEN @sql_major_version >= 14
+            THEN N'SUM(CONVERT(bigint, qsrs2.avg_num_physical_io_reads * qsrs2.count_executions))'
+            ELSE N'CONVERT(bigint, 0)'
+            END);
+        SET @discovery_sql = REPLACE(@discovery_sql, N'{{PHYSICAL_READS_ORDER_LEGACY}}',
+            CASE WHEN @sql_major_version >= 14
+            THEN N'SUM(CONVERT(float, qsrs.avg_num_physical_io_reads * qsrs.count_executions))'
+            ELSE N'SUM(CONVERT(float, 0))'
+            END);
+
         INSERT INTO
             #stats_to_process
         (
@@ -7150,6 +7413,12 @@ OPTION (RECOMPILE);';
             qs_total_cpu_ms,
             qs_total_duration_ms,
             qs_total_logical_reads,
+            qs_total_memory_grant_kb,
+            qs_total_tempdb_pages,
+            qs_total_physical_reads,
+            qs_total_logical_writes,
+            qs_max_dop,
+            qs_active_feedback_count,
             qs_last_execution,
             qs_priority_boost,
             is_published,
@@ -8782,6 +9051,12 @@ OPTION (RECOMPILE);';
                             qs_total_cpu_ms = CONVERT(bigint, NULL),
                             qs_total_duration_ms = CONVERT(bigint, NULL),
                             qs_total_logical_reads = CONVERT(bigint, NULL),
+                            qs_total_memory_grant_kb = CONVERT(bigint, NULL),
+                            qs_total_tempdb_pages = CONVERT(bigint, NULL),
+                            qs_total_physical_reads = CONVERT(bigint, NULL),
+                            qs_total_logical_writes = CONVERT(bigint, NULL),
+                            qs_max_dop = CONVERT(smallint, NULL),
+                            qs_active_feedback_count = CONVERT(int, NULL),
                             qs_last_execution = CONVERT(datetime2, NULL),
                             qs_priority_boost = CONVERT(bigint, 0),
                             is_published = ISNULL(t.is_published, 0),
@@ -8896,7 +9171,8 @@ OPTION (RECOMPILE);';
                                 modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                                 has_filter, filter_definition, unfiltered_rows,
                                 qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
-                                qs_total_logical_reads, qs_last_execution, qs_priority_boost,
+                                qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_max_dop, qs_active_feedback_count,
+                                qs_last_execution, qs_priority_boost,
                                 is_published, is_tracked_by_cdc, temporal_type, priority
                             )
                             EXECUTE sys.sp_executesql
@@ -9029,6 +9305,11 @@ OPTION (RECOMPILE);';
             @current_qs_total_cpu_ms = stp.qs_total_cpu_ms,
             @current_qs_total_duration_ms = stp.qs_total_duration_ms,
             @current_qs_total_logical_reads = stp.qs_total_logical_reads,
+            @current_qs_total_memory_grant_kb = stp.qs_total_memory_grant_kb,
+            @current_qs_total_tempdb_pages = stp.qs_total_tempdb_pages,
+            @current_qs_total_physical_reads = stp.qs_total_physical_reads,
+            @current_qs_total_logical_writes = stp.qs_total_logical_writes,
+            @current_qs_max_dop = stp.qs_max_dop,
             @current_qs_last_execution = stp.qs_last_execution,
             @current_qs_priority_boost = stp.qs_priority_boost,
             /* Replication and temporal table awareness */
@@ -9750,6 +10031,16 @@ OPTION (RECOMPILE);';
 
         RAISERROR(@progress_msg, 10, 1) WITH NOWAIT;
 
+        /* SQL 2022+ plan feedback warning (#369) */
+        IF @Debug = 1 AND ISNULL(@current_qs_active_feedback_count, 0) > 0
+        BEGIN
+            SET @progress_msg = N'  Note: ' + CONVERT(nvarchar(10), @current_qs_active_feedback_count)
+                + N' active plan feedback entries on '
+                + @current_schema_name + N'.' + @current_table_name
+                + N' -- stats update may reset CE/grant/DOP feedback';
+            RAISERROR(@progress_msg, 10, 1) WITH NOWAIT;
+        END;
+
         IF @Debug = 1
         BEGIN
             RAISERROR(N'  Command: %s', 10, 1, @current_command) WITH NOWAIT;
@@ -10040,6 +10331,12 @@ OPTION (RECOMPILE);';
                                 @current_qs_total_cpu_ms AS QSTotalCpuMs,
                                 @current_qs_total_duration_ms AS QSTotalDurationMs,
                                 @current_qs_total_logical_reads AS QSTotalLogicalReads,
+                                @current_qs_total_memory_grant_kb AS QSTotalMemoryGrantKB,
+                                @current_qs_total_tempdb_pages AS QSTotalTempdbPages,
+                                @current_qs_total_physical_reads AS QSTotalPhysicalReads,
+                                @current_qs_total_logical_writes AS QSTotalLogicalWrites,
+                                @current_qs_max_dop AS QSMaxDOP,
+                                @current_qs_active_feedback_count AS QSActiveFeedbackCount,
                                 @current_qs_last_execution AS QSLastExecution,
                                 @current_qs_priority_boost AS QSPriorityBoost,
                                 @QueryStoreMetric AS QSMetric,
@@ -10585,6 +10882,12 @@ OPTION (RECOMPILE);';
                         qs_total_cpu_ms = CONVERT(bigint, NULL),
                         qs_total_duration_ms = CONVERT(bigint, NULL),
                         qs_total_logical_reads = CONVERT(bigint, NULL),
+                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),
+                        qs_total_tempdb_pages = CONVERT(bigint, NULL),
+                        qs_total_physical_reads = CONVERT(bigint, NULL),
+                        qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_max_dop = CONVERT(smallint, NULL),
+                        qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
                         qs_priority_boost = CONVERT(bigint, 0),
                         is_published = ISNULL(t.is_published, 0),
@@ -10721,7 +11024,8 @@ OPTION (RECOMPILE);';
                             modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                             has_filter, filter_definition, unfiltered_rows,
                             qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
-                            qs_total_logical_reads, qs_last_execution, qs_priority_boost,
+                            qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_max_dop, qs_active_feedback_count,
+                            qs_last_execution, qs_priority_boost,
                             is_published, is_tracked_by_cdc, temporal_type, priority
                         )
                         EXECUTE sys.sp_executesql
@@ -10949,6 +11253,12 @@ OPTION (RECOMPILE);';
                     qs_total_cpu_ms = CONVERT(bigint, NULL),
                     qs_total_duration_ms = CONVERT(bigint, NULL),
                     qs_total_logical_reads = CONVERT(bigint, NULL),
+                    qs_total_memory_grant_kb = CONVERT(bigint, NULL),
+                    qs_total_tempdb_pages = CONVERT(bigint, NULL),
+                    qs_total_physical_reads = CONVERT(bigint, NULL),
+                    qs_total_logical_writes = CONVERT(bigint, NULL),
+                    qs_max_dop = CONVERT(smallint, NULL),
+                    qs_active_feedback_count = CONVERT(int, NULL),
                     qs_last_execution = CONVERT(datetime2, NULL),
                     qs_priority_boost = CONVERT(bigint, 0),
                     is_published = ISNULL(t.is_published, 0),
@@ -11085,7 +11395,8 @@ OPTION (RECOMPILE);';
                         modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                         has_filter, filter_definition, unfiltered_rows,
                         qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
-                        qs_total_logical_reads, qs_last_execution, qs_priority_boost,
+                        qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_max_dop, qs_active_feedback_count,
+                            qs_last_execution, qs_priority_boost,
                         is_published, is_tracked_by_cdc, temporal_type, priority
                     )
                     EXECUTE sys.sp_executesql
