@@ -36,11 +36,24 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.26.2026.03.25 (Major.Minor.YYYY.MM.DD)
+Version:    2.27.2026.03.26 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.26.2026.03.25 - fix: @StopByTime HHMM format (e.g., '0500') silently parsed
+History:    2.27.2026.03.26 - fix: mop-up discovery referenced dbo.CommandLog without 3-part
+                            name after USE <userdb>, causing "Invalid object name" (#354).
+                            Added @commandlog_3part variable for all 3 mop-up paths.
+                            fix: @parameters_string missing @ExcludeTables, @ExcludeStatistics,
+                            @TieredThresholds, @FilteredStatsMode, @QueryStorePriority -- caused
+                            parallel workers with different filters to share wrong queue,
+                            leading to same-table blocking (#355).
+                            fix: mop-up discovery ignored @ExcludeTables/@ExcludeStatistics
+                            filters -- excluded stats picked up by mop-up pass (#356).
+                            fix: mop-up QueueStatistic NOT EXISTS blocked re-queuing of
+                            completed priority tables -- mop-up stats discovered but never
+                            processed (#357).  DELETE completed entries before INSERT.
+                            Also fixed follower @mop_up_stats_processed baseline.
+            2.26.2026.03.25 - fix: @StopByTime HHMM format (e.g., '0500') silently parsed
                             as midnight by CONVERT(time).  Now normalizes HHMM to HH:MM
                             and HHMMSS to HH:MM:SS before conversion.
                             Parallel discovery skip: workers joining an active queue skip
@@ -689,8 +702,8 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.26.2026.03.25',
-        @procedure_version_date datetime = '20260325',
+        @procedure_version varchar(20) = '2.27.2026.03.26',
+        @procedure_version_date datetime = '20260326',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -1802,6 +1815,7 @@ ORDER BY TotalStatUpdates DESC;')
         @run_label nvarchar(100) = N'',
         @stop_reason nvarchar(50) = NULL,
         @commandlog_exists bit = CASE WHEN OBJECT_ID(N'dbo.CommandLog', N'U') IS NOT NULL THEN 1 ELSE 0 END,
+        @commandlog_3part nvarchar(300) = QUOTENAME(DB_NAME()) + N'.dbo.CommandLog', /* v2.26: 3-part name for mop-up dynamic SQL after USE <userdb> */
         @mop_up_done bit = 0, /* v2.24: prevents mop-up re-entry after GOTO */
         @in_mop_up bit = 0, /* v2.24: set during mop-up pass for QualifyReason tagging */
         @mop_up_stats_found int = 0, /* v2.24: mop-up candidates discovered */
@@ -5277,11 +5291,16 @@ OPTION (RECOMPILE);';
             @parameters_string =
                 N'@Databases=' + ISNULL(LTRIM(RTRIM(@Databases)), N'') +
                 N',@Tables=' + ISNULL(LTRIM(RTRIM(@Tables)), N'') +
+                N',@ExcludeTables=' + ISNULL(LTRIM(RTRIM(@ExcludeTables)), N'') +
+                N',@ExcludeStatistics=' + ISNULL(LTRIM(RTRIM(@ExcludeStatistics)), N'') +
                 N',@TargetNorecompute=' + ISNULL(LTRIM(RTRIM(@TargetNorecompute)), N'') +
                 N',@ModificationThreshold=' + ISNULL(CONVERT(nvarchar(20), @ModificationThreshold), N'') +
                 N',@MinPageCount=' + ISNULL(CONVERT(nvarchar(20), @MinPageCount), N'') +
                 N',@IncludeSystemObjects=' + ISNULL(LTRIM(RTRIM(@IncludeSystemObjects)), N'') +
-                N',@SortOrder=' + ISNULL(LTRIM(RTRIM(@SortOrder)), N'');
+                N',@SortOrder=' + ISNULL(LTRIM(RTRIM(@SortOrder)), N'') +
+                N',@TieredThresholds=' + ISNULL(CONVERT(nvarchar(5), @TieredThresholds), N'') +
+                N',@FilteredStatsMode=' + ISNULL(LTRIM(RTRIM(@FilteredStatsMode)), N'') +
+                N',@QueryStorePriority=' + ISNULL(LTRIM(RTRIM(@QueryStorePriority)), N'');
 
         /* Check if a matching queue has unclaimed work items */
         SELECT
@@ -7790,44 +7809,63 @@ OPTION (RECOMPILE);';
 
     IF @total_stats = 0
     BEGIN
-        RAISERROR(N'No statistics qualify for update. Exiting.', 10, 1) WITH NOWAIT;
-
         /*
-        Set OUTPUT parameters before early return
+        v2.26: Check if mop-up pass can run even with 0 priority stats.
+        Mop-up discovers stats with modification_counter > 0 not updated in this run.
         */
-        SELECT
-            @StatsFoundOut = 0,
-            @StatsProcessedOut = 0,
-            @StatsSucceededOut = 0,
-            @StatsFailedOut = 0,
-            @StatsRemainingOut = 0,
-            @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
-            @WarningsOut = NULLIF(@warnings, N''),
-            @StopReasonOut = N'NO_QUALIFYING_STATS';
+        IF @MopUpPass = N'Y'
+        AND @LogToTable = N'Y'
+        AND @TimeLimit IS NOT NULL
+        AND @Execute = N'Y'
+        AND @commandlog_exists = 1
+        AND (DATEDIFF(SECOND, @start_time, SYSDATETIME()) + @MopUpMinRemainingSeconds) <= @TimeLimit
+        BEGIN
+            /* Mop-up is enabled and has time budget -- continue to mop-up discovery */
+            RAISERROR(N'No priority statistics found. Checking mop-up pass...', 10, 1) WITH NOWAIT;
+            SET @stop_reason = N'NATURAL_END'; /* Allow mop-up pass to trigger */
+        END
+        ELSE
+        BEGIN
+            /* Mop-up disabled or insufficient time -- exit */
+            RAISERROR(N'No statistics qualify for update. Exiting.', 10, 1) WITH NOWAIT;
 
-        /*
-        Return summary result set even on early exit (0 qualifying stats).
-        Without this, INSERT #Summary EXEC sp_StatUpdate gets no rows.
-        */
-        SELECT
-            Status = N'SUCCESS',
-            StatusMessage = N'No statistics qualify for update',
-            StatsFound = 0,
-            StatsProcessed = 0,
-            StatsSucceeded = 0,
-            StatsFailed = 0,
-            StatsToctou = 0,
-            StatsSkipped = 0,
-            StatsRemaining = 0,
-            DatabasesProcessed = @database_count,
-            DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
-            StopReason = CONVERT(nvarchar(50), N'NO_QUALIFYING_STATS'),
-            RunLabel = @run_label,
-            Version = @procedure_version;
+            /*
+            Set OUTPUT parameters before early return
+            */
+            SELECT
+                @StatsFoundOut = 0,
+                @StatsProcessedOut = 0,
+                @StatsSucceededOut = 0,
+                @StatsFailedOut = 0,
+                @StatsRemainingOut = 0,
+                @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
+                @WarningsOut = NULLIF(@warnings, N''),
+                @StopReasonOut = N'NO_QUALIFYING_STATS';
 
-        IF @StatsInParallel = N'N'
-            EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
-        RETURN 0;
+            /*
+            Return summary result set even on early exit (0 qualifying stats).
+            Without this, INSERT #Summary EXEC sp_StatUpdate gets no rows.
+            */
+            SELECT
+                Status = N'SUCCESS',
+                StatusMessage = N'No statistics qualify for update',
+                StatsFound = 0,
+                StatsProcessed = 0,
+                StatsSucceeded = 0,
+                StatsFailed = 0,
+                StatsToctou = 0,
+                StatsSkipped = 0,
+                StatsRemaining = 0,
+                DatabasesProcessed = @database_count,
+                DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
+                StopReason = CONVERT(nvarchar(50), N'NO_QUALIFYING_STATS'),
+                RunLabel = @run_label,
+                Version = @procedure_version;
+
+            IF @StatsInParallel = N'N'
+                EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+            RETURN 0;
+        END;
     END;
     /*#endregion 17-POST-DISCOVERY */
 
@@ -7897,11 +7935,16 @@ OPTION (RECOMPILE);';
                 @parameters_string =
                     N'@Databases=' + ISNULL(LTRIM(RTRIM(@Databases)), N'') +
                     N',@Tables=' + ISNULL(LTRIM(RTRIM(@Tables)), N'') +
+                    N',@ExcludeTables=' + ISNULL(LTRIM(RTRIM(@ExcludeTables)), N'') +
+                    N',@ExcludeStatistics=' + ISNULL(LTRIM(RTRIM(@ExcludeStatistics)), N'') +
                     N',@TargetNorecompute=' + ISNULL(LTRIM(RTRIM(@TargetNorecompute)), N'') +
                     N',@ModificationThreshold=' + ISNULL(CONVERT(nvarchar(20), @ModificationThreshold), N'') +
                     N',@MinPageCount=' + ISNULL(CONVERT(nvarchar(20), @MinPageCount), N'') +
                     N',@IncludeSystemObjects=' + ISNULL(LTRIM(RTRIM(@IncludeSystemObjects)), N'') +
-                    N',@SortOrder=' + ISNULL(LTRIM(RTRIM(@SortOrder)), N'');
+                    N',@SortOrder=' + ISNULL(LTRIM(RTRIM(@SortOrder)), N'') +
+                    N',@TieredThresholds=' + ISNULL(CONVERT(nvarchar(5), @TieredThresholds), N'') +
+                    N',@FilteredStatsMode=' + ISNULL(LTRIM(RTRIM(@FilteredStatsMode)), N'') +
+                    N',@QueryStorePriority=' + ISNULL(LTRIM(RTRIM(@QueryStorePriority)), N'');
         END;
 
         BEGIN TRY
@@ -8701,8 +8744,19 @@ OPTION (RECOMPILE);';
                         AND   (@TargetNorecompute_param = N''BOTH''
                                OR (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
                                OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1))
+                        /* v2.26: Statistics exclusion filter (was missing from lazy mop-up) */
+                        AND   (
+                                  @ExcludeStatistics_param IS NULL
+                               OR NOT EXISTS
+                                  (
+                                      SELECT 1
+                                      FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
+                                      WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                                         OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                                  )
+                              )
                         AND   NOT EXISTS (
-                            SELECT 1 FROM dbo.CommandLog AS cl
+                            SELECT 1 FROM ' + @commandlog_3part + N' AS cl
                             WHERE cl.CommandType = N''UPDATE_STATISTICS''
                             AND   cl.DatabaseName = DB_NAME() COLLATE DATABASE_DEFAULT
                             AND   cl.SchemaName = OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT
@@ -8729,9 +8783,10 @@ OPTION (RECOMPILE);';
                             )
                             EXECUTE sys.sp_executesql
                                 @lazy_mop_sql,
-                                N'@object_id_param int, @TargetNorecompute_param nvarchar(10), @start_time_param datetime2(7)',
+                                N'@object_id_param int, @TargetNorecompute_param nvarchar(10), @ExcludeStatistics_param nvarchar(max), @start_time_param datetime2(7)',
                                 @object_id_param = @claimed_table_object_id,
                                 @TargetNorecompute_param = @TargetNorecompute,
+                                @ExcludeStatistics_param = @ExcludeStatistics,
                                 @start_time_param = @start_time;
 
                             SET @lazy_mop_found = ROWCOUNT_BIG();
@@ -10327,8 +10382,9 @@ OPTION (RECOMPILE);';
                 BEGIN
                     SELECT @mop_up_db = database_name FROM @mop_up_db_list WHERE idx = @mop_up_db_idx;
 
-                    SET @mop_up_sql = N'
-                    USE ' + QUOTENAME(@mop_up_db) + N';
+                    /* v2.26: CAST first element to nvarchar(max) to prevent 4000 char truncation during concatenation */
+                    SET @mop_up_sql = CAST(N'
+                    USE ' AS nvarchar(max)) + QUOTENAME(@mop_up_db) + N';
 
                     SELECT
                         database_name = DB_NAME(),
@@ -10381,6 +10437,27 @@ OPTION (RECOMPILE);';
                            OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
                            OR @TargetNorecompute_param = N''BOTH''
                           )
+                    /* v2.26: Table exclusion filter (was missing from mop-up) */
+                    AND   (
+                              @ExcludeTables_param IS NULL
+                           OR NOT EXISTS
+                              (
+                                  SELECT 1
+                                  FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
+                                  WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                              )
+                          )
+                    /* v2.26: Statistics exclusion filter (was missing from mop-up) */
+                    AND   (
+                              @ExcludeStatistics_param IS NULL
+                           OR NOT EXISTS
+                              (
+                                  SELECT 1
+                                  FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
+                                  WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                                     OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                              )
+                          )
                     AND   NOT EXISTS (
                         SELECT 1 FROM #stats_to_process AS stp
                         WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
@@ -10388,7 +10465,7 @@ OPTION (RECOMPILE);';
                         AND   stp.stats_id = s.stats_id
                     )
                     AND   NOT EXISTS (
-                        SELECT 1 FROM dbo.CommandLog AS cl
+                        SELECT 1 FROM ' + @commandlog_3part + N' AS cl
                         WHERE cl.CommandType = N''UPDATE_STATISTICS''
                         AND   cl.DatabaseName = DB_NAME() COLLATE DATABASE_DEFAULT
                         AND   cl.SchemaName = OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT
@@ -10403,7 +10480,15 @@ OPTION (RECOMPILE);';
                     SET @mop_up_params = N'
                         @IncludeSystemObjects_param nvarchar(1),
                         @TargetNorecompute_param nvarchar(10),
+                        @ExcludeTables_param nvarchar(max),
+                        @ExcludeStatistics_param nvarchar(max),
                         @start_time_param datetime2(7)';
+
+                    IF @Debug = 1
+                    BEGIN
+                        DECLARE @mop_up_sql_len_p int = LEN(@mop_up_sql);
+                        RAISERROR(N'  Mop-up SQL for %s (%d chars)', 10, 1, @mop_up_db, @mop_up_sql_len_p) WITH NOWAIT;
+                    END;
 
                     BEGIN TRY
                         INSERT INTO #stats_to_process
@@ -10421,6 +10506,8 @@ OPTION (RECOMPILE);';
                             @mop_up_params,
                             @IncludeSystemObjects_param = @IncludeSystemObjects,
                             @TargetNorecompute_param = @TargetNorecompute,
+                            @ExcludeTables_param = @ExcludeTables,
+                            @ExcludeStatistics_param = @ExcludeStatistics,
                             @start_time_param = @start_time;
                     END TRY
                     BEGIN CATCH
@@ -10439,6 +10526,24 @@ OPTION (RECOMPILE);';
                 IF @mop_up_found > 0
                 BEGIN
                     /* Populate QueueStatistic with mop-up tables */
+
+                    /* v2.27 (#357): Remove completed QueueStatistic entries for tables that
+                       mop-up found new stats on.  Without this, the NOT EXISTS on the INSERT
+                       blocks re-queuing -- tables from the priority pass (now marked complete)
+                       can never transition to the mop-up queue. */
+                    DELETE qs
+                    FROM dbo.QueueStatistic AS qs
+                    WHERE qs.QueueID = @queue_id
+                    AND   qs.TableEndTime IS NOT NULL
+                    AND   EXISTS (
+                              SELECT 1
+                              FROM #stats_to_process AS stp
+                              WHERE stp.processed = 0
+                              AND   stp.database_name = qs.DatabaseName COLLATE DATABASE_DEFAULT
+                              AND   stp.schema_name = qs.SchemaName COLLATE DATABASE_DEFAULT
+                              AND   stp.table_name = qs.ObjectName COLLATE DATABASE_DEFAULT
+                          );
+
                     DECLARE @phase_a_max_priority int = ISNULL(
                         (SELECT MAX(qs.TablePriority) FROM dbo.QueueStatistic AS qs WHERE qs.QueueID = @queue_id),
                         0
@@ -10542,6 +10647,7 @@ OPTION (RECOMPILE);';
 
                     SET @stop_reason = NULL;
                     SET @in_mop_up = 1;
+                    SET @mop_up_stats_processed = @stats_processed; /* v2.27 (#357): baseline for MopUpProcessed count */
 
                     SELECT
                         @claimed_table_database = NULL,
@@ -10585,8 +10691,9 @@ OPTION (RECOMPILE);';
             BEGIN
                 SELECT @mop_up_db = database_name FROM @mop_up_db_list_s WHERE idx = @mop_up_db_idx;
 
-                SET @mop_up_sql = N'
-                USE ' + QUOTENAME(@mop_up_db) + N';
+                /* v2.26: CAST first element to nvarchar(max) to prevent 4000 char truncation during concatenation */
+                SET @mop_up_sql = CAST(N'
+                USE ' AS nvarchar(max)) + QUOTENAME(@mop_up_db) + N';
 
                 SELECT
                     database_name = DB_NAME(),
@@ -10639,6 +10746,27 @@ OPTION (RECOMPILE);';
                        OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
                        OR @TargetNorecompute_param = N''BOTH''
                       )
+                /* v2.26: Table exclusion filter (was missing from mop-up) */
+                AND   (
+                          @ExcludeTables_param IS NULL
+                       OR NOT EXISTS
+                          (
+                              SELECT 1
+                              FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
+                              WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                          )
+                      )
+                /* v2.26: Statistics exclusion filter (was missing from mop-up) */
+                AND   (
+                          @ExcludeStatistics_param IS NULL
+                       OR NOT EXISTS
+                          (
+                              SELECT 1
+                              FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
+                              WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                                 OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                          )
+                      )
                 AND   NOT EXISTS (
                     SELECT 1 FROM #stats_to_process AS stp
                     WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
@@ -10646,7 +10774,7 @@ OPTION (RECOMPILE);';
                     AND   stp.stats_id = s.stats_id
                 )
                 AND   NOT EXISTS (
-                    SELECT 1 FROM dbo.CommandLog AS cl
+                    SELECT 1 FROM ' + @commandlog_3part + N' AS cl
                     WHERE cl.CommandType = N''UPDATE_STATISTICS''
                     AND   cl.DatabaseName = DB_NAME() COLLATE DATABASE_DEFAULT
                     AND   cl.SchemaName = OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT
@@ -10661,7 +10789,15 @@ OPTION (RECOMPILE);';
                 SET @mop_up_params = N'
                     @IncludeSystemObjects_param nvarchar(1),
                     @TargetNorecompute_param nvarchar(10),
+                    @ExcludeTables_param nvarchar(max),
+                    @ExcludeStatistics_param nvarchar(max),
                     @start_time_param datetime2(7)';
+
+                IF @Debug = 1
+                BEGIN
+                    DECLARE @mop_up_sql_len int = LEN(@mop_up_sql);
+                    RAISERROR(N'  Mop-up SQL for %s (%d chars)', 10, 1, @mop_up_db, @mop_up_sql_len) WITH NOWAIT;
+                END;
 
                 BEGIN TRY
                     INSERT INTO #stats_to_process
@@ -10679,6 +10815,8 @@ OPTION (RECOMPILE);';
                         @mop_up_params,
                         @IncludeSystemObjects_param = @IncludeSystemObjects,
                         @TargetNorecompute_param = @TargetNorecompute,
+                        @ExcludeTables_param = @ExcludeTables,
+                        @ExcludeStatistics_param = @ExcludeStatistics,
                         @start_time_param = @start_time;
                 END TRY
                 BEGIN CATCH
