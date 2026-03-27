@@ -36,11 +36,19 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.35.2026.03.26 (Major.Minor.YYYY.MM.DD)
+Version:    2.37.2026.03.27 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.35.2026.03.26 - feat: @QueryStoreMetric WAITS -- stats-relevant wait time (#366).
+History:    2.37.2026.03.27 - fix: Phase 6 debug message printed even when QS disabled (#372).
+                            Staged discovery path printed "Phase 6 enriched" message
+                            unconditionally. Now gated on actual_state IN (1, 2) check.
+            2.36.2026.03.27 - fix: WAITS enrichment CTE ran unbounded XML plan parsing on every
+                            QS-enabled run regardless of @QueryStoreMetric, causing 6+ hour
+                            discovery (#371).  Gate on @QueryStoreMetric = WAITS only.  Apply
+                            @QueryStoreTopPlans limit + time-window filter to inner subquery.
+                            Both staged and legacy paths.
+            2.35.2026.03.26 - feat: @QueryStoreMetric WAITS -- stats-relevant wait time (#366).
                             Prioritizes tables by SortAndTempDb, Memory, and BufferIO wait
                             categories from sys.query_store_wait_stats (SQL 2017+).  New column
                             qs_total_wait_time_ms in #stat_candidates and #stats_to_process.
@@ -762,8 +770,8 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.35.2026.03.26',
-        @procedure_version_date datetime = '20260326',
+        @procedure_version varchar(20) = '2.37.2026.03.27',
+        @procedure_version_date datetime = '20260327',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -6541,10 +6549,12 @@ OPTION (RECOMPILE);';
                     END;
 
                     /* #366: Stats-relevant wait stats enrichment (SQL 2017+).
+                       Only runs when @QueryStoreMetric = WAITS to avoid unbounded XML parsing (#371).
                        Uses same plan XML extraction as QSByTable to correctly map
                        plan_ids to table object_ids (q.object_id is the MODULE id,
                        not the table id -- same issue #271 fixed for runtime_stats). */
                     IF OBJECT_ID(N''sys.query_store_wait_stats'') IS NOT NULL
+                    AND @QueryStoreMetric_param = N''WAITS''
                     BEGIN
                         ;WITH WaitPlanTableRefs AS (
                             SELECT DISTINCT
@@ -6557,10 +6567,16 @@ OPTION (RECOMPILE);';
                             WHERE x.plan_xml IS NOT NULL
                               AND ref.value(''@Table'', ''sysname'') IS NOT NULL
                               AND qsp.plan_id IN (
-                                  SELECT qsp2.plan_id
+                                  SELECT TOP (ISNULL(@QueryStoreTopPlans_param, 2147483647))
+                                      qsp2.plan_id
                                   FROM sys.query_store_plan AS qsp2
                                   JOIN sys.query_store_wait_stats AS qsws2 ON qsws2.plan_id = qsp2.plan_id
+                                  JOIN sys.query_store_runtime_stats_interval AS qsrsi2
+                                      ON qsrsi2.runtime_stats_interval_id = qsws2.runtime_stats_interval_id
                                   WHERE qsws2.wait_category IN (3, 12, 15)
+                                    AND qsrsi2.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+                                  GROUP BY qsp2.plan_id
+                                  ORDER BY SUM(qsws2.total_query_wait_time_ms) DESC
                               )
                         ),
                         WaitFilteredRefs AS (
@@ -6607,11 +6623,15 @@ OPTION (RECOMPILE);';
                     /*#endregion PHASE-6-QS-ENRICHMENT */
                 END; /* IF @QueryStorePriority AND QS enabled */
 
-                /* v2.24: Report how many stats were enriched with QS data */
-                DECLARE @phase6_enriched int = (SELECT COUNT(*) FROM #stat_candidates WHERE ISNULL(qs_priority_boost, 0) > 0);
-                SET @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
-                IF @Debug_param = 1
-                    RAISERROR(N''    Phase 6 (Query Store): %d stats enriched with QS data (%d ms)'', 10, 1, @phase6_enriched, @phase_ms) WITH NOWAIT;
+                /* v2.36: Report how many stats were enriched with QS data (only if enrichment ran) */
+                IF @QueryStorePriority_param = N''Y''
+                AND EXISTS (SELECT 1 FROM sys.database_query_store_options WHERE actual_state IN (1, 2))
+                BEGIN
+                    DECLARE @phase6_enriched int = (SELECT COUNT(*) FROM #stat_candidates WHERE ISNULL(qs_priority_boost, 0) > 0);
+                    SET @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
+                    IF @Debug_param = 1
+                        RAISERROR(N''    Phase 6 (Query Store): %d stats enriched with QS data (%d ms)'', 10, 1, @phase6_enriched, @phase_ms) WITH NOWAIT;
+                END;
 
                 /*
                 ================================================================
@@ -6991,10 +7011,12 @@ OPTION (RECOMPILE);';
             END;
 
             /* #366: Stats-relevant wait stats enrichment (SQL 2017+).
+               Only runs when @QueryStoreMetric = WAITS to avoid unbounded XML parsing (#371).
                Uses same plan XML extraction as FilteredRefs to correctly map
                plan_ids to table object_ids (q.object_id is the MODULE id,
                not the table id -- same issue #271 fixed for runtime_stats). */
             IF OBJECT_ID(N''sys.query_store_wait_stats'') IS NOT NULL
+            AND @QueryStoreMetric_param = N''WAITS''
             BEGIN
                 ;WITH WaitPlanTableRefs AS (
                     SELECT DISTINCT
@@ -7007,10 +7029,16 @@ OPTION (RECOMPILE);';
                     WHERE x.plan_xml IS NOT NULL
                       AND ref.value(''@Table'', ''sysname'') IS NOT NULL
                       AND qsp.plan_id IN (
-                          SELECT qsp2.plan_id
+                          SELECT TOP (ISNULL(@QueryStoreTopPlans_param, 2147483647))
+                              qsp2.plan_id
                           FROM sys.query_store_plan AS qsp2
                           JOIN sys.query_store_wait_stats AS qsws2 ON qsws2.plan_id = qsp2.plan_id
+                          JOIN sys.query_store_runtime_stats_interval AS qsrsi2
+                              ON qsrsi2.runtime_stats_interval_id = qsws2.runtime_stats_interval_id
                           WHERE qsws2.wait_category IN (3, 12, 15)
+                            AND qsrsi2.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+                          GROUP BY qsp2.plan_id
+                          ORDER BY SUM(qsws2.total_query_wait_time_ms) DESC
                       )
                 ),
                 WaitFilteredRefs AS (
