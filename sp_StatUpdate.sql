@@ -36,11 +36,18 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2.34.2026.03.26 (Major.Minor.YYYY.MM.DD)
+Version:    2.35.2026.03.26 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    2.34.2026.03.26 - enhance: SQL 2022+ plan feedback awareness (#369).
+History:    2.35.2026.03.26 - feat: @QueryStoreMetric WAITS -- stats-relevant wait time (#366).
+                            Prioritizes tables by SortAndTempDb, Memory, and BufferIO wait
+                            categories from sys.query_store_wait_stats (SQL 2017+).  New column
+                            qs_total_wait_time_ms in #stat_candidates and #stats_to_process.
+                            Separate CTE chain (WaitPlanTableRefs/WaitFilteredRefs/WaitByTable)
+                            uses same plan XML extraction pattern as QSByTable.  Both staged and
+                            legacy discovery paths.  ExtendedInfo: QSTotalWaitTimeMs.
+            2.34.2026.03.26 - enhance: SQL 2022+ plan feedback awareness (#369).
                             Counts active/pending plan feedback entries per table during
                             Phase 6 QS enrichment.  Debug warning when stats update may
                             reset CE/grant/DOP feedback.  ExtendedInfo: QSActiveFeedbackCount.
@@ -605,7 +612,7 @@ ALTER PROCEDURE
     ============================================================================
     */
     @QueryStorePriority nvarchar(1) = NULL, /*Y = boost priority for stats on tables actively used by Query Store plans. N = ignore QS data. NULL = default (normalized to N'N' when no preset, or to N'Y' by OLTP_LIGHT preset). P2e fix v2.4: changed from N'N' to NULL to allow presets to override.*/
-    @QueryStoreMetric nvarchar(20) = N'CPU', /*resource metric for priority: CPU (total CPU ms, default), DURATION (elapsed time), READS (logical I/O), EXECUTIONS (count), AVG_CPU (avg CPU per exec), MEMORY_GRANT (total memory grant KB, SQL 2016+), TEMPDB_SPILLS (total tempdb pages, SQL 2017+), PHYSICAL_READS (total physical I/O reads, SQL 2017+), AVG_MEMORY (avg memory grant KB per execution, SQL 2016+)*/
+    @QueryStoreMetric nvarchar(20) = N'CPU', /*resource metric for priority: CPU (total CPU ms, default), DURATION (elapsed time), READS (logical I/O), EXECUTIONS (count), AVG_CPU (avg CPU per exec), MEMORY_GRANT (total memory grant KB, SQL 2016+), TEMPDB_SPILLS (total tempdb pages, SQL 2017+), PHYSICAL_READS (total physical I/O reads, SQL 2017+), AVG_MEMORY (avg memory grant KB per execution, SQL 2016+), WAITS (stats-relevant wait time, SQL 2017+)*/
     @QueryStoreMinExecutions bigint = 100, /*minimum plan executions to boost priority*/
     @QueryStoreRecentHours integer = 168, /*plans executed in last N hours (default: 7 days). Intentionally short - recent query activity more relevant than 30-day history*/
     @QueryStoreTopPlans integer = 500, /*max plans to XML-parse for table references.  NULL = unlimited (parse all).  Lower values reduce Phase 6 overhead on large QS catalogs at the cost of potentially missing low-CPU plan references.  Top N selected by @QueryStoreMetric.*/
@@ -755,7 +762,7 @@ BEGIN
     DECLARE
         /* VERSION: Update BOTH @procedure_version AND @procedure_version_date together.
            Also update the header comment "Version:" line at the top of the file. */
-        @procedure_version varchar(20) = '2.34.2026.03.26',
+        @procedure_version varchar(20) = '2.35.2026.03.26',
         @procedure_version_date datetime = '20260326',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -911,7 +918,7 @@ BEGIN
                     WHEN N'@QueryStorePriority'
                     THEN N'Y = prioritize stats used by Query Store plans, N = ignore'
                     WHEN N'@QueryStoreMetric'
-                    THEN N'CPU = total CPU time (default), DURATION = elapsed time, READS = logical I/O, EXECUTIONS = count, AVG_CPU = avg CPU per execution, MEMORY_GRANT = total memory grant KB (bad CE -> wrong grants -> spills), TEMPDB_SPILLS = total tempdb pages used (SQL 2017+, direct spill evidence), PHYSICAL_READS = total physical I/O reads (SQL 2017+, wrong join order -> table scans), AVG_MEMORY = avg memory grant KB per execution (surfaces infrequent memory-hungry queries)'
+                    THEN N'CPU = total CPU time (default), DURATION = elapsed time, READS = logical I/O, EXECUTIONS = count, AVG_CPU = avg CPU per execution, MEMORY_GRANT = total memory grant KB (bad CE -> wrong grants -> spills), TEMPDB_SPILLS = total tempdb pages used (SQL 2017+, direct spill evidence), PHYSICAL_READS = total physical I/O reads (SQL 2017+, wrong join order -> table scans), AVG_MEMORY = avg memory grant KB per execution (surfaces infrequent memory-hungry queries), WAITS = stats-relevant wait time in ms (SQL 2017+, BufferIO + Memory + SortAndTempDb waits from sys.query_store_wait_stats)'
                     WHEN N'@QueryStoreMinExecutions'
                     THEN N'minimum plan executions to boost priority (default 100)'
                     WHEN N'@QueryStoreRecentHours'
@@ -1046,7 +1053,7 @@ BEGIN
                     WHEN N'@Preset' THEN N'NULL, NIGHTLY_MAINTENANCE, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE_AGGRESSIVE'
                     WHEN N'@SortOrder' THEN N'MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED'
                     WHEN N'@FilteredStatsMode' THEN N'INCLUDE, EXCLUDE, ONLY, PRIORITY'
-                    WHEN N'@QueryStoreMetric' THEN N'CPU, DURATION, READS, EXECUTIONS, AVG_CPU, MEMORY_GRANT, TEMPDB_SPILLS, PHYSICAL_READS, AVG_MEMORY'
+                    WHEN N'@QueryStoreMetric' THEN N'CPU, DURATION, READS, EXECUTIONS, AVG_CPU, MEMORY_GRANT, TEMPDB_SPILLS, PHYSICAL_READS, AVG_MEMORY, WAITS'
                     WHEN N'@ThresholdLogic' THEN N'OR, AND'
                     /* Numeric */
                     WHEN N'@ModificationThreshold' THEN N'0-N (floor for modification_counter)'
@@ -1821,6 +1828,7 @@ ORDER BY TotalStatUpdates DESC;')
         @current_qs_total_tempdb_pages bigint = NULL,
         @current_qs_total_physical_reads bigint = NULL,
         @current_qs_total_logical_writes bigint = NULL,
+        @current_qs_total_wait_time_ms bigint = NULL,
         @current_qs_max_dop smallint = NULL,
         @current_qs_active_feedback_count int = NULL,
         @current_qs_last_execution datetime2(3) = NULL,
@@ -2006,6 +2014,7 @@ ORDER BY TotalStatUpdates DESC;')
         qs_total_tempdb_pages bigint NULL, /*total tempdb pages (avg_tempdb_space_used * executions, SQL 2017+)*/
         qs_total_physical_reads bigint NULL, /*total physical I/O reads (avg_num_physical_io_reads * executions, SQL 2017+)*/
         qs_total_logical_writes bigint NULL, /*total logical write pages (avg_logical_io_writes * executions, diagnostic only)*/
+        qs_total_wait_time_ms bigint NULL, /*total stats-relevant wait time ms (BufferIO+Memory+SortAndTempDb from sys.query_store_wait_stats, SQL 2017+)*/
         qs_max_dop smallint NULL, /*maximum observed DOP (last_dop, diagnostic only)*/
         qs_active_feedback_count int NULL, /*SQL 2022+: count of active plan feedback entries (CE/grant/DOP)*/
         qs_last_execution datetime2(3) NULL, /*most recent plan execution*/
@@ -2922,7 +2931,7 @@ ORDER BY TotalStatUpdates DESC;')
     /*
     Validate @QueryStoreMetric
     */
-    IF @QueryStoreMetric NOT IN (N'CPU', N'DURATION', N'READS', N'EXECUTIONS', N'AVG_CPU', N'MEMORY_GRANT', N'TEMPDB_SPILLS', N'PHYSICAL_READS', N'AVG_MEMORY')
+    IF @QueryStoreMetric NOT IN (N'CPU', N'DURATION', N'READS', N'EXECUTIONS', N'AVG_CPU', N'MEMORY_GRANT', N'TEMPDB_SPILLS', N'PHYSICAL_READS', N'AVG_MEMORY', N'WAITS')
     BEGIN
         INSERT INTO
             @errors
@@ -2932,7 +2941,7 @@ ORDER BY TotalStatUpdates DESC;')
         )
         SELECT
             error_message =
-                N'The value for @QueryStoreMetric is not supported. Use CPU, DURATION, READS, EXECUTIONS, AVG_CPU, MEMORY_GRANT, TEMPDB_SPILLS, PHYSICAL_READS, or AVG_MEMORY.',
+                N'The value for @QueryStoreMetric is not supported. Use CPU, DURATION, READS, EXECUTIONS, AVG_CPU, MEMORY_GRANT, TEMPDB_SPILLS, PHYSICAL_READS, AVG_MEMORY, or WAITS.',
             error_severity = 16;
     END;
 
@@ -2963,6 +2972,21 @@ ORDER BY TotalStatUpdates DESC;')
         SELECT
             error_message =
                 N'@QueryStoreMetric = PHYSICAL_READS requires SQL Server 2017 or later (avg_num_physical_io_reads not available).',
+            error_severity = 16;
+    END;
+
+    /* WAITS requires SQL 2017+ (sys.query_store_wait_stats added in 14.x) */
+    IF @QueryStoreMetric = N'WAITS' AND @sql_major_version < 14
+    BEGIN
+        INSERT INTO
+            @errors
+        (
+            error_message,
+            error_severity
+        )
+        SELECT
+            error_message =
+                N'@QueryStoreMetric = WAITS requires SQL Server 2017 or later (sys.query_store_wait_stats not available).',
             error_severity = 16;
     END;
 
@@ -5772,6 +5796,7 @@ OPTION (RECOMPILE);';
                         qs_total_tempdb_pages = CONVERT(bigint, NULL),
                         qs_total_physical_reads = CONVERT(bigint, NULL),
                         qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_total_wait_time_ms = CONVERT(bigint, NULL),
                         qs_max_dop = CONVERT(smallint, NULL),
                         qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
@@ -5860,6 +5885,7 @@ OPTION (RECOMPILE);';
                         qs_total_tempdb_pages = CONVERT(bigint, NULL),
                         qs_total_physical_reads = CONVERT(bigint, NULL),
                         qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_total_wait_time_ms = CONVERT(bigint, NULL),
                         qs_max_dop = CONVERT(smallint, NULL),
                         qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
@@ -5958,6 +5984,7 @@ OPTION (RECOMPILE);';
                         qs_total_tempdb_pages = CONVERT(bigint, NULL),
                         qs_total_physical_reads = CONVERT(bigint, NULL),
                         qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_total_wait_time_ms = CONVERT(bigint, NULL),
                         qs_max_dop = CONVERT(smallint, NULL),
                         qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
@@ -6137,6 +6164,7 @@ OPTION (RECOMPILE);';
                         qs_total_tempdb_pages = CONVERT(bigint, NULL),
                         qs_total_physical_reads = CONVERT(bigint, NULL),
                         qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_total_wait_time_ms = CONVERT(bigint, NULL),
                         qs_max_dop = CONVERT(smallint, NULL),
                         qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
@@ -6216,6 +6244,7 @@ OPTION (RECOMPILE);';
                             qs_total_tempdb_pages = CONVERT(bigint, NULL),
                             qs_total_physical_reads = CONVERT(bigint, NULL),
                             qs_total_logical_writes = CONVERT(bigint, NULL),
+                            qs_total_wait_time_ms = CONVERT(bigint, NULL),
                             qs_max_dop = CONVERT(smallint, NULL),
                             qs_active_feedback_count = CONVERT(int, NULL),
                             qs_last_execution = CONVERT(datetime2, NULL),
@@ -6285,6 +6314,7 @@ OPTION (RECOMPILE);';
                         qs_total_tempdb_pages = CONVERT(bigint, NULL),
                         qs_total_physical_reads = CONVERT(bigint, NULL),
                         qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_total_wait_time_ms = CONVERT(bigint, NULL),
                         qs_max_dop = CONVERT(smallint, NULL),
                         qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
@@ -6315,6 +6345,7 @@ OPTION (RECOMPILE);';
                     qs_total_tempdb_pages bigint NULL,
                     qs_total_physical_reads bigint NULL,
                     qs_total_logical_writes bigint NULL,
+                    qs_total_wait_time_ms bigint NULL,
                     qs_max_dop smallint NULL,
                     qs_active_feedback_count int NULL,
                     qs_last_execution datetime2 NULL,
@@ -6404,6 +6435,7 @@ OPTION (RECOMPILE);';
                             WHEN N''TEMPDB_SPILLS'' THEN {{TEMPDB_SPILLS_ORDER}}
                             WHEN N''PHYSICAL_READS'' THEN {{PHYSICAL_READS_ORDER}}
                             WHEN N''AVG_MEMORY'' THEN SUM(CONVERT(float, qsrs.avg_query_max_used_memory * qsrs.count_executions)) / NULLIF(SUM(CONVERT(float, qsrs.count_executions)), 0)
+                            WHEN N''WAITS'' THEN {{WAITS_ORDER}}
                             ELSE SUM(qsrs.avg_cpu_time * qsrs.count_executions)
                         END DESC
                     ),
@@ -6477,6 +6509,7 @@ OPTION (RECOMPILE);';
                                          WHEN N''TEMPDB_SPILLS'' THEN ISNULL(qs.total_tempdb_pages, 0)
                                          WHEN N''PHYSICAL_READS'' THEN ISNULL(qs.total_physical_reads, 0)
                                          WHEN N''AVG_MEMORY'' THEN ISNULL(qs.total_memory_grant_kb, 0) / NULLIF(qs.total_executions, 0)
+                                         WHEN N''WAITS'' THEN 0 /* populated by separate wait stats UPDATE below */
                                          ELSE ISNULL(qs.total_cpu_ms, 0)
                                      END
                                 ELSE 0
@@ -6505,6 +6538,69 @@ OPTION (RECOMPILE);';
                             WHERE pf.state_desc IN (N''ACTIVE'', N''PENDING_VALIDATION'')
                             GROUP BY q.object_id
                         ) AS fb ON fb.object_id = sc.object_id;
+                    END;
+
+                    /* #366: Stats-relevant wait stats enrichment (SQL 2017+).
+                       Uses same plan XML extraction as QSByTable to correctly map
+                       plan_ids to table object_ids (q.object_id is the MODULE id,
+                       not the table id -- same issue #271 fixed for runtime_stats). */
+                    IF OBJECT_ID(N''sys.query_store_wait_stats'') IS NOT NULL
+                    BEGIN
+                        ;WITH WaitPlanTableRefs AS (
+                            SELECT DISTINCT
+                                qsp.plan_id,
+                                PARSENAME(ref.value(''@Schema'',  ''sysname''), 1) AS ref_schema,
+                                PARSENAME(ref.value(''@Table'',   ''sysname''), 1) AS ref_table
+                            FROM sys.query_store_plan AS qsp
+                            CROSS APPLY (SELECT TRY_CONVERT(xml, qsp.query_plan)) AS x(plan_xml)
+                            CROSS APPLY x.plan_xml.nodes(''//*:Object'') AS t(ref)
+                            WHERE x.plan_xml IS NOT NULL
+                              AND ref.value(''@Table'', ''sysname'') IS NOT NULL
+                              AND qsp.plan_id IN (
+                                  SELECT qsp2.plan_id
+                                  FROM sys.query_store_plan AS qsp2
+                                  JOIN sys.query_store_wait_stats AS qsws2 ON qsws2.plan_id = qsp2.plan_id
+                                  WHERE qsws2.wait_category IN (3, 12, 15)
+                              )
+                        ),
+                        WaitFilteredRefs AS (
+                            SELECT DISTINCT wptr.plan_id, sc2.object_id
+                            FROM WaitPlanTableRefs AS wptr
+                            JOIN (SELECT DISTINCT object_id, schema_name, table_name
+                                  FROM #stat_candidates) AS sc2
+                                ON sc2.schema_name = wptr.ref_schema COLLATE DATABASE_DEFAULT
+                                AND sc2.table_name = wptr.ref_table COLLATE DATABASE_DEFAULT
+                        ),
+                        WaitByTable AS (
+                            SELECT
+                                wfr.object_id,
+                                SUM(qsws.total_query_wait_time_ms) AS total_wait_ms
+                            FROM WaitFilteredRefs AS wfr
+                            JOIN sys.query_store_wait_stats AS qsws
+                                ON qsws.plan_id = wfr.plan_id
+                            JOIN sys.query_store_runtime_stats_interval AS qsrsi
+                                ON qsrsi.runtime_stats_interval_id = qsws.runtime_stats_interval_id
+                            WHERE qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+                            AND qsws.wait_category IN (3, 12, 15) /* BufferIO, Memory, SortAndTempDb */
+                            GROUP BY wfr.object_id
+                        )
+                        UPDATE sc
+                        SET sc.qs_total_wait_time_ms = wbt.total_wait_ms
+                        FROM #stat_candidates AS sc
+                        INNER JOIN WaitByTable AS wbt ON wbt.object_id = sc.object_id;
+                    END;
+
+                    /* #366: Update priority boost for WAITS metric (must run after wait stats UPDATE) */
+                    IF @QueryStoreMetric_param = N''WAITS''
+                    BEGIN
+                        UPDATE sc
+                        SET sc.qs_priority_boost = CASE
+                            WHEN ISNULL(sc.qs_total_executions, 0) >= @QueryStoreMinExecutions_param
+                            THEN ISNULL(sc.qs_total_wait_time_ms, 0)
+                            ELSE 0
+                        END
+                        FROM #stat_candidates AS sc
+                        WHERE sc.qs_total_wait_time_ms IS NOT NULL;
                     END;
 
                     END; /* ELSE from early bail-out */
@@ -6552,6 +6648,7 @@ OPTION (RECOMPILE);';
                     qs_total_tempdb_pages,
                     qs_total_physical_reads,
                     qs_total_logical_writes,
+                    qs_total_wait_time_ms,
                     qs_max_dop,
                     qs_active_feedback_count,
                     qs_last_execution,
@@ -6635,6 +6732,13 @@ OPTION (RECOMPILE);';
                     ELSE N'SUM(CONVERT(float, 0))'
                     END);
 
+                /* Version-gate WAITS: sys.query_store_wait_stats added in SQL 2017 (14.x) */
+                SET @staged_sql = REPLACE(@staged_sql, N'{{WAITS_ORDER}}',
+                    CASE WHEN @sql_major_version >= 14
+                    THEN N'(SELECT ISNULL(SUM(CONVERT(float, qsws.total_query_wait_time_ms)), 0) FROM sys.query_store_wait_stats AS qsws WHERE qsws.plan_id = qsp.plan_id AND qsws.wait_category IN (3, 12, 15) AND qsws.runtime_stats_interval_id IN (SELECT runtime_stats_interval_id FROM sys.query_store_runtime_stats_interval WHERE end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())))'
+                    ELSE N'SUM(CONVERT(float, 0))'
+                    END);
+
                 /*
                 Execute staged discovery and insert results
                 */
@@ -6645,7 +6749,7 @@ OPTION (RECOMPILE);';
                     modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                     has_filter, filter_definition, unfiltered_rows,
                     qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
-                    qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_max_dop, qs_active_feedback_count,
+                    qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_total_wait_time_ms, qs_max_dop, qs_active_feedback_count,
                     qs_last_execution, qs_priority_boost,
                     is_published, is_tracked_by_cdc, temporal_type, priority
                 )
@@ -6764,6 +6868,7 @@ OPTION (RECOMPILE);';
             total_tempdb_pages bigint NULL,
             total_physical_reads bigint NULL,
             total_logical_writes bigint NULL,
+            total_wait_time_ms bigint NULL,
             max_dop smallint NULL,
             active_feedback_count int NULL,
             last_execution datetime2(3) NULL
@@ -6823,6 +6928,7 @@ OPTION (RECOMPILE);';
                     WHEN N''TEMPDB_SPILLS'' THEN {{TEMPDB_SPILLS_ORDER_LEGACY}}
                     WHEN N''PHYSICAL_READS'' THEN {{PHYSICAL_READS_ORDER_LEGACY}}
                     WHEN N''AVG_MEMORY'' THEN SUM(CONVERT(float, qsrs.avg_query_max_used_memory * qsrs.count_executions)) / NULLIF(SUM(CONVERT(float, qsrs.count_executions)), 0)
+                    WHEN N''WAITS'' THEN {{WAITS_ORDER_LEGACY}}
                     ELSE SUM(qsrs.avg_cpu_time * qsrs.count_executions)
                 END DESC
             ),
@@ -6863,7 +6969,9 @@ OPTION (RECOMPILE);';
                 {{TEMPDB_SPILLS_EXPR_LEGACY}},
                 {{PHYSICAL_READS_EXPR_LEGACY}},
                 SUM(CONVERT(bigint, qsrs2.avg_logical_io_writes * qsrs2.count_executions)),
+                CONVERT(bigint, NULL), /* total_wait_time_ms -- populated by separate UPDATE below (#366) */
                 MAX(qsrs2.last_dop),
+                CONVERT(int, NULL), /* active_feedback_count -- populated by separate UPDATE below (#369) */
                 MAX(qsrs2.last_execution_time)
             FROM FilteredRefs AS fr
             JOIN sys.query_store_runtime_stats AS qsrs2
@@ -6880,6 +6988,59 @@ OPTION (RECOMPILE);';
                 DECLARE @legacy_qs_count int = (SELECT COUNT(*) FROM #qs_table_stats);
                 DECLARE @legacy_qs_ms int = DATEDIFF(MILLISECOND, @legacy_qs_timer, SYSDATETIME());
                 RAISERROR(N''    Legacy QS: enriched %d tables (%d ms)'', 10, 1, @legacy_qs_count, @legacy_qs_ms) WITH NOWAIT;
+            END;
+
+            /* #366: Stats-relevant wait stats enrichment (SQL 2017+).
+               Uses same plan XML extraction as FilteredRefs to correctly map
+               plan_ids to table object_ids (q.object_id is the MODULE id,
+               not the table id -- same issue #271 fixed for runtime_stats). */
+            IF OBJECT_ID(N''sys.query_store_wait_stats'') IS NOT NULL
+            BEGIN
+                ;WITH WaitPlanTableRefs AS (
+                    SELECT DISTINCT
+                        qsp.plan_id,
+                        PARSENAME(ref.value(''@Schema'', ''sysname''), 1) AS ref_schema,
+                        PARSENAME(ref.value(''@Table'',  ''sysname''), 1) AS ref_table
+                    FROM sys.query_store_plan AS qsp
+                    CROSS APPLY (SELECT TRY_CONVERT(xml, qsp.query_plan)) AS x(plan_xml)
+                    CROSS APPLY x.plan_xml.nodes(''//*:Object'') AS t(ref)
+                    WHERE x.plan_xml IS NOT NULL
+                      AND ref.value(''@Table'', ''sysname'') IS NOT NULL
+                      AND qsp.plan_id IN (
+                          SELECT qsp2.plan_id
+                          FROM sys.query_store_plan AS qsp2
+                          JOIN sys.query_store_wait_stats AS qsws2 ON qsws2.plan_id = qsp2.plan_id
+                          WHERE qsws2.wait_category IN (3, 12, 15)
+                      )
+                ),
+                WaitFilteredRefs AS (
+                    SELECT DISTINCT wptr.plan_id,
+                        o2.object_id AS table_object_id
+                    FROM WaitPlanTableRefs AS wptr
+                    JOIN sys.objects AS o2
+                        ON o2.name = wptr.ref_table COLLATE DATABASE_DEFAULT
+                    JOIN sys.schemas AS s2
+                        ON s2.schema_id = o2.schema_id
+                        AND s2.name = wptr.ref_schema COLLATE DATABASE_DEFAULT
+                    WHERE OBJECTPROPERTY(o2.object_id, N''IsUserTable'') = 1
+                       OR o2.type = N''V''
+                ),
+                WaitByTable AS (
+                    SELECT
+                        wfr.table_object_id,
+                        SUM(qsws.total_query_wait_time_ms) AS total_wait_ms
+                    FROM WaitFilteredRefs AS wfr
+                    JOIN sys.query_store_wait_stats AS qsws
+                        ON qsws.plan_id = wfr.plan_id
+                    JOIN sys.query_store_runtime_stats_interval AS qsrsi
+                        ON qsrsi.runtime_stats_interval_id = qsws.runtime_stats_interval_id
+                    WHERE qsrsi.end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())
+                    AND qsws.wait_category IN (3, 12, 15) /* BufferIO, Memory, SortAndTempDb */
+                    GROUP BY wfr.table_object_id
+                )
+                UPDATE qs SET qs.total_wait_time_ms = wbt.total_wait_ms
+                FROM #qs_table_stats AS qs
+                INNER JOIN WaitByTable AS wbt ON wbt.table_object_id = qs.table_object_id;
             END;
 
             /* SQL 2022+ plan feedback awareness (#369) */
@@ -6948,6 +7109,7 @@ OPTION (RECOMPILE);';
             qs_total_tempdb_pages = qs_stats.total_tempdb_pages,
             qs_total_physical_reads = qs_stats.total_physical_reads,
             qs_total_logical_writes = qs_stats.total_logical_writes,
+            qs_total_wait_time_ms = qs_stats.total_wait_time_ms,
             qs_max_dop = qs_stats.max_dop,
             qs_active_feedback_count = qs_stats.active_feedback_count,
             qs_last_execution = qs_stats.last_execution,
@@ -6969,6 +7131,7 @@ OPTION (RECOMPILE);';
                              WHEN N''TEMPDB_SPILLS'' THEN ISNULL(qs_stats.total_tempdb_pages, 0)
                              WHEN N''PHYSICAL_READS'' THEN ISNULL(qs_stats.total_physical_reads, 0)
                              WHEN N''AVG_MEMORY'' THEN ISNULL(qs_stats.total_memory_grant_kb, 0) / NULLIF(qs_stats.total_executions, 0)
+                             WHEN N''WAITS'' THEN ISNULL(qs_stats.total_wait_time_ms, 0)
                              ELSE ISNULL(qs_stats.total_cpu_ms, 0) /* default to CPU */
                          END
                     ELSE 0
@@ -7007,6 +7170,7 @@ OPTION (RECOMPILE);';
                                      WHEN N''TEMPDB_SPILLS'' THEN ISNULL(qs_stats.total_tempdb_pages, 0)
                                      WHEN N''PHYSICAL_READS'' THEN ISNULL(qs_stats.total_physical_reads, 0)
                                      WHEN N''AVG_MEMORY'' THEN ISNULL(qs_stats.total_memory_grant_kb, 0) / NULLIF(qs_stats.total_executions, 0)
+                                     WHEN N''WAITS'' THEN ISNULL(qs_stats.total_wait_time_ms, 0)
                                      ELSE ISNULL(qs_stats.total_cpu_ms, 0)
                                  END
                             ELSE 0
@@ -7031,6 +7195,7 @@ OPTION (RECOMPILE);';
                                      WHEN N''TEMPDB_SPILLS'' THEN ISNULL(qs_stats.total_tempdb_pages, 0)
                                      WHEN N''PHYSICAL_READS'' THEN ISNULL(qs_stats.total_physical_reads, 0)
                                      WHEN N''AVG_MEMORY'' THEN ISNULL(qs_stats.total_memory_grant_kb, 0) / NULLIF(qs_stats.total_executions, 0)
+                                     WHEN N''WAITS'' THEN ISNULL(qs_stats.total_wait_time_ms, 0)
                                      ELSE ISNULL(qs_stats.total_cpu_ms, 0)
                                  END
                             WHEN N''FILTERED_DRIFT''
@@ -7385,6 +7550,13 @@ OPTION (RECOMPILE);';
             ELSE N'SUM(CONVERT(float, 0))'
             END);
 
+        /* Version-gate WAITS: sys.query_store_wait_stats added in SQL 2017 (14.x) */
+        SET @discovery_sql = REPLACE(@discovery_sql, N'{{WAITS_ORDER_LEGACY}}',
+            CASE WHEN @sql_major_version >= 14
+            THEN N'(SELECT ISNULL(SUM(CONVERT(float, qsws.total_query_wait_time_ms)), 0) FROM sys.query_store_wait_stats AS qsws WHERE qsws.plan_id = qsp.plan_id AND qsws.wait_category IN (3, 12, 15) AND qsws.runtime_stats_interval_id IN (SELECT runtime_stats_interval_id FROM sys.query_store_runtime_stats_interval WHERE end_time >= DATEADD(HOUR, -@QueryStoreRecentHours_param, SYSDATETIME())))'
+            ELSE N'SUM(CONVERT(float, 0))'
+            END);
+
         INSERT INTO
             #stats_to_process
         (
@@ -7417,6 +7589,7 @@ OPTION (RECOMPILE);';
             qs_total_tempdb_pages,
             qs_total_physical_reads,
             qs_total_logical_writes,
+            qs_total_wait_time_ms,
             qs_max_dop,
             qs_active_feedback_count,
             qs_last_execution,
@@ -9055,6 +9228,7 @@ OPTION (RECOMPILE);';
                             qs_total_tempdb_pages = CONVERT(bigint, NULL),
                             qs_total_physical_reads = CONVERT(bigint, NULL),
                             qs_total_logical_writes = CONVERT(bigint, NULL),
+                            qs_total_wait_time_ms = CONVERT(bigint, NULL),
                             qs_max_dop = CONVERT(smallint, NULL),
                             qs_active_feedback_count = CONVERT(int, NULL),
                             qs_last_execution = CONVERT(datetime2, NULL),
@@ -9171,7 +9345,7 @@ OPTION (RECOMPILE);';
                                 modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                                 has_filter, filter_definition, unfiltered_rows,
                                 qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
-                                qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_max_dop, qs_active_feedback_count,
+                                qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_total_wait_time_ms, qs_max_dop, qs_active_feedback_count,
                                 qs_last_execution, qs_priority_boost,
                                 is_published, is_tracked_by_cdc, temporal_type, priority
                             )
@@ -9309,6 +9483,7 @@ OPTION (RECOMPILE);';
             @current_qs_total_tempdb_pages = stp.qs_total_tempdb_pages,
             @current_qs_total_physical_reads = stp.qs_total_physical_reads,
             @current_qs_total_logical_writes = stp.qs_total_logical_writes,
+            @current_qs_total_wait_time_ms = stp.qs_total_wait_time_ms,
             @current_qs_max_dop = stp.qs_max_dop,
             @current_qs_last_execution = stp.qs_last_execution,
             @current_qs_priority_boost = stp.qs_priority_boost,
@@ -10335,6 +10510,7 @@ OPTION (RECOMPILE);';
                                 @current_qs_total_tempdb_pages AS QSTotalTempdbPages,
                                 @current_qs_total_physical_reads AS QSTotalPhysicalReads,
                                 @current_qs_total_logical_writes AS QSTotalLogicalWrites,
+                                @current_qs_total_wait_time_ms AS QSTotalWaitTimeMs,
                                 @current_qs_max_dop AS QSMaxDOP,
                                 @current_qs_active_feedback_count AS QSActiveFeedbackCount,
                                 @current_qs_last_execution AS QSLastExecution,
@@ -10886,6 +11062,7 @@ OPTION (RECOMPILE);';
                         qs_total_tempdb_pages = CONVERT(bigint, NULL),
                         qs_total_physical_reads = CONVERT(bigint, NULL),
                         qs_total_logical_writes = CONVERT(bigint, NULL),
+                        qs_total_wait_time_ms = CONVERT(bigint, NULL),
                         qs_max_dop = CONVERT(smallint, NULL),
                         qs_active_feedback_count = CONVERT(int, NULL),
                         qs_last_execution = CONVERT(datetime2, NULL),
@@ -11024,7 +11201,7 @@ OPTION (RECOMPILE);';
                             modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                             has_filter, filter_definition, unfiltered_rows,
                             qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
-                            qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_max_dop, qs_active_feedback_count,
+                            qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_total_wait_time_ms, qs_max_dop, qs_active_feedback_count,
                             qs_last_execution, qs_priority_boost,
                             is_published, is_tracked_by_cdc, temporal_type, priority
                         )
@@ -11257,6 +11434,7 @@ OPTION (RECOMPILE);';
                     qs_total_tempdb_pages = CONVERT(bigint, NULL),
                     qs_total_physical_reads = CONVERT(bigint, NULL),
                     qs_total_logical_writes = CONVERT(bigint, NULL),
+                    qs_total_wait_time_ms = CONVERT(bigint, NULL),
                     qs_max_dop = CONVERT(smallint, NULL),
                     qs_active_feedback_count = CONVERT(int, NULL),
                     qs_last_execution = CONVERT(datetime2, NULL),
@@ -11395,7 +11573,7 @@ OPTION (RECOMPILE);';
                         modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                         has_filter, filter_definition, unfiltered_rows,
                         qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
-                        qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_max_dop, qs_active_feedback_count,
+                        qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_total_wait_time_ms, qs_max_dop, qs_active_feedback_count,
                             qs_last_execution, qs_priority_boost,
                         is_published, is_tracked_by_cdc, temporal_type, priority
                     )
