@@ -1246,7 +1246,12 @@ BEGIN
         tiered_thresholds   = s.ExtendedInfo.value(N''(Parameters/TieredThresholds)[1]'', N''nvarchar(10)''),
         threshold_logic     = s.ExtendedInfo.value(N''(Parameters/ThresholdLogic)[1]'', N''nvarchar(10)''),
         sort_order          = s.ExtendedInfo.value(N''(Parameters/SortOrder)[1]'', N''nvarchar(50)''),
-        qs_priority         = s.ExtendedInfo.value(N''(Parameters/QueryStorePriority)[1]'', N''nvarchar(1)''),
+        /* #390: v2 writes Y/N (nvarchar), v3 writes 1/0 (bit).  Normalize at extraction. */
+        qs_priority         = CASE s.ExtendedInfo.value(N''(Parameters/QueryStorePriority)[1]'', N''nvarchar(5)'')
+                                  WHEN N''Y'' THEN N''Y'' WHEN N''1'' THEN N''Y''
+                                  WHEN N''N'' THEN N''N'' WHEN N''0'' THEN N''N''
+                                  ELSE NULL
+                              END,
         stat_sample         = s.ExtendedInfo.value(N''(Parameters/StatisticsSample)[1]'', N''int''),
         parallel            = s.ExtendedInfo.value(N''(Parameters/StatsInParallel)[1]'', N''nvarchar(1)''),
         preset              = s.ExtendedInfo.value(N''(Parameters/Preset)[1]'', N''nvarchar(30)''),
