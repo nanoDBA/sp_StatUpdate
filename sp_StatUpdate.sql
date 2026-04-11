@@ -294,7 +294,7 @@ BEGIN
             (N'NORECOMPUTE',   N'NORECOMPUTE flag is PRESERVED on update (not cleared).  To clear: manually DROP+CREATE the statistic.'),
             (N'COMMANDLOG',    N'Requires dbo.CommandLog from https://ola.hallengren.com/scripts/CommandLog.sql.  Set @LogToTable=N if not installed.'),
             (N'DIAGNOSTICS',   N'Run sp_StatUpdate_Diag after for automated analysis.  @ExpertMode=1 for full detail, 0 for dashboard only.'),
-            (N'VERSION',       N'v3.0 -- simplified API (33 input + 10 OUTPUT vs 58 input + 10 OUTPUT in v2).  Full behavioral parity with v2.35.  Preset-first design.')
+            (N'VERSION',       N'v3.0 -- simplified API (33 input + 10 OUTPUT vs 58 input + 10 OUTPUT in v2).  Full behavioral parity with v2.37.  Preset-first design.')
         ) AS t(topic, detail);
 
         RETURN;
@@ -1173,7 +1173,6 @@ BEGIN
         @i_orphaned_run_threshold_hours int = 48,
         @i_command_log_retention_days int = 90,
         @i_max_seconds_per_stat int = NULL,
-        @i_temporal_co_schedule nvarchar(1) = N'Y',
         @i_update_incremental bit = 1,
         @i_dead_worker_timeout_min int = 15,
         @i_max_workers int = NULL,
@@ -2125,10 +2124,7 @@ BEGIN
 
         IF @StaleHours IS NOT NULL
         BEGIN
-            IF @i_threshold_logic = N'OR'
-                RAISERROR(N'  OR days since update >= %d', 10, 1, @StaleHours) WITH NOWAIT;
-            ELSE
-                RAISERROR(N'  AND days since update >= %d', 10, 1, @StaleHours) WITH NOWAIT;
+            RAISERROR(N'  OR days since update >= %d', 10, 1, @StaleHours) WITH NOWAIT;
         END;
     END;
 
@@ -2441,7 +2437,6 @@ BEGIN
                     @i_include_system_objects AS IncludeSystemObjects,
                     @i_include_indexed_views AS IncludeIndexedViews,
                     @i_skip_tables_with_columnstore AS SkipTablesWithColumnstore,
-                    @i_temporal_co_schedule AS TemporalCoSchedule,
                     @i_ascending_key_boost AS AscendingKeyBoost,
 
                     /* Thresholds */
@@ -2570,8 +2565,7 @@ BEGIN
     Only orphans >24h old are cleaned - this avoids marking concurrent runs
     (that are still actively running) as KILLED.
     */
-    IF  1 = 1 /* always on in v3 */
-    AND @LogToTable = N'Y'
+    IF  @LogToTable = N'Y'
     AND @commandlog_exists = 1
     BEGIN
         DECLARE @orphaned_count int = 0;
@@ -3152,7 +3146,6 @@ OPTION (RECOMPILE);';
               - No inline SQRT calculations in WHERE clause
               - Query Store join (most expensive) runs last and only if needed
             */
-            IF 1 = 1 /* only discovery path in v3 */
             BEGIN
                 DECLARE @staged_sql nvarchar(max);
 
@@ -3394,7 +3387,7 @@ OPTION (RECOMPILE);';
                 IF @phase1_count > 100 AND (@phase2_count * 100) < @phase1_count
                 BEGIN
                     /* v3: no fallback path -- log warning and continue with partial data */
-                    RAISERROR(N''    WARNING: Phase 2 enriched %d of %d candidates (<1%%) -- skipping database (legacy fallback)'', 10, 1, @phase2_count, @phase1_count) WITH NOWAIT;
+                    RAISERROR(N''    WARNING: Phase 2 enriched %d of %d candidates (<1%%) -- skipping database'', 10, 1, @phase2_count, @phase1_count) WITH NOWAIT;
 
                     /* Return empty result set to satisfy INSERT...EXEC schema */
                     SELECT
@@ -3495,7 +3488,7 @@ OPTION (RECOMPILE);';
                 IF EXISTS (SELECT 1 FROM #stat_candidates WHERE tier_threshold IS NULL AND rows IS NOT NULL)
                 BEGIN
                     /* v3: no fallback path -- log warning and continue with partial data */
-                    RAISERROR(N''    WARNING: Phase 3 has NULL tier_threshold with non-NULL rows -- skipping database (legacy fallback)'', 10, 1) WITH NOWAIT;
+                    RAISERROR(N''    WARNING: Phase 3 has NULL tier_threshold with non-NULL rows -- skipping database'', 10, 1) WITH NOWAIT;
 
                     SELECT
                         database_name = DB_NAME(),
@@ -3551,52 +3544,23 @@ OPTION (RECOMPILE);';
                 */
                 ALTER TABLE #stat_candidates ADD qualifies bit NOT NULL DEFAULT 0;
 
-                /* Apply threshold logic */
-                IF @i_threshold_logic_param = N''OR''
-                BEGIN
-                    UPDATE #stat_candidates
-                    SET qualifies = 1
-                    WHERE (
-                        /* Fixed modification threshold */
-                        (@ModificationThreshold_param IS NOT NULL AND modification_counter >= @ModificationThreshold_param)
-                        /* Modification percent (non-tiered) */
-                        OR (@i_tiered_thresholds_param = 0 AND @i_modification_percent_param IS NOT NULL
-                            AND modification_counter >= (@i_modification_percent_param * SQRT(CONVERT(float, ISNULL(rows, 1)))))
-                        /* Tiered thresholds */
-                        OR (@i_tiered_thresholds_param = 1 AND (modification_counter >= tier_threshold OR modification_counter >= sqrt_threshold))
-                        /* Hours stale (v2.3) */
-                        OR (@StaleHours_param IS NOT NULL AND hours_stale >= @StaleHours_param)
-                        /* No thresholds = include all */
-                        OR (@ModificationThreshold_param IS NULL AND @i_modification_percent_param IS NULL
-                            AND @i_tiered_thresholds_param = 0 AND @StaleHours_param IS NULL)
-                    );
-                END
-                ELSE /* AND logic -- modifications are the primary signal (#422) */
-                BEGIN
-                    UPDATE #stat_candidates
-                    SET qualifies = 1
-                    WHERE
-                        /* Primary: modifications exceed any threshold */
-                        (
-                            (@ModificationThreshold_param IS NOT NULL AND modification_counter >= @ModificationThreshold_param)
-                            OR (@i_tiered_thresholds_param = 0 AND @i_modification_percent_param IS NOT NULL
-                                AND modification_counter >= (@i_modification_percent_param * SQRT(CONVERT(float, ISNULL(rows, 1)))))
-                            OR (@i_tiered_thresholds_param = 1 AND (modification_counter >= tier_threshold OR modification_counter >= sqrt_threshold))
-                        )
-                        OR
-                        /* Fallback: any modifications AND stale (staleness alone does not qualify) */
-                        (
-                            @StaleHours_param IS NOT NULL
-                            AND modification_counter > 0
-                            AND hours_stale >= @StaleHours_param
-                        )
-                        OR
-                        /* No thresholds = include all */
-                        (
-                            @ModificationThreshold_param IS NULL AND @i_modification_percent_param IS NULL
-                            AND @i_tiered_thresholds_param = 0 AND @StaleHours_param IS NULL
-                        );
-                END;
+                /* Apply threshold logic (v3: OR is the only supported mode) */
+                UPDATE #stat_candidates
+                SET qualifies = 1
+                WHERE (
+                    /* Fixed modification threshold */
+                    (@ModificationThreshold_param IS NOT NULL AND modification_counter >= @ModificationThreshold_param)
+                    /* Modification percent (non-tiered) */
+                    OR (@i_tiered_thresholds_param = 0 AND @i_modification_percent_param IS NOT NULL
+                        AND modification_counter >= (@i_modification_percent_param * SQRT(CONVERT(float, ISNULL(rows, 1)))))
+                    /* Tiered thresholds */
+                    OR (@i_tiered_thresholds_param = 1 AND (modification_counter >= tier_threshold OR modification_counter >= sqrt_threshold))
+                    /* Hours stale (v2.3) */
+                    OR (@StaleHours_param IS NOT NULL AND hours_stale >= @StaleHours_param)
+                    /* No thresholds = include all */
+                    OR (@ModificationThreshold_param IS NULL AND @i_modification_percent_param IS NULL
+                        AND @i_tiered_thresholds_param = 0 AND @StaleHours_param IS NULL)
+                );
 
                 /*
                 #143: Ascending key boost -- identity column stats with ANY modifications
@@ -3757,7 +3721,7 @@ OPTION (RECOMPILE);';
                     IF @null_page_count > (@phase4_qualifying / 2)
                     BEGIN
                         /* v3: no fallback path -- log warning and continue with partial data */
-                        RAISERROR(N''    WARNING: Phase 5 has %d of %d stats with NULL page_count -- skipping database (legacy fallback)'', 10, 1,
+                        RAISERROR(N''    WARNING: Phase 5 has %d of %d stats with NULL page_count -- skipping database'', 10, 1,
                             @null_page_count, @phase4_qualifying) WITH NOWAIT;
 
                         SELECT
@@ -3827,7 +3791,7 @@ OPTION (RECOMPILE);';
                 AND @phase5_remaining * 2 < @phase4_qualifying
                 BEGIN
                     /* v3: no fallback path -- log warning and continue with partial data */
-                    RAISERROR(N''    WARNING: Phase 5 kept %d of %d rows with MinPageCount=0 -- skipping database (legacy fallback)'', 10, 1,
+                    RAISERROR(N''    WARNING: Phase 5 kept %d of %d rows with MinPageCount=0 -- skipping database'', 10, 1,
                         @phase5_remaining, @phase4_qualifying) WITH NOWAIT;
 
                     SELECT
@@ -4328,7 +4292,6 @@ OPTION (RECOMPILE);';
                       @ModificationThreshold_param bigint,
                       @i_modification_percent_param float,
                       @i_tiered_thresholds_param bit,
-                      @i_threshold_logic_param nvarchar(3),
                       @StaleHours_param integer,
                       @i_min_page_count_param bigint,
                       @i_include_system_objects_param nvarchar(1),
@@ -4351,7 +4314,6 @@ OPTION (RECOMPILE);';
                     @ModificationThreshold_param = @i_modification_threshold,
                     @i_modification_percent_param = @i_modification_percent,
                     @i_tiered_thresholds_param = @i_tiered_thresholds,
-                    @i_threshold_logic_param = @i_threshold_logic,
                     @StaleHours_param = @StaleHours,
                     @i_min_page_count_param = @i_min_page_count,
                     @i_include_system_objects_param = @i_include_system_objects,
@@ -4638,8 +4600,7 @@ OPTION (RECOMPILE);';
     also schedule its history table stats. Prevents cross-table cardinality
     inconsistency for FOR SYSTEM_TIME queries that join current + history tables.
     */
-    IF  @i_temporal_co_schedule = N'Y'
-    AND @mode = N'DISCOVERY'
+    IF  @mode = N'DISCOVERY'
     AND EXISTS (SELECT 1 FROM #stats_to_process WHERE temporal_type = 2)
     BEGIN
         /* #317: Converted from temporal_cursor to WHILE loop */
