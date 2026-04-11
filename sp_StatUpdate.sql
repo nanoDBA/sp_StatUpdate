@@ -3924,8 +3924,12 @@ OPTION (RECOMPILE);';
                     /* Step 1: Rank plans by @i_qs_metric, take TOP N for XML parsing.
                        Step 2: Extract table references from plan XML.
                        Step 3: Filter to only tables we have stat candidates for.
-                       Step 4: Aggregate runtime stats per table object_id. */
-                    ;WITH TopPlanIds AS (
+                       Step 4: Aggregate runtime stats per table object_id.
+                       bd -iqw: WAITS metric pre-aggregates wait stats in a CTE
+                       (WaitsByPlan) instead of a correlated subquery per plan row.
+                       Injected via {{WAITS_CTE}}/{{WAITS_JOIN}}/{{WAITS_ORDER}}
+                       REPLACE tokens; empty on SQL 2016 (no query_store_wait_stats). */
+                    ;WITH {{WAITS_CTE}}TopPlanIds AS (
                         SELECT TOP (ISNULL(@i_qs_top_plans_param, 2147483647))
                             qsp.plan_id
                         FROM sys.query_store_plan AS qsp
@@ -3933,6 +3937,7 @@ OPTION (RECOMPILE);';
                             ON qsrs.plan_id = qsp.plan_id
                         JOIN sys.query_store_runtime_stats_interval AS qsrsi
                             ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
+                        {{WAITS_JOIN}}
                         WHERE qsrsi.end_time >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME())
                         GROUP BY qsp.plan_id
                         ORDER BY CASE @i_qs_metric_param
@@ -4227,18 +4232,20 @@ OPTION (RECOMPILE);';
                 ';
 
                 /*
-                P1a fix (v2.4): Parameterize MAX_GRANT_PERCENT in the candidate discovery SELECT.
-                Replace hardcoded 25 with @i_max_grant_percent, or remove hint entirely when NULL.
-                Gated on @supports_maxdop_stats (SQL 2016 SP2+) -- older builds don't support the hint.
+                Parameterize MAX_GRANT_PERCENT in the candidate discovery SELECT.
+                Replace the hardcoded 25 with @i_max_grant_percent, or remove the hint
+                entirely when NULL.  MAX_GRANT_PERCENT has been supported since SQL
+                2012 SP3, well before v3's SQL 2016 minimum, so no version gate is
+                needed (bd -31k).
                 */
-                IF @i_max_grant_percent IS NOT NULL AND @supports_maxdop_stats = 1
+                IF @i_max_grant_percent IS NOT NULL
                     SET @staged_sql = REPLACE(@staged_sql,
                         N'OPTION (MAX_GRANT_PERCENT = 25)',
                         N'OPTION (MAX_GRANT_PERCENT = ' + CAST(@i_max_grant_percent AS nvarchar(3)) + N')');
                 ELSE
                     SET @staged_sql = REPLACE(@staged_sql,
                         N' OPTION (MAX_GRANT_PERCENT = 25);',
-                        N';'); /* Remove hint when NULL or unsupported */
+                        N';'); /* Remove hint when NULL -- let SQL decide */
 
                 /* Version-gate TEMPDB_SPILLS: avg_tempdb_space_used added in SQL 2017 (14.x) */
                 SET @staged_sql = REPLACE(@staged_sql, N'{{TEMPDB_SPILLS_EXPR}}',
@@ -4264,10 +4271,31 @@ OPTION (RECOMPILE);';
                     ELSE N'SUM(CONVERT(float, 0))'
                     END);
 
-                /* Version-gate WAITS: sys.query_store_wait_stats added in SQL 2017 (14.x) */
+                /* Version-gate WAITS: sys.query_store_wait_stats added in SQL 2017 (14.x).
+                   bd -iqw: pre-aggregate wait stats in a CTE + LEFT JOIN instead of
+                   a correlated subquery in the ORDER BY (O(N+M) vs O(N*M) on large QS). */
+                SET @staged_sql = REPLACE(@staged_sql, N'{{WAITS_CTE}}',
+                    CASE WHEN @sql_major_version >= 14
+                    THEN N'WaitsByPlan AS (
+                        SELECT qsws.plan_id, SUM(CONVERT(float, qsws.total_query_wait_time_ms)) AS wait_ms
+                        FROM sys.query_store_wait_stats AS qsws
+                        JOIN sys.query_store_runtime_stats_interval AS qsrsi2
+                            ON qsrsi2.runtime_stats_interval_id = qsws.runtime_stats_interval_id
+                        WHERE qsws.wait_category IN (3, 12, 15)
+                          AND qsrsi2.end_time >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME())
+                        GROUP BY qsws.plan_id
+                    ),
+                    '
+                    ELSE N''
+                    END);
+                SET @staged_sql = REPLACE(@staged_sql, N'{{WAITS_JOIN}}',
+                    CASE WHEN @sql_major_version >= 14
+                    THEN N'LEFT JOIN WaitsByPlan AS wbp ON wbp.plan_id = qsp.plan_id'
+                    ELSE N''
+                    END);
                 SET @staged_sql = REPLACE(@staged_sql, N'{{WAITS_ORDER}}',
                     CASE WHEN @sql_major_version >= 14
-                    THEN N'(SELECT ISNULL(SUM(CONVERT(float, qsws.total_query_wait_time_ms)), 0) FROM sys.query_store_wait_stats AS qsws WHERE qsws.plan_id = qsp.plan_id AND qsws.wait_category IN (3, 12, 15) AND qsws.runtime_stats_interval_id IN (SELECT runtime_stats_interval_id FROM sys.query_store_runtime_stats_interval WHERE end_time >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME())))'
+                    THEN N'ISNULL(MAX(wbp.wait_ms), 0)'
                     ELSE N'SUM(CONVERT(float, 0))'
                     END);
 
