@@ -1031,6 +1031,7 @@ BEGIN
             StatsFailed integer NULL,
             StatsSkipped integer NULL,
             LastStatCompletedAt datetime2(3) NULL, /* v2.3: timestamp of last individual stat completion per worker */
+            ClaimLoginTime datetime NULL, /* bd -h9a: login_time of claiming session; pairs with SessionID to survive SPID reuse */
             CONSTRAINT PK_QueueStatistic
                 PRIMARY KEY CLUSTERED (QueueID, DatabaseName, SchemaName, ObjectName)
         );
@@ -1061,6 +1062,19 @@ BEGIN
         ALTER TABLE dbo.QueueStatistic ADD LastStatCompletedAt datetime2(3) NULL;
         IF @Debug = 1
             RAISERROR(N'Added LastStatCompletedAt column to dbo.QueueStatistic (v2.3 migration).', 10, 1) WITH NOWAIT;
+    END;
+
+    /*
+    bd -h9a: Backward-compatible migration -- add ClaimLoginTime if it doesn't exist.
+    Paired with SessionID to disambiguate SPID reuse after failover or restart.
+    */
+    IF  @StatsInParallel = N'Y'
+    AND OBJECT_ID(N'dbo.QueueStatistic', N'U') IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic') AND name = N'ClaimLoginTime')
+    BEGIN
+        ALTER TABLE dbo.QueueStatistic ADD ClaimLoginTime datetime NULL;
+        IF @Debug = 1
+            RAISERROR(N'Added ClaimLoginTime column to dbo.QueueStatistic (bd -h9a migration).', 10, 1) WITH NOWAIT;
     END;
     /*
     #142: Server-level AG readable secondary detection.
@@ -4939,6 +4953,16 @@ OPTION (RECOMPILE);';
         RAISERROR(N'', 10, 1) WITH NOWAIT;
         RAISERROR(N'Parallel mode: Initializing work queue...', 10, 1) WITH NOWAIT;
 
+        /* #430: probe heartbeat + login_time columns once before any parallel
+           coordination code.  Both probes dominate every QueueStatistic touch-point
+           (MAX_WORKERS count, dead-worker release, claim, per-stat heartbeat). */
+        DECLARE @has_heartbeat_col bit = CASE
+            WHEN EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic') AND name = N'LastStatCompletedAt')
+            THEN 1 ELSE 0 END;
+        DECLARE @has_login_time_col bit = CASE
+            WHEN EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic') AND name = N'ClaimLoginTime')
+            THEN 1 ELSE 0 END;
+
         /*
         v2.3: Backward-compatible migration -- add ParameterFingerprint to dbo.Queue if missing.
         Allows detecting conflicting parameter sets when multiple workers join the same queue.
@@ -5107,18 +5131,30 @@ OPTION (RECOMPILE);';
             #181: Max worker count coordination.
             Before claiming, count active workers (sessions still alive in dm_exec_sessions).
             If >= @i_max_workers, exit cleanly without joining the queue.
+            bd -h9a: when ClaimLoginTime exists, a reused SPID only counts as live
+            when BOTH session_id AND login_time match.  Otherwise a reused SPID
+            would inflate the count and trigger a false MAX_WORKERS exit.
             */
             IF @i_max_workers IS NOT NULL AND @queue_id IS NOT NULL
             BEGIN
                 DECLARE @active_worker_count int = 0;
-
-                SELECT
-                    @active_worker_count = COUNT(DISTINCT qs.SessionID)
+                DECLARE @mw_sql nvarchar(max) = N'
+                SELECT @cnt = COUNT(DISTINCT qs.SessionID)
                 FROM dbo.QueueStatistic AS qs
                 JOIN sys.dm_exec_sessions AS ses
-                  ON ses.session_id = qs.SessionID
-                WHERE qs.QueueID = @queue_id
-                AND   qs.TableEndTime IS NULL;
+                  ON ses.session_id = qs.SessionID'
+                    + CASE WHEN @has_login_time_col = 1
+                           THEN N'
+                 AND (qs.ClaimLoginTime IS NULL OR ses.login_time = qs.ClaimLoginTime)'
+                           ELSE N'' END + N'
+                WHERE qs.QueueID = @qid
+                AND   qs.TableEndTime IS NULL;';
+
+                EXEC sys.sp_executesql
+                    @mw_sql,
+                    N'@qid int, @cnt int OUTPUT',
+                    @qid = @queue_id,
+                    @cnt = @active_worker_count OUTPUT;
 
                 IF @active_worker_count >= @i_max_workers
                 BEGIN
@@ -5337,10 +5373,9 @@ OPTION (RECOMPILE);';
     /*
     Processing loop
     */
-    /* #430: evaluate heartbeat column once before loop, not per-iteration */
-    DECLARE @has_heartbeat_col bit = CASE
-        WHEN EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic') AND name = N'LastStatCompletedAt')
-        THEN 1 ELSE 0 END;
+    /* #430: @has_heartbeat_col + bd -h9a: @has_login_time_col both probed once
+       earlier at the @StatsInParallel block entry.  Declarations here would
+       conflict; those probes dominate this point. */
 
     ProcessLoop:
     WHILE 1 = 1
@@ -5616,6 +5651,7 @@ OPTION (RECOMPILE);';
                 between stat claims are not in dm_exec_requests but ARE in dm_exec_sessions.
                 */
                 /* v2.3: LastStatCompletedAt column may not exist on pre-v2.3 installations.
+                   bd -h9a: ClaimLoginTime column may not exist on pre-fix installations.
                    Use dynamic SQL to avoid compile-time column validation failure. */
                 DECLARE @dead_worker_sql nvarchar(max);
                 /* #430: @has_heartbeat_col moved outside process loop (one-time evaluation) */
@@ -5629,6 +5665,10 @@ OPTION (RECOMPILE);';
                     + CASE WHEN @has_heartbeat_col = 1
                            THEN N',
                        qs.LastStatCompletedAt = NULL'
+                           ELSE N'' END
+                    + CASE WHEN @has_login_time_col = 1
+                           THEN N',
+                       qs.ClaimLoginTime = NULL'
                            ELSE N'' END + N'
                 FROM dbo.QueueStatistic AS qs
                 WHERE qs.QueueID = @queue_id
@@ -5639,7 +5679,11 @@ OPTION (RECOMPILE);';
                           (
                               SELECT 1
                               FROM sys.dm_exec_sessions AS s
-                              WHERE s.session_id = qs.SessionID
+                              WHERE s.session_id = qs.SessionID'
+                    + CASE WHEN @has_login_time_col = 1
+                           THEN N'
+                                AND (qs.ClaimLoginTime IS NULL OR s.login_time = qs.ClaimLoginTime)'
+                           ELSE N'' END + N'
                           )
                           OR
                           (
@@ -5695,42 +5739,60 @@ OPTION (RECOMPILE);';
                 on large queue tables). READPAST skips rows locked by other concurrent workers.
                 When multiple workers claim tables concurrently, this prevents blocking.
                 */
-                UPDATE
-                    qs
-                SET
-                    qs.TableStartTime = SYSDATETIME(),
-                    qs.SessionID = @@SPID,
-                    qs.RequestID =
-                    (
-                        SELECT
-                            r.request_id
-                        FROM sys.dm_exec_requests AS r
-                        WHERE r.session_id = @@SPID
-                    ),
-                    qs.RequestStartTime =
-                    (
-                        SELECT
-                            r.start_time
-                        FROM sys.dm_exec_requests AS r
-                        WHERE r.session_id = @@SPID
-                    )
+                /* bd -h9a: snapshot login_time for this session once, pass into UPDATE.
+                   Pairs with SessionID in the dead-worker check so a reused SPID (post-
+                   failover or post-restart) cannot match a stale ClaimLoginTime.
+
+                   Claim UPDATE is dynamic SQL so the ClaimLoginTime column reference
+                   is only parsed when the column actually exists (gated on
+                   @has_login_time_col).  Pre-h9a installations skip the ClaimLoginTime
+                   assignment entirely and fall back to the original session-id-only
+                   dead-worker detection. */
+                DECLARE @claim_login_time datetime =
+                    (SELECT s.login_time FROM sys.dm_exec_sessions AS s WHERE s.session_id = @@SPID);
+
+                DECLARE @claim_sql nvarchar(max) = N'
+                UPDATE qs
+                SET    qs.TableStartTime = SYSDATETIME(),
+                       qs.SessionID = @@SPID'
+                    + CASE WHEN @has_login_time_col = 1
+                           THEN N',
+                       qs.ClaimLoginTime = @login_time_in'
+                           ELSE N'' END + N',
+                       qs.RequestID =
+                       (
+                           SELECT r.request_id
+                           FROM sys.dm_exec_requests AS r
+                           WHERE r.session_id = @@SPID
+                       ),
+                       qs.RequestStartTime =
+                       (
+                           SELECT r.start_time
+                           FROM sys.dm_exec_requests AS r
+                           WHERE r.session_id = @@SPID
+                       )
                 OUTPUT
                     inserted.DatabaseName,
                     inserted.SchemaName,
                     inserted.ObjectName,
                     inserted.ObjectID
-                INTO @claimed_tables
                 FROM dbo.QueueStatistic AS qs WITH (ROWLOCK, READPAST)
-                WHERE qs.QueueID = @queue_id
+                WHERE qs.QueueID = @qid
                 AND   qs.TableStartTime IS NULL
                 AND   qs.TablePriority =
                       (
-                          SELECT
-                              MIN(qs2.TablePriority)
-                          FROM dbo.QueueStatistic AS qs2 WITH (ROWLOCK, READPAST) /* P2a fix: ROWLOCK prevents page/table lock escalation under parallel load */
-                          WHERE qs2.QueueID = @queue_id
+                          SELECT MIN(qs2.TablePriority)
+                          FROM dbo.QueueStatistic AS qs2 WITH (ROWLOCK, READPAST)
+                          WHERE qs2.QueueID = @qid
                           AND   qs2.TableStartTime IS NULL
-                      );
+                      );';
+
+                INSERT INTO @claimed_tables (DatabaseName, SchemaName, ObjectName, ObjectID)
+                EXEC sys.sp_executesql
+                    @claim_sql,
+                    N'@qid int, @login_time_in datetime',
+                    @qid = @queue_id,
+                    @login_time_in = @claim_login_time;
 
                 SELECT TOP (1)
                     @claimed_table_database = ct.DatabaseName,
