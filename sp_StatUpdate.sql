@@ -1770,6 +1770,7 @@ BEGIN
     WHERE d.name <> N'tempdb'
     AND   d.source_database_id IS NULL  /* Exclude database snapshots */
     AND   d.state = 0                   /* ONLINE only */
+    AND   d.is_in_standby = 0           /* bd -47y: exclude log-shipping STANDBY databases */
     AND   HAS_DBACCESS(d.name) = 1;     /* Skip SINGLE_USER held by other sessions */
 
     /*
