@@ -5391,9 +5391,9 @@ OPTION (RECOMPILE);';
                     THEN N'HEAP'
                     ELSE N''
                 END,
-            modifications = FORMAT(stp.modification_counter, N'N0'),
+            modifications = CONVERT(nvarchar(20), stp.modification_counter),
             days_stale = stp.days_stale,
-            pages = FORMAT(stp.page_count, N'N0')
+            pages = CONVERT(nvarchar(20), stp.page_count)
         FROM #stats_to_process AS stp
         ORDER BY
             stp.priority;
@@ -6839,7 +6839,7 @@ OPTION (RECOMPILE);';
                 CASE
                     WHEN @current_is_heap = 1
                     AND  @current_forwarded_records > 0
-                    THEN N', HEAP (fwd: ' + FORMAT(@current_forwarded_records, N'N0') + N')'
+                    THEN N', HEAP (fwd: ' + CONVERT(nvarchar(20), @current_forwarded_records) + N')'
                     WHEN @current_is_heap = 1
                     THEN N', HEAP'
                     ELSE N''
