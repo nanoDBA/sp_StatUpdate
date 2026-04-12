@@ -302,10 +302,9 @@ BEGIN
     /*#endregion 02-HELP */
     /*#region 03-SETUP: Re-entrancy, variables, guards, presets, validation */
     /*
-    Check transaction count BEFORE acquiring applock - UPDATE STATISTICS acquires Sch-M locks
-    that escalate unpredictably inside caller's transaction; connection pool poison risk.
-    Must precede applock because sp_getapplock behavior inside an open transaction is
-    version-dependent and can mask the real error.
+    Check transaction count BEFORE acquiring re-entrancy lock -- UPDATE STATISTICS
+    acquires Sch-M locks that escalate unpredictably inside a caller's transaction.
+    Must precede lock acquisition to avoid masking the real error.
     */
     IF @@TRANCOUNT <> 0
     BEGIN
@@ -329,23 +328,55 @@ BEGIN
 
     /*
     ============================================================================
-    RE-ENTRANCY GUARD (sp_HeapDoctor pattern)
+    RE-ENTRANCY GUARD (queue-table pattern, bd -j9d)
     Prevents concurrent non-parallel runs from corrupting shared state
     (orphan cleanup, progress tables, CommandLog bracketing).
-    Parallel mode workers skip this guard - they coordinate via queue tables.
+    Uses a row in dbo.StatUpdateLock with (SessionID, LoginTime) liveness
+    tuple instead of sp_getapplock.  Dead holders are auto-reclaimed via
+    sys.dm_exec_sessions -- no ALREADY_RUNNING cascade when sessions die.
+    Parallel mode workers skip this guard -- they coordinate via dbo.Queue +
+    dbo.QueueStatistic.
     ============================================================================
     */
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.objects AS o
+        JOIN sys.schemas AS s ON s.schema_id = o.schema_id
+        WHERE o.type = N'U' AND s.name = N'dbo' AND o.name = N'StatUpdateLock'
+    )
+    BEGIN
+        CREATE TABLE dbo.StatUpdateLock (
+            Resource sysname NOT NULL,
+            SessionID smallint NOT NULL,
+            LoginTime datetime NOT NULL,
+            AcquiredAt datetime2(3) NOT NULL DEFAULT SYSDATETIME(),
+            CONSTRAINT PK_StatUpdateLock PRIMARY KEY CLUSTERED (Resource)
+        );
+    END;
+
     IF @StatsInParallel = N'N'
     BEGIN
-        DECLARE @lock_result int;
-        EXEC @lock_result = sp_getapplock
-            @Resource = N'sp_StatUpdate',
-            @LockMode = N'Exclusive',
-            @LockTimeout = 0,
-            @LockOwner = N'Session';
+        DECLARE @my_login_time datetime =
+            (SELECT s.login_time FROM sys.dm_exec_sessions AS s WHERE s.session_id = @@SPID);
 
-        IF @lock_result < 0
+        DECLARE @existing_sid smallint, @existing_lt datetime;
+
+        BEGIN TRANSACTION;
+
+        SELECT @existing_sid = SessionID, @existing_lt = LoginTime
+        FROM dbo.StatUpdateLock WITH (UPDLOCK, HOLDLOCK)
+        WHERE Resource = N'sp_StatUpdate';
+
+        IF @existing_sid IS NULL
         BEGIN
+            INSERT INTO dbo.StatUpdateLock (Resource, SessionID, LoginTime)
+            VALUES (N'sp_StatUpdate', @@SPID, @my_login_time);
+        END
+        ELSE IF EXISTS (
+            SELECT 1 FROM sys.dm_exec_sessions
+            WHERE session_id = @existing_sid AND login_time = @existing_lt
+        )
+        BEGIN
+            COMMIT TRANSACTION;
             RAISERROR(N'Another instance of sp_StatUpdate is already running (non-parallel mode). Use @StatsInParallel=''Y'' for concurrent execution.', 16, 1);
             SET @StopReasonOut = N'ALREADY_RUNNING';
             SET @StatsFoundOut = 0;
@@ -362,7 +393,16 @@ BEGIN
                 StopReason = N'ALREADY_RUNNING', RunLabel = CONVERT(nvarchar(100), NULL),
                 Version = @procedure_version;
             RETURN;
+        END
+        ELSE
+        BEGIN
+            /* Dead holder -- reclaim */
+            UPDATE dbo.StatUpdateLock
+            SET SessionID = @@SPID, LoginTime = @my_login_time, AcquiredAt = SYSDATETIME()
+            WHERE Resource = N'sp_StatUpdate';
         END;
+
+        COMMIT TRANSACTION;
     END;
     /*
     ============================================================================
@@ -1568,7 +1608,7 @@ BEGIN
             Version = @procedure_version;
 
         IF @StatsInParallel = N'N'
-            EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+            DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
         RETURN 50000;
     END;
     /*#endregion 03-SETUP */
@@ -1795,7 +1835,7 @@ BEGIN
             StopReason = N'PARAMETER_ERROR', RunLabel = @run_label,
             Version = @procedure_version;
         IF @StatsInParallel = N'N'
-            EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+            DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
         RETURN 1;
     END;
 
@@ -1870,7 +1910,7 @@ BEGIN
             RunLabel = @run_label,
             Version = @procedure_version;
         IF @StatsInParallel = N'N'
-            EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+            DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
         RETURN 1;
     END;
 
@@ -4931,7 +4971,7 @@ OPTION (RECOMPILE);';
                 Version = @procedure_version;
 
             IF @StatsInParallel = N'N'
-                EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+                DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
             RETURN 0;
         END;
     END;
@@ -5117,7 +5157,7 @@ OPTION (RECOMPILE);';
                             RAISERROR(N'Conflicting sp_StatUpdate parameters detected. Worker cannot join existing queue initialized with different threshold parameters. (Stored fingerprint: %d, This worker: %d)', 16, 1,
                                 @stored_fingerprint, @parameter_fingerprint);
                             IF @StatsInParallel = N'N'
-                                EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+                                DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
                             RETURN 50001;
                         END;
                     END;
@@ -5166,7 +5206,7 @@ OPTION (RECOMPILE);';
 
                     SET @StopReasonOut = N'MAX_WORKERS';
                     IF @StatsInParallel = N'N'
-                        EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+                        DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
                     RETURN 0;
                 END;
 
@@ -5311,7 +5351,7 @@ OPTION (RECOMPILE);';
 
             RAISERROR(N'ERROR: Queue initialization failed: %s', 16, 1, @queue_error_message) WITH NOWAIT;
             IF @StatsInParallel = N'N'
-                EXEC sp_releaseapplock @Resource = N'sp_StatUpdate', @LockOwner = N'Session';
+                DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
             RETURN -1;
         END CATCH;
 
@@ -8657,13 +8697,12 @@ OPTION (RECOMPILE);';
     END;
 
     /*
-    Release re-entrancy guard (sp_HeapDoctor pattern)
+    Release re-entrancy guard (bd -j9d: queue-table pattern)
     */
     IF @StatsInParallel = N'N'
     BEGIN
-        EXEC sp_releaseapplock
-            @Resource = N'sp_StatUpdate',
-            @LockOwner = N'Session';
+        DELETE FROM dbo.StatUpdateLock
+        WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
     END;
 
     RETURN @return_code;
