@@ -4296,7 +4296,7 @@ OPTION (RECOMPILE);';
                 IF @i_max_grant_percent IS NOT NULL
                     SET @staged_sql = REPLACE(@staged_sql,
                         N'OPTION (MAX_GRANT_PERCENT = 25)',
-                        N'OPTION (MAX_GRANT_PERCENT = ' + CAST(@i_max_grant_percent AS nvarchar(3)) + N')');
+                        N'OPTION (MAX_GRANT_PERCENT = ' + CONVERT(nvarchar(3), @i_max_grant_percent) + N')');
                 ELSE
                     SET @staged_sql = REPLACE(@staged_sql,
                         N' OPTION (MAX_GRANT_PERCENT = 25);',
@@ -6405,7 +6405,7 @@ OPTION (RECOMPILE);';
         IF  @current_row_count IS NOT NULL
         AND @current_persisted_sample_percent IS NOT NULL
         AND @current_persisted_sample_percent > 0
-            SET @absolute_sampled_rows = CAST(@current_row_count * (@current_persisted_sample_percent / 100.0) AS BIGINT);
+            SET @absolute_sampled_rows = CONVERT(bigint, @current_row_count * (@current_persisted_sample_percent / 100.0));
 
         /*
         #183 (P2): Warn when @i_statistics_sample explicitly overrides a persisted sample percent.
@@ -6879,6 +6879,14 @@ OPTION (RECOMPILE);';
                 + @current_schema_name + N'.' + @current_table_name
                 + N' -- stats update may reset CE/grant/DOP feedback';
             RAISERROR(@progress_msg, 10, 1) WITH NOWAIT;
+        END;
+
+        /* CDC FULLSCAN log volume warning (#mzn) */
+        IF @Debug = 1
+        AND @current_is_tracked_by_cdc = 1
+        AND @with_clause LIKE N'%FULLSCAN%'
+        BEGIN
+            RAISERROR(N'  Note: CDC-tracked table -- FULLSCAN may increase log volume', 10, 1) WITH NOWAIT;
         END;
 
         IF @Debug = 1
@@ -7464,7 +7472,7 @@ OPTION (RECOMPILE);';
             END;
 
             DECLARE
-                @delay_time datetime = DATEADD(MILLISECOND, CAST(@i_delay_between_stats * 1000 AS int), '00:00:00');
+                @delay_time datetime = DATEADD(MILLISECOND, CONVERT(int, @i_delay_between_stats * 1000), '00:00:00');
 
             WAITFOR DELAY @delay_time;
         END;
