@@ -217,8 +217,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.03.26.1',
-        @procedure_version_date datetime = '20260326';
+        @procedure_version varchar(20) = '2026.04.11.1',
+        @procedure_version_date datetime = '20260411';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -454,7 +454,7 @@ BEGIN
                 (N'COMPLETION',  N'30%', N'What percentage of qualifying stats get updated each run'),
                 (N'RELIABILITY', N'25%', N'Absence of killed runs, failures, and orphaned entries'),
                 (N'SPEED',       N'20%', N'Average seconds per stat update -- are updates fast enough'),
-                (N'WORKLOAD',    N'25%', N'Are high-CPU stats prioritized early (requires @QueryStorePriority=Y)')
+                (N'WORKLOAD',    N'25%', N'Are high-CPU stats prioritized early (requires @QueryStore = CPU in v3, @QueryStorePriority=Y in v2)')
         ) AS v (category, default_weight, what_it_measures);
 
         /* Result set 7: Prerequisites and Known Limitations */
@@ -470,13 +470,13 @@ BEGIN
                 (N'CommandLog Table',
                  N'Requires dbo.CommandLog from Ola Hallengren''s Maintenance Solution.  sp_StatUpdate writes SP_STATUPDATE_START, SP_STATUPDATE_END, and UPDATE_STATISTICS entries.  No CommandLog = no diagnostics.'),
                 (N'sp_StatUpdate Version',
-                 N'Full feature support requires sp_StatUpdate v2.16+ (ProcessingPosition in ExtendedInfo for RS 12).  QS efficacy requires @QueryStorePriority=Y runs.  Legacy runs (pre-RunLabel) are supported with synthetic labels.'),
+                 N'Full feature support requires sp_StatUpdate v2.16+ (ProcessingPosition in ExtendedInfo for RS 12).  QS efficacy requires QS-enabled runs (@QueryStore in v3, @QueryStorePriority=Y in v2).  Legacy runs (pre-RunLabel) are supported with synthetic labels.'),
                 (N'INSERT...EXEC Limitation',
                  N'@SingleResultSet=1 auto-enables @SkipHistory=1 because SQL Server''s INSERT...EXEC creates an implicit transaction that prevents persistent table writes.  @ObfuscationMapTable writes are attempted but may silently fail in this context.'),
                 (N'Obfuscation Map Security',
                  N'@SingleResultSet=1 excludes the obfuscation map from RowData to prevent leaking real names in the unified output.  Use @ObfuscationMapTable to persist the map separately.'),
                 (N'WORKLOAD Grade Without QS',
-                 N'If no runs use @QueryStorePriority=Y, the WORKLOAD category scores a neutral 50/100 (grade C).  Enable QS prioritization for meaningful workload grades.')
+                 N'If no runs use QS prioritization (@QueryStore in v3, @QueryStorePriority=Y in v2), the WORKLOAD category scores a neutral 50/100 (grade C).  Enable QS prioritization for meaningful workload grades.')
         ) AS v (topic, detail);
 
         /* Result set 8: Additional Examples */
@@ -1969,10 +1969,10 @@ BEGIN
                 + N'(1) SQL Agent job killed or timed out, '
                 + N'(2) Server restart during maintenance, '
                 + N'(3) Manual cancellation. '
-                + N'Enable @CleanupOrphanedRuns = N''Y'' (default in v1.9+). '
+                + N'Orphan cleanup runs automatically in v3. On v2, set @CleanupOrphanedRuns = N''Y'' (default in v1.9+). '
                 + N'Review SQL Agent job history for stop events. '
                 + N'Consider adjusting @TimeLimit to complete within your maintenance window.',
-            N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @CleanupOrphanedRuns = N''Y'', @TimeLimit = 3600;',
+            N'EXECUTE dbo.sp_StatUpdate @Preset = N''NIGHTLY'', @Databases = N''USER_DATABASES'', @TimeLimit = 3600;',
             10
         FROM #runs AS r
         WHERE r.IsKilled = 1;
@@ -2059,7 +2059,7 @@ BEGIN
                 + N'(1) Increase @TimeLimit to ' + ISNULL(CONVERT(nvarchar(10), @latest_timelimit_sec * 2), N'<current_value_x2>') + N' seconds, '
                 + N'(2) Enable @LongRunningThresholdMinutes to cap slow individual stats, '
                 + N'(3) Raise @ModificationThreshold to reduce qualifying stats, '
-                + N'(4) Use @Preset = N''NIGHTLY_MAINTENANCE'' for balanced defaults.',
+                + N'(4) Use @Preset = N''NIGHTLY'' for balanced defaults.',
             N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @TimeLimit = '
                 + ISNULL(CONVERT(nvarchar(10), @latest_timelimit_sec * 2), N'<current_value_x2>')
                 + N', @LongRunningThresholdMinutes = 30;',
@@ -2198,9 +2198,9 @@ BEGIN
             (
                 N'WARNING', N'SUBOPTIMAL_PARAMS',
                 N'TieredThresholds is disabled',
-                N'Current: @TieredThresholds = 0. Fixed threshold of ' + ISNULL(CONVERT(nvarchar(20), @latest_mod_threshold), N'NULL') + N' applied uniformly to all table sizes.',
-                N'Tiered thresholds adapt the modification threshold based on table size (small tables need fewer mods to justify an update). This is especially important for mixed workloads with tables ranging from hundreds to millions of rows.',
-                N'EXECUTE dbo.sp_StatUpdate @TieredThresholds = 1;',
+                N'Fixed modification threshold of ' + ISNULL(CONVERT(nvarchar(20), @latest_mod_threshold), N'NULL') + N' applied uniformly to all table sizes (tiered thresholds disabled).',
+                N'Tiered thresholds adapt the modification threshold based on table size (small tables need fewer mods to justify an update). This is especially important for mixed workloads with tables ranging from hundreds to millions of rows. In v3, tiered thresholds are always active -- upgrade to v3 or set @TieredThresholds = 1 on v2.',
+                N'EXECUTE dbo.sp_StatUpdate @Preset = N''NIGHTLY'', @Databases = N''USER_DATABASES''; /* v3 -- tiered thresholds always on */',
                 30
             );
         END;
@@ -2349,7 +2349,7 @@ BEGIN
                 + N'(1) Increase @TimeLimit, '
                 + N'(2) Enable @StatsInParallel = N''Y'' for parallel processing, '
                 + N'(3) Raise @ModificationThreshold to reduce qualifying stats, '
-                + N'(4) Use @Preset = N''NIGHTLY_MAINTENANCE'' for balanced defaults.',
+                + N'(4) Use @Preset = N''NIGHTLY'' for balanced defaults.',
             N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @TimeLimit = 7200, @StatsInParallel = N''Y'';',
             25
         FROM #runs AS r
@@ -2409,11 +2409,11 @@ BEGIN
             (
                 N'WARNING', N'QS_NOT_EFFECTIVE',
                 N'Query Store priority enabled but no QS data captured in stat updates',
-                N'@QueryStorePriority = N''Y'' was used but QS enrichment did not run in any stat updates (QSPlanCount IS NULL in all). '
+                N'QS prioritization was configured (@QueryStore in v3, @QueryStorePriority in v2) but QS enrichment did not run in any stat updates (QSPlanCount IS NULL in all). '
                     + N'This typically means Query Store is disabled, read-only, purged, or has no recent runtime stats.',
                 N'Verify Query Store is enabled and in READ_WRITE mode on target databases: '
                     + N'SELECT name, is_query_store_on FROM sys.databases. '
-                    + N'If QS is intentionally disabled, remove @QueryStorePriority to avoid unnecessary overhead. '
+                    + N'If QS is intentionally disabled, set @QueryStore = NULL (v3) to avoid unnecessary overhead. '
                     /* #278: capture mode guidance */
                     + N'Also verify CAPTURE_MODE is AUTO or CUSTOM, not ALL (SELECT actual_state_desc, query_capture_mode_desc FROM sys.database_query_store_options).',
                 N'/* Check: SELECT name, is_query_store_on FROM sys.databases WHERE state_desc = N''ONLINE''; */',
@@ -2431,7 +2431,7 @@ BEGIN
                 N'WARNING', N'QS_NOT_EFFECTIVE',
                 N'QS enrichment ran in only ' + CONVERT(nvarchar(10), @w5_qs_data_runs)
                     + N' of ' + CONVERT(nvarchar(10), @w5_qs_runs) + N' QS-priority runs',
-                N'@QueryStorePriority = N''Y'' was used across ' + CONVERT(nvarchar(10), @w5_qs_runs)
+                N'QS prioritization was configured across ' + CONVERT(nvarchar(10), @w5_qs_runs)
                     + N' runs, but QS enrichment only executed in ' + CONVERT(nvarchar(10), @w5_qs_data_runs)
                     + N'.  Query Store may have transitioned to READ_ONLY or had no recent runtime stats in some runs.',
                 N'Check QS status: SELECT actual_state_desc, query_capture_mode_desc, current_storage_size_mb, max_storage_size_mb FROM sys.database_query_store_options. '
@@ -2526,8 +2526,8 @@ BEGIN
                 N'WARNING', N'EXCESSIVE_OVERHEAD',
                 N'Discovery and environment checks consuming disproportionate time vs actual stat updates',
                 @w6_detail,
-                N'Review recent parameter changes -- newly enabled features (@CollectHeapForwarding, @GroupByJoinPattern, @QueryStorePriority) add discovery overhead. '
-                    + N'Consider @StagedDiscovery=N for legacy fast-path, reduce @CommandLogRetentionDays, or check whether CommandLog table needs a StartTime index. '
+                N'Review recent parameter changes -- features like @QueryStore (CPU/DURATION/READS) and extended discovery options add overhead. '
+                    + N'Reduce @CommandLogRetentionDays, or check whether CommandLog table needs a StartTime index. '
                     + N'If SQL Server is under memory pressure (check sys.dm_os_memory_brokers, sys.dm_os_process_memory), high overhead may indicate page cache eviction during stat scans.',
                 N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @Debug = 1; /* Review per-phase timing in debug output */',
                 33
@@ -2611,7 +2611,7 @@ BEGIN
                     N'High-workload statistics processed late in maintenance window',
                     N'Top CPU stats with high processing positions: ' + @w7_evidence,
                     N'Enable Query Store-based prioritization to process high-impact stats first.',
-                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStorePriority = N''Y'', @SortOrder = N''QUERY_STORE'';',
+                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStore = N''CPU'', @SortOrder = N''QUERY_STORE'';',
                     36
                 );
 
@@ -2652,8 +2652,8 @@ BEGIN
                     + CONVERT(nvarchar(10), @i9_top_n) + N' account for '
                     + CONVERT(nvarchar(10), @i9_pct) + N'% of total CPU. '
                     + N'Concentrating statistics maintenance on these tables maximizes performance impact.',
-                N'Use @QueryStorePriority = N''Y'' to automatically prioritize these high-impact tables.',
-                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStorePriority = N''Y'';',
+                N'Use @QueryStore = N''CPU'' (v3) to automatically prioritize these high-impact tables.',
+                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStore = N''CPU'';',
                 74
             );
 
@@ -2848,7 +2848,7 @@ BEGIN
             IF @w10_qsp_vals >= 2 AND @w10_run_count >= 6
             BEGIN
                 SET @w10_changes += 1;
-                SET @w10_evidence += N'@QueryStorePriority toggled. ';
+                SET @w10_evidence += N'Query Store prioritization toggled (@QueryStore in v3, @QueryStorePriority in v2). ';
             END;
 
             IF @w10_changes >= 2
@@ -2861,7 +2861,7 @@ BEGIN
                         + CONVERT(nvarchar(10), @w10_run_count) + N' runs',
                     @w10_evidence + N'Trend metrics unreliable when configuration changes between runs.',
                     N'Stabilize parameters for 10+ runs before adjusting.  Use @Preset for consistent configurations.',
-                    N'EXECUTE dbo.sp_StatUpdate @Preset = N''NIGHTLY_MAINTENANCE'', @Databases = N''USER_DATABASES'';',
+                    N'EXECUTE dbo.sp_StatUpdate @Preset = N''NIGHTLY'', @Databases = N''USER_DATABASES'';',
                     50
                 );
 
@@ -3076,8 +3076,8 @@ BEGIN
                 N'INFO', N'UNUSED_FEATURES',
                 N'Presets not in use',
                 N'@Preset is NULL. Presets provide tested parameter combinations for common scenarios.',
-                N'Consider using presets for standardized configurations: NIGHTLY_MAINTENANCE, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE_AGGRESSIVE.',
-                N'EXECUTE dbo.sp_StatUpdate @Preset = N''NIGHTLY_MAINTENANCE'', @Databases = N''USER_DATABASES'';',
+                N'Consider using presets for standardized configurations: NIGHTLY, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE.',
+                N'EXECUTE dbo.sp_StatUpdate @Preset = N''NIGHTLY'', @Databases = N''USER_DATABASES'';',
                 60
             );
         END;
@@ -3635,8 +3635,8 @@ BEGIN
                         ELSE N' QS data exists across runs, but individual stats appear only once each.'
                     END,
                 N'Tracked ' + CONVERT(nvarchar(10), @i8_total_tracked) + N' statistics with 2+ appearances. At least 2 are needed for trend analysis.',
-                N'Run sp_StatUpdate with @QueryStorePriority=Y across multiple maintenance windows to build up comparison data.',
-                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStorePriority = N''Y'';',
+                N'Run sp_StatUpdate with @QueryStore = N''CPU'' (v3) across multiple maintenance windows to build up comparison data.',
+                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStore = N''CPU'';',
                 73
             );
 
@@ -3752,9 +3752,9 @@ BEGIN
             N'INFO', N'QS_PERFORMANCE_TREND',
             N'No Query Store CPU data found in any run. RS 13 (QS Performance Correlation) will be empty.',
             N'0 of ' + CONVERT(nvarchar(10), (SELECT COUNT(*) FROM #runs))
-                + N' runs contained Query Store CPU metrics. Ensure @QueryStorePriority=Y and Query Store is enabled/READ_WRITE.',
-            N'Enable QS prioritization: EXEC sp_StatUpdate @QueryStorePriority = N''Y'', @QueryStoreMetric = N''CPU''.',
-            N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStorePriority = N''Y'';',
+                + N' runs contained Query Store CPU metrics. Ensure QS prioritization is configured (@QueryStore = N''CPU'' in v3) and Query Store is enabled/READ_WRITE.',
+            N'Enable QS prioritization: EXEC sp_StatUpdate @QueryStore = N''CPU''.',
+            N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStore = N''CPU'';',
             73
         );
         RAISERROR(N'  [INFO] I8: no Query Store CPU data available', 10, 1) WITH NOWAIT;
@@ -3793,8 +3793,6 @@ BEGIN
                 @rc_long_min        integer,
                 @rc_long_pct        integer,
                 @rc_parallel        nvarchar(1),
-                @rc_group_join      nvarchar(1),
-                @rc_filtered_mode   nvarchar(10),
                 @rc_fail_fast       bit,
                 @rc_call            nvarchar(1000),
                 @rc_rationale       nvarchar(2000) = N'',
@@ -3809,8 +3807,6 @@ BEGIN
                 @rc_long_min      = LongRunningThresholdMinutes,
                 @rc_long_pct      = LongRunningSamplePercent,
                 @rc_parallel      = StatsInParallel,
-                @rc_group_join    = GroupByJoinPattern,
-                @rc_filtered_mode = FilteredStatsMode,
                 @rc_fail_fast     = FailFast
             FROM #runs
             WHERE RunLabel = @rc_baseline;
@@ -3885,53 +3881,25 @@ BEGIN
             BEGIN
                 SET @rc_parallel = N'Y';
                 SET @rc_rationale += N'Parallel enabled (W3: persistent backlog). ';
-
-                /* @StatsInParallel and @GroupByJoinPattern are mutually exclusive */
-                IF ISNULL(@rc_group_join, N'N') = N'Y'
-                BEGIN
-                    SET @rc_group_join = N'N';
-                    SET @rc_rationale += N'@GroupByJoinPattern dropped (mutually exclusive with parallel). ';
-                END;
-            END;
-
-            /* ---- Preserve features from historical runs ---- */
-            /* @GroupByJoinPattern: only restore if parallel is NOT being recommended */
-            IF @rc_group_join IS NULL
-            AND ISNULL(@rc_parallel, N'N') = N'N'
-            AND EXISTS (SELECT 1 FROM #runs WHERE GroupByJoinPattern = N'Y')
-            BEGIN
-                SET @rc_group_join = N'Y';
-                SET @rc_rationale += N'@GroupByJoinPattern restored from prior runs. ';
-            END;
-
-            IF @rc_filtered_mode IS NULL
-            AND EXISTS (
-                SELECT 1 FROM #runs
-                WHERE FilteredStatsMode IS NOT NULL
-                AND   FilteredStatsMode <> N'INCLUDE'
-            )
-            BEGIN
-                SET @rc_filtered_mode = (
-                    SELECT TOP (1) FilteredStatsMode
-                    FROM #runs
-                    WHERE FilteredStatsMode IS NOT NULL
-                    AND   FilteredStatsMode <> N'INCLUDE'
-                    ORDER BY StartTime DESC
-                );
-                SET @rc_rationale += N'@FilteredStatsMode=' + @rc_filtered_mode + N' restored from prior runs. ';
             END;
 
             /* ---- Build the EXEC call ---- */
+            /*
+            Note: I10 generates a v3-compatible call.  v3 removed several v2 public params
+            (@TieredThresholds, @CleanupOrphanedRuns, @GroupByJoinPattern, @FilteredStatsMode,
+            @QueryStorePriority/@QueryStoreMetric).  Tiered thresholds are always on in v3.
+            Orphan cleanup is always on internally.  QS is enabled via @QueryStore = N'CPU'.
+            FilteredStatsMode and GroupByJoinPattern have no v3 equivalents.
+            */
             SET @rc_call = N'EXECUTE dbo.sp_StatUpdate'
                 + NCHAR(13) + NCHAR(10) + N'    @Databases = N''' + @rc_databases + N''''
                 + NCHAR(13) + NCHAR(10) + N'  , @TimeLimit = ' + CONVERT(nvarchar(10), ISNULL(@rc_timelimit, 18000))
                 + NCHAR(13) + NCHAR(10) + N'  , @SortOrder = N''' + ISNULL(@rc_sort, N'MODIFICATION_COUNTER') + N''''
-                + NCHAR(13) + NCHAR(10) + N'  , @TieredThresholds = 1'
-                + NCHAR(13) + NCHAR(10) + N'  , @ModificationThreshold = ' + CONVERT(nvarchar(20), ISNULL(@rc_mod_thresh, 5000))
-                + NCHAR(13) + NCHAR(10) + N'  , @CleanupOrphanedRuns = N''Y''';
+                + NCHAR(13) + NCHAR(10) + N'  , @ModificationThreshold = ' + CONVERT(nvarchar(20), ISNULL(@rc_mod_thresh, 5000));
 
+            /* v3: QS enabled via @QueryStore = metric name (replaces v2 @QueryStorePriority + @QueryStoreMetric) */
             IF ISNULL(@rc_qs_pri, N'N') = N'Y'
-                SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @QueryStorePriority = N''Y''';
+                SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @QueryStore = N''CPU''';
 
             IF @rc_long_min IS NOT NULL
                 SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @LongRunningThresholdMinutes = ' + CONVERT(nvarchar(10), @rc_long_min)
@@ -3939,12 +3907,6 @@ BEGIN
 
             IF ISNULL(@rc_parallel, N'N') = N'Y'
                 SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @StatsInParallel = N''Y''';
-
-            IF ISNULL(@rc_group_join, N'N') = N'Y'
-                SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @GroupByJoinPattern = N''Y''';
-
-            IF @rc_filtered_mode IS NOT NULL AND @rc_filtered_mode <> N'INCLUDE'
-                SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @FilteredStatsMode = N''' + @rc_filtered_mode + N'''';
 
             /* Add @MopUpPass if runs consistently complete early and it's not already enabled */
             IF EXISTS (
@@ -3956,13 +3918,6 @@ BEGIN
                 SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @MopUpPass = N''Y''';
 
             SET @rc_call += N';';
-
-            /* #343: Final mutual exclusion validation guard */
-            IF ISNULL(@rc_parallel, N'N') = N'Y' AND ISNULL(@rc_group_join, N'N') = N'Y'
-            BEGIN
-                SET @rc_group_join = N'N';
-                SET @rc_rationale += N'@GroupByJoinPattern cleared (mutually exclusive with @StatsInParallel). ';
-            END;
 
             /* ---- Safeguard parameters (not tracked in CommandLog) ---- */
             SET @rc_safeguards = N'Also consider safeguards not tracked in CommandLog: @MinTempdbFreeMB = 500, @MaxConsecutiveFailures = 5';
@@ -4279,7 +4234,7 @@ BEGIN
             WHEN @qs_run_count > 0 THEN N'QS runs: ' + CONVERT(nvarchar(10), @qs_run_count)
                 + N'. Avg workload coverage: ' + ISNULL(CONVERT(nvarchar(10), @avg_workload_cov), N'N/A') + N'%'
                 + N'. High-CPU stats in first quartile: ' + ISNULL(CONVERT(nvarchar(10), @avg_q1_pct_score), N'N/A') + N'%.'
-            ELSE N'Enable with: @QueryStorePriority = N''Y'', @SortOrder = N''QUERY_STORE'''
+            ELSE N'Enable with: @QueryStore = N''CPU'', @SortOrder = N''QUERY_STORE'''
         END
             + CASE WHEN @override_workload IN ('A','B','C','D','F') THEN N' (actual score: ' + CONVERT(nvarchar(10), @score_workload) + N')' ELSE N'' END,
         NULL,
