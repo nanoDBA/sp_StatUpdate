@@ -36,9 +36,21 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.04.13.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.04.13.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.04.13.1 - Parallel-mode false positives (7 issues):
+History:    2026.04.13.2 - PARALLEL_COMPLETE parity and new checks (4 issues):
+                           NaturalEndRuns (RS3): now counts PARALLEL_COMPLETE in addition to
+                             COMPLETED so parallel runs are recognised as natural completions.
+                           workload_pct (#qs_efficacy): PARALLEL_COMPLETE treated as 100% coverage
+                             same as COMPLETED (all work distributed across workers finished).
+                           W1d mop-up suggestion: fires for PARALLEL_COMPLETE runs in addition to
+                             COMPLETED/NATURAL_END runs (parallel runs with time budget unused).
+                           W12 PRIORITY_PASS_EMPTY: new WARNING when mop-up does all the work
+                             (priority pass averages <5 stats across 3+ runs while mop-up runs).
+                           SPEED grade parallel-aware: when all non-killed runs are parallel
+                             (@StatsInParallel='Y'), grade is based on GB/min throughput instead
+                             of sec/stat wall-clock (which underestimates per-worker speed).
+            2026.04.13.1 - Parallel-mode false positives (7 issues):
                            W3 STALE_BACKLOG: suppress when all non-killed runs are PARALLEL_COMPLETE
                              with AvgStatsRemaining=0 (per-worker remaining is not a real backlog).
                            W4 OVERLAPPING_RUNS: suppress when both overlapping runs have
@@ -334,6 +346,7 @@ BEGIN
                 (N'I8', N'INFO',     N'QS_PERFORMANCE_TREND',  N'Per-stat per-execution query CPU trend -- are queries getting faster after stat updates? Detects forced plans at risk (#292).'),
                 (N'I10', N'INFO',    N'RECOMMENDED_CONFIG',    N'Synthesized parameter set balancing immediate fixes, long-term safeguards, and historical parameter usage.  Based on diagnostic findings and parameter change history.'),
                 (N'W11', N'WARNING', N'MOPUP_LOW_YIELD',       N'Mop-up pass consistently unable to process most of the stats it discovers (avg <50% yield across 3+ runs).'),
+                (N'W12', N'WARNING', N'PRIORITY_PASS_EMPTY',   N'Priority pass averages <5 stats across 3+ mop-up runs -- mop-up is doing all the work.  Lower @ModificationThreshold so the priority pass captures more stats.'),
                 (N'I15', N'INFO',    N'HEAP_TIME_BUDGET',      N'Heap tables account for >50% of total maintenance time.  @CollectHeapForwarding and heap REBUILD may help.')
         ) AS v (check_id, severity, category, description);
 
@@ -2270,7 +2283,7 @@ BEGIN
     IF EXISTS (
             SELECT 1
             FROM #runs AS r
-            WHERE r.StopReason IN (N'COMPLETED', N'NATURAL_END')
+            WHERE r.StopReason IN (N'COMPLETED', N'NATURAL_END', N'PARALLEL_COMPLETE')
             AND   r.TimeLimit IS NOT NULL
             AND   r.DurationSeconds IS NOT NULL
             AND   r.DurationSeconds < r.TimeLimit * 0.5 /* used less than half the time budget */
@@ -2290,7 +2303,7 @@ BEGIN
                 @w1d_avg_pct = AVG(CASE WHEN r.TimeLimit > 0 THEN r.DurationSeconds * 100 / r.TimeLimit ELSE NULL END),
                 @w1d_count = COUNT(*)
             FROM #runs AS r
-            WHERE r.StopReason IN (N'COMPLETED', N'NATURAL_END')
+            WHERE r.StopReason IN (N'COMPLETED', N'NATURAL_END', N'PARALLEL_COMPLETE')
             AND   r.TimeLimit IS NOT NULL
             AND   r.DurationSeconds IS NOT NULL
             AND   r.DurationSeconds < r.TimeLimit * 0.5
@@ -3168,6 +3181,67 @@ BEGIN
     END;
 
     /* ======================================================================
+       W12: PRIORITY_PASS_EMPTY
+       Priority pass contributes almost no stats (<5 on average across 3+ runs)
+       while mop-up is doing the real work.  This means @ModificationThreshold
+       or tiered thresholds are too high for the current workload -- the priority
+       pass filters out nearly everything and leaves it all for mop-up.
+       ====================================================================== */
+    BEGIN
+        DECLARE
+            @w12_run_count   integer = 0,
+            @w12_avg_priority decimal(10, 1),
+            @w12_avg_mopup   decimal(10, 1),
+            @w12_mopup_pct   decimal(5, 1),
+            @w12_mod_thresh  bigint;
+
+        SELECT
+            @w12_run_count    = COUNT(*),
+            @w12_avg_priority = AVG(CONVERT(decimal(10, 1), ISNULL(r.StatsProcessed, 0) - ISNULL(r.MopUpProcessed, 0))),
+            @w12_avg_mopup    = AVG(CONVERT(decimal(10, 1), ISNULL(r.MopUpProcessed, 0))),
+            @w12_mod_thresh   = MAX(r.ModificationThreshold)
+        FROM #runs AS r
+        WHERE r.MopUpTriggered = 1
+        AND   r.IsKilled = 0;
+
+        IF @w12_run_count >= 3
+           AND ISNULL(@w12_avg_priority, 99) < 5
+           AND ISNULL(@w12_avg_mopup, 0) > 0
+        BEGIN
+            SET @w12_mopup_pct = CASE
+                WHEN (@w12_avg_priority + @w12_avg_mopup) > 0
+                THEN CONVERT(decimal(5, 1), @w12_avg_mopup * 100.0 / (@w12_avg_priority + @w12_avg_mopup))
+                ELSE 100.0
+            END;
+
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES (
+                N'WARNING',
+                N'PRIORITY_PASS_EMPTY',
+                N'Priority pass finds almost no qualifying stats -- mop-up does '
+                    + CONVERT(nvarchar(10), CONVERT(int, ISNULL(@w12_mopup_pct, 0))) + N'% of the work',
+                N'Across ' + CONVERT(nvarchar(10), @w12_run_count) + N' mop-up runs, the priority pass averaged only '
+                    + CONVERT(nvarchar(10), CONVERT(int, ISNULL(@w12_avg_priority, 0))) + N' stat(s) while mop-up averaged '
+                    + CONVERT(nvarchar(10), CONVERT(int, ISNULL(@w12_avg_mopup, 0))) + N' stat(s).  '
+                    + N'The modification threshold or tiered threshold settings are filtering out nearly all candidates '
+                    + N'from the priority pass, leaving them for the broad mop-up sweep.  '
+                    + CASE WHEN @w12_mod_thresh IS NOT NULL
+                        THEN N'Current @ModificationThreshold: ' + CONVERT(nvarchar(20), @w12_mod_thresh) + N'.'
+                        ELSE N'' END,
+                N'Lower @ModificationThreshold so more stats qualify for the priority pass (with its workload-aware ordering), '
+                    + N'rather than falling through to the unordered mop-up sweep.  '
+                    + N'This ensures high-impact stats are prioritised when the time limit is hit.',
+                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @MopUpPass = N''Y'', @ModificationThreshold = '
+                    + ISNULL(CONVERT(nvarchar(20), @w12_mod_thresh / 2), N'1000') + N';',
+                42
+            );
+
+            DECLARE @w12_mopup_pct_int integer = CONVERT(integer, ISNULL(@w12_mopup_pct, 0));
+            RAISERROR(N'  [WARNING] W12: Priority pass empty -- mop-up does %i%% of work', 10, 1, @w12_mopup_pct_int) WITH NOWAIT;
+        END;
+    END;
+
+    /* ======================================================================
        I15: HEAP TIME BUDGET
        Heap tables (IsHeap = 1) account for >50% of total maintenance time.
        Signals that forwarding pointer overhead or full-table scans on heaps
@@ -3427,12 +3501,13 @@ BEGIN
                               ELSE NULL
                           END,
         /* BUG-A fix: For completed runs, WorkloadCoveragePct = 100% (all qualifying stats processed).
+           PARALLEL_COMPLETE also means all distributed work finished -- treat same as COMPLETED.
            For incomplete runs, extrapolate: estimated_total = processed_cpu * (StatsFound / StatsProcessed).
            This accounts for unprocessed stats whose CPU we don't know. */
         workload_pct    = CASE
                               WHEN ISNULL(rm.qs_stat_count, 0) = 0 THEN NULL
                               WHEN rm.processed_cpu_ms <= 0 THEN NULL
-                              WHEN r.StopReason = N'COMPLETED' OR r.StatsFound = ISNULL(r.StatsProcessed, 0) THEN 100.0
+                              WHEN r.StopReason IN (N'COMPLETED', N'PARALLEL_COMPLETE') OR r.StatsFound = ISNULL(r.StatsProcessed, 0) THEN 100.0
                               WHEN r.StatsFound > 0 AND ISNULL(r.StatsProcessed, 0) > 0
                               THEN CONVERT(decimal(5, 1),
                                   rm.processed_cpu_ms * 100.0 /
@@ -4131,7 +4206,8 @@ BEGIN
         @score_speed integer = 0,
         @score_workload integer = 50,   /* default 50 if no QS runs (neutral); #267: updated below based on run count */
         @score_overall integer = 0,
-        @health_score integer = 0;
+        @health_score integer = 0,
+        @all_parallel bit = 0;          /* 1 when every non-killed run uses @StatsInParallel='Y' */
 
     /* Completion score: based on avg completion % across recent runs */
     IF @run_count > 0
@@ -4187,7 +4263,11 @@ BEGIN
         IF @score_reliability > 100 SET @score_reliability = 100;
     END;
 
-    /* Speed score: based on avg seconds per stat (lower is better) */
+    /* Speed score: based on avg seconds per stat (lower is better).
+       Parallel-mode caveat: sec/stat is wall-clock / total-stats-across-all-workers, which
+       underestimates per-worker throughput.  When ALL non-killed runs use @StatsInParallel='Y',
+       grade on GB/min instead (> 50 A, > 30 B, > 15 C, > 5 D, else F).
+       sec/stat is still shown in the Detail text for reference. */
     IF EXISTS (SELECT 1 FROM #runs WHERE IsKilled = 0 AND StatsProcessed > 0)
     BEGIN
         DECLARE @avg_sec_per_stat decimal(10, 1) = (
@@ -4201,14 +4281,39 @@ BEGIN
             SELECT AVG(CASE WHEN r.DurationSeconds > 0 THEN CONVERT(decimal(10, 2), r.TotalGB / (r.DurationSeconds / 60.0)) ELSE NULL END)
             FROM #runs AS r WHERE r.IsKilled = 0 AND r.TotalGB IS NOT NULL AND r.DurationSeconds > 0
         );
-        SET @score_speed = CASE
-            WHEN @avg_sec_per_stat <= 0.5 THEN 100
-            WHEN @avg_sec_per_stat <= 1.0 THEN 90
-            WHEN @avg_sec_per_stat <= 2.0 THEN 80
-            WHEN @avg_sec_per_stat <= 5.0 THEN 70
-            WHEN @avg_sec_per_stat <= 10.0 THEN 55
-            WHEN @avg_sec_per_stat <= 30.0 THEN 40
-            ELSE 20
+
+        /* Detect all-parallel mode: every non-killed run uses @StatsInParallel='Y' */
+        SET @all_parallel = (
+            SELECT CASE WHEN COUNT(*) > 0
+                         AND SUM(CASE WHEN ISNULL(r.StatsInParallel, N'N') = N'Y' THEN 1 ELSE 0 END) = COUNT(*)
+                        THEN 1 ELSE 0 END
+            FROM #runs AS r
+            WHERE r.IsKilled = 0
+        );
+
+        IF @all_parallel = 1 AND @avg_gb_per_min IS NOT NULL
+        BEGIN
+            /* Parallel mode: use GB/min as the primary speed signal */
+            SET @score_speed = CASE
+                WHEN @avg_gb_per_min > 50.0 THEN 100
+                WHEN @avg_gb_per_min > 30.0 THEN 90
+                WHEN @avg_gb_per_min > 15.0 THEN 75
+                WHEN @avg_gb_per_min >  5.0 THEN 55
+                ELSE 25
+            END;
+        END
+        ELSE
+        BEGIN
+            /* Serial or mixed mode: use sec/stat */
+            SET @score_speed = CASE
+                WHEN @avg_sec_per_stat <= 0.5 THEN 100
+                WHEN @avg_sec_per_stat <= 1.0 THEN 90
+                WHEN @avg_sec_per_stat <= 2.0 THEN 80
+                WHEN @avg_sec_per_stat <= 5.0 THEN 70
+                WHEN @avg_sec_per_stat <= 10.0 THEN 55
+                WHEN @avg_sec_per_stat <= 30.0 THEN 40
+                ELSE 20
+            END;
         END;
     END;
 
@@ -4352,17 +4457,37 @@ BEGIN
         CASE WHEN @override_speed = 'X' THEN N'[IGNORED] '
              WHEN @override_speed IN ('A','B','C','D','F') THEN N'[OVERRIDE: ' + @override_speed + N'] '
              ELSE N'' END
-            + CASE
-                WHEN @score_speed >= 90 THEN N'Statistics are being updated very quickly (' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'<1') + N' sec/stat average'
-                    + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N', ' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min' ELSE N'' END + N').'
-                WHEN @score_speed >= 75 THEN N'Update speed is good at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat average'
-                    + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min)' ELSE N'' END + N'.'
-                WHEN @score_speed >= 60 THEN N'Update speed is moderate at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat'
-                    + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min)' ELSE N'' END + N'. Consider parallel mode or adaptive sampling.'
-                ELSE N'Updates are slow at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat'
-                    + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min)' ELSE N'' END + N'. Investigate I/O, table sizes, and sample rates.'
+            /* Parallel mode: headline leads with GB/min (the meaningful throughput metric).
+               Serial/mixed mode: headline leads with sec/stat as before. */
+            + CASE WHEN @all_parallel = 1 AND @avg_gb_per_min IS NOT NULL
+                THEN CASE
+                    WHEN @score_speed >= 90 THEN N'Parallel throughput is excellent at ' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min'
+                        + N' (' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat wall-clock).'
+                    WHEN @score_speed >= 75 THEN N'Parallel throughput is good at ' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min'
+                        + N' (' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat wall-clock).'
+                    WHEN @score_speed >= 55 THEN N'Parallel throughput is moderate at ' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min'
+                        + N'. Consider adding more parallel workers or reviewing I/O capacity.'
+                    ELSE N'Parallel throughput is low at ' + ISNULL(CONVERT(nvarchar(20), @avg_gb_per_min), N'?') + N' GB/min'
+                        + N'. Investigate I/O, worker count, and table sizes.'
+                END
+                ELSE CASE
+                    WHEN @score_speed >= 90 THEN N'Statistics are being updated very quickly (' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'<1') + N' sec/stat average'
+                        + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N', ' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min' ELSE N'' END + N').'
+                    WHEN @score_speed >= 75 THEN N'Update speed is good at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat average'
+                        + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min)' ELSE N'' END + N'.'
+                    WHEN @score_speed >= 60 THEN N'Update speed is moderate at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat'
+                        + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min)' ELSE N'' END + N'. Consider parallel mode or adaptive sampling.'
+                    ELSE N'Updates are slow at ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'?') + N' sec/stat'
+                        + CASE WHEN @avg_gb_per_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), @avg_gb_per_min) + N' GB/min)' ELSE N'' END + N'. Investigate I/O, table sizes, and sample rates.'
+                END
             END,
-        N'Average seconds per stat update: ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'N/A')
+        CASE WHEN @all_parallel = 1
+            THEN N'Parallel mode (all runs use @StatsInParallel=Y). Speed graded on GB/min: '
+                + ISNULL(CONVERT(nvarchar(20), @avg_gb_per_min), N'N/A') + N' GB/min avg.'
+                + N' Wall-clock sec/stat: ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'N/A')
+                + N' (not used for grade -- underestimates per-worker throughput).'
+            ELSE N'Average seconds per stat update: ' + ISNULL(CONVERT(nvarchar(20), @avg_sec_per_stat), N'N/A')
+        END
             + CASE WHEN @avg_total_gb IS NOT NULL THEN N'. Average data volume: ' + CONVERT(nvarchar(20), @avg_total_gb) + N' GB/run (' + ISNULL(CONVERT(nvarchar(20), @avg_gb_per_min), N'N/A') + N' GB/min)' ELSE N'' END
             + N'. Average run duration: ' + ISNULL(CONVERT(nvarchar(10), (SELECT AVG(DurationSeconds) / 60 FROM #runs WHERE IsKilled = 0)), N'N/A') + N' minutes.'
             + CASE WHEN @override_speed IN ('A','B','C','D','F') THEN N' (actual score: ' + CONVERT(nvarchar(10), @score_speed) + N')' ELSE N'' END,
@@ -4670,7 +4795,7 @@ BEGIN
                 ELSE 0
             END,
             TimeLimitedRuns = @time_limit_runs,
-            NaturalEndRuns = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason = N'COMPLETED'),
+            NaturalEndRuns = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason IN (N'COMPLETED', N'PARALLEL_COMPLETE')),
             /* ksi fix: exclude killed runs with StatsProcessed=0 -- orphan-cleanup creates 48-hour phantom END records that inflate avg */
             AvgDurationSec = (SELECT AVG(DurationSeconds) FROM #runs WHERE IsKilled = 0 OR ISNULL(StatsProcessed, 0) > 0),
             AvgStatsProcessed = (SELECT AVG(StatsProcessed) FROM #runs WHERE IsKilled = 0),
@@ -4714,7 +4839,7 @@ BEGIN
                                                 ELSE 0
                                             END,
                     TimeLimitedRuns        = @time_limit_runs,
-                    NaturalEndRuns         = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason = N'COMPLETED'),
+                    NaturalEndRuns         = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason IN (N'COMPLETED', N'PARALLEL_COMPLETE')),
                     /* ksi fix: exclude killed runs with StatsProcessed=0 -- orphan-cleanup creates 48-hour phantom END records that inflate avg */
                     AvgDurationSec         = (SELECT AVG(DurationSeconds) FROM #runs WHERE IsKilled = 0 OR ISNULL(StatsProcessed, 0) > 0),
                     AvgStatsProcessed      = (SELECT AVG(StatsProcessed) FROM #runs WHERE IsKilled = 0),
