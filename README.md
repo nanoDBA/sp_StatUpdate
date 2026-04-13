@@ -12,19 +12,18 @@
 
 | Problem | Fix |
 |---------|-----|
-| Alphabetical ordering | `@SortOrder = 'MODIFICATION_COUNTER'` - worst first |
-| 10-hour jobs killed at 5 AM | `@TimeLimit` - stops gracefully, logs what's left |
+| Alphabetical ordering | `@SortOrder = 'MODIFICATION_COUNTER'` -- worst first |
+| 10-hour jobs killed at 5 AM | `@TimeLimit` -- stops gracefully, logs what's left |
 | "Did it finish or get killed?" | START/END markers in CommandLog |
-| NORECOMPUTE orphans | `@TargetNorecompute = 'Y'` - finds and refreshes them |
-| Large stats that never finish | `@LongRunningThresholdMinutes` - auto-reduce sample rate |
-| Query Store knows what's hot | `@QueryStorePriority = 'Y'` - prioritize by CPU/reads |
-| QS enrichment too slow | `@QueryStoreTopPlans = 200` - parse only top N plans |
-| Cascading failures | `@MaxConsecutiveFailures` - stops after N failures |
-| AG secondary falls behind | `@MaxAGRedoQueueMB` - pauses when redo queue is deep |
-| tempdb pressure during FULLSCAN | `@MinTempdbFreeMB` - checks before each stat update |
+| NORECOMPUTE orphans | `@TargetNorecompute = 'Y'` -- finds and refreshes them |
+| Large stats that never finish | `@LongRunningThresholdMinutes` -- auto-reduce sample rate |
+| Query Store knows what's hot | `@QueryStore = 'CPU'` -- prioritize by workload metric |
+| QS enrichment too slow | `@QueryStoreTopPlans = 200` -- parse only top N plans |
+| Cascading failures | `@FailFast = 1` -- stop on first error |
+| AG secondary falls behind | `@MaxAGRedoQueueMB` -- pauses when redo queue is deep |
+| tempdb pressure during FULLSCAN | `@MinTempdbFreeMB` -- checks before each stat update |
 | Azure DTU/vCore concerns | Auto-detects Azure SQL DB vs MI, platform-specific warnings |
-| Indexed view stats ignored | `@IncludeIndexedViews = 'Y'` - discovers view statistics |
-| No audit trail for skipped stats | `@LogSkippedToCommandLog = 'Y'` - TOCTOU skip logging |
+| Priority pass finishes early | `@MopUpPass = 'Y'` -- broad sweep with remaining time |
 
 ## Quick Start
 
@@ -38,9 +37,8 @@
 -- 3. Run statistics maintenance
 EXEC dbo.sp_StatUpdate
     @Databases = N'YourDatabase',
-    @TargetNorecompute = N'BOTH',      -- All stats (NORECOMPUTE + regular)
     @TimeLimit = 3600;                  -- 1 hour limit
-    -- Defaults: @TieredThresholds=1, @ModificationThreshold=5000, @LogToTable='Y'
+    -- Defaults: @Preset='DEFAULT', @TargetNorecompute='BOTH', @LogToTable='Y'
 ```
 
 ## Requirements
@@ -52,24 +50,37 @@ EXEC dbo.sp_StatUpdate
 | **SQL Server** | 2016+ (uses `STRING_SPLIT`). 2016 SP2+ recommended for MAXDOP support |
 | **Azure SQL** | Database (EngineEdition 5), Managed Instance (8), and Edge (9) supported |
 | **dbo.CommandLog** | [CommandLog.sql](https://ola.hallengren.com/scripts/CommandLog.sql) or set `@LogToTable = 'N'` |
-| **dbo.Queue** | [Queue.sql](https://ola.hallengren.com/scripts/Queue.sql) - only for `@StatsInParallel = 'Y'` |
+| **dbo.Queue** | [Queue.sql](https://ola.hallengren.com/scripts/Queue.sql) -- only for `@StatsInParallel = 'Y'` |
 
 **Note**: `dbo.QueueStatistic` is auto-created on first parallel run. `dbo.CommandExecute` is NOT required.
 
-## Presets (Quick Configuration)
+## Presets
+
+v3 uses a preset-first API.  Choose a preset, then override individual parameters as needed.  Explicit parameters always win over preset defaults.
+
+| Preset | TimeLimit | SortOrder | QueryStore | MopUp | Sample | Description |
+|--------|-----------|-----------|------------|-------|--------|-------------|
+| `DEFAULT` | 18000 (5h) | MODIFICATION_COUNTER | OFF | N | auto | Balanced default for any workload |
+| `NIGHTLY` | 3600 (1h) | QUERY_STORE | CPU | Y | auto | QS-prioritized nightly job with mop-up |
+| `WEEKLY_FULL` | 14400 (4h) | QUERY_STORE | CPU | Y | 100 | Comprehensive weekly: FULLSCAN + lower thresholds |
+| `OLTP_LIGHT` | 1800 (30m) | MODIFICATION_COUNTER | OFF | N | auto | Low-impact OLTP: high threshold, inter-stat delay |
+| `WAREHOUSE` | unlimited | ROWS | OFF | N | 100 | Data warehouse: FULLSCAN, no time limit |
 
 ```sql
--- Nightly maintenance (1hr, tiered thresholds, balanced)
-EXEC dbo.sp_StatUpdate @Preset = 'NIGHTLY_MAINTENANCE', @Databases = 'USER_DATABASES';
+-- Nightly maintenance (1hr, QS-prioritized, mop-up)
+EXEC dbo.sp_StatUpdate @Preset = 'NIGHTLY', @Databases = 'USER_DATABASES';
 
--- Weekly comprehensive (4hr, lower thresholds)
+-- Weekly comprehensive (4hr, FULLSCAN)
 EXEC dbo.sp_StatUpdate @Preset = 'WEEKLY_FULL', @Databases = 'USER_DATABASES';
 
 -- OLTP with minimal impact (30min, high thresholds, delays)
 EXEC dbo.sp_StatUpdate @Preset = 'OLTP_LIGHT', @Databases = 'MyOLTPDatabase';
 
 -- Data warehouse full refresh (no limit, FULLSCAN)
-EXEC dbo.sp_StatUpdate @Preset = 'WAREHOUSE_AGGRESSIVE', @Databases = 'MyDW';
+EXEC dbo.sp_StatUpdate @Preset = 'WAREHOUSE', @Databases = 'MyDW';
+
+-- Preset + overrides: NIGHTLY preset but with 2hr time limit
+EXEC dbo.sp_StatUpdate @Preset = 'NIGHTLY', @Databases = 'USER_DATABASES', @TimeLimit = 7200;
 ```
 
 ## Common Scenarios
@@ -90,20 +101,20 @@ EXEC dbo.sp_StatUpdate
 -- Let Query Store tell you what matters
 EXEC dbo.sp_StatUpdate
     @Databases = N'Production',
-    @QueryStorePriority = N'Y',
-    @QueryStoreMetric = N'CPU',           -- Or DURATION, READS, EXECUTIONS, AVG_CPU
+    @QueryStore = N'CPU',                   -- Or DURATION, READS, AVG_CPU, MEMORY_GRANT, etc.
     @SortOrder = N'QUERY_STORE',
     @TimeLimit = 3600;
 
 -- Large QS catalog? Limit XML plan parsing to top 200 plans by CPU
 EXEC dbo.sp_StatUpdate
     @Databases = N'Production',
-    @QueryStorePriority = N'Y',
-    @QueryStoreMetric = N'CPU',
-    @QueryStoreTopPlans = 200,            -- Default 500. NULL = unlimited
+    @QueryStore = N'CPU',
+    @QueryStoreTopPlans = 200,              -- Default 500. NULL = unlimited
     @SortOrder = N'QUERY_STORE',
     @TimeLimit = 3600;
 ```
+
+**Available QS metrics:** `CPU`, `DURATION`, `READS`, `EXECUTIONS`, `AVG_CPU`, `MEMORY_GRANT`, `TEMPDB_SPILLS` (SQL 2017+), `PHYSICAL_READS`, `AVG_MEMORY`, `WAITS`
 
 **Performance note:** Phase 6 (QS enrichment) parses plan XML to find table references. On databases with 10,000+ QS plans, this can take minutes. `@QueryStoreTopPlans` limits XML parsing to the most impactful plans. The proc also skips Phase 6 entirely when QS has no recent runtime stats within `@QueryStoreRecentHours`.
 
@@ -125,7 +136,7 @@ EXEC dbo.sp_StatUpdate
 EXEC dbo.sp_StatUpdate
     @Databases = N'USER_DATABASES',
     @MaxAGRedoQueueMB = 500,
-    @MaxAGWaitMinutes = 10,               -- Wait up to 10 min for drain
+    @MaxAGWaitMinutes = 10,                 -- Wait up to 10 min for drain
     @TimeLimit = 3600;
 ```
 
@@ -152,18 +163,6 @@ EXEC dbo.sp_StatUpdate
 SELECT * FROM #Preview ORDER BY SequenceNum;
 ```
 
-### ETL Completion Notification
-
-```sql
--- Downstream ETL waits for this table to have a row
-EXEC dbo.sp_StatUpdate
-    @Databases = N'Production',
-    @TimeLimit = 3600,
-    @CompletionNotifyTable = N'dbo.StatUpdateNotify';
-
--- ETL checks: SELECT * FROM dbo.StatUpdateNotify WHERE RunLabel = ...
-```
-
 ### Mop-Up Pass (Use Remaining Time)
 
 ```sql
@@ -180,93 +179,92 @@ with time to spare, the mop-up pass discovers every stat with `modification_coun
 that wasn't already updated in this run and processes them by modification count descending.
 Requires `@LogToTable = 'Y'` and `@Execute = 'Y'`.  Not compatible with `@StatsInParallel`.
 
+### Absolute Stop Time
+
+```sql
+-- Stop at 4 AM regardless of when the job started
+EXEC dbo.sp_StatUpdate
+    @Databases = N'USER_DATABASES',
+    @StopByTime = N'04:00';
+```
+
 ## Parameter Reference
 
-Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operational notes.
+Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operational notes and preset details.
+
+### v3 API Summary
+
+v3 has **33 input parameters** (was 58 in v2) plus **10 OUTPUT parameters**.  25 parameters from v2 were absorbed into preset-controlled internal variables.  Explicit parameters always override preset defaults.
 
 ### Database & Table Selection
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `@Statistics` | `NULL` | Direct stat references: `'Schema.Table.Stat'` (comma-separated, skips discovery) |
 | `@Databases` | Current DB | `USER_DATABASES`, `SYSTEM_DATABASES`, `ALL_DATABASES`, `AVAILABILITY_GROUP_DATABASES`, wildcards (`%Prod%`), exclusions (`-DevDB`) |
 | `@Tables` | All | Table filter (comma-separated `Schema.Table`) |
 | `@ExcludeTables` | `NULL` | Exclude tables by LIKE pattern (`%Archive%`) |
 | `@ExcludeStatistics` | `NULL` | Exclude stats by LIKE pattern (`_WA_Sys%`) |
-| `@Statistics` | `NULL` | Direct stat references (`Schema.Table.Stat`, comma-separated) |
-| `@StatisticsFromTable` | `NULL` | Table containing stat references (`#MyStats`, `dbo.StatsQueue`) |
-| `@IncludeSystemObjects` | `'N'` | Include stats on system objects |
-| `@IncludeIndexedViews` | `'N'` | Include statistics on indexed views (v2.8+) |
 
-### Threshold Configuration
+### Preset & Threshold Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `@Preset` | `'DEFAULT'` | `DEFAULT`, `NIGHTLY`, `WEEKLY_FULL`, `OLTP_LIGHT`, `WAREHOUSE` |
 | `@TargetNorecompute` | `'BOTH'` | `'Y'`=NORECOMPUTE only, `'N'`=regular only, `'BOTH'`=all |
-| `@ModificationThreshold` | `5000` | Minimum modifications to qualify |
-| `@ModificationPercent` | `NULL` | Alternative: min mod % of rows (SQRT-based) |
-| `@TieredThresholds` | `1` | Use Tiger Toolbox 5-tier adaptive formula |
-| `@ThresholdLogic` | `'OR'` | `'OR'`=any threshold, `'AND'`=all must be met |
-| `@DaysStaleThreshold` | `NULL` | Minimum days since last update |
-| `@HoursStaleThreshold` | `NULL` | Alternative: minimum hours since last update |
-| `@MinPageCount` | `0` | Minimum pages (125 = ~1MB, 125000 = ~1GB) |
+| `@ModificationThreshold` | Preset-dependent | Minimum modifications to qualify (DEFAULT=5000) |
+| `@StaleHours` | `NULL` | Minimum hours since last update |
 
 ### Execution Control
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `@TimeLimit` | `3600` | Max seconds (1 hour). `NULL` = unlimited |
-| `@StopByTime` | `NULL` | Absolute wall-clock stop time (`'04:00'` = 4 AM) |
+| `@TimeLimit` | Preset-dependent | Max seconds (DEFAULT=18000). `NULL` = unlimited |
+| `@StopByTime` | `NULL` | Absolute wall-clock stop time (`'04:00'` = 4 AM). Overrides `@TimeLimit` |
 | `@BatchLimit` | `NULL` | Max stats per run |
-| `@MaxConsecutiveFailures` | `NULL` | Stop after N consecutive failures |
-| `@LockTimeout` | `NULL` | Seconds to wait for schema locks per stat |
-| `@DelayBetweenStats` | `NULL` | Seconds to pause between stats |
-| `@SortOrder` | `'MODIFICATION_COUNTER'` | Priority order (see below) |
+| `@SortOrder` | Preset-dependent | Priority order (see below) |
+| `@MopUpPass` | Preset-dependent | `'Y'` = broad sweep after priority pass |
 | `@Execute` | `'Y'` | `'N'` for dry run |
 | `@FailFast` | `0` | `1` = abort on first error |
-| `@MaxGrantPercent` | `10` | Memory grant cap (%) on candidate discovery SELECT (1–100, `NULL` = disabled). Prevents discovery query from reserving excessive memory on busy servers. (v2.4+) |
-| `@MaxSecondsPerStat` | `NULL` | Per-stat duration cap (seconds). Stats estimated to exceed the remaining `@StopByTime` budget are skipped rather than started. Prevents overshoot on tight maintenance windows. (v2.4+) |
 
 ### Sort Orders
 
 | Value | Description |
 |-------|-------------|
-| `MODIFICATION_COUNTER` | Most modifications first (default) |
+| `MODIFICATION_COUNTER` | Most modifications first (DEFAULT/OLTP_LIGHT preset) |
+| `QUERY_STORE` | Highest Query Store metric first (NIGHTLY/WEEKLY_FULL preset) |
+| `ROWS` | Largest tables first (WAREHOUSE preset) |
 | `DAYS_STALE` | Oldest stats first |
-| `PAGE_COUNT` | Largest tables first |
-| `QUERY_STORE` | Highest Query Store metric first |
+| `PAGE_COUNT` | Largest tables by page count first |
 | `FILTERED_DRIFT` | Filtered stats with drift first |
 | `AUTO_CREATED` | User-created stats before auto-created |
 | `RANDOM` | Random order |
 
-### Safety Checks (v2.7+)
+### Query Store Integration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `@QueryStore` | Preset-dependent | `'OFF'` or metric name: `CPU`, `DURATION`, `READS`, `EXECUTIONS`, `AVG_CPU`, `MEMORY_GRANT`, `TEMPDB_SPILLS`, `PHYSICAL_READS`, `AVG_MEMORY`, `WAITS` |
+| `@QueryStoreTopPlans` | `500` | Max plans to XML-parse. `NULL` = unlimited. Lower = faster Phase 6 |
+| `@QueryStoreMinExecutions` | `100` | Minimum plan executions to boost |
+| `@QueryStoreRecentHours` | `168` | Only consider plans from last N hours (7 days) |
+
+### Sampling
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `@StatisticsSample` | Preset-dependent | `NULL`=SQL Server decides, `100`=FULLSCAN |
+| `@MaxDOP` | `NULL` | MAXDOP for UPDATE STATISTICS (SQL 2016 SP2+) |
+| `@LongRunningThresholdMinutes` | `NULL` | Stats that took longer get forced sample rate |
+| `@LongRunningSamplePercent` | `10` | Sample percent for long-running stats |
+
+### Safety Checks
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@MaxAGRedoQueueMB` | `NULL` | Pause when AG secondary redo queue exceeds this MB |
 | `@MaxAGWaitMinutes` | `10` | Max minutes to wait for redo queue to drain |
 | `@MinTempdbFreeMB` | `NULL` | Min tempdb free space (MB). `@FailFast=1` aborts, else warns |
-
-### Query Store Integration
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `@QueryStorePriority` | `'N'` | Prioritize stats used by Query Store plans |
-| `@QueryStoreMetric` | `'CPU'` | `CPU`, `DURATION`, `READS`, `EXECUTIONS`, or `AVG_CPU` |
-| `@QueryStoreMinExecutions` | `100` | Minimum plan executions to boost |
-| `@QueryStoreRecentHours` | `168` | Only consider plans from last N hours |
-| `@QueryStoreTopPlans` | `500` | Max plans to XML-parse for table references. `NULL` = unlimited. Lower values reduce Phase 6 overhead on large QS catalogs (v2.23+) |
-| `@GroupByJoinPattern` | `'Y'` | Update joined tables together (prevents optimization cliffs) |
-
-### Adaptive Sampling
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `@LongRunningThresholdMinutes` | `NULL` | Stats that took longer get forced sample rate |
-| `@LongRunningSamplePercent` | `10` | Sample percent for long-running stats |
-| `@StatisticsSample` | `NULL` | `NULL`=SQL Server decides, `100`=FULLSCAN |
-| `@PersistSamplePercent` | `'Y'` | PERSIST_SAMPLE_PERCENT (SQL 2016 SP1 CU4+) |
-| `@PersistSampleMinRows` | `1000000` | Minimum sampled rows required before the RESAMPLE_PERSIST path is used. When `rowcount * sample_pct / 100` is below this value, falls back to a full FULLSCAN pass to ensure histogram quality. Prevents persisting under-sampled stats on small tables. (v2.4+) |
-| `@MaxDOP` | `NULL` | MAXDOP for UPDATE STATISTICS (SQL 2016 SP2+) |
 
 ### Logging & Output
 
@@ -275,12 +273,15 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operatio
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@LogToTable` | `'Y'` | Log to dbo.CommandLog |
-| `@LogSkippedToCommandLog` | `'N'` | Log TOCTOU-skipped stats for audit trail (v2.8+) |
-| `@ProgressLogInterval` | `NULL` | Log progress every N stats |
-| `@ReturnDetailedResults` | `0` | `1` = return per-statistic detail result set (v2.8+) |
-| `@CompletionNotifyTable` | `NULL` | Table for completion notification row (v2.8+) |
 | `@WhatIfOutputTable` | `NULL` | Table for dry-run commands (`@Execute = 'N'` required) |
+| `@MopUpMinRemainingSeconds` | `60` | Minimum seconds remaining to trigger mop-up |
 | `@Debug` | `0` | `1` = verbose diagnostic output |
+
+### Parallel Execution
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `@StatsInParallel` | `'N'` | `'Y'` = queue-based parallel processing via `dbo.QueueStatistic` |
 
 ### OUTPUT Parameters
 
@@ -305,7 +306,7 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operatio
 
 `LOW_UPTIME`, `BACKUP_RUNNING`, `AZURE_SQL`, `AZURE_MI`, `RESOURCE_GOVERNOR`, `AG_REDO_ELEVATED`, `TEMPDB_LOW`, `RLS_DETECTED`, `COLUMNSTORE_CONTEXT`, `QS_FORCED_PLANS`, `LOG_SPACE_HIGH`, `WIDE_STATS`, `FILTER_MISMATCH`
 
-## Environment Detection (v2.0+)
+## Environment Detection
 
 Debug mode (`@Debug = 1`) automatically reports:
 
@@ -315,11 +316,11 @@ Debug mode (`@Debug = 1`) automatically reports:
 - **DB-scoped configs** (LEGACY_CARDINALITY_ESTIMATION)
 - **Hardware context** (CPU count, memory, NUMA nodes, uptime)
 - **Azure platform** (SQL DB vs Managed Instance vs Edge, with platform-specific guidance)
-- **AG primary status** and redo queue depth (v2.7+)
-- **tempdb free space** (v2.7+)
-- **Resource Governor** active resource pools (v2.5+)
+- **AG primary status** and redo queue depth
+- **tempdb free space**
+- **Resource Governor** active resource pools
 
-### Per-Database Detection (v2.8+)
+### Per-Database Detection
 
 When `@Debug = 1`, after discovery the proc checks each database for:
 
@@ -392,12 +393,10 @@ IF @Warnings LIKE '%AG_REDO_ELEVATED%'
 ### Real-Time Progress
 
 ```sql
--- Secure option: log to CommandLog every 50 stats
-EXEC sp_StatUpdate @Databases = 'USER_DATABASES', @ProgressLogInterval = 50;
-
--- Opt-in global temp table (visible to all sessions - security consideration)
-EXEC sp_StatUpdate @Databases = 'USER_DATABASES', @ExposeProgressToAllSessions = 'Y';
--- Query from another session: SELECT * FROM ##sp_StatUpdate_Progress;
+-- Log progress to CommandLog every 50 stats (secure, access-controlled)
+EXEC sp_StatUpdate @Databases = 'USER_DATABASES', @TimeLimit = 3600;
+-- Query in-progress stats:
+SELECT * FROM dbo.CommandLog WHERE EndTime IS NULL AND CommandType = 'UPDATE_STATISTICS';
 ```
 
 ## Diagnostic Tool
@@ -469,7 +468,7 @@ Key result sets for this story:
 
 - **RS 10 (Efficacy Trend)**: Weekly roll-up showing high-CPU stats reaching first quartile, workload coverage %, trend direction
 - **RS 11 (Efficacy Detail)**: Per-run showing completion %, time-to-critical stats, delta vs prior run
-- **RS 13 (QS Performance Correlation)**: Per-stat CPU before vs after — "5 of 5 tracked stats show 8% lower query CPU"
+- **RS 13 (QS Performance Correlation)**: Per-stat CPU before vs after -- "5 of 5 tracked stats show 8% lower query CPU"
 - **I7 check**: Automatically detects the configuration change point and compares before/after metrics
 - **I8 check**: Summarizes whether queries are actually faster after stat updates
 
@@ -491,22 +490,22 @@ EXEC dbo.sp_StatUpdate_Diag @SkipHistory = 1;
 
 Customize the Executive Dashboard when you know certain issues are expected or irrelevant.
 
-#### @GradeOverrides — Force Grades or Ignore Categories
+#### @GradeOverrides -- Force Grades or Ignore Categories
 
 Force a specific letter grade (A/B/C/D/F) or exclude a category entirely (IGNORE).
 
 ```sql
--- "I know about the 2 killed runs — don't penalize the score"
+-- "I know about the 2 killed runs -- don't penalize the score"
 EXEC dbo.sp_StatUpdate_Diag @GradeOverrides = 'RELIABILITY=A';
 
--- "I don't use Query Store — exclude workload focus from my score"
+-- "I don't use Query Store -- exclude workload focus from my score"
 EXEC dbo.sp_StatUpdate_Diag @GradeOverrides = 'WORKLOAD=IGNORE';
 
 -- Force multiple: known slow stats + don't care about QS
 EXEC dbo.sp_StatUpdate_Diag
     @GradeOverrides = 'SPEED=B, WORKLOAD=IGNORE';
 
--- "Only care about completion and speed — ignore everything else"
+-- "Only care about completion and speed -- ignore everything else"
 EXEC dbo.sp_StatUpdate_Diag
     @GradeOverrides = 'RELIABILITY=IGNORE, WORKLOAD=IGNORE';
 
@@ -517,7 +516,7 @@ EXEC dbo.sp_StatUpdate_Diag @GradeOverrides = 'COMPLETION=F';
 **Valid categories:** `COMPLETION`, `RELIABILITY`, `SPEED`, `WORKLOAD`
 **Valid values:** `A`, `B`, `C`, `D`, `F` (force grade), `IGNORE` (exclude from OVERALL score)
 
-#### @GradeWeights — Custom Category Weights
+#### @GradeWeights -- Custom Category Weights
 
 Change how much each category contributes to the OVERALL score. Values are integers that auto-normalize to sum to 100%.
 
@@ -525,14 +524,14 @@ Change how much each category contributes to the OVERALL score. Values are integ
 -- Default weights: COMPLETION=30, RELIABILITY=25, SPEED=20, WORKLOAD=25
 
 -- Single category override: bump completion importance
--- 50 + 25(default) + 20(default) + 25(default) = 120 → normalized to 42/21/17/21
+-- 50 + 25(default) + 20(default) + 25(default) = 120 -> normalized to 42/21/17/21
 EXEC dbo.sp_StatUpdate_Diag @GradeWeights = 'COMPLETION=50';
 
 -- Two categories: only care about completion and speed equally
--- 50 + 25(default) + 50 + 25(default) = 150 → normalized to 33/17/33/17
+-- 50 + 25(default) + 50 + 25(default) = 150 -> normalized to 33/17/33/17
 EXEC dbo.sp_StatUpdate_Diag @GradeWeights = 'COMPLETION=50, SPEED=50';
 
--- Weight=0 is the same as IGNORE — excludes category from OVERALL
+-- Weight=0 is the same as IGNORE -- excludes category from OVERALL
 EXEC dbo.sp_StatUpdate_Diag @GradeWeights = 'WORKLOAD=0';
 
 -- All four explicit (auto-normalized, don't need to sum to 100)
@@ -562,13 +561,13 @@ SPEED           -          0  [IGNORED] Updates are slow at 17.9 sec/stat...
 WORKLOAD FOCUS  D         50  Query Store prioritization is not enabled...
 ```
 
-- `[OVERRIDE: A]` — grade forced; Detail column shows `(actual score: 28)`
-- `[IGNORED]` — excluded from OVERALL; Grade=`-`, Score=0
-- `[Overrides active]` — shown on OVERALL when any override/weight change is active
+- `[OVERRIDE: A]` -- grade forced; Detail column shows `(actual score: 28)`
+- `[IGNORED]` -- excluded from OVERALL; Grade=`-`, Score=0
+- `[Overrides active]` -- shown on OVERALL when any override/weight change is active
 
-**Weight normalization:** Weights are integers that auto-normalize to sum to 100%. Passing a single category (e.g., `'COMPLETION=50'`) keeps the other three at their defaults (25, 20, 25), then all four are normalized together (50+25+20+25=120 → 42/21/17/21%). Weight of 0 is equivalent to IGNORE.
+**Weight normalization:** Weights are integers that auto-normalize to sum to 100%. Passing a single category (e.g., `'COMPLETION=50'`) keeps the other three at their defaults (25, 20, 25), then all four are normalized together (50+25+20+25=120 -> 42/21/17/21%). Weight of 0 is equivalent to IGNORE.
 
-**Note:** History table (`StatUpdateDiagHistory`) always uses hardcoded weights (30/25/20/25) — overrides only affect the current dashboard view, not persisted scores.
+**Note:** History table (`StatUpdateDiagHistory`) always uses hardcoded weights (30/25/20/25) -- overrides only affect the current dashboard view, not persisted scores.
 
 ### Obfuscated Mode
 
@@ -584,7 +583,7 @@ EXEC dbo.sp_StatUpdate_Diag
     @ObfuscationSeed = N'acme-2026-q1';
 ```
 
-Output tokens look like: `DB_7f2a`, `TBL_e4c1`, `IX_STAT_9b3d`. The seed ensures the same object always maps to the same token — so if a consultant says "TBL_e4c1 is slow", you can decode it consistently.
+Output tokens look like: `DB_7f2a`, `TBL_e4c1`, `IX_STAT_9b3d`. The seed ensures the same object always maps to the same token -- so if a consultant says "TBL_e4c1 is slow", you can decode it consistently.
 
 #### T-SQL Examples
 
@@ -622,7 +621,7 @@ When running the wrapper with `-Obfuscate`, three files are produced per run:
 | `*_CONFIDENTIAL_DECODE.sql` | Standalone T-SQL script to decode tokens | **No** |
 
 ```powershell
-# Generate reports for 3 servers — Markdown format, seeded obfuscation
+# Generate reports for 3 servers -- Markdown format, seeded obfuscation
 .\Invoke-StatUpdateDiag.ps1 `
     -Servers "PROD-SQL01", "PROD-SQL02", "PROD-SQL03" `
     -Obfuscate `
@@ -634,14 +633,6 @@ When running the wrapper with `-Obfuscate`, three files are produced per run:
 #   C:\temp\diag\sp_StatUpdate_Diag_20260310_SAFE_TO_SHARE.md   <-- send this
 #   C:\temp\diag\sp_StatUpdate_Diag_20260310_CONFIDENTIAL.md    <-- keep this
 #   C:\temp\diag\sp_StatUpdate_Diag_20260310_CONFIDENTIAL_DECODE.sql
-
-# Same thing with JSON output and server list from a file
-.\Invoke-StatUpdateDiag.ps1 `
-    -Servers (Get-Content servers.txt) `
-    -Obfuscate `
-    -ObfuscationSeed "acme-2026-q1" `
-    -OutputFormat JSON `
-    -OutputPath "C:\temp\diag"
 
 # Also persist the map table on each server for later decoding
 .\Invoke-StatUpdateDiag.ps1 `
@@ -659,7 +650,7 @@ Without `-Obfuscate`, a single report file is produced (no suffix).
 ```
 1. DBA runs:     Invoke-StatUpdateDiag.ps1 -Servers ... -Obfuscate -ObfuscationSeed "..."
 2. DBA sends:    *_SAFE_TO_SHARE.md to consultant (no real names visible)
-3. Consultant:   "TBL_e4c1 has a C2 finding — stat IX_STAT_9b3d fails every run"
+3. Consultant:   "TBL_e4c1 has a C2 finding -- stat IX_STAT_9b3d fails every run"
 4. DBA decodes:  Opens _CONFIDENTIAL_DECODE.sql in SSMS, searches for TBL_e4c1
 5. DBA finds:    TBL_e4c1 = dbo.OrderHistory, IX_STAT_9b3d = IX_OrderHistory_Date
 6. DBA fixes:    The actual object, shares updated SAFE_TO_SHARE report to confirm
@@ -709,10 +700,10 @@ ORDER BY [Server], ObjectType, OriginalName;
 ```
 
 **How obfuscation works:**
-- **With a seed**: Hashes are **deterministic** — the same object always produces the same token across servers, runs, and time. This means `TBL_e4c1` in Monday's report is the same table as `TBL_e4c1` in Friday's report.
+- **With a seed**: Hashes are **deterministic** -- the same object always produces the same token across servers, runs, and time. This means `TBL_e4c1` in Monday's report is the same table as `TBL_e4c1` in Friday's report.
 - **Without a seed**: Hashes are random per run. Useful for one-off sharing but tokens can't be correlated across runs.
 - The map table **appends** on each run (no data loss from prior runs)
-- The `_CONFIDENTIAL_DECODE.sql` file is standalone — works in any SSMS session, no server access needed
+- The `_CONFIDENTIAL_DECODE.sql` file is standalone -- works in any SSMS session, no server access needed
 - Without the seed, the map, or the decode file, obfuscated tokens **cannot** be reversed (HASHBYTES is one-way)
 
 ### Custom Analysis
@@ -748,13 +739,14 @@ Cross-server analysis detects version skew and parameter inconsistencies.
 
 | Severity | ID | Checks |
 |----------|----|--------|
-| CRITICAL | C1-C4 | Killed runs, repeated stat failures, time limit exhaustion, degrading throughput |
-| WARNING | W1-W6 | Suboptimal parameters, long-running stats, stale-stats backlog, overlapping runs, QS not effective, excessive overhead |
+| CRITICAL | C1-C5 | Killed runs, repeated stat failures, time limit exhaustion, degrading throughput, sample rate degradation |
+| WARNING | W1-W10 | Suboptimal parameters, long-running stats, stale-stats backlog, overlapping runs, QS not effective, excessive overhead, mop-up ineffective, lock timeout ineffective, parameter churn |
 | INFO | I1-I5 | Run health trends, parameter history, top tables by cost, unused features, version history |
 | INFO | I6 | QS efficacy: "10 of 10 highest-workload stats updated in first 1 minute" |
 | INFO | I7 | QS inflection: before/after comparison when QS prioritization was enabled |
 | INFO | I8 | QS performance trend: per-stat CPU correlation across runs |
 | INFO | I10 | Recommended configuration: synthesized EXEC call based on diagnostic findings |
+| INFO | I11-I14 | Failure clustering, QS coverage drift, parallel opportunity, mop-up missing pagecount |
 
 ### Diag Parameter Reference
 
@@ -790,32 +782,79 @@ ALTER EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER STATE = START;
 
 Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and long-running statements.
 
+## Migrating from v2
+
+v3 simplifies the API from 58 to 33 input parameters.  Most v2 scripts work with minor changes.
+
+### Quick Migration Guide
+
+| v2 Parameter | v3 Equivalent |
+|--------------|---------------|
+| `@QueryStorePriority = 'Y', @QueryStoreMetric = 'CPU'` | `@QueryStore = 'CPU'` |
+| `@DaysStaleThreshold = 7` | `@StaleHours = 168` |
+| `@HoursStaleThreshold = 48` | `@StaleHours = 48` |
+| `@Preset = 'NIGHTLY_MAINTENANCE'` | `@Preset = 'NIGHTLY'` |
+| `@Preset = 'WAREHOUSE_AGGRESSIVE'` | `@Preset = 'WAREHOUSE'` |
+| `@TieredThresholds = 1` | Preset-controlled (always on for DEFAULT/NIGHTLY/WEEKLY_FULL) |
+| `@ThresholdLogic = 'OR'` | Preset-controlled |
+| `@ModificationPercent = 10` | Preset-controlled |
+| `@MaxConsecutiveFailures = 5` | Preset-controlled |
+| `@DelayBetweenStats = 2` | Preset-controlled (OLTP_LIGHT uses 2s delay) |
+| `@LockTimeout = 10` | Preset-controlled (OLTP_LIGHT uses 10s) |
+| `@CleanupOrphanedRuns = 'Y'` | Always on |
+| `@PersistSamplePercent = 'Y'` | Always on (when supported) |
+| `@IncludeSystemObjects = 'Y'` | Removed (system objects excluded) |
+| `@IncludeIndexedViews = 'Y'` | Removed (indexed views always included) |
+| `@GroupByJoinPattern = 'Y'` | Removed |
+| `@ExposeProgressToAllSessions = 'Y'` | Removed |
+| `@CompletionNotifyTable` | Removed |
+| `@LogSkippedToCommandLog` | Removed |
+| `@ReturnDetailedResults` | Removed |
+| `@ProgressLogInterval` | Removed |
+| `@StatisticsFromTable` | Removed |
+| `@FilteredStatsMode` | Preset-controlled |
+
+### Example: v2 Agent Job to v3
+
+```sql
+-- v2 (old)
+EXEC dbo.sp_StatUpdate
+    @Databases = N'USER_DATABASES',
+    @QueryStorePriority = N'Y',
+    @QueryStoreMetric = N'CPU',
+    @TieredThresholds = 1,
+    @TimeLimit = 3600,
+    @SortOrder = N'QUERY_STORE',
+    @MopUpPass = N'Y',
+    @LogToTable = N'Y';
+
+-- v3 (new) -- same behavior, fewer params
+EXEC dbo.sp_StatUpdate
+    @Preset = N'NIGHTLY',
+    @Databases = N'USER_DATABASES';
+```
+
 ## Version History
 
-- **2.24.2026.0324** - Staged discovery hardening: Phase 1 early exit, ratio-based Phase 2 fallback, Phase 5 NULL page count detection, Phase 3 defensive validation.  Legacy QS consistency: removed parameter mutation, added retention warning + debug timing.  Phase 3/6 row count reporting.  New: `@MopUpPass` -- after priority pass completes, broad sweep of any stats with `modification_counter > 0` using remaining `@TimeLimit`.  Skips recently-updated stats via CommandLog.  `@MopUpMinRemainingSeconds` (default 60) controls minimum time budget.
-- **2.23.2026.0324** - New: `@QueryStoreTopPlans` (default 500) limits XML plan parsing to top N plans by metric, dramatically reducing Phase 6 overhead on large QS catalogs. Early bail-out skips Phase 6 entirely when QS has no recent runtime stats. Both staged and legacy discovery paths.
-- **2.22.2026.0320** - 7 issues: AscendingKeyBoost SEQUENCE+datetime detection, CE QUERY_OPTIMIZER_HOTFIXES, APC awareness, low sample rate warning, @StopByTime overshoot warning, cursor-to-set-based conversions, gated per-stat forced plan check.
-- **Diag 2026.03.23.1** - I10 RECOMMENDED_CONFIG: diagnostic tool now synthesizes a single recommended `EXEC sp_StatUpdate` call based on findings, parameter history, and safeguards. Handles @StatsInParallel/@GroupByJoinPattern mutual exclusion.
-- **2.16.2026.0308** - QS Efficacy Trending + Executive Dashboard. sp_StatUpdate: ProcessingPosition in per-stat ExtendedInfo XML. Diag: @ExpertMode (management vs DBA view), @SkipHistory, persistent StatUpdateDiagHistory table, Executive Dashboard with A-F grades, RS 13 QS Performance Correlation (per-stat CPU trend), I6/I7/I8 checks for QS efficacy/inflection/performance correlation. 13 result sets total. @EfficacyDaysBack, @EfficacyDetailDays parameters. 122 tests.
-- **2.14.2026.0304** - Bulk issue resolution (42 issues). New: @OrphanedRunThresholdHours. AG/safety guards, warnings, discovery improvements. See CLAUDE.md for full details.
-- **2.8.2026.0302** - Comprehensive issue sweep (31 issues resolved). New params: @IncludeIndexedViews, @LogSkippedToCommandLog, @ReturnDetailedResults, @CompletionNotifyTable. Detection: QS forced plan warning, RLS, wide stats, columnstore context, filtered index mismatch, computed columns, Stretch DB skip, log space check. Azure MI vs DB distinction. 12-topic @Help operational notes.
-- **2.7.2026.0302** - AG redo queue pause (@MaxAGRedoQueueMB, @MaxAGWaitMinutes). tempdb pressure check (@MinTempdbFreeMB). New StopReasons: AG_REDO_QUEUE, TEMPDB_PRESSURE.
-- **2.6.2026.0302** - Multi-database direct mode: @Statistics and @StatisticsFromTable respect @Databases.
-- **2.5.2026.0302** - CommandLog index advisory, Resource Governor detection, @LockTimeout docs.
-- **2.4.2026.0302** - Region markers for LLM navigation. Collation-aware comparisons (COLLATE DATABASE_DEFAULT). Per-phase timing in debug mode. **Comprehensive bug-fix and UX sprint (12 issues):** 4 P1 fixes (MAX_GRANT_PERCENT parameterized via `@MaxGrantPercent`, SQL injection hardened on DIRECT mode inputs, RESAMPLE floor added via `@PersistSampleMinRows`, container memory diagnostics improved); 5 P2 enhancements (ROWLOCK on discovery candidate query, heartbeat TRY/CATCH so write failures don't fail the stat, StopByTime overshoot protection via `@MaxSecondsPerStat`, QS forced plan detection unconditional on startup, OLTP_LIGHT preset `@StopByTime` fix); 3 P3 UX improvements (`@Help` QUICK START preset guide, dry-run `Mode:` label in startup banner, ETR `~Xm` in per-stat Complete message).
-- **2.3.2026.0302** - Bug fixes: applock release on CATCH, @@TRANCOUNT check, SET ANSI_WARNINGS/ARITHABORT, HAS_DBACCESS() filter, MAXRECURSION unlimited, midnight @StopByTime crossing, @CheckPermissionsOnly, CommandLog schema check.
-- **2.1.2026.0219** - Extended Awareness. Azure SQL detection, hardware context, RCSI awareness, Replication/CDC/Temporal detection. New: @MaxConsecutiveFailures, @WarningsOut, @StopReasonOut.
-- **2.0.2026.0212** - Environment Intelligence. CE version/trace flag/DB-scoped config detection. Staged discovery auto-fallback. Truncated partition handling. XE session overhaul. Diagnostic tool (sp_StatUpdate_Diag).
-- **1.9.2026.0206** - Status/StatusMessage columns for Agent alerting. Batch QS enrichment (O(n) to O(1)).
-- **1.9.2026.0128** - @Preset parameter, @GroupByJoinPattern, ##sp_StatUpdate_Progress, @CleanupOrphanedRuns default Y.
-- **1.8.2026.0128** - Code review fixes, XE troubleshooting session.
-- **1.7.2026.0127** - BREAKING: @ModificationThreshold default 1000 to 5000.
-- **1.6.2026.0128** - Staged discovery, adaptive sampling, @ExcludeTables, @WhatIfOutputTable.
+- **3.0.2026.0407** - v3 architecture: preset-first API.  33 input params (was 58 in v2) + 10 OUTPUT params.  25 params absorbed into `@i_` internal variables controlled by presets (DEFAULT, NIGHTLY, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE).  New `@QueryStore` param replaces `@QueryStorePriority` + `@QueryStoreMetric`.  `@StaleHours` replaces `@DaysStaleThreshold` + `@HoursStaleThreshold`.  Table-driven validation, 6-phase staged discovery only (no legacy fallback), unified mop-up filters.  Full behavioral parity with v2.37.
+- **2.37.2026.0327** - WAITS enrichment unbounded XML parsing fix (metric gate + TopPlans limit), Phase 6 debug gate.
+- **2.35.2026.0327** - @QueryStoreMetric WAITS + diag memory grant trending.
+- **2.34.2026.0326** - QS discovery metric gaps: 6 issues resolved.
+- **2.29.2026.0325** - Em dashes, AG sync-only redo, mop-up safety + 8 new diag checks (W8-W10, C5, I11-I14).
+- **2.24.2026.0324** - Staged discovery hardening, legacy QS consistency, @MopUpPass, @MopUpMinRemainingSeconds.
+- **2.23.2026.0324** - @QueryStoreTopPlans (Phase 6 XML parsing limit), early bail-out.
+- **2.22.2026.0320** - AscendingKeyBoost, CE QUERY_OPTIMIZER_HOTFIXES, APC awareness, cursor-to-set-based.
+- **Diag 2026.03.23.1** - I10 RECOMMENDED_CONFIG, @ExpertMode, Executive Dashboard A-F grades, persistent history.
+- **2.16.2026.0308** - QS Efficacy Trending, ProcessingPosition, diag RS 9-13, I6/I7/I8.
+- **2.14.2026.0304** - Bulk issue resolution (42 issues). @OrphanedRunThresholdHours. AG/safety guards.
+- **2.8.2026.0302** - Comprehensive sweep (31 issues). @IncludeIndexedViews, @LogSkippedToCommandLog, QS forced plan warning.
+- **2.7.2026.0302** - AG redo queue pause, tempdb pressure check.
+- **2.4.2026.0302** - Region markers, collation-aware comparisons, per-phase timing, 12-issue bug-fix sprint.
+- **2.0.2026.0212** - Environment Intelligence, staged discovery, diagnostic tool (sp_StatUpdate_Diag).
+- **1.9.2026.0206** - Status/StatusMessage columns, batch QS enrichment.
 - **1.5.2026.0120** - CRITICAL: Fixed @ExcludeStatistics filter, incremental partition targeting.
 - **1.4.2026.0119** - Query Store prioritization, filtered stats handling.
 - **1.3.2026.0119** - Multi-database support, OUTPUT parameters, return codes.
-- **1.2.2026.0117** - Tiger Toolbox tiered thresholds, AND/OR logic, PERSIST_SAMPLE_PERCENT.
-- **1.1.2026.0117** - Style refactor, @Help, parallel mode.
 - **1.0.2026.0117** - Initial public release.
 
 ## When to Use This (vs IndexOptimize)
@@ -826,9 +865,10 @@ Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and lo
 - Priority ordering (worst stats first)
 - Time-limited runs with graceful stops
 - NORECOMPUTE targeting
-- Query Store-driven prioritization (with tunable plan parsing overhead)
+- Query Store-driven prioritization (10 metrics, tunable plan parsing)
 - Adaptive sampling for problematic stats
 - AG-safe maintenance with redo queue awareness
+- Mop-up pass for thorough coverage
 - Programmatic access to results via OUTPUT parameters
 
 ## License
