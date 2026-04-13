@@ -36,9 +36,24 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.03.26.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.04.13.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.03.26.1 - RS 13 memory grant and tempdb spill trending (#368): FirstMemoryGrantKB,
+History:    2026.04.13.1 - Parallel-mode false positives (7 issues):
+                           W3 STALE_BACKLOG: suppress when all non-killed runs are PARALLEL_COMPLETE
+                             with AvgStatsRemaining=0 (per-worker remaining is not a real backlog).
+                           W4 OVERLAPPING_RUNS: suppress when both overlapping runs have
+                             StatsInParallel='Y' (intentional two-schedule parallel pattern).
+                           COMPLETION grade: set score to 95 when all non-killed runs end with
+                             PARALLEL_COMPLETE and AvgStatsRemaining=0 (aggregate = done).
+                           C3 TIME_LIMIT_EXHAUSTION: also count COMPLETED runs with StatsRemaining>0
+                             as functionally time-limited.
+                           RS3 AvgDurationSec: exclude killed runs with StatsProcessed=0 (48-hour
+                             phantom durations from orphan-cleanup synthetic END records).
+                           I10 RECOMMENDED_CONFIG: removed stray @TieredThresholds and
+                             @CleanupOrphanedRuns references from I10 code path (v2 params).
+                           I11 FAILURE_CLUSTERING: escalate from INFO to WARNING when C2
+                             REPEATED_FAILURES is also active and top error covers >80% of failures.
+            2026.03.26.1 - RS 13 memory grant and tempdb spill trending (#368): FirstMemoryGrantKB,
                            LastMemoryGrantKB, MemoryGrantChangePct, MemoryGrantTrend, FirstTempdbPages,
                            LastTempdbPages, TempdbChangePct, TempdbTrend columns.  I8 headline includes
                            memory grant trends when data available.  New #stat_updates columns:
@@ -217,8 +232,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.04.11.1',
-        @procedure_version_date datetime = '20260411';
+        @procedure_version varchar(20) = '2026.04.13.1',
+        @procedure_version_date datetime = '20260413';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -317,7 +332,9 @@ BEGIN
                 (N'I6', N'INFO',     N'QS_EFFICACY',           N'Query Store prioritization effectiveness -- what % of high-workload stats get serviced early'),
                 (N'I7', N'INFO',     N'QS_INFLECTION',         N'Before/after comparison when sort order changed to Query Store-based prioritization'),
                 (N'I8', N'INFO',     N'QS_PERFORMANCE_TREND',  N'Per-stat per-execution query CPU trend -- are queries getting faster after stat updates? Detects forced plans at risk (#292).'),
-                (N'I10', N'INFO',    N'RECOMMENDED_CONFIG',    N'Synthesized parameter set balancing immediate fixes, long-term safeguards, and historical parameter usage.  Based on diagnostic findings and parameter change history.')
+                (N'I10', N'INFO',    N'RECOMMENDED_CONFIG',    N'Synthesized parameter set balancing immediate fixes, long-term safeguards, and historical parameter usage.  Based on diagnostic findings and parameter change history.'),
+                (N'W11', N'WARNING', N'MOPUP_LOW_YIELD',       N'Mop-up pass consistently unable to process most of the stats it discovers (avg <50% yield across 3+ runs).'),
+                (N'I15', N'INFO',    N'HEAP_TIME_BUDGET',      N'Heap tables account for >50% of total maintenance time.  @CollectHeapForwarding and heap REBUILD may help.')
         ) AS v (check_id, severity, category, description);
 
         /* Result set 3: Result set order */
@@ -2020,7 +2037,14 @@ BEGIN
        ====================================================================== */
     DECLARE
         @total_completed_runs integer = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 0),
-        @time_limit_runs integer = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason = N'TIME_LIMIT'),
+        /* e5x fix: also count COMPLETED runs with StatsRemaining>0 -- these are functionally
+           time-limited even though they ended with StopReason=COMPLETED (ran out of budget
+           before all qualifying stats were processed). */
+        @time_limit_runs integer = (
+            SELECT COUNT_BIG(*) FROM #runs
+            WHERE StopReason = N'TIME_LIMIT'
+               OR (StopReason = N'COMPLETED' AND ISNULL(StatsRemaining, 0) > 0)
+        ),
         /* BUG-12: use latest run's TimeLimit for the recommendation, not MAX across all TIME_LIMIT runs.
            Using MAX of historical TIME_LIMIT runs could recommend an extreme value from a one-off test run. */
         @latest_timelimit_sec integer = (SELECT TOP 1 TimeLimit FROM #runs WHERE IsKilled = 0 ORDER BY StartTime DESC);
@@ -2065,7 +2089,8 @@ BEGIN
                 + N', @LongRunningThresholdMinutes = 30;',
             15
         FROM #runs AS r
-        WHERE r.StopReason = N'TIME_LIMIT';
+        WHERE r.StopReason = N'TIME_LIMIT'
+           OR (r.StopReason = N'COMPLETED' AND ISNULL(r.StatsRemaining, 0) > 0);  /* e5x: COMPLETED with leftovers = functionally time-limited */
 
         RAISERROR(N'  [CRITICAL] C3: Time limit exhaustion detected', 10, 1) WITH NOWAIT;
     END;
@@ -2323,8 +2348,24 @@ BEGIN
 
     /* ======================================================================
        W3: STALE-STATS BACKLOG
+       p1n fix: in parallel mode each worker reports per-worker StatsRemaining
+       (stats the coordinator assigned to other workers), which looks like a
+       backlog but is not.  Suppress W3 when all non-killed runs end with
+       PARALLEL_COMPLETE and the aggregate StatsRemaining across all workers
+       is 0 (the work was fully distributed and completed).
        ====================================================================== */
-    IF EXISTS (
+    /* p1n: check whether every non-killed run completed via parallel coordination */
+    DECLARE @w3_parallel_complete bit = 0;
+    IF NOT EXISTS (
+        SELECT 1 FROM #runs
+        WHERE IsKilled = 0
+        AND   StopReason <> N'PARALLEL_COMPLETE'
+    )
+    AND (SELECT SUM(ISNULL(StatsRemaining, 0)) FROM #runs WHERE IsKilled = 0) = 0
+        SET @w3_parallel_complete = 1;
+
+    IF @w3_parallel_complete = 0
+    AND EXISTS (
         SELECT 1
         FROM #runs AS r
         WHERE r.IsKilled = 0
@@ -2363,6 +2404,11 @@ BEGIN
 
     /* ======================================================================
        W4: OVERLAPPING RUNS
+       vws fix: suppress when BOTH overlapping runs have StatsInParallel='Y'.
+       Two-schedule parallel patterns (e.g., 20:15 + 23:00 Agent jobs) are
+       intentional -- each worker joins the same coordinator queue and divides
+       the work. Only fire when at least one run is serial, which indicates an
+       unintentional schedule overlap with no queue coordination.
        ====================================================================== */
     INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
     SELECT
@@ -2384,7 +2430,9 @@ BEGIN
         AND r2.StartTime < ISNULL(r1.EndTime, DATEADD(SECOND, ISNULL(r1.TimeLimit, 18000), r1.StartTime))
         AND r2.RunLabel <> r1.RunLabel
     WHERE r1.IsKilled = 0
-      AND r2.IsKilled = 0;
+      AND r2.IsKilled = 0
+      /* vws fix: skip intentional parallel pairs -- both workers use the coordinator queue */
+      AND NOT (ISNULL(r1.StatsInParallel, N'N') = N'Y' AND ISNULL(r2.StatsInParallel, N'N') = N'Y');
 
     IF @@ROWCOUNT > 0
         RAISERROR(N'  [WARNING] W4: Overlapping runs detected', 10, 1) WITH NOWAIT;
@@ -2795,19 +2843,35 @@ BEGIN
                         ELSE N'Focus: investigate error ' + CONVERT(nvarchar(10), @i11_top_error) + N' root cause.'
                     END;
 
+                /* cq4 fix: escalate from INFO to WARNING when C2 REPEATED_FAILURES is also
+                   active and this error code explains >80% of all failures.  The combination
+                   means the same stat is failing consistently AND one error dominates -- a
+                   clear, actionable root cause that warrants WARNING visibility. */
+                DECLARE @i11_severity nvarchar(10) = N'INFO';
+                DECLARE @i11_sort integer = 70;
+                IF @i11_top_pct >= 80.0
+                AND EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'REPEATED_FAILURES')
+                BEGIN
+                    SET @i11_severity = N'WARNING';
+                    SET @i11_sort = 22;     /* sort near W-group findings */
+                END;
+
                 INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
                 VALUES (
-                    N'INFO',
+                    @i11_severity,
                     N'FAILURE_CLUSTERING',
                     N'Dominant failure cause: Error ' + CONVERT(nvarchar(10), @i11_top_error) + N' ('
                         + CONVERT(nvarchar(10), CONVERT(int, @i11_top_pct)) + N'% of failures)',
                     @i11_evidence,
                     N'Address the dominant error code to resolve the majority of failures.',
                     NULL,
-                    70
+                    @i11_sort
                 );
 
-                RAISERROR(N'  [INFO] I11: Failure cause clustering identified', 10, 1) WITH NOWAIT;
+                IF @i11_severity = N'WARNING'
+                    RAISERROR(N'  [WARNING] I11: Failure cause clustering escalated to WARNING (C2 active + dominant error)', 10, 1) WITH NOWAIT;
+                ELSE
+                    RAISERROR(N'  [INFO] I11: Failure cause clustering identified', 10, 1) WITH NOWAIT;
             END;
         END;
     END;
@@ -3059,6 +3123,89 @@ BEGIN
             );
 
             RAISERROR(N'  [INFO] I14: Mop-up PageCount gaps detected', 10, 1) WITH NOWAIT;
+        END;
+    END;
+
+    /* ======================================================================
+       W11: MOP-UP LOW YIELD
+       Mop-up consistently processes <50% of the stats it discovers.
+       Signals TimeLimit exhaustion during the mop-up window, or that
+       @MopUpMinRemainingSeconds leaves too little runway to do real work.
+       ====================================================================== */
+    BEGIN
+        DECLARE @w11_mop_runs integer = 0;
+        DECLARE @w11_avg_yield decimal(5, 1);
+
+        SELECT
+            @w11_mop_runs   = COUNT(*),
+            @w11_avg_yield  = AVG(CONVERT(decimal(5, 1), CONVERT(decimal(10, 4), MopUpProcessed) / NULLIF(MopUpFound, 0) * 100.0))
+        FROM #runs
+        WHERE MopUpTriggered = 1
+        AND   MopUpFound > 0          /* exclude runs where mop-up found nothing (W8 territory) */
+        AND   IsKilled = 0;
+
+        IF @w11_mop_runs >= 3 AND ISNULL(@w11_avg_yield, 100.0) < 50.0
+        BEGIN
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES (
+                N'WARNING',
+                N'MOPUP_LOW_YIELD',
+                N'Mop-up pass unable to process most qualifying stats (avg '
+                    + CONVERT(nvarchar(10), CONVERT(int, ISNULL(@w11_avg_yield, 0))) + N'% processed across '
+                    + CONVERT(nvarchar(10), @w11_mop_runs) + N' runs)',
+                N'Mop-up discovers qualifying stats but cannot finish them before the TimeLimit expires.  '
+                    + N'Average yield: ' + CONVERT(nvarchar(10), CONVERT(int, ISNULL(@w11_avg_yield, 0)))
+                    + N'%.  The mop-up window is too narrow relative to the number of qualifying stats.',
+                N'Consider increasing @TimeLimit or lowering @MopUpMinRemainingSeconds to allow more runway.  '
+                    + N'Alternatively, lower @ModificationThreshold so the priority pass captures these stats before mop-up.',
+                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @TimeLimit = 7200, @MopUpPass = N''Y'', @MopUpMinRemainingSeconds = 60;',
+                45
+            );
+
+            DECLARE @w11_yield_int integer = CONVERT(integer, ISNULL(@w11_avg_yield, 0));
+            RAISERROR(N'  [WARNING] W11: Mop-up low yield (avg %i%% processed)', 10, 1, @w11_yield_int) WITH NOWAIT;
+        END;
+    END;
+
+    /* ======================================================================
+       I15: HEAP TIME BUDGET
+       Heap tables (IsHeap = 1) account for >50% of total maintenance time.
+       Signals that forwarding pointer overhead or full-table scans on heaps
+       are consuming a disproportionate share of the maintenance window.
+       ====================================================================== */
+    BEGIN
+        DECLARE @i15_total_duration_ms bigint;
+        DECLARE @i15_heap_duration_ms bigint;
+        DECLARE @i15_heap_pct decimal(5, 1);
+
+        SELECT
+            @i15_total_duration_ms = SUM(CASE WHEN su.DurationMs IS NOT NULL AND (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL) THEN su.DurationMs ELSE 0 END),
+            @i15_heap_duration_ms  = SUM(CASE WHEN su.IsHeap = 1 AND su.DurationMs IS NOT NULL AND (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL) THEN su.DurationMs ELSE 0 END)
+        FROM #stat_updates AS su;
+
+        SET @i15_heap_pct = CASE WHEN ISNULL(@i15_total_duration_ms, 0) > 0
+            THEN CONVERT(decimal(5, 1), @i15_heap_duration_ms * 100.0 / @i15_total_duration_ms)
+            ELSE 0.0 END;
+
+        IF @i15_heap_pct > 50.0
+        BEGIN
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES (
+                N'INFO',
+                N'HEAP_TIME_BUDGET',
+                N'Heap tables consume ' + CONVERT(nvarchar(10), CONVERT(int, @i15_heap_pct)) + N'% of total maintenance time',
+                N'Heap table statistics require full-table scans without a clustered index seek, and forwarding pointers '
+                    + N'on heaps accumulate over time causing increasingly expensive updates.  '
+                    + CONVERT(nvarchar(10), CONVERT(int, @i15_heap_pct)) + N'% of maintenance duration is spent on heap stats.',
+                N'Consider enabling @CollectHeapForwarding=Y to surface forwarding pointer counts, and schedule periodic '
+                    + N'heap REBUILD (ALTER TABLE ... REBUILD) to remove forwarding pointers.  '
+                    + N'Adding a clustered index eliminates the heap entirely.',
+                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @CollectHeapForwarding = N''Y'';',
+                70
+            );
+
+            DECLARE @i15_heap_pct_int integer = CONVERT(integer, @i15_heap_pct);
+            RAISERROR(N'  [INFO] I15: Heap tables dominate maintenance time (%i%%)', 10, 1, @i15_heap_pct_int) WITH NOWAIT;
         END;
     END;
 
@@ -3989,27 +4136,38 @@ BEGIN
     /* Completion score: based on avg completion % across recent runs */
     IF @run_count > 0
     BEGIN
-        DECLARE @avg_completion decimal(5, 1) = (
-            SELECT AVG(CASE WHEN r.StatsFound > 0 THEN CONVERT(decimal(5, 1), ISNULL(r.StatsProcessed, 0) * 100.0 / r.StatsFound) ELSE 100.0 END)
-            FROM #runs AS r WHERE r.IsKilled = 0
-        );
-        SET @score_completion = CASE
-            WHEN @avg_completion >= 95 THEN 100
-            WHEN @avg_completion >= 85 THEN 90
-            WHEN @avg_completion >= 70 THEN 75
-            WHEN @avg_completion >= 50 THEN 60
-            WHEN @avg_completion >= 30 THEN 40
-            ELSE 20
+        /* 2k2 fix: in parallel mode each worker processes a fraction of StatsFound but the
+           aggregate completion is 100%.  When all non-killed runs ended PARALLEL_COMPLETE and
+           total StatsRemaining = 0, skip the per-worker ratio and award Grade A (score 95).
+           @w3_parallel_complete was computed in the W3 block above. */
+        IF @w3_parallel_complete = 1
+        BEGIN
+            SET @score_completion = 95;     /* Grade A: all work distributed and completed */
+        END
+        ELSE
+        BEGIN
+            DECLARE @avg_completion decimal(5, 1) = (
+                SELECT AVG(CASE WHEN r.StatsFound > 0 THEN CONVERT(decimal(5, 1), ISNULL(r.StatsProcessed, 0) * 100.0 / r.StatsFound) ELSE 100.0 END)
+                FROM #runs AS r WHERE r.IsKilled = 0
+            );
+            SET @score_completion = CASE
+                WHEN @avg_completion >= 95 THEN 100
+                WHEN @avg_completion >= 85 THEN 90
+                WHEN @avg_completion >= 70 THEN 75
+                WHEN @avg_completion >= 50 THEN 60
+                WHEN @avg_completion >= 30 THEN 40
+                ELSE 20
+            END;
+
+            /* #238: If majority of runs hit TIME_LIMIT, cap completion score --
+               a 95% avg looks great but means nothing if the window is too short */
+            DECLARE @tl_run_pct decimal(5, 1) = @time_limit_runs * 100.0 / @run_count;
+
+            IF @tl_run_pct >= 80.0 AND @score_completion > 60
+                SET @score_completion = 60;     /* Can't exceed C if 80%+ runs hit time limit */
+            ELSE IF @tl_run_pct >= 50.0 AND @score_completion > 75
+                SET @score_completion = 75;     /* Can't exceed B if 50%+ runs hit time limit */
         END;
-
-        /* #238: If majority of runs hit TIME_LIMIT, cap completion score --
-           a 95% avg looks great but means nothing if the window is too short */
-        DECLARE @tl_run_pct decimal(5, 1) = @time_limit_runs * 100.0 / @run_count;
-
-        IF @tl_run_pct >= 80.0 AND @score_completion > 60
-            SET @score_completion = 60;     /* Can't exceed C if 80%+ runs hit time limit */
-        ELSE IF @tl_run_pct >= 50.0 AND @score_completion > 75
-            SET @score_completion = 75;     /* Can't exceed B if 50%+ runs hit time limit */
     END;
 
     /* Reliability score: penalize killed runs, failures, time limit exhaustion */
@@ -4513,7 +4671,8 @@ BEGIN
             END,
             TimeLimitedRuns = @time_limit_runs,
             NaturalEndRuns = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason = N'COMPLETED'),
-            AvgDurationSec = (SELECT AVG(DurationSeconds) FROM #runs WHERE IsKilled = 0),
+            /* ksi fix: exclude killed runs with StatsProcessed=0 -- orphan-cleanup creates 48-hour phantom END records that inflate avg */
+            AvgDurationSec = (SELECT AVG(DurationSeconds) FROM #runs WHERE IsKilled = 0 OR ISNULL(StatsProcessed, 0) > 0),
             AvgStatsProcessed = (SELECT AVG(StatsProcessed) FROM #runs WHERE IsKilled = 0),
             AvgStatsRemaining = (SELECT AVG(StatsRemaining) FROM #runs WHERE IsKilled = 0),
             TotalStatUpdates = @stat_update_count,
@@ -4556,7 +4715,8 @@ BEGIN
                                             END,
                     TimeLimitedRuns        = @time_limit_runs,
                     NaturalEndRuns         = (SELECT COUNT_BIG(*) FROM #runs WHERE StopReason = N'COMPLETED'),
-                    AvgDurationSec         = (SELECT AVG(DurationSeconds) FROM #runs WHERE IsKilled = 0),
+                    /* ksi fix: exclude killed runs with StatsProcessed=0 -- orphan-cleanup creates 48-hour phantom END records that inflate avg */
+                    AvgDurationSec         = (SELECT AVG(DurationSeconds) FROM #runs WHERE IsKilled = 0 OR ISNULL(StatsProcessed, 0) > 0),
                     AvgStatsProcessed      = (SELECT AVG(StatsProcessed) FROM #runs WHERE IsKilled = 0),
                     AvgStatsRemaining      = (SELECT AVG(StatsRemaining) FROM #runs WHERE IsKilled = 0),
                     TotalStatUpdates       = @stat_update_count,
@@ -5138,8 +5298,17 @@ BEGIN
                                           WHEN wr.prior_composite IS NULL THEN N'N/A'
                                           WHEN wr.RunCount < 2 OR ISNULL(wr.prior_run_count, 0) < 2 THEN N'INSUFFICIENT_DATA'
                                           WHEN wr.current_composite > wr.prior_composite * 1.02 THEN N'IMPROVING'
-                                          WHEN wr.current_composite < wr.prior_composite * 0.98 THEN N'DEGRADING'
-                                          ELSE N'STABLE'
+                                          WHEN wr.prior_composite > 0
+                                               AND (wr.current_composite < wr.prior_composite - 10
+                                                    OR wr.current_composite < wr.prior_composite * 0.85)
+                                               THEN CASE WHEN wr.SortStrategy = N'Modification Counter'
+                                                         THEN N'DEGRADING (workload-driven)'
+                                                         ELSE N'DEGRADING'
+                                                    END
+                                          ELSE CASE WHEN wr.SortStrategy = N'Modification Counter'
+                                                    THEN N'STABLE (workload-driven)'
+                                                    ELSE N'STABLE'
+                                               END
                                       END,
             Top5ConcentrationPct    = wr.Top5ConcentrationPct  /* #269 */
         FROM weekly_ranked AS wr
@@ -5241,8 +5410,17 @@ BEGIN
                                                   WHEN wr.prior_composite IS NULL THEN N'N/A'
                                                   WHEN wr.RunCount < 2 OR ISNULL(wr.prior_run_count, 0) < 2 THEN N'INSUFFICIENT_DATA'
                                                   WHEN wr.current_composite > wr.prior_composite * 1.02 THEN N'IMPROVING'
-                                                  WHEN wr.current_composite < wr.prior_composite * 0.98 THEN N'DEGRADING'
-                                                  ELSE N'STABLE'
+                                                  WHEN wr.prior_composite > 0
+                                                       AND (wr.current_composite < wr.prior_composite - 10
+                                                            OR wr.current_composite < wr.prior_composite * 0.85)
+                                                       THEN CASE WHEN wr.SortStrategy = N'Modification Counter'
+                                                                 THEN N'DEGRADING (workload-driven)'
+                                                                 ELSE N'DEGRADING'
+                                                            END
+                                                  ELSE CASE WHEN wr.SortStrategy = N'Modification Counter'
+                                                            THEN N'STABLE (workload-driven)'
+                                                            ELSE N'STABLE'
+                                                       END
                                               END,
                     Top5ConcentrationPct    = wr.Top5ConcentrationPct  /* #269 */
                 FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
