@@ -301,6 +301,7 @@ BEGIN
     END;
     /*#endregion 02-HELP */
     /*#region 03-SETUP: Re-entrancy, variables, guards, presets, validation */
+    /*#region 03A-TRANCOUNT: Transaction guard + StatUpdateLock re-entrancy */
     /*
     Check transaction count BEFORE acquiring re-entrancy lock -- UPDATE STATISTICS
     acquires Sch-M locks that escalate unpredictably inside a caller's transaction.
@@ -404,6 +405,8 @@ BEGIN
 
         COMMIT TRANSACTION;
     END;
+    /*#endregion 03A-TRANCOUNT */
+    /*#region 03B-VARIABLES: Version detection, trace flags, table variables, temp tables */
     /*
     ============================================================================
     VARIABLE DECLARATIONS
@@ -829,6 +832,8 @@ BEGIN
         (processed, priority)
     INCLUDE
         (database_name, schema_name, table_name, stat_name);
+    /*#endregion 03B-VARIABLES */
+    /*#region 03C-PREREQS: Version check, SET options, CommandLog, Queue auto-create, AG, Azure, RCSI */
     /*
     ============================================================================
     CORE REQUIREMENTS CHECKS
@@ -1187,6 +1192,8 @@ BEGIN
         END;
     END;
 
+    /*#endregion 03C-PREREQS */
+    /*#region 03D-PRESETS: Internal @i_ variables, preset application, explicit param overrides */
     /*
     ============================================================================
     PRESET SYSTEM: Internal variables set by presets, overridden by explicit params
@@ -1312,6 +1319,8 @@ BEGIN
     IF @MinTempdbFreeMB IS NOT NULL SET @i_min_tempdb_free_mb = @MinTempdbFreeMB;
     IF @MopUpMinRemainingSeconds IS NOT NULL SET @i_mop_up_min_remaining = @MopUpMinRemainingSeconds;
 
+    /*#endregion 03D-PRESETS */
+    /*#region 03E-VALIDATION: Y/N checks, enum validation, cross-param checks, error aggregation */
     /*
     ============================================================================
     TABLE-DRIVEN VALIDATION
@@ -1611,6 +1620,7 @@ BEGIN
             DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
         RETURN 50000;
     END;
+    /*#endregion 03E-VALIDATION */
     /*#endregion 03-SETUP */
     /*#region 04-DB-PARSE: Database parsing, AG secondary check */
     /*
@@ -2691,6 +2701,7 @@ BEGIN
     END;
     /*#endregion 06-RUN-INIT */
     /*#region 07-DISCOVERY: Adaptive sampling, direct mode, staged discovery */
+    /*#region 07A-ADAPTIVE: CommandLog query for historically long-running stats */
     /*
     ============================================================================
     QUERY COMMANDLOG FOR LONG-RUNNING STATS (adaptive sampling)
@@ -2771,6 +2782,8 @@ BEGIN
         END;
     END;
 
+    /*#endregion 07A-ADAPTIVE */
+    /*#region 07B-MODE-DETECT: Mode detection, DIRECT_STRING db loop, @parameters_string, parallel skip */
     /*
     ============================================================================
     DETERMINE MODE: DIRECT (table), DIRECT (string), or DISCOVERY
@@ -3052,6 +3065,8 @@ OPTION (RECOMPILE);';
         END;
     END;
 
+    /*#endregion 07B-MODE-DETECT */
+    /*#region 07C-DISC-PHASES-1-4: Phase 1 candidates, Phase 2 stats properties, Phase 3 tier thresholds, Phase 4 threshold filter */
     /*
     ============================================================================
     MODE 2: DISCOVERY - DMV-based candidate selection
@@ -3744,6 +3759,8 @@ OPTION (RECOMPILE);';
                     RETURN;
                 END;
 
+                /*#endregion 07C-DISC-PHASES-1-4 */
+                /*#region 07D-DISC-PHASES-5-6: Page counts, QS enrichment, plan XML parsing */
                 /*
                 ================================================================
                 PHASE 5: Add page counts (only for qualifying stats)
@@ -4415,6 +4432,8 @@ OPTION (RECOMPILE);';
                     @i_qs_top_plans_param = @i_qs_top_plans,
                     @Debug_param = @Debug;
             END; /* End of staged discovery */
+            /*#endregion 07D-DISC-PHASES-5-6 */
+            /*#region 07E-POST-DB-WARNINGS: RLS, wide stats, filtered index, columnstore, CDC, computed cols */
             /*
             ================================================================
             POST-DISCOVERY PER-DATABASE DETECTION WARNINGS
@@ -4617,6 +4636,8 @@ OPTION (RECOMPILE);';
 
         END; /* End of WHILE database loop */
 
+        /*#endregion 07E-POST-DB-WARNINGS */
+        /*#region 07F-TABLES-AMBIGUITY: @Tables unqualified token multi-schema check */
         /*
         #209: @Tables unqualified token multi-schema ambiguity warning.
         When a token in @Tables contains no dot (no schema prefix), it matches ALL schemas
@@ -4672,6 +4693,7 @@ OPTION (RECOMPILE);';
         END;
 
     END; /* End of IF @mode = N'DISCOVERY' */
+    /*#endregion 07F-TABLES-AMBIGUITY */
     /*#endregion 07-DISCOVERY */
     /*#region 08-POST-DISCOVERY: Stats report, early return, parallel queue */
 
@@ -5401,6 +5423,7 @@ OPTION (RECOMPILE);';
     END;
     /*#endregion 08-POST-DISCOVERY */
     /*#region 09-PROCESS-LOOP: Main processing loop */
+    /*#region 09A-LOOP-HEADER: Banner, ProcessLoop label, time limit check, batch limit check */
     /*
     ============================================================================
     PROCESS STATISTICS
@@ -5452,6 +5475,8 @@ OPTION (RECOMPILE);';
             BREAK;
         END;
 
+        /*#endregion 09A-LOOP-HEADER */
+        /*#region 09B-SAFETY-CHECKS: Backup detection, AG redo queue wait, tempdb pressure, log space */
         /*
         ====================================================================
         AG REDO QUEUE CHECK (v2.7, #18)
@@ -5671,6 +5696,8 @@ OPTION (RECOMPILE);';
             END;
         END;
 
+        /*#endregion 09B-SAFETY-CHECKS */
+        /*#region 09C-PARALLEL-CLAIM: Dead worker release, atomic table claim, lazy mop-up discovery */
         /*
         ====================================================================
         PARALLEL MODE: Claim table from QueueStatistic
@@ -6132,6 +6159,8 @@ OPTION (RECOMPILE);';
             END;
         END;
 
+        /*#endregion 09C-PARALLEL-CLAIM */
+        /*#region 09D-WORK-CLAIM: SELECT TOP 1 from #stats_to_process, mark processed, COMPLETED break */
         /*
         Claim next work item
         */
@@ -6278,6 +6307,8 @@ OPTION (RECOMPILE);';
             @stats_processed += 1,
             @current_start_time = SYSDATETIME();
 
+        /*#endregion 09D-WORK-CLAIM */
+        /*#region 09E-COMMAND-BUILD: Lock timeout, FULLSCAN/SAMPLE/RESAMPLE, MAXDOP, ON PARTITIONS, NORECOMPUTE */
         /*
         ========================================================================
         BUILD UPDATE STATISTICS COMMAND
@@ -6806,6 +6837,8 @@ OPTION (RECOMPILE);';
                     CONVERT(nvarchar(20), @original_lock_timeout) + N';';
         END;
 
+        /*#endregion 09E-COMMAND-BUILD */
+        /*#region 09F-EXECUTE: Progress msg, TOCTOU check, CommandLog, deadlock retry, error handling, dry-run */
         /*
         ========================================================================
         OUTPUT / EXECUTE
@@ -7486,6 +7519,8 @@ OPTION (RECOMPILE);';
             @current_error_message = NULL,
             @current_extended_info = NULL;
 
+        /*#endregion 09F-EXECUTE */
+        /*#region 09G-PARALLEL-COMPLETE: Check claimed table finished, UPDATE QueueStatistic TableEndTime */
         /*
         ====================================================================
         PARALLEL MODE: Check if we're done with the current table
@@ -7548,6 +7583,7 @@ OPTION (RECOMPILE);';
             END;
         END;
     END;
+    /*#endregion 09G-PARALLEL-COMPLETE */
     /*#endregion 09-PROCESS-LOOP */
     /*#region 10-MOP-UP: Broad sweep with remaining time budget */
     /*
