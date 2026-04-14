@@ -3939,21 +3939,17 @@ OPTION (RECOMPILE);';
 
                 v1.9: Warn if Query Store is READ_ONLY (state 1) as data may be stale.
                 */
+                /* bd -67s: consolidate 3 reads of sys.database_query_store_options into 1 */
+                DECLARE @qs_actual_state tinyint, @qs_retention_days int;
+                SELECT @qs_actual_state = actual_state, @qs_retention_days = stale_query_threshold_days
+                FROM sys.database_query_store_options;
+
                 IF @i_qs_enabled_param = 1
-                AND EXISTS (SELECT 1 FROM sys.database_query_store_options WHERE actual_state IN (1, 2))
+                AND @qs_actual_state IN (1, 2)
                 BEGIN
                     /* v1.9: Warn if Query Store is READ_ONLY (might have stale data) */
-                    IF EXISTS (SELECT 1 FROM sys.database_query_store_options WHERE actual_state = 1)
-                    BEGIN
-                        IF @Debug_param = 1
-                            RAISERROR(N''    Warning: Query Store is READ_ONLY - priority data may be stale'', 10, 1) WITH NOWAIT;
-                    END;
-
-                    /* #190: Check if @i_qs_recent_hours exceeds QS retention.
-                       Uses stale_query_threshold_days from sys.database_query_store_options. */
-                    DECLARE @qs_retention_days int;
-                    SELECT @qs_retention_days = stale_query_threshold_days
-                    FROM sys.database_query_store_options;
+                    IF @qs_actual_state = 1 AND @Debug_param = 1
+                        RAISERROR(N''    Warning: Query Store is READ_ONLY - priority data may be stale'', 10, 1) WITH NOWAIT;
 
                     IF @qs_retention_days IS NOT NULL AND @i_qs_recent_hours_param > (@qs_retention_days * 24)
                     BEGIN
@@ -5652,6 +5648,7 @@ OPTION (RECOMPILE);';
         BEGIN
             DECLARE @log_check_db sysname;
             DECLARE @log_used_pct float = 0;
+            DECLARE @last_log_check_db sysname; /* bd -xdx: skip when same db as last check */
 
             /* Get the next stat's database */
             SELECT TOP (1) @log_check_db = stp.database_name
@@ -5659,8 +5656,12 @@ OPTION (RECOMPILE);';
             WHERE stp.processed = 0
             ORDER BY stp.priority;
 
+            /* bd -xdx: only re-check log space when the database changes.
+               On a single-database run with 2500 stats, saves 2499 sp_executesql calls. */
             IF @log_check_db IS NOT NULL
+            AND @log_check_db <> ISNULL(@last_log_check_db, N'')
             BEGIN
+                SET @last_log_check_db = @log_check_db;
                 DECLARE @log_sql nvarchar(500) = N'
                     SELECT @pct = used_log_space_in_percent
                     FROM ' + QUOTENAME(@log_check_db) + N'.sys.dm_db_log_space_usage';
@@ -6930,7 +6931,13 @@ OPTION (RECOMPILE);';
             TOCTOU check (sp_HeapDoctor pattern): verify stat still exists.
             Between discovery and execution, the statistic may have been dropped
             (e.g., table dropped, stat auto-dropped on schema change, manual DROP).
+            bd -h4s: gated on @Debug.  The CATCH block already has a TOCTOU carve-out
+            (errors 208, 15009, 2767) that handles drops gracefully without counting
+            them as failures.  Skipping the pre-check in non-debug mode saves ~2500
+            sp_executesql calls per run (~2.5-5 seconds).
             */
+            IF @Debug = 1
+            BEGIN
             SET @toctou_sql = N'SELECT @exists = COUNT(*) FROM '
                 + QUOTENAME(@current_database) + N'.sys.stats AS s '
                 + N'WHERE s.object_id = @obj_id AND s.stats_id = @stat_id';
@@ -6999,6 +7006,7 @@ OPTION (RECOMPILE);';
 
                 CONTINUE;
             END;
+            END; /* IF @Debug = 1 -- bd -h4s TOCTOU pre-check */
 
             /*
             Pre-execution INSERT to CommandLog (Ola Hallengren two-phase pattern):
