@@ -3241,6 +3241,8 @@ OPTION (RECOMPILE);';
                 ================================================================
                 */
                 IF OBJECT_ID(N''tempdb..#stat_candidates'') IS NOT NULL DROP TABLE #stat_candidates;
+                /* bd -s4z: all columns declared upfront (was 5 ALTER TABLE ADD passes).
+                   Eliminates 5 metadata lock operations per database. */
                 CREATE TABLE #stat_candidates (
                     object_id int NOT NULL,
                     stats_id int NOT NULL,
@@ -3253,10 +3255,41 @@ OPTION (RECOMPILE);';
                     filter_definition nvarchar(max) NULL,
                     is_memory_optimized bit NOT NULL DEFAULT 0,
                     auto_created bit NOT NULL DEFAULT 0,
-                    /* Replication/CDC/Temporal */
                     is_published bit NOT NULL DEFAULT 0,
                     is_tracked_by_cdc bit NOT NULL DEFAULT 0,
                     temporal_type tinyint NOT NULL DEFAULT 0,
+                    /* Phase 2: stats properties */
+                    modification_counter bigint NULL,
+                    rows bigint NULL,
+                    last_updated datetime2 NULL,
+                    unfiltered_rows bigint NULL,
+                    persisted_sample_percent float NULL,
+                    histogram_steps int NULL,
+                    /* Phase 3: tier thresholds */
+                    tier_threshold bigint NULL,
+                    sqrt_threshold bigint NULL,
+                    days_stale int NULL,
+                    hours_stale int NULL,
+                    /* Phase 4: qualification flag */
+                    qualifies bit NOT NULL DEFAULT 0,
+                    /* Phase 5: page counts */
+                    page_count bigint NULL,
+                    is_heap bit NULL,
+                    /* Phase 6: Query Store enrichment */
+                    qs_plan_count int NULL,
+                    qs_total_executions bigint NULL,
+                    qs_total_cpu_ms bigint NULL,
+                    qs_total_duration_ms bigint NULL,
+                    qs_total_logical_reads bigint NULL,
+                    qs_total_memory_grant_kb bigint NULL,
+                    qs_total_tempdb_pages bigint NULL,
+                    qs_total_physical_reads bigint NULL,
+                    qs_total_logical_writes bigint NULL,
+                    qs_total_wait_time_ms bigint NULL,
+                    qs_max_dop smallint NULL,
+                    qs_active_feedback_count int NULL,
+                    qs_last_execution datetime2 NULL,
+                    qs_priority_boost bigint NULL,
                     PRIMARY KEY CLUSTERED (object_id, stats_id)
                 );
 
@@ -3423,14 +3456,6 @@ OPTION (RECOMPILE);';
                 PHASE 2: Enrich with stats properties (batch CROSS APPLY)
                 ================================================================
                 */
-                ALTER TABLE #stat_candidates ADD
-                    modification_counter bigint NULL,
-                    rows bigint NULL,
-                    last_updated datetime2 NULL,
-                    unfiltered_rows bigint NULL,
-                    persisted_sample_percent float NULL,
-                    histogram_steps int NULL;
-
                 UPDATE sc
                 SET
                     sc.modification_counter = ISNULL(sp.modification_counter, 0),
@@ -3527,12 +3552,6 @@ OPTION (RECOMPILE);';
                 PHASE 3: Pre-calculate tier thresholds (avoids inline SQRT)
                 ================================================================
                 */
-                ALTER TABLE #stat_candidates ADD
-                    tier_threshold bigint NULL,
-                    sqrt_threshold bigint NULL,
-                    days_stale int NULL,
-                    hours_stale int NULL; /* v2.3: for @StaleHours */
-
                 UPDATE #stat_candidates
                 SET
                     tier_threshold =
@@ -3612,8 +3631,6 @@ OPTION (RECOMPILE);';
                 PHASE 4: Apply threshold filters (early elimination)
                 ================================================================
                 */
-                ALTER TABLE #stat_candidates ADD qualifies bit NOT NULL DEFAULT 0;
-
                 /* Apply threshold logic (v3: OR is the only supported mode) */
                 UPDATE #stat_candidates
                 SET qualifies = 1
@@ -3766,10 +3783,6 @@ OPTION (RECOMPILE);';
                 PHASE 5: Add page counts (only for qualifying stats)
                 ================================================================
                 */
-                ALTER TABLE #stat_candidates ADD
-                    page_count bigint NULL,
-                    is_heap bit NULL;
-
                 UPDATE sc
                 SET
                     sc.page_count = ISNULL(pgs.total_pages, 0),
@@ -3917,22 +3930,6 @@ OPTION (RECOMPILE);';
                 P2 #20: Skip QS operations when QS is disabled.
                 ================================================================
                 */
-                ALTER TABLE #stat_candidates ADD
-                    qs_plan_count int NULL,
-                    qs_total_executions bigint NULL,
-                    qs_total_cpu_ms bigint NULL,
-                    qs_total_duration_ms bigint NULL,
-                    qs_total_logical_reads bigint NULL,
-                    qs_total_memory_grant_kb bigint NULL,
-                    qs_total_tempdb_pages bigint NULL,
-                    qs_total_physical_reads bigint NULL,
-                    qs_total_logical_writes bigint NULL,
-                    qs_total_wait_time_ms bigint NULL,
-                    qs_max_dop smallint NULL,
-                    qs_active_feedback_count int NULL,
-                    qs_last_execution datetime2 NULL,
-                    qs_priority_boost bigint NULL;
-
                 /*
                 Only populate QS data if:
                 1. User requested QS priority (@i_qs_enabled = Y)
