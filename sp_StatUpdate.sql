@@ -7323,27 +7323,44 @@ OPTION (RECOMPILE);';
                 summary (#32) still provides the aggregate count for monitoring automation.
                 Wrapped in TRY/CATCH: silently skipped when QS is disabled on the database.
                 #288: Gated on @i_qs_enabled -- per-stat QS check is expensive (dynamic SQL per stat).
-                The startup check (Check 1) and end-of-run aggregate (Check 3) remain unconditional.
+                bd -pf7: cached per table -- query fires once per table, not once per stat.
+                A 31-stat table like TBL_2CF193 now does 1 QS query instead of 31.
                 */
                 IF @i_qs_enabled = 1
                 BEGIN
                 BEGIN TRY
                     DECLARE @qs168_count int = 0, @qs168_sql nvarchar(max), @qs168_msg nvarchar(1000);
-                    SET @qs168_sql =
-                        N'SELECT @cnt = COUNT(DISTINCT qsp.plan_id)
-                          FROM ' + QUOTENAME(@current_database) + N'.sys.query_store_plan AS qsp
-                          INNER JOIN ' + QUOTENAME(@current_database) + N'.sys.query_store_query AS qsq
-                              ON qsq.query_id = qsp.query_id
-                          INNER JOIN ' + QUOTENAME(@current_database) + N'.sys.query_store_query_text AS qsqt
-                              ON qsqt.query_text_id = qsq.query_text_id
-                          WHERE qsp.is_forced_plan = 1
-                          AND qsp.force_failure_count = 0
-                          AND CHARINDEX(@tbl COLLATE DATABASE_DEFAULT,
-                                        qsqt.query_sql_text COLLATE DATABASE_DEFAULT) > 0';
-                    EXEC sp_executesql @qs168_sql,
-                        N'@tbl sysname, @cnt int OUTPUT',
-                        @tbl = @current_table_name,
-                        @cnt = @qs168_count OUTPUT;
+                    DECLARE @fp_cached_table sysname, @fp_cached_db sysname, @fp_cached_count int;
+
+                    /* Cache hit: same table+db as last stat — reuse cached count */
+                    IF  @current_table_name = @fp_cached_table
+                    AND @current_database = @fp_cached_db
+                    BEGIN
+                        SET @qs168_count = @fp_cached_count;
+                    END
+                    ELSE
+                    BEGIN
+                        /* Cache miss: new table — query QS and cache */
+                        SET @qs168_sql =
+                            N'SELECT @cnt = COUNT(DISTINCT qsp.plan_id)
+                              FROM ' + QUOTENAME(@current_database) + N'.sys.query_store_plan AS qsp
+                              INNER JOIN ' + QUOTENAME(@current_database) + N'.sys.query_store_query AS qsq
+                                  ON qsq.query_id = qsp.query_id
+                              INNER JOIN ' + QUOTENAME(@current_database) + N'.sys.query_store_query_text AS qsqt
+                                  ON qsqt.query_text_id = qsq.query_text_id
+                              WHERE qsp.is_forced_plan = 1
+                              AND qsp.force_failure_count = 0
+                              AND CHARINDEX(@tbl COLLATE DATABASE_DEFAULT,
+                                            qsqt.query_sql_text COLLATE DATABASE_DEFAULT) > 0';
+                        EXEC sp_executesql @qs168_sql,
+                            N'@tbl sysname, @cnt int OUTPUT',
+                            @tbl = @current_table_name,
+                            @cnt = @qs168_count OUTPUT;
+                        SET @fp_cached_table = @current_table_name;
+                        SET @fp_cached_db = @current_database;
+                        SET @fp_cached_count = ISNULL(@qs168_count, 0);
+                    END;
+
                     IF ISNULL(@qs168_count, 0) > 0
                     BEGIN
                         SET @qs168_msg =
