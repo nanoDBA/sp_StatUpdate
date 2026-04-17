@@ -836,6 +836,9 @@ EXEC dbo.sp_StatUpdate
 
 ## Version History
 
+- **3.2.1.2026.0417** - Phase 5 bug fix: DIRECT_STRING discovery path (`@Statistics` param) now honors `@TargetNorecompute` and `@ExcludeStatistics` filters, matching staged discovery Phase 1 behavior (gh-492).
+- **3.2.2026.0417** - Phase 4 quality/perf batch (8 issues): Phase 6 plan feedback bounded by time + top-N, 5 COUNT_BIG scans collapsed to one SUM(CASE), orphan cleanup materializes END labels, per-table sys.partitions cache, per-database warning block skipped when DB has zero stats, MAX_GRANT_PERCENT token-substituted, 6 empty CATCH blocks surface to `@WarningsOut`, threshold-logic explanation gated behind `@Debug = 1` (gh-460, 463, 464, 466-470).
+- **3.1.2026.0417** - Phase 1 correctness batch (9 issues): parallel early-return paths set OUTPUT params + summary result set, LOCK_TIMEOUT restored after forced-plan check, `@QueryStore = AVG_CPU` sorts by average (not total), `@parameter_fingerprint` + additional correctness fixes (gh-451..459). Also Phase 2/3 diag correctness (10 issues) in sp_StatUpdate_Diag 2026.04.17.1 (gh-471..480).
 - **3.0.2026.0407** - v3 architecture: preset-first API.  33 input params (was 58 in v2) + 10 OUTPUT params.  25 params absorbed into `@i_` internal variables controlled by presets (DEFAULT, NIGHTLY, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE).  New `@QueryStore` param replaces `@QueryStorePriority` + `@QueryStoreMetric`.  `@StaleHours` replaces `@DaysStaleThreshold` + `@HoursStaleThreshold`.  Table-driven validation, 6-phase staged discovery only (no legacy fallback), unified mop-up filters.  Full behavioral parity with v2.37.
 - **2.37.2026.0327** - WAITS enrichment unbounded XML parsing fix (metric gate + TopPlans limit), Phase 6 debug gate.
 - **2.35.2026.0327** - @QueryStoreMetric WAITS + diag memory grant trending.
