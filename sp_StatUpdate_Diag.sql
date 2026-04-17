@@ -36,9 +36,28 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.04.13.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.04.17.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.04.13.2 - PARALLEL_COMPLETE parity and new checks (4 issues):
+History:    2026.04.17.1 - Diag bug batch Phase 2 (10 issues):
+                           gh-471: Sync @procedure_version with header Version.
+                           gh-472: Auto-upgrade StatUpdateDiagHistory via COL_LENGTH-gated ALTER.
+                           gh-473: C3 denominator/numerator parity -- filter @time_limit_runs by
+                             IsKilled=0 to match @total_completed_runs.
+                           gh-474: Move @latest_qs_run DECLARE above IF/ELSE so SingleResultSet
+                             path can reference it.
+                           gh-475: W12 clamp StatsProcessed-MopUpProcessed to >=0 via CASE WHEN.
+                           gh-476: W7 evidence filter uses @w7_median_position (ISNULL,0) instead
+                             of hard-coded > 5.
+                           gh-477: C5 evidence GROUP BY includes DatabaseName/SchemaName/ObjectName
+                             to prevent collision across tables sharing a stat name.
+                           gh-478: W6 clamp overhead_pct to [0,100] to avoid negative display
+                             when stat_ms slightly exceeds wall-clock due to clock skew.
+                           gh-479: C4 cross join requires recent_w.parallel_mode = prior_w.parallel_mode
+                             to prevent cross-mode throughput comparisons.
+                           gh-480: Dashboard SingleResultSet path -- initialize @avg_completion
+                             and @tl_run_pct in @w3_parallel_complete=1 branch so downstream
+                             COMPLETION detail text always has a value.
+            2026.04.13.2 - PARALLEL_COMPLETE parity and new checks (4 issues):
                            NaturalEndRuns (RS3): now counts PARALLEL_COMPLETE in addition to
                              COMPLETED so parallel runs are recognised as natural completions.
                            workload_pct (#qs_efficacy): PARALLEL_COMPLETE treated as 100% coverage
@@ -244,8 +263,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.04.13.1',
-        @procedure_version_date datetime = '20260413';
+        @procedure_version varchar(20) = '2026.04.17.1',
+        @procedure_version_date datetime = '20260417';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -944,6 +963,27 @@ BEGIN
         END
         ELSE
         BEGIN
+            /* gh-472: Auto-upgrade existing StatUpdateDiagHistory tables from older diag versions.
+               COL_LENGTH returns NULL when column missing.  Each ALTER gated independently so
+               partial upgrades resume cleanly. */
+            SET @sql = N'
+                IF COL_LENGTH(''' + @history_ref + N''', ''HealthScore'') IS NULL
+                    ALTER TABLE ' + @history_ref + N' ADD HealthScore integer NULL;
+                IF COL_LENGTH(''' + @history_ref + N''', ''OverallGrade'') IS NULL
+                    ALTER TABLE ' + @history_ref + N' ADD OverallGrade char(1) NULL;
+                IF COL_LENGTH(''' + @history_ref + N''', ''CompletionPct'') IS NULL
+                    ALTER TABLE ' + @history_ref + N' ADD CompletionPct decimal(5,1) NULL;
+                IF COL_LENGTH(''' + @history_ref + N''', ''AvgSecPerStat'') IS NULL
+                    ALTER TABLE ' + @history_ref + N' ADD AvgSecPerStat decimal(10,1) NULL;
+                IF COL_LENGTH(''' + @history_ref + N''', ''WorkloadCoveragePct'') IS NULL
+                    ALTER TABLE ' + @history_ref + N' ADD WorkloadCoveragePct decimal(5,1) NULL;
+                IF COL_LENGTH(''' + @history_ref + N''', ''HighCpuFirstQuartilePct'') IS NULL
+                    ALTER TABLE ' + @history_ref + N' ADD HighCpuFirstQuartilePct decimal(5,1) NULL;
+                IF COL_LENGTH(''' + @history_ref + N''', ''MinutesToHighCpuComplete'') IS NULL
+                    ALTER TABLE ' + @history_ref + N' ADD MinutesToHighCpuComplete decimal(10,1) NULL;
+            ';
+            EXECUTE sys.sp_executesql @sql;
+
             /* Get watermark: max CommandLog ID already processed */
             SET @sql = N'
                 SELECT @max_id = ISNULL(MAX(MaxCommandLogID), 0),
@@ -2054,9 +2094,12 @@ BEGIN
            time-limited even though they ended with StopReason=COMPLETED (ran out of budget
            before all qualifying stats were processed). */
         @time_limit_runs integer = (
+            /* gh-473: Filter by IsKilled=0 to match @total_completed_runs denominator.
+               Without this, killed runs counted in numerator but not denominator inflated the pct. */
             SELECT COUNT_BIG(*) FROM #runs
-            WHERE StopReason = N'TIME_LIMIT'
-               OR (StopReason = N'COMPLETED' AND ISNULL(StatsRemaining, 0) > 0)
+            WHERE IsKilled = 0
+            AND   (StopReason = N'TIME_LIMIT'
+                OR (StopReason = N'COMPLETED' AND ISNULL(StatsRemaining, 0) > 0))
         ),
         /* BUG-12: use latest run's TimeLimit for the recommendation, not MAX across all TIME_LIMIT runs.
            Using MAX of historical TIME_LIMIT runs could recommend an extreme value from a one-off test run. */
@@ -2188,11 +2231,10 @@ BEGIN
     AND   recent_w.avg_sec > prior_w.avg_sec * 1.5
     AND   prior_w.run_count >= 2
     AND   recent_w.run_count >= 1
-    /* When modes match, compare within same mode. When modes differ, still report but as INFO */
-    AND   (recent_w.parallel_mode = prior_w.parallel_mode
-        OR NOT EXISTS (SELECT 1 FROM window_avgs AS w2
-                       WHERE w2.window_label = N'PRIOR'
-                       AND   w2.parallel_mode = recent_w.parallel_mode));
+    /* gh-479: Strict parallel-mode parity -- only compare within the same StatsInParallel mode.
+       Cross-mode comparison was producing misleading 'INFO' rows that looked like throughput
+       degradation but reflected only a parallel/serial mode switch. */
+    AND   recent_w.parallel_mode = prior_w.parallel_mode;
 
     IF @@ROWCOUNT > 0
         RAISERROR(N'  [CRITICAL] C4: Degrading throughput detected', 10, 1) WITH NOWAIT;
@@ -2524,9 +2566,16 @@ BEGIN
                 r.DurationSeconds,
                 r.StatsProcessed,
                 stat_seconds = CONVERT(decimal(10,1), ISNULL(su_agg.TotalStatMs, 0) / 1000.0),
+                /* gh-478: Clamp to [0, 100].  DurationMs sums can exceed wall-clock when stats run
+                   in overlapping transactions or when clock skew occurs across workers, producing
+                   negative overhead percentages. */
                 overhead_pct = CASE
                     WHEN r.DurationSeconds > 0
-                    THEN CONVERT(decimal(5,1), (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100)
+                    THEN CASE
+                        WHEN (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100 < 0 THEN CONVERT(decimal(5,1), 0)
+                        WHEN (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100 > 100 THEN CONVERT(decimal(5,1), 100)
+                        ELSE CONVERT(decimal(5,1), (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100)
+                    END
                     ELSE 0
                 END
             FROM #runs AS r
@@ -2556,9 +2605,14 @@ BEGIN
             (
                 SELECT
                     r.RunLabel,
+                    /* gh-478: Clamp to [0, 100] (see primary run_overhead CTE above). */
                     overhead_pct = CASE
                         WHEN r.DurationSeconds > 0
-                        THEN CONVERT(decimal(5,1), (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100)
+                        THEN CASE
+                            WHEN (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100 < 0 THEN CONVERT(decimal(5,1), 0)
+                            WHEN (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100 > 100 THEN CONVERT(decimal(5,1), 100)
+                            ELSE CONVERT(decimal(5,1), (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100)
+                        END
                         ELSE 0
                     END
                 FROM #runs AS r
@@ -2659,7 +2713,10 @@ BEGIN
                     GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
                     ORDER BY MAX(wi.TotalCpuMs) DESC
                 ) AS tcs
-                WHERE tcs.avg_position > 5
+                /* gh-476: Use @w7_median_position (ISNULL 0) to match the outer @w7_deprioritized_count
+                   threshold.  Hard-coded > 5 caused evidence to be empty while @w7_deprioritized_count
+                   was > 0, producing the "(details unavailable)" path. */
+                WHERE tcs.avg_position > ISNULL(@w7_median_position, 0)
                 ORDER BY tcs.avg_position DESC
                 FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N'');
 
@@ -2977,19 +3034,24 @@ BEGIN
 
         IF ISNULL(@c5_degraded_count, 0) > 0
         BEGIN
+            /* gh-477: GROUP BY includes Database/Schema/ObjectName so stats with the same name
+               across different tables are not collapsed (e.g., _WA_Sys_... appears on many tables). */
             SET @c5_evidence = STUFF((
-                SELECT TOP (5) N', ' + st.StatisticsName
+                SELECT TOP (5) N', ' + st.DatabaseName + N'.' + st.SchemaName + N'.' + st.ObjectName + N'.' + st.StatisticsName
                     + N' (avg ' + CONVERT(nvarchar(10), CONVERT(decimal(5, 1), st.avg_prior))
                     + N'% -> ' + CONVERT(nvarchar(10), CONVERT(decimal(5, 1), st.avg_recent)) + N'%)'
                 FROM (
                     SELECT
+                        su.DatabaseName,
+                        su.SchemaName,
+                        su.ObjectName,
                         su.StatisticsName,
                         avg_recent = AVG(CASE WHEN su.StartTime >= DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END),
                         avg_prior  = AVG(CASE WHEN su.StartTime <  DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END)
                     FROM #stat_updates AS su
                     WHERE su.EffectiveSamplePct IS NOT NULL AND su.EffectiveSamplePct > 0
                     AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
-                    GROUP BY su.StatisticsName
+                    GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
                     HAVING COUNT(*) >= 4
                     AND    AVG(CASE WHEN su.StartTime >= DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END) IS NOT NULL
                     AND    AVG(CASE WHEN su.StartTime <  DATEADD(DAY, -@DaysBack / 2, SYSDATETIME()) THEN CONVERT(decimal(10, 2), su.EffectiveSamplePct) END) IS NOT NULL
@@ -3197,7 +3259,9 @@ BEGIN
 
         SELECT
             @w12_run_count    = COUNT(*),
-            @w12_avg_priority = AVG(CONVERT(decimal(10, 1), ISNULL(r.StatsProcessed, 0) - ISNULL(r.MopUpProcessed, 0))),
+            /* gh-475: Clamp to 0 -- MopUpProcessed can exceed StatsProcessed when the priority
+               pass crashed or restarted, producing a negative priority-pass count otherwise. */
+            @w12_avg_priority = AVG(CONVERT(decimal(10, 1), CASE WHEN ISNULL(r.StatsProcessed, 0) - ISNULL(r.MopUpProcessed, 0) < 0 THEN 0 ELSE ISNULL(r.StatsProcessed, 0) - ISNULL(r.MopUpProcessed, 0) END)),
             @w12_avg_mopup    = AVG(CONVERT(decimal(10, 1), ISNULL(r.MopUpProcessed, 0))),
             @w12_mod_thresh   = MAX(r.ModificationThreshold)
         FROM #runs AS r
@@ -4209,6 +4273,12 @@ BEGIN
         @health_score integer = 0,
         @all_parallel bit = 0;          /* 1 when every non-killed run uses @StatsInParallel='Y' */
 
+    /* gh-480: Hoist @avg_completion and @tl_run_pct out of the ELSE branch so the parallel-complete
+       fast path also populates them.  The COMPLETION dashboard row's Detail text references
+       @avg_completion, producing 'N/A' when parallel-complete was the only signal. */
+    DECLARE @avg_completion decimal(5, 1) = NULL;
+    DECLARE @tl_run_pct decimal(5, 1) = 0.0;
+
     /* Completion score: based on avg completion % across recent runs */
     IF @run_count > 0
     BEGIN
@@ -4219,10 +4289,13 @@ BEGIN
         IF @w3_parallel_complete = 1
         BEGIN
             SET @score_completion = 95;     /* Grade A: all work distributed and completed */
+            /* gh-480: Populate downstream display variables so COMPLETION detail text is accurate */
+            SET @avg_completion = 100.0;
+            SET @tl_run_pct = 0.0;
         END
         ELSE
         BEGIN
-            DECLARE @avg_completion decimal(5, 1) = (
+            SET @avg_completion = (
                 SELECT AVG(CASE WHEN r.StatsFound > 0 THEN CONVERT(decimal(5, 1), ISNULL(r.StatsProcessed, 0) * 100.0 / r.StatsFound) ELSE 100.0 END)
                 FROM #runs AS r WHERE r.IsKilled = 0
             );
@@ -4237,7 +4310,7 @@ BEGIN
 
             /* #238: If majority of runs hit TIME_LIMIT, cap completion score --
                a 95% avg looks great but means nothing if the window is too short */
-            DECLARE @tl_run_pct decimal(5, 1) = @time_limit_runs * 100.0 / @run_count;
+            SET @tl_run_pct = @time_limit_runs * 100.0 / @run_count;
 
             IF @tl_run_pct >= 80.0 AND @score_completion > 60
                 SET @score_completion = 60;     /* Can't exceed C if 80%+ runs hit time limit */
@@ -5667,15 +5740,18 @@ BEGIN
     RESULT SET 12: HIGH-CPU STAT POSITIONS (Most Recent Run -- @ExpertMode = 1 only)
     ============================================================================
     */
+    /* gh-474: Declared at outer scope so both the standalone result-set branch and the
+       SingleResultSet branch below can reference it.  Previously only the non-SingleResultSet
+       branch declared it, causing the SingleResultSet path to reference an undefined variable. */
+    DECLARE @latest_qs_run nvarchar(100) = (
+        SELECT TOP (1) e.RunLabel
+        FROM #qs_efficacy AS e
+        WHERE e.IsQSRun = 1
+        ORDER BY e.StartTime DESC
+    );
+
     IF @ExpertMode = 1 AND @SingleResultSet = 0
     BEGIN
-        DECLARE @latest_qs_run nvarchar(100) = (
-            SELECT TOP (1) e.RunLabel
-            FROM #qs_efficacy AS e
-            WHERE e.IsQSRun = 1
-            ORDER BY e.StartTime DESC
-        );
-
         ;WITH rs12_ranked AS
         (
             SELECT
