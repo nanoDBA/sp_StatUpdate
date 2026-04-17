@@ -36,11 +36,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.2.2026.04.17 (Major.Minor.YYYY.MM.DD)
+Version:    3.2.1.2026.04.17 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.2.2026.04.17 - Phase 4 quality/perf batch (9 issues):
+History:    3.2.1.2026.04.17 - Phase 5 bug fix (1 issue):
+                            gh-492 DIRECT_STRING discovery path (@Statistics param)
+                              now honors @TargetNorecompute and @ExcludeStatistics.
+                              Previously both filters were only applied in the
+                              staged discovery path.
+            3.2.2026.04.17 - Phase 4 quality/perf batch (9 issues):
                             gh-470 per-database warning block (6 checks) now
                               short-circuits when the database has zero stats
                               in #stats_to_process -- saves up to 6 sp_executesql
@@ -235,7 +240,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.2.2026.04.17',
+        @procedure_version varchar(20) = '3.2.1.2026.04.17',
         @procedure_version_date datetime = '20260417',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -3041,12 +3046,31 @@ OUTER APPLY
     AND   p.index_id IN (0, 1)
 ) AS pgs
 WHERE (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @i_include_system_objects_param = N''Y'')
+/* gh-492: NORECOMPUTE filter (was missing in DIRECT_STRING path) */
+AND   (
+          (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
+       OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
+       OR @TargetNorecompute_param = N''BOTH''
+      )
+/* gh-492: Statistics exclusion filter (was missing in DIRECT_STRING path) */
+AND   (
+          @ExcludeStatistics_param IS NULL
+       OR NOT EXISTS
+          (
+              SELECT 1
+              FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
+              WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                 OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+          )
+      )
 OPTION (RECOMPILE);';
 
                 EXECUTE sys.sp_executesql
                     @direct_string_sql,
-                    N'@i_include_system_objects_param nvarchar(1)',
-                    @i_include_system_objects_param = @i_include_system_objects;
+                    N'@i_include_system_objects_param nvarchar(1), @TargetNorecompute_param nvarchar(10), @ExcludeStatistics_param nvarchar(max)',
+                    @i_include_system_objects_param = @i_include_system_objects,
+                    @TargetNorecompute_param = @TargetNorecompute,
+                    @ExcludeStatistics_param = @ExcludeStatistics;
 
             END TRY
             BEGIN CATCH
