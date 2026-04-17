@@ -36,11 +36,34 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.0.2026.04.07 (Major.Minor.YYYY.MM.DD)
+Version:    3.1.2026.04.17 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.0.2026.04.07 - v3 architecture: preset-first API, 33 input params (was 58),
+History:    3.1.2026.04.17 - Phase 1 correctness batch (9 issues):
+                            gh-451 parallel early-return paths (FINGERPRINT_CONFLICT,
+                              MAX_WORKERS, QUEUE_INIT_ERROR) now set all OUTPUT params
+                              and return the summary result set.
+                            gh-452 second LOCK_TIMEOUT restore after the forced-plan
+                              check (sp_executesql SET LOCK_TIMEOUT persists).
+                            gh-453 @QueryStore = AVG_CPU now sorts by average CPU
+                              (divides SUM by SUM(count_executions)), not total CPU.
+                            gh-454 @parameter_fingerprint now includes
+                              @QueryStoreMinExecutions and @QueryStoreRecentHours so
+                              workers with different QS criteria cannot share a queue.
+                            gh-455 @MopUpPass + @StopByTime (without @TimeLimit) no
+                              longer rejected at validation.
+                            gh-456 bracket-quoted names in @Statistics
+                              (e.g. 'dbo.[My Table].[My Stat]') are now matched --
+                              brackets stripped from PARSENAME output.
+                            gh-457 @log_used_pct reset per-iteration so a failed
+                              sp_executesql cannot carry a stale value across dbs.
+                            gh-458 @SortOrder = RANDOM + @QueryStore enabled now
+                              raises a startup warning (QS boost is ignored).
+                            gh-459 parallel mop-up follower now reports correct
+                              MopUpFound (uses @mop_up_queued, not local
+                              #stats_to_process which has 0 unprocessed rows).
+            3.0.2026.04.07 - v3 architecture: preset-first API, 33 input params (was 58),
                             + 10 OUTPUT params.  Absorbed 25 params into @i_ internal
                             variables controlled by presets.  Table-driven validation,
                             6-phase staged discovery only (no fallback path), removed join
@@ -186,8 +209,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.0.2026.04.07',
-        @procedure_version_date datetime = '20260407',
+        @procedure_version varchar(20) = '3.1.2026.04.17',
+        @procedure_version_date datetime = '20260417',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -1431,9 +1454,11 @@ BEGIN
         INSERT INTO @errors (error_message, error_severity)
         VALUES (N'@WhatIfOutputTable requires @Execute = N.', 16);
 
-    IF @i_mop_up_pass = N'Y' AND @i_time_limit IS NULL
+    /* gh-455: @StopByTime supplies a time budget too -- converted to @i_time_limit
+       further down in this region.  Accept either. */
+    IF @i_mop_up_pass = N'Y' AND @i_time_limit IS NULL AND @StopByTime IS NULL
         INSERT INTO @errors (error_message, error_severity)
-        VALUES (N'@MopUpPass requires @TimeLimit (needs a time budget).', 16);
+        VALUES (N'@MopUpPass requires a time budget (@TimeLimit or @StopByTime).', 16);
 
     IF @i_qs_metric = N'TEMPDB_SPILLS' AND @sql_major_version < 14
         INSERT INTO @errors (error_message, error_severity)
@@ -1451,10 +1476,11 @@ BEGIN
         INSERT INTO @errors (error_message, error_severity)
         VALUES (N'@MopUpPass requires @LogToTable = Y (uses CommandLog to skip recent updates).', 16);
 
+    /* gh-455: accept @StopByTime as time-budget source. */
     IF @i_mop_up_pass = N'Y' AND @StatsInParallel = N'Y'
-    AND @i_time_limit IS NULL
+    AND @i_time_limit IS NULL AND @StopByTime IS NULL
         INSERT INTO @errors (error_message, error_severity)
-        VALUES (N'@MopUpPass with @StatsInParallel requires @TimeLimit.', 16);
+        VALUES (N'@MopUpPass with @StatsInParallel requires @TimeLimit or @StopByTime.', 16);
 
     IF @LongRunningThresholdMinutes IS NOT NULL AND @LogToTable = N'N'
         INSERT INTO @errors (error_message, error_severity)
@@ -2130,6 +2156,13 @@ BEGIN
             RAISERROR(N'  @QueryStoreTopPlans       = %d', 10, 1, @i_qs_top_plans) WITH NOWAIT;
         ELSE
             RAISERROR(N'  @QueryStoreTopPlans       = NULL (unlimited)', 10, 1) WITH NOWAIT;
+
+        /* gh-458: RANDOM sort discards qs_priority_boost -- QS enrichment is
+           wasted work.  Warn so the user knows. */
+        IF @i_sort_order = N'RANDOM'
+        BEGIN
+            RAISERROR(N'  WARNING: @SortOrder = RANDOM ignores qs_priority_boost -- QS enrichment has no effect on ordering.', 10, 1) WITH NOWAIT;
+        END;
 
         /* #189: Pre-run QS READ_ONLY warning -- alert DBA before discovery, not after */
         DECLARE @qs_readonly_count int = 0;
@@ -2831,10 +2864,13 @@ BEGIN
             parsed_table,
             parsed_stat
         )
+        /* gh-456: PARSENAME preserves brackets ('[My Stat]' stays bracketed).
+           sys.stats.name never contains bracket chars, so the join silently
+           returns 0 rows.  Strip [] from each part. */
         SELECT
-            parsed_schema = PARSENAME(LTRIM(RTRIM(ss.value)), 3),
-            parsed_table = PARSENAME(LTRIM(RTRIM(ss.value)), 2),
-            parsed_stat = PARSENAME(LTRIM(RTRIM(ss.value)), 1)
+            parsed_schema = REPLACE(REPLACE(PARSENAME(LTRIM(RTRIM(ss.value)), 3), N'[', N''), N']', N''),
+            parsed_table  = REPLACE(REPLACE(PARSENAME(LTRIM(RTRIM(ss.value)), 2), N'[', N''), N']', N''),
+            parsed_stat   = REPLACE(REPLACE(PARSENAME(LTRIM(RTRIM(ss.value)), 1), N'[', N''), N']', N'')
         FROM STRING_SPLIT(@Statistics, N',') AS ss
         WHERE LTRIM(RTRIM(ss.value)) <> N''
         AND   PARSENAME(LTRIM(RTRIM(ss.value)), 1) IS NOT NULL;
@@ -4010,7 +4046,7 @@ OPTION (RECOMPILE);';
                             WHEN N''DURATION''    THEN SUM(qsrs.avg_duration * qsrs.count_executions)
                             WHEN N''READS''       THEN SUM(CONVERT(float, qsrs.avg_logical_io_reads * qsrs.count_executions))
                             WHEN N''EXECUTIONS''  THEN SUM(CONVERT(float, qsrs.count_executions))
-                            WHEN N''AVG_CPU''     THEN SUM(qsrs.avg_cpu_time * qsrs.count_executions)
+                            WHEN N''AVG_CPU''     THEN SUM(qsrs.avg_cpu_time * qsrs.count_executions) / NULLIF(SUM(CONVERT(float, qsrs.count_executions)), 0) /* gh-453: avg, not total */
                             WHEN N''MEMORY_GRANT'' THEN SUM(CONVERT(float, qsrs.avg_query_max_used_memory * qsrs.count_executions))
                             WHEN N''TEMPDB_SPILLS'' THEN {{TEMPDB_SPILLS_ORDER}}
                             WHEN N''PHYSICAL_READS'' THEN {{PHYSICAL_READS_ORDER}}
@@ -5054,7 +5090,11 @@ OPTION (RECOMPILE);';
             ISNULL(@i_qs_metric, N'NULL'),
             ISNULL(@i_mop_up_pass, N'NULL'),
             ISNULL(CONVERT(nvarchar(20), @i_mop_up_min_remaining), N'NULL'),
-            ISNULL(CONVERT(nvarchar(20), @i_qs_top_plans), N'NULL')
+            ISNULL(CONVERT(nvarchar(20), @i_qs_top_plans), N'NULL'),
+            /* gh-454: QS enrichment criteria affect priority ordering --
+               workers with different values must not share a queue */
+            ISNULL(CONVERT(nvarchar(20), @i_qs_min_executions), N'NULL'),
+            ISNULL(CONVERT(nvarchar(20), @i_qs_recent_hours), N'NULL')
         );
 
         /*
@@ -5172,6 +5212,23 @@ OPTION (RECOMPILE);';
                         BEGIN
                             RAISERROR(N'Conflicting sp_StatUpdate parameters detected. Worker cannot join existing queue initialized with different threshold parameters. (Stored fingerprint: %d, This worker: %d)', 16, 1,
                                 @stored_fingerprint, @parameter_fingerprint);
+                            /* gh-451: populate OUTPUT params + summary result set on early return */
+                            SET @StopReasonOut = N'FINGERPRINT_CONFLICT';
+                            SET @StatsFoundOut = 0;
+                            SET @StatsProcessedOut = 0;
+                            SET @StatsSucceededOut = 0;
+                            SET @StatsFailedOut = 0;
+                            SET @StatsRemainingOut = 0;
+                            SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
+                            SELECT
+                                Status = N'ERROR',
+                                StatusMessage = N'Conflicting parameter fingerprint on existing queue.',
+                                StatsFound = 0, StatsProcessed = 0, StatsSucceeded = 0, StatsFailed = 0,
+                                StatsToctou = 0, StatsSkipped = 0, StatsRemaining = 0,
+                                DatabasesProcessed = 0,
+                                DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
+                                StopReason = N'FINGERPRINT_CONFLICT', RunLabel = @run_label,
+                                Version = @procedure_version;
                             IF @StatsInParallel = N'N'
                                 DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
                             RETURN 50001;
@@ -5220,7 +5277,23 @@ OPTION (RECOMPILE);';
                         CONVERT(nvarchar(10), @i_max_workers) + N'). Exiting cleanly.';
                     RAISERROR(@mw_msg, 10, 1) WITH NOWAIT;
 
+                    /* gh-451: populate OUTPUT params + summary result set on early return */
                     SET @StopReasonOut = N'MAX_WORKERS';
+                    SET @StatsFoundOut = 0;
+                    SET @StatsProcessedOut = 0;
+                    SET @StatsSucceededOut = 0;
+                    SET @StatsFailedOut = 0;
+                    SET @StatsRemainingOut = 0;
+                    SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
+                    SELECT
+                        Status = N'SUCCESS',
+                        StatusMessage = @mw_msg,
+                        StatsFound = 0, StatsProcessed = 0, StatsSucceeded = 0, StatsFailed = 0,
+                        StatsToctou = 0, StatsSkipped = 0, StatsRemaining = 0,
+                        DatabasesProcessed = 0,
+                        DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
+                        StopReason = N'MAX_WORKERS', RunLabel = @run_label,
+                        Version = @procedure_version;
                     IF @StatsInParallel = N'N'
                         DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
                     RETURN 0;
@@ -5366,6 +5439,23 @@ OPTION (RECOMPILE);';
                 @queue_error_message nvarchar(4000) = ERROR_MESSAGE();
 
             RAISERROR(N'ERROR: Queue initialization failed: %s', 16, 1, @queue_error_message) WITH NOWAIT;
+            /* gh-451: populate OUTPUT params + summary result set on early return */
+            SET @StopReasonOut = N'QUEUE_INIT_ERROR';
+            SET @StatsFoundOut = 0;
+            SET @StatsProcessedOut = 0;
+            SET @StatsSucceededOut = 0;
+            SET @StatsFailedOut = 0;
+            SET @StatsRemainingOut = 0;
+            SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
+            SELECT
+                Status = N'ERROR',
+                StatusMessage = N'Queue initialization failed: ' + ISNULL(@queue_error_message, N'(no message)'),
+                StatsFound = 0, StatsProcessed = 0, StatsSucceeded = 0, StatsFailed = 0,
+                StatsToctou = 0, StatsSkipped = 0, StatsRemaining = 0,
+                DatabasesProcessed = 0,
+                DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
+                StopReason = N'QUEUE_INIT_ERROR', RunLabel = @run_label,
+                Version = @procedure_version;
             IF @StatsInParallel = N'N'
                 DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
             RETURN -1;
@@ -5665,6 +5755,11 @@ OPTION (RECOMPILE);';
                 DECLARE @log_sql nvarchar(500) = N'
                     SELECT @pct = used_log_space_in_percent
                     FROM ' + QUOTENAME(@log_check_db) + N'.sys.dm_db_log_space_usage';
+                /* gh-457: reset per-iteration -- DECLARE initializer runs once at
+                   proc entry, so a throw in sp_executesql leaves the prior db's
+                   value behind, potentially triggering false LOG_SPACE_HIGH on
+                   the current db. */
+                SET @log_used_pct = 0;
                 BEGIN TRY
                     EXEC sp_executesql @log_sql,
                         N'@pct float OUTPUT', @pct = @log_used_pct OUTPUT;
@@ -8078,7 +8173,11 @@ OPTION (RECOMPILE);';
 
                     SET @stop_reason = NULL;
                     SET @in_mop_up = 1;
-                    SET @mop_up_stats_found = (SELECT COUNT(*) FROM #stats_to_process WHERE processed = 0);
+                    /* gh-459: follower skipped discovery, so #stats_to_process
+                       has 0 unprocessed rows.  Use the queue row count that the
+                       leader populated instead so MopUpFound is accurate in the
+                       CommandLog END XML. */
+                    SET @mop_up_stats_found = @mop_up_queued;
                     SET @mop_up_stats_processed = @stats_processed; /* v2.27 (#357): baseline for MopUpProcessed count */
 
                     SELECT
@@ -8591,6 +8690,11 @@ OPTION (RECOMPILE);';
             RAISERROR(N'WARNING: %d Query Store forced plan(s) on tables with updated statistics: %s', 10, 1, @qs_forced_total, @qs_forced_details) WITH NOWAIT;
             RAISERROR(N'         Stats changes may affect forced plan quality. Review with sys.query_store_plan.', 10, 1) WITH NOWAIT;
         END;
+
+        /* gh-452: the forced-plan check issued SET LOCK_TIMEOUT 10000/30000 via
+           sp_executesql, which persists at session level after the EXECUTE
+           returns -- overwriting the restore done at region-top.  Re-restore now. */
+        EXECUTE (@lock_restore_sql);
     END;
 
     /*
