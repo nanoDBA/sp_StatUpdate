@@ -36,11 +36,37 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.1.2026.04.17 (Major.Minor.YYYY.MM.DD)
+Version:    3.2.2026.04.17 (Major.Minor.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.1.2026.04.17 - Phase 1 correctness batch (9 issues):
+History:    3.2.2026.04.17 - Phase 4 quality/perf batch (9 issues):
+                            gh-470 per-database warning block (6 checks) now
+                              short-circuits when the database has zero stats
+                              in #stats_to_process -- saves up to 6 sp_executesql
+                              compilations + DMV scans per skipped db.
+                            gh-460 Phase 6 plan feedback query now bounded by
+                              @i_qs_recent_hours + @i_qs_top_plans -- prevents
+                              unbounded XML parsing on deep QS retention.
+                            gh-463 five COUNT_BIG(*) full-scans of #stats_to_process
+                              collapsed to one SUM(CASE) pass (NORECOMPUTE,
+                              incremental, heap, memory-opt, persisted sample).
+                            gh-464 orphan CommandLog cleanup materializes END
+                              RunLabels into a temp table -- replaces correlated
+                              per-row XML NOT EXISTS.
+                            gh-466 MAX_GRANT_PERCENT hint now token-replaced
+                              ({{MAX_GRANT_HINT}}) instead of sentinel-replacing
+                              the literal '= 25)' (fragile).
+                            gh-467 sys.partitions count for incremental stats
+                              cached per (database, object_id) across consecutive
+                              stats on the same table.
+                            gh-468 six per-database warning checks (RLS, wide stats,
+                              filter mismatch, columnstore, compressed, computed
+                              cols) now log failures to @warnings instead of
+                              silently swallowing in empty CATCH blocks.
+                            gh-469 threshold-logic explanation block now gated
+                              on @Debug = 1 (was firing on every run).
+            3.1.2026.04.17 - Phase 1 correctness batch (9 issues):
                             gh-451 parallel early-return paths (FINGERPRINT_CONFLICT,
                               MAX_WORKERS, QUEUE_INIT_ERROR) now set all OUTPUT params
                               and return the summary result set.
@@ -209,7 +235,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.1.2026.04.17',
+        @procedure_version varchar(20) = '3.2.2026.04.17',
         @procedure_version_date datetime = '20260417',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -2197,9 +2223,10 @@ BEGIN
         RAISERROR(N'  @DeadWorkerTimeout       = %d minutes', 10, 1, @i_dead_worker_timeout_min) WITH NOWAIT;
 
     /*
-    Threshold Interaction Explanation (v1.9, debug mode only)
+    Threshold Interaction Explanation (debug mode only -- gh-469)
     Helps users understand how the threshold parameters work together.
     */
+    IF @Debug_int = 1
     BEGIN
         DECLARE @mod_pct_str nvarchar(20) = CONVERT(nvarchar(20), ISNULL(@i_modification_percent, 0));
 
@@ -2671,9 +2698,28 @@ BEGIN
         /*
         Insert SP_STATUPDATE_END for each orphaned SP_STATUPDATE_START
         Match on RunLabel from ExtendedInfo XML to identify the specific run.
-        Only clean up entries older than 24 hours to avoid interfering with
-        concurrent runs that are still in progress.
+        Only clean up entries older than @i_orphaned_run_threshold_hours to avoid
+        interfering with concurrent runs that are still in progress.
+
+        gh-464: materialize END RunLabels into a temp table once, then LEFT JOIN.
+                Previously the cleanup did a correlated NOT EXISTS that forced
+                per-outer-row XML parsing of every END row -- unbounded on busy
+                CommandLogs (millions of rows + per-row .value() cost).
         */
+        CREATE TABLE #orphan_end_labels
+        (
+            RunLabel nvarchar(100) NOT NULL PRIMARY KEY WITH (IGNORE_DUP_KEY = ON)
+        );
+
+        INSERT INTO #orphan_end_labels (RunLabel)
+        SELECT cl_end.ExtendedInfo.value('(/Summary/RunLabel)[1]', 'nvarchar(100)')
+        FROM dbo.CommandLog AS cl_end
+        WHERE cl_end.CommandType = N'SP_STATUPDATE_END'
+        AND   cl_end.ExtendedInfo IS NOT NULL
+        AND   cl_end.ExtendedInfo.exist('(/Summary/RunLabel)[1]') = 1
+        /* Only labels that could match START entries within the candidate window */
+        AND   cl_end.StartTime >= DATEADD(HOUR, -(@i_orphaned_run_threshold_hours + 24), SYSDATETIME());
+
         INSERT INTO dbo.CommandLog
         (
             DatabaseName,
@@ -2718,13 +2764,14 @@ BEGIN
         AND   NOT EXISTS
               (
                   SELECT 1
-                  FROM dbo.CommandLog AS cl_end
-                  WHERE cl_end.CommandType = N'SP_STATUPDATE_END'
-                  AND   cl_end.ExtendedInfo.value('(/Summary/RunLabel)[1]', 'nvarchar(100)') =
+                  FROM #orphan_end_labels AS oel
+                  WHERE oel.RunLabel =
                         cl_start.ExtendedInfo.value('(/Parameters/RunLabel)[1]', 'nvarchar(100)')
               );
 
         SELECT @orphaned_count = @@ROWCOUNT;
+
+        DROP TABLE #orphan_end_labels;
 
         IF @orphaned_count > 0
         BEGIN
@@ -4140,25 +4187,40 @@ OPTION (RECOMPILE);';
 
                     /* SQL 2022+ plan feedback awareness (#369):
                        Count active/pending plan feedback entries per table.
-                       Stats updates may reset CE/grant/DOP feedback. */
-                    /* #432: use plan XML table extraction (not q.object_id which is module id) */
+                       Stats updates may reset CE/grant/DOP feedback.
+                       #432: use plan XML table extraction (not q.object_id which is module id).
+                       gh-460: bound work via @i_qs_recent_hours time filter + @i_qs_top_plans cap.
+                               Previously this processed every active/pending feedback entry with
+                               no time or row budget -- unbounded XML parsing on instances with
+                               deep QS retention. */
                     IF OBJECT_ID(N''sys.query_store_plan_feedback'') IS NOT NULL
                     BEGIN
+                        ;WITH RecentFeedbackPlanIds AS (
+                            SELECT TOP (ISNULL(@i_qs_top_plans_param, 2147483647))
+                                pf2.plan_id,
+                                feedback_count = COUNT(*)
+                            FROM sys.query_store_plan_feedback AS pf2
+                            INNER JOIN sys.query_store_plan AS p2 ON p2.plan_id = pf2.plan_id
+                            WHERE pf2.state_desc IN (N''ACTIVE'', N''PENDING_VALIDATION'')
+                              AND (pf2.last_updated_time IS NULL
+                                   OR pf2.last_updated_time >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME()))
+                            GROUP BY pf2.plan_id
+                            ORDER BY COUNT(*) DESC
+                        )
                         UPDATE sc
                         SET sc.qs_active_feedback_count = fb.feedback_count
                         FROM #stat_candidates AS sc
                         INNER JOIN (
-                            SELECT tref.object_id, COUNT(*) AS feedback_count
-                            FROM sys.query_store_plan_feedback AS pf
-                            INNER JOIN sys.query_store_plan AS p ON pf.plan_id = p.plan_id
+                            SELECT tref.object_id, SUM(rfp.feedback_count) AS feedback_count
+                            FROM RecentFeedbackPlanIds AS rfp
+                            INNER JOIN sys.query_store_plan AS p ON rfp.plan_id = p.plan_id
                             CROSS APPLY (SELECT TRY_CONVERT(xml, p.query_plan)) AS x(plan_xml)
                             CROSS APPLY x.plan_xml.nodes(''//*:Object'') AS t(ref)
                             INNER JOIN (SELECT DISTINCT object_id, schema_name, table_name
                                         FROM #stat_candidates) AS tref
                                 ON tref.schema_name = PARSENAME(ref.value(''@Schema'', ''sysname''), 1) COLLATE DATABASE_DEFAULT
                                 AND tref.table_name = PARSENAME(ref.value(''@Table'', ''sysname''), 1) COLLATE DATABASE_DEFAULT
-                            WHERE pf.state_desc IN (N''ACTIVE'', N''PENDING_VALIDATION'')
-                              AND x.plan_xml IS NOT NULL
+                            WHERE x.plan_xml IS NOT NULL
                               AND ref.value(''@Table'', ''sysname'') IS NOT NULL
                             GROUP BY tref.object_id
                         ) AS fb ON fb.object_id = sc.object_id;
@@ -4327,26 +4389,22 @@ OPTION (RECOMPILE);';
                             stats_id ASC
                     )
                 FROM #stat_candidates
-                OPTION (MAX_GRANT_PERCENT = 25); /* Cap memory grant: prevents monopolizing server memory during maintenance -- value replaced dynamically below */
+                {{MAX_GRANT_HINT}}
 
                 DROP TABLE #stat_candidates;
                 ';
 
                 /*
-                Parameterize MAX_GRANT_PERCENT in the candidate discovery SELECT.
-                Replace the hardcoded 25 with @i_max_grant_percent, or remove the hint
-                entirely when NULL.  MAX_GRANT_PERCENT has been supported since SQL
-                2012 SP3, well before v3's SQL 2016 minimum, so no version gate is
-                needed (bd -31k).
+                gh-466: Token-replace MAX_GRANT_PERCENT hint.  Replaces the prior
+                sentinel-replace approach (REPLACE on literal '= 25)') which was
+                fragile to any change in the sentinel value or surrounding syntax.
+                Token is unique in @staged_sql; substitution is deterministic.
                 */
-                IF @i_max_grant_percent IS NOT NULL
-                    SET @staged_sql = REPLACE(@staged_sql,
-                        N'OPTION (MAX_GRANT_PERCENT = 25)',
-                        N'OPTION (MAX_GRANT_PERCENT = ' + CONVERT(nvarchar(3), @i_max_grant_percent) + N')');
-                ELSE
-                    SET @staged_sql = REPLACE(@staged_sql,
-                        N' OPTION (MAX_GRANT_PERCENT = 25);',
-                        N';'); /* Remove hint when NULL -- let SQL decide */
+                SET @staged_sql = REPLACE(@staged_sql, N'{{MAX_GRANT_HINT}}',
+                    CASE WHEN @i_max_grant_percent IS NOT NULL
+                        THEN N'OPTION (MAX_GRANT_PERCENT = ' + CONVERT(nvarchar(10), @i_max_grant_percent) + N');'
+                        ELSE N';'
+                    END);
 
                 /* Version-gate TEMPDB_SPILLS: avg_tempdb_space_used added in SQL 2017 (14.x) */
                 SET @staged_sql = REPLACE(@staged_sql, N'{{TEMPDB_SPILLS_EXPR}}',
@@ -4467,8 +4525,20 @@ OPTION (RECOMPILE);';
             ================================================================
             POST-DISCOVERY PER-DATABASE DETECTION WARNINGS
             Lightweight checks on discovered stats for operational awareness.
+
+            gh-470: Skip entire block when the current database has zero stats
+            in #stats_to_process.  Avoids up to 6 sequential sp_executesql
+            compilations + DMV scans per database when there's nothing to warn
+            about (common when wildcards or exclusions trim to 0 stats in a db).
             ================================================================
             */
+            DECLARE @pdw_stats_in_db int = 0;
+            SELECT @pdw_stats_in_db = COUNT(*)
+            FROM #stats_to_process AS stp
+            WHERE stp.database_name = @CurrentDatabaseName COLLATE DATABASE_DEFAULT;
+
+            IF @pdw_stats_in_db > 0
+            BEGIN
 
             /* #60: RLS (Row-Level Security) detection -- biased histogram risk */
             IF @Debug = 1
@@ -4497,7 +4567,11 @@ OPTION (RECOMPILE);';
                         SET @warnings += N'RLS_DETECTED: ' + @CurrentDatabaseName + N'(' + CONVERT(nvarchar(10), @rls_table_count) + N' tables); ';
                     END;
                 END TRY
-                BEGIN CATCH /* RLS DMVs might not be accessible */ END CATCH;
+                BEGIN CATCH
+                    /* gh-468: surface rather than swallow (was: empty CATCH) */
+                    SET @warnings += N'RLS_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    IF @Debug = 1 RAISERROR(N'    RLS check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
+                END CATCH;
             END;
 
             /* #59: Wide statistics detection (>8 columns) -- tempdb/memory pressure risk */
@@ -4529,7 +4603,11 @@ OPTION (RECOMPILE);';
                         RAISERROR(@wide_msg, 10, 1) WITH NOWAIT;
                     END;
                 END TRY
-                BEGIN CATCH END CATCH;
+                BEGIN CATCH
+                    /* gh-468: surface rather than swallow */
+                    SET @warnings += N'WIDESTAT_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    IF @Debug = 1 RAISERROR(N'    Wide-stats check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
+                END CATCH;
             END;
 
             /* #38: Filtered index statistics -- detect filter_definition mismatch */
@@ -4562,7 +4640,11 @@ OPTION (RECOMPILE);';
                         SET @warnings += N'FILTER_MISMATCH: ' + @CurrentDatabaseName + N'(' + CONVERT(nvarchar(10), @filter_mismatch_count) + N'); ';
                     END;
                 END TRY
-                BEGIN CATCH END CATCH;
+                BEGIN CATCH
+                    /* gh-468: surface rather than swallow */
+                    SET @warnings += N'FILTER_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    IF @Debug = 1 RAISERROR(N'    Filter-mismatch check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
+                END CATCH;
             END;
 
             /* #28/#149: Columnstore context detection -- always-on warning (promoted from debug-only) */
@@ -4590,7 +4672,11 @@ OPTION (RECOMPILE);';
                         SET @warnings += N'COLUMNSTORE_TABLES: ' + CONVERT(nvarchar(10), @cs_table_count) + N' table(s) with columnstore indexes; ';
                     END;
                 END TRY
-                BEGIN CATCH END CATCH;
+                BEGIN CATCH
+                    /* gh-468: surface rather than swallow */
+                    SET @warnings += N'COLUMNSTORE_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    IF @Debug = 1 RAISERROR(N'    Columnstore check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
+                END CATCH;
             END;
 
             /* #156: Compressed tables page_count inflation warning */
@@ -4616,7 +4702,11 @@ OPTION (RECOMPILE);';
                         SET @warnings += N'COMPRESSED_TABLES: ' + CONVERT(nvarchar(10), @compressed_table_count) + N' table(s) with compression -- @i_min_page_count uses compressed page counts; ';
                     END;
                 END TRY
-                BEGIN CATCH END CATCH;
+                BEGIN CATCH
+                    /* gh-468: surface rather than swallow */
+                    SET @warnings += N'COMPRESSED_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    IF @Debug = 1 RAISERROR(N'    Compressed-tables check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
+                END CATCH;
             END;
 
             /* #30: Computed column statistics -- non-persisted computed columns have higher update cost */
@@ -4643,8 +4733,14 @@ OPTION (RECOMPILE);';
                         RAISERROR(@cc_msg, 10, 1) WITH NOWAIT;
                     END;
                 END TRY
-                BEGIN CATCH END CATCH;
+                BEGIN CATCH
+                    /* gh-468: surface rather than swallow */
+                    SET @warnings += N'COMPUTEDCOL_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    IF @Debug = 1 RAISERROR(N'    Computed-columns check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
+                END CATCH;
             END;
+
+            END; /* gh-470: close IF @pdw_stats_in_db > 0 BEGIN */
 
             END TRY
             BEGIN CATCH
@@ -4896,41 +4992,21 @@ OPTION (RECOMPILE);';
             FROM #stats_to_process
         )
         END,
-        @norecompute_stats integer =
-        (
-            SELECT
-                COUNT_BIG(*)
-            FROM #stats_to_process AS stp
-            WHERE stp.no_recompute = 1
-        ),
-        @incremental_stats integer =
-        (
-            SELECT
-                COUNT_BIG(*)
-            FROM #stats_to_process AS stp
-            WHERE stp.is_incremental = 1
-        ),
-        @heap_stats integer =
-        (
-            SELECT
-                COUNT_BIG(*)
-            FROM #stats_to_process AS stp
-            WHERE stp.is_heap = 1
-        ),
-        @memory_optimized_stats integer =
-        (
-            SELECT
-                COUNT_BIG(*)
-            FROM #stats_to_process AS stp
-            WHERE stp.is_memory_optimized = 1
-        ),
-        @persisted_sample_stats integer =
-        (
-            SELECT
-                COUNT_BIG(*)
-            FROM #stats_to_process AS stp
-            WHERE stp.persisted_sample_percent IS NOT NULL
-        );
+        @norecompute_stats integer = 0,
+        @incremental_stats integer = 0,
+        @heap_stats integer = 0,
+        @memory_optimized_stats integer = 0,
+        @persisted_sample_stats integer = 0;
+
+    /* gh-463: single scan of #stats_to_process populates all five counters
+       (was five separate COUNT_BIG full-scans). */
+    SELECT
+        @norecompute_stats       = SUM(CASE WHEN stp.no_recompute = 1 THEN 1 ELSE 0 END),
+        @incremental_stats       = SUM(CASE WHEN stp.is_incremental = 1 THEN 1 ELSE 0 END),
+        @heap_stats              = SUM(CASE WHEN stp.is_heap = 1 THEN 1 ELSE 0 END),
+        @memory_optimized_stats  = SUM(CASE WHEN stp.is_memory_optimized = 1 THEN 1 ELSE 0 END),
+        @persisted_sample_stats  = SUM(CASE WHEN stp.persisted_sample_percent IS NOT NULL THEN 1 ELSE 0 END)
+    FROM #stats_to_process AS stp;
 
     IF @skip_discovery = 0
     BEGIN
@@ -5523,6 +5599,14 @@ OPTION (RECOMPILE);';
     /* #430: @has_heartbeat_col + bd -h9a: @has_login_time_col both probed once
        earlier at the @StatsInParallel block entry.  Declarations here would
        conflict; those probes dominate this point. */
+
+    /* gh-467: Per-table sys.partitions count cache for incremental stats.
+       Avoids recompiling + rescanning sys.partitions once per stat when
+       multiple incremental stats live on the same table. */
+    DECLARE
+        @last_partition_db sysname = N'',
+        @last_partition_object_id int = NULL,
+        @last_partition_count int = NULL;
 
     ProcessLoop:
     WHILE 1 = 1
@@ -6678,19 +6762,36 @@ OPTION (RECOMPILE);';
             P1 #26: Cross-reference with sys.partitions
             dm_db_incremental_stats_properties may miss truncated/empty partitions.
             Get physical partition count from sys.partitions as authoritative source.
-            */
-            DECLARE @physical_sql nvarchar(max) = N'
-                USE ' + QUOTENAME(@current_database) + N';
-                SELECT @count_out = COUNT(DISTINCT partition_number)
-                FROM sys.partitions
-                WHERE object_id = @obj_id
-                AND   index_id IN (0, 1)';
 
-            EXEC sys.sp_executesql
-                @physical_sql,
-                N'@obj_id int, @count_out int OUTPUT',
-                @obj_id = @current_object_id,
-                @count_out = @physical_partition_count OUTPUT;
+            gh-467: Cache physical partition count per (database, object_id).
+            Consecutive stats on the same table would otherwise recompile + rescan
+            sys.partitions once per stat.  Cache lives for the whole process loop.
+            */
+            IF  @last_partition_db COLLATE DATABASE_DEFAULT = @current_database COLLATE DATABASE_DEFAULT
+            AND @last_partition_object_id = @current_object_id
+            AND @last_partition_count IS NOT NULL
+            BEGIN
+                SET @physical_partition_count = @last_partition_count;
+            END;
+            ELSE
+            BEGIN
+                DECLARE @physical_sql nvarchar(max) = N'
+                    USE ' + QUOTENAME(@current_database) + N';
+                    SELECT @count_out = COUNT(DISTINCT partition_number)
+                    FROM sys.partitions
+                    WHERE object_id = @obj_id
+                    AND   index_id IN (0, 1)';
+
+                EXEC sys.sp_executesql
+                    @physical_sql,
+                    N'@obj_id int, @count_out int OUTPUT',
+                    @obj_id = @current_object_id,
+                    @count_out = @physical_partition_count OUTPUT;
+
+                SET @last_partition_db = @current_database;
+                SET @last_partition_object_id = @current_object_id;
+                SET @last_partition_count = @physical_partition_count;
+            END;
 
             /*
             Query dm_db_incremental_stats_properties to find partitions with modifications.
