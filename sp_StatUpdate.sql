@@ -36,11 +36,30 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.2.2.2026.04.17 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.3.0.2026.04.18 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.2.2.2026.04.17 - Internal refactors (3 issues, behavior-preserving):
+History:    3.3.0.2026.04.18 - Additive enhancements (5 issues):
+                            gh-423 @JobName input param -- optional context tag written
+                              to CONTEXT_INFO at entry and restored at exit.  Surfaced
+                              via Extended Events sessions and sys.dm_exec_requests.
+                            gh-425 @DeadWorkerTimeoutMinutes NULL coercion (floor 30s)
+                              + cross-QueueID stale-row sweep on parallel leader path.
+                              Old rows without matching sys.dm_exec_sessions entries are
+                              removed to prevent phantom worker inflation.
+                            gh-426 @WarningsCodesOut OUTPUT param -- pipe-delimited
+                              stable code tokens paired with existing @WarningsOut.
+                              Every @warnings site now also emits a code token so
+                              callers can parse warnings without string matching.
+                            gh-427 @SkipTablesWithNCCI / @SkipTablesWithCCI params --
+                              replaces the single @i_skip_tables_with_columnstore
+                              internal flag with per-type controls (type 6 NCCI,
+                              type 5 CCI).  Default: skip NCCI (Y), update CCI (N).
+                            gh-428 Parallel pre-flight validation -- AG-secondary guard
+                              and orphan-row backlog check added before queue init when
+                              @StatsInParallel = Y.
+            3.2.2.2026.04.17 - Internal refactors (3 issues, behavior-preserving):
                             gh-461 @parameters_string built unconditionally in region 07B;
                               removed duplicate construction in region 08.
                             gh-462 mop-up discovery WHERE filter extracted into
@@ -153,25 +172,29 @@ ALTER PROCEDURE
     /*
     ============================================================================
     v3 SIMPLIFIED API
-      33 input parameters (was 58 in v2) + 10 OUTPUT parameters
+      36 input parameters (was 33 in v3.2) + 11 OUTPUT parameters
       25 input parameters absorbed into preset-controlled @i_ internal variables.
       Explicit params always override preset defaults.
 
-    INPUT (33):  @Statistics, @Preset, @Databases, @Tables, @ExcludeTables,
+    INPUT (36):  @Statistics, @JobName, @Preset, @Databases, @Tables, @ExcludeTables,
                  @ExcludeStatistics, @TargetNorecompute, @StaleHours, @QueryStore,
                  @TimeLimit, @StopByTime, @BatchLimit, @SortOrder, @MopUpPass,
                  @StatisticsSample, @MaxDOP, @ModificationThreshold,
                  @LongRunningThresholdMinutes, @LongRunningSamplePercent,
                  @QueryStoreTopPlans, @QueryStoreMinExecutions, @QueryStoreRecentHours,
                  @MaxAGRedoQueueMB, @MaxAGWaitMinutes, @MinTempdbFreeMB,
-                 @MopUpMinRemainingSeconds, @LogToTable, @Execute, @WhatIfOutputTable,
+                 @MopUpMinRemainingSeconds, @SkipTablesWithNCCI, @SkipTablesWithCCI,
+                 @LogToTable, @Execute, @WhatIfOutputTable,
                  @FailFast, @Debug, @StatsInParallel, @Help
 
-    OUTPUT (10): @Version, @VersionDate, @StatsFoundOut, @StatsProcessedOut,
+    OUTPUT (11): @Version, @VersionDate, @StatsFoundOut, @StatsProcessedOut,
                  @StatsSucceededOut, @StatsFailedOut, @StatsRemainingOut,
-                 @DurationSecondsOut, @WarningsOut, @StopReasonOut
+                 @DurationSecondsOut, @WarningsOut, @WarningsCodesOut, @StopReasonOut
     ============================================================================
     */
+
+    /* CONTEXT (gh-423) */
+    @JobName sysname = NULL,                        /* optional caller tag written to CONTEXT_INFO; appears in Extended Events + sys.dm_exec_requests */
 
     /* MODE 1: DIRECT -- pass specific statistics (skips DMV discovery) */
     @Statistics sysname = NULL,                     /* 'Schema.Table.Stat' or 'Table.Stat', comma-separated */
@@ -182,6 +205,8 @@ ALTER PROCEDURE
     @Tables nvarchar(max) = NULL,                   /* NULL = all tables, or comma-separated 'Schema.Table' */
     @ExcludeTables nvarchar(max) = NULL,            /* comma-separated patterns (supports %) */
     @ExcludeStatistics nvarchar(max) = NULL,        /* comma-separated patterns (supports %) */
+    @SkipTablesWithNCCI nchar(1) = N'Y',          /* Y = skip tables with nonclustered columnstore (type 6); N = include (gh-427) */
+    @SkipTablesWithCCI nchar(1) = N'N',           /* Y = skip tables with clustered columnstore (type 5); N = include (gh-427) */
     @TargetNorecompute nvarchar(10) = N'BOTH',       /* Y = only NORECOMPUTE, N = only regular, BOTH = all */
     @StaleHours int = NULL,                         /* minimum hours since last update (replaces @DaysStaleThreshold + @HoursStaleThreshold) */
 
@@ -236,6 +261,7 @@ ALTER PROCEDURE
     @StatsRemainingOut integer = NULL OUTPUT,
     @DurationSecondsOut integer = NULL OUTPUT,
     @WarningsOut nvarchar(max) = NULL OUTPUT,
+    @WarningsCodesOut nvarchar(max) = NULL OUTPUT,  /* pipe-delimited stable warning codes, e.g. AG_REDO_ELEVATED|TEMPDB_LOW (gh-426) */
     @StopReasonOut nvarchar(50) = NULL OUTPUT
 )
 WITH RECOMPILE
@@ -249,8 +275,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.2.2.2026.04.17',
-        @procedure_version_date datetime = '20260417',
+        @procedure_version varchar(20) = '3.3.0.2026.04.18',
+        @procedure_version_date datetime = '20260418',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -348,7 +374,10 @@ BEGIN
         FROM (VALUES
             (N'QUICK START',   N'Use @Preset for a pre-tuned config.  Override individual params as needed.  @Execute=N for dry run.'),
             (N'PRESETS',       N'DEFAULT=balanced, NIGHTLY=1h+QS+mop-up, WEEKLY_FULL=4h+FULLSCAN, OLTP_LIGHT=30m+high-thresh, WAREHOUSE=unlimited+FULLSCAN.'),
-            (N'PARALLEL',      N'@StatsInParallel=Y. Requires dbo.Queue + dbo.QueueStatistic (auto-created). Run same EXEC from multiple Agent steps.'),
+            (N'CONTEXT_INFO',  N'@JobName=NMyJobName sets CONTEXT_INFO on entry, restored on exit.  Visible in XE sessions, dm_exec_requests, and any session-level monitoring.'),
+            (N'COLUMNSTORE',   N'@SkipTablesWithNCCI=Y (default) skips tables with nonclustered columnstore (plan stability).  @SkipTablesWithCCI=N (default) updates CCI tables.'),
+            (N'WARNINGS',      N'@WarningsCodesOut returns pipe-delimited codes (e.g. AG_REDO_ELEVATED|TEMPDB_LOW) for programmatic parsing.  @WarningsOut is human-readable.'),
+            (N'PARALLEL',      N'@StatsInParallel=Y. Requires dbo.Queue + dbo.QueueStatistic (auto-created). Run same EXEC from multiple Agent steps. AG-secondary guard and orphan-row sweep run at startup.'),
             (N'QUERY STORE',   N'@QueryStore=CPU/DURATION/READS/etc. to prioritize stats on high-workload tables.  OFF to disable.'),
             (N'MOP-UP',        N'@MopUpPass=Y: after priority pass, sweep any stat with modification_counter>0.  Needs @TimeLimit + @LogToTable=Y.'),
             (N'DIRECT MODE',   N'@Statistics=''Schema.Table.Stat'' for ad-hoc updates. Skips discovery.  Comma-separate for multiple.'),
@@ -485,6 +514,25 @@ BEGIN
         @@LOCK_TIMEOUT returns -1 for infinite wait, or timeout in milliseconds
         */
         @original_lock_timeout integer = @@LOCK_TIMEOUT;
+
+    /*
+    gh-423: CONTEXT_INFO instrumentation.
+    Save caller's CONTEXT_INFO on entry, set structured value, restore on exit.
+    Makes sp_StatUpdate sessions identifiable in Extended Events and dm_exec_requests.
+    */
+    DECLARE
+        @original_context_info varbinary(128) = CONTEXT_INFO(),
+        @context_info_bin varbinary(128) = NULL,
+        @context_info_set bit = 0;
+
+    /* Build context string: sp_StatUpdate|DB:<name>|Job:<caller>|Preset:<preset> */
+    DECLARE @new_context_str nvarchar(128) =
+        N'sp_StatUpdate|DB:' + DB_NAME()
+        + N'|Job:' + ISNULL(@JobName, N'manual')
+        + N'|Preset:' + ISNULL(@Preset, N'DEFAULT');
+    SET @context_info_bin = CONVERT(varbinary(128), LEFT(@new_context_str, 128));
+    SET CONTEXT_INFO @context_info_bin;
+    SET @context_info_set = 1;
 
     /*
     SQL Server version detection
@@ -1204,6 +1252,7 @@ BEGIN
             SET @is_ag_secondary_server = 1;
             RAISERROR(N'WARNING: This server is an AG readable secondary for all availability groups. UPDATE STATISTICS will fail for AG databases.', 10, 1) WITH NOWAIT;
             SET @WarningsOut = ISNULL(@WarningsOut, N'') + N'AG_SECONDARY_SERVER: All local AGs are secondary replicas; ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'AG_SECONDARY_SERVER';
         END;
     END;
 
@@ -1223,6 +1272,7 @@ BEGIN
                 RAISERROR(N'WARNING: Running in Azure elastic pool [%s]. Statistics maintenance consumes', 10, 1, @elastic_pool_name) WITH NOWAIT;
                 RAISERROR(N'  shared pool DTU/vCore -- other databases in the pool may be impacted.', 10, 1) WITH NOWAIT;
                 SET @warnings += N'ELASTIC_POOL: ' + @elastic_pool_name + N'; ';
+            SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'ELASTIC_POOL';
             END;
         END TRY
         BEGIN CATCH
@@ -1252,6 +1302,7 @@ BEGIN
                 @rcsi_db_count, @version_store_mb) WITH NOWAIT;
             RAISERROR(N'  FULLSCAN statistics updates may spike version store usage in tempdb.', 10, 1) WITH NOWAIT;
             SET @warnings += N'RCSI_VERSION_STORE: ' + CONVERT(nvarchar(20), @version_store_mb) + N' MB in use; ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'RCSI_VERSION_STORE';
         END;
     END;
 
@@ -1287,6 +1338,9 @@ BEGIN
         @i_include_system_objects nvarchar(1) = N'N',
         @i_include_indexed_views nvarchar(1) = N'N',
         @i_skip_tables_with_columnstore nchar(1) = N'N',
+        /* gh-427: per-type columnstore skip flags (take precedence over the legacy combined flag) */
+        @i_skip_ncci nchar(1) = N'Y',  /* Y = skip nonclustered columnstore (type 6) -- plan stability */
+        @i_skip_cci nchar(1) = N'N',   /* N = include clustered columnstore (type 5) -- prevent drift */
         @i_filtered_stats_mode nvarchar(10) = N'INCLUDE',
         @i_filtered_stats_stale_factor float = 2.0,
         @i_long_running_threshold_min int = NULL,
@@ -1382,6 +1436,36 @@ BEGIN
     IF @MinTempdbFreeMB IS NOT NULL SET @i_min_tempdb_free_mb = @MinTempdbFreeMB;
     IF @MopUpMinRemainingSeconds IS NOT NULL SET @i_mop_up_min_remaining = @MopUpMinRemainingSeconds;
 
+    /* gh-427: Wire new public columnstore params to internal vars.
+       Public params default to Y/N which maps to the original behavior (skip NCCI, update CCI).
+       @i_skip_tables_with_columnstore=Y also sets both when caller uses the legacy preset path. */
+    SET @i_skip_ncci = @SkipTablesWithNCCI;
+    SET @i_skip_cci  = @SkipTablesWithCCI;
+    /* Legacy compatibility: if @i_skip_tables_with_columnstore was set to Y by a preset,
+       propagate to both new flags only when caller did not explicitly set either new param.
+       In v3 the internal default is N so this path is only reached by future presets. */
+    IF @i_skip_tables_with_columnstore = N'Y'
+    AND @SkipTablesWithNCCI = N'Y' /* default unchanged */
+    AND @SkipTablesWithCCI = N'N'  /* default unchanged */
+    BEGIN
+        SET @i_skip_ncci = N'Y';
+        SET @i_skip_cci  = N'Y';
+    END;
+
+
+
+    /* gh-425 Part A: @i_dead_worker_timeout_min NULL safety floor.
+       Default is 15 (see @i_ declarations above).  If a preset or future
+       override sets it to NULL, dead-worker detection is disabled entirely,
+       which can stall parallel queues indefinitely.  Coerce to 30 min and warn. */
+    IF @i_dead_worker_timeout_min IS NULL AND @StatsInParallel = N'Y'
+    BEGIN
+        SET @i_dead_worker_timeout_min = 30;
+        SET @WarningsOut = ISNULL(@WarningsOut, N'') + N'DEAD_WORKER_TIMEOUT_NULL_COERCED: coerced to 30 min; ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'DEAD_WORKER_TIMEOUT_NULL_COERCED';
+        RAISERROR(N'Note: @i_dead_worker_timeout_min was NULL -- coerced to 30 minutes (gh-425).', 10, 1) WITH NOWAIT;
+    END;
+
     /*#endregion 03D-PRESETS */
     /*#region 03E-VALIDATION: Y/N checks, enum validation, cross-param checks, error aggregation */
     /*
@@ -1407,6 +1491,7 @@ BEGIN
     BEGIN
         SET @Statistics = NULL;
         SET @WarningsOut = ISNULL(@WarningsOut, N'') + N'EMPTY_STRING_PARAM: @Statistics='''' treated as NULL; ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'EMPTY_STRING_PARAM';
     END;
     IF @Tables IS NOT NULL AND LEN(LTRIM(RTRIM(@Tables))) = 0
         SET @Tables = NULL;
@@ -1421,7 +1506,9 @@ BEGIN
         (N'@Execute', @Execute),
         (N'@LogToTable', @LogToTable),
         (N'@StatsInParallel', @StatsInParallel),
-        (N'@MopUpPass (internal)', @i_mop_up_pass);
+        (N'@MopUpPass (internal)', @i_mop_up_pass),
+        (N'@SkipTablesWithNCCI', @SkipTablesWithNCCI),
+        (N'@SkipTablesWithCCI', @SkipTablesWithCCI);
 
     INSERT INTO @errors (error_message, error_severity)
     SELECT N'The value for ' + c.param_name + N' is not supported.  Use Y or N.', 16
@@ -2053,12 +2140,14 @@ BEGIN
             RAISERROR(N'  Note: Azure SQL DB -- DTU/vCore impact, no Resource Governor, no incremental stats.', 10, 1) WITH NOWAIT;
             RAISERROR(N'  Consider running during off-peak hours or scaling up temporarily.', 10, 1) WITH NOWAIT;
             SET @warnings += N'AZURE_SQL_DB: DTU/vCore impact, limited feature set; ';
+            SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'AZURE_SQL_DB';
         END
         ELSE IF @engine_edition = 8
         BEGIN
             RAISERROR(N'  Note: Azure SQL MI -- most on-prem features supported (incremental stats, RG, etc.).', 10, 1) WITH NOWAIT;
             RAISERROR(N'  vCore consumption still applies during maintenance windows.', 10, 1) WITH NOWAIT;
             SET @warnings += N'AZURE_SQL_MI: vCore impact during maintenance; ';
+            SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'AZURE_SQL_MI';
         END;
     END;
 
@@ -2093,6 +2182,7 @@ BEGIN
         RAISERROR(N'  @Statistics, @ExcludeStatistics uses COLLATE DATABASE_DEFAULT. Ensure filter', 10, 1) WITH NOWAIT;
         RAISERROR(N'  values match the exact case of database object names.', 10, 1) WITH NOWAIT;
         SET @warnings += N'CASE_SENSITIVE_COLLATION: ' + @server_collation + N'; ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'CASE_SENSITIVE_COLLATION';
     END;
 
     RAISERROR(N'Procedure:   %s', 10, 1, @procedure_version) WITH NOWAIT;
@@ -2300,6 +2390,7 @@ BEGIN
 
     IF @hw_uptime_hours < 24
         SET @warnings += N'LOW_UPTIME: SQL Server restarted < 24h ago; ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'LOW_UPTIME';
 
     DECLARE @active_backups int = 0;
     SELECT @active_backups = COUNT(*)
@@ -2308,6 +2399,7 @@ BEGIN
 
     IF @active_backups > 0
         SET @warnings += N'BACKUP_RUNNING: ' + CONVERT(nvarchar(10), @active_backups) + N' backup(s) active; ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'BACKUP_RUNNING';
 
     /* #184: Peak hours plan cache warning -- UPDATE STATISTICS clears plan cache entries
        for affected tables, which can cause recompilations during peak load. */
@@ -2317,6 +2409,7 @@ BEGIN
         RAISERROR(N'WARNING: Running during business hours (%d:00). UPDATE STATISTICS clears plan cache', 10, 1, @current_hour) WITH NOWAIT;
         RAISERROR(N'  entries for affected tables -- expect query recompilations. Consider scheduling off-peak.', 10, 1) WITH NOWAIT;
         SET @warnings += N'PEAK_HOURS: running at ' + CONVERT(nvarchar(5), @current_hour) + N':00 (plan cache impact); ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'PEAK_HOURS';
     END;
 
     /*
@@ -2356,6 +2449,7 @@ BEGIN
         SET @warnings += N'CONTAINER_MEMORY: OOMKill risk -- host RAM '
             + CONVERT(nvarchar(20), @host_ram_gb) + N' GB, process RSS '
             + CONVERT(nvarchar(20), @process_rss_mb) + N' MB; configure max server memory from cgroup limit; ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'CONTAINER_MEMORY';
     END;
 
     /* #251: Advisory -- suggest index on CommandLog.StartTime when retention window is large */
@@ -2576,6 +2670,9 @@ BEGIN
                     @i_include_system_objects AS IncludeSystemObjects,
                     @i_include_indexed_views AS IncludeIndexedViews,
                     @i_skip_tables_with_columnstore AS SkipTablesWithColumnstore,
+                    @i_skip_ncci AS SkipNCCI,
+                    @i_skip_cci AS SkipCCI,
+                    @JobName AS JobName,
                     @i_ascending_key_boost AS AscendingKeyBoost,
 
                     /* Thresholds */
@@ -3089,6 +3186,7 @@ OPTION (RECOMPILE);';
                 RAISERROR(@ds_skip_msg, 10, 1) WITH NOWAIT;
                 /* #204: Add per-database skip to @WarningsOut */
                 SET @warnings += N'DB_SKIPPED: ' + @CurrentDatabaseName + N'; ';
+                SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'DB_SKIPPED';
             END CATCH;
 
             UPDATE @tmpDatabases
@@ -3146,6 +3244,8 @@ OPTION (RECOMPILE);';
                 N',@i_ascending_key_boost=' + ISNULL(LTRIM(RTRIM(@i_ascending_key_boost)), N'') +
                 N',@i_filtered_stats_stale_factor=' + ISNULL(CONVERT(nvarchar(20), @i_filtered_stats_stale_factor), N'') +
                 N',@i_skip_tables_with_columnstore=' + ISNULL(LTRIM(RTRIM(@i_skip_tables_with_columnstore)), N'') +
+                N',@i_skip_ncci=' + ISNULL(LTRIM(RTRIM(@i_skip_ncci)), N'') +
+                N',@i_skip_cci=' + ISNULL(LTRIM(RTRIM(@i_skip_cci)), N'') +
                 N',@i_include_indexed_views=' + ISNULL(LTRIM(RTRIM(@i_include_indexed_views)), N'') +
                 N',@i_qs_metric=' + ISNULL(LTRIM(RTRIM(@i_qs_metric)), N'') +
                 N',@i_qs_min_executions=' + ISNULL(CONVERT(nvarchar(20), @i_qs_min_executions), N'') +
@@ -3540,17 +3640,31 @@ OPTION (RECOMPILE);';
                        OR (@i_filtered_stats_mode_param = N''EXCLUDE'' AND s.has_filter = 0)
                        OR (@i_filtered_stats_mode_param = N''ONLY'' AND s.has_filter = 1)
                       )
-                /* v2.3: Skip tables with columnstore indexes when @i_skip_tables_with_columnstore = Y */
-                /* Columnstore indexes (type 5=nonclustered columnstore, 6=clustered columnstore) */
-                /* may have plan stability concerns when rowstore stats are updated alongside NCCIs */
+                /* gh-427: Per-type columnstore skip (NCCI=type 6, CCI=type 5).
+                   @i_skip_ncci_param=Y skips tables with nonclustered columnstore (plan stability).
+                   @i_skip_cci_param=Y skips tables with clustered columnstore (prevents stat drift).
+                   Old @i_skip_tables_with_columnstore_param retained for backward compat; when it is Y
+                   and both new params are N, emulates the previous combined skip. */
                 AND   (
-                          @i_skip_tables_with_columnstore_param = N''N''
+                          /* NCCI check */
+                          @i_skip_ncci_param = N''N''
                        OR NOT EXISTS
                           (
                               SELECT 1
                               FROM sys.indexes AS ci
                               WHERE ci.object_id = s.object_id
-                              AND   ci.type IN (5, 6) /* 5 = nonclustered columnstore, 6 = clustered columnstore */
+                              AND   ci.type = 6 /* nonclustered columnstore */
+                          )
+                      )
+                AND   (
+                          /* CCI check */
+                          @i_skip_cci_param = N''N''
+                       OR NOT EXISTS
+                          (
+                              SELECT 1
+                              FROM sys.indexes AS ci
+                              WHERE ci.object_id = s.object_id
+                              AND   ci.type = 5 /* clustered columnstore */
                           )
                       );
 
@@ -4337,6 +4451,8 @@ OPTION (RECOMPILE);';
                       @i_qs_min_executions_param bigint,
                       @i_qs_recent_hours_param integer,
                       @i_skip_tables_with_columnstore_param nchar(1),
+                      @i_skip_ncci_param nchar(1),    /* gh-427: skip NCCI tables */
+                      @i_skip_cci_param nchar(1),     /* gh-427: skip CCI tables */
                       @i_include_indexed_views_param nvarchar(1),
                       @i_ascending_key_boost_param nvarchar(1),
                       @i_qs_top_plans_param integer,
@@ -4359,6 +4475,8 @@ OPTION (RECOMPILE);';
                     @i_qs_min_executions_param = @i_qs_min_executions,
                     @i_qs_recent_hours_param = @i_qs_recent_hours,
                     @i_skip_tables_with_columnstore_param = @i_skip_tables_with_columnstore,
+                    @i_skip_ncci_param = @i_skip_ncci,
+                    @i_skip_cci_param = @i_skip_cci,
                     @i_include_indexed_views_param = @i_include_indexed_views,
                     @i_ascending_key_boost_param = @i_ascending_key_boost,
                     @i_qs_top_plans_param = @i_qs_top_plans,
@@ -4410,11 +4528,13 @@ OPTION (RECOMPILE);';
                             + N' table(s) with Row-Level Security -- histogram quality may vary by execution context';
                         RAISERROR(@rls_msg, 10, 1) WITH NOWAIT;
                         SET @warnings += N'RLS_DETECTED: ' + @CurrentDatabaseName + N'(' + CONVERT(nvarchar(10), @rls_table_count) + N' tables); ';
+                        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'RLS_DETECTED';
                     END;
                 END TRY
                 BEGIN CATCH
                     /* gh-468: surface rather than swallow (was: empty CATCH) */
                     SET @warnings += N'RLS_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'RLS_CHECK_FAILED';
                     IF @Debug = 1 RAISERROR(N'    RLS check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
                 END CATCH;
             END;
@@ -4451,6 +4571,7 @@ OPTION (RECOMPILE);';
                 BEGIN CATCH
                     /* gh-468: surface rather than swallow */
                     SET @warnings += N'WIDESTAT_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'WIDESTAT_CHECK_FAILED';
                     IF @Debug = 1 RAISERROR(N'    Wide-stats check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
                 END CATCH;
             END;
@@ -4483,11 +4604,13 @@ OPTION (RECOMPILE);';
                             + N' stat(s) with stale filter_definition (differs from index filter)';
                         RAISERROR(@filter_msg, 10, 1) WITH NOWAIT;
                         SET @warnings += N'FILTER_MISMATCH: ' + @CurrentDatabaseName + N'(' + CONVERT(nvarchar(10), @filter_mismatch_count) + N'); ';
+                        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'FILTER_MISMATCH';
                     END;
                 END TRY
                 BEGIN CATCH
                     /* gh-468: surface rather than swallow */
                     SET @warnings += N'FILTER_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'FILTER_CHECK_FAILED';
                     IF @Debug = 1 RAISERROR(N'    Filter-mismatch check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
                 END CATCH;
             END;
@@ -4515,11 +4638,13 @@ OPTION (RECOMPILE);';
                             + N' table(s) with columnstore indexes -- modification_counter may underreport after bulk loads';
                         RAISERROR(@cs_msg, 10, 1) WITH NOWAIT;
                         SET @warnings += N'COLUMNSTORE_TABLES: ' + CONVERT(nvarchar(10), @cs_table_count) + N' table(s) with columnstore indexes; ';
+                        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'COLUMNSTORE_TABLES';
                     END;
                 END TRY
                 BEGIN CATCH
                     /* gh-468: surface rather than swallow */
                     SET @warnings += N'COLUMNSTORE_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'COLUMNSTORE_CHECK_FAILED';
                     IF @Debug = 1 RAISERROR(N'    Columnstore check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
                 END CATCH;
             END;
@@ -4550,6 +4675,7 @@ OPTION (RECOMPILE);';
                 BEGIN CATCH
                     /* gh-468: surface rather than swallow */
                     SET @warnings += N'COMPRESSED_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'COMPRESSED_CHECK_FAILED';
                     IF @Debug = 1 RAISERROR(N'    Compressed-tables check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
                 END CATCH;
             END;
@@ -4581,6 +4707,7 @@ OPTION (RECOMPILE);';
                 BEGIN CATCH
                     /* gh-468: surface rather than swallow */
                     SET @warnings += N'COMPUTEDCOL_CHECK_FAILED: ' + @CurrentDatabaseName + N' (' + ISNULL(ERROR_MESSAGE(), N'unknown') + N'); ';
+                    SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'COMPUTEDCOL_CHECK_FAILED';
                     IF @Debug = 1 RAISERROR(N'    Computed-columns check skipped: %s', 10, 1, @CurrentDatabaseName) WITH NOWAIT;
                 END CATCH;
             END;
@@ -4595,6 +4722,7 @@ OPTION (RECOMPILE);';
                 RAISERROR(@db_skip_msg, 10, 1) WITH NOWAIT;
                 /* #204: Add per-database skip to @WarningsOut */
                 SET @warnings += N'DB_SKIPPED: ' + @CurrentDatabaseName + N'; ';
+                SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'DB_SKIPPED';
             END CATCH;
 
             /*
@@ -4870,6 +4998,7 @@ OPTION (RECOMPILE);';
     BEGIN
         RAISERROR(N'  - CDC-tracked:      %d (FULLSCAN may delay CDC capture job)', 10, 1, @cdc_stats) WITH NOWAIT;
         SET @warnings += N'CDC_TABLES: ' + CONVERT(nvarchar(10), @cdc_stats) + N' stats on CDC-tracked tables; ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'CDC_TABLES';
     END;
 
     /* #192: Warn when replicated tables are a majority of candidates */
@@ -4883,6 +5012,7 @@ OPTION (RECOMPILE);';
             RAISERROR(N'  WARNING: >50%% of candidates are on replicated tables. Statistics updates', 10, 1) WITH NOWAIT;
             RAISERROR(N'  generate log records that replicate to subscribers -- monitor replication lag.', 10, 1) WITH NOWAIT;
             SET @warnings += N'REPLICATION_MAJORITY: ' + CONVERT(nvarchar(10), @repl_pct) + N'%% of stats on replicated tables; ';
+            SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'REPLICATION_MAJORITY';
         END;
     END;
 
@@ -4921,6 +5051,7 @@ OPTION (RECOMPILE);';
                 @StatsRemainingOut = 0,
                 @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
                 @WarningsOut = NULLIF(@warnings, N''),
+                @WarningsCodesOut = NULLIF(@WarningsCodesOut, N''),
                 @StopReasonOut = N'NO_QUALIFYING_STATS';
 
             /*
@@ -4948,7 +5079,84 @@ OPTION (RECOMPILE);';
             RETURN 0;
         END;
     END;
-    /*
+    /* gh-428: Parallel pre-flight validation.
+       Runs before queue init when @StatsInParallel = Y.
+       Checks (1) AG-secondary guard, (2) orphan row backlog. */
+    IF @StatsInParallel = N'Y'
+    BEGIN
+
+        /* gh-428 Check 1: Block if this server is an AG secondary for all groups.
+           The per-DB check in region 04-DB-PARSE already excludes individual
+           secondary databases.  This guard catches the edge case where all
+           selected databases belong to AGs where this instance is SECONDARY. */
+        IF @is_ag_secondary_server = 1
+        BEGIN
+            RAISERROR(N'ERROR: @StatsInParallel=Y blocked -- all AG databases are on secondary replicas.  Parallel mode requires primary access.', 16, 1) WITH NOWAIT;
+            SET @StopReasonOut = N'AG_SECONDARY';
+            SET @StatsFoundOut = 0;
+            SET @StatsProcessedOut = 0;
+            SET @StatsSucceededOut = 0;
+            SET @StatsFailedOut = 0;
+            SET @StatsRemainingOut = 0;
+            SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
+            SELECT
+                Status = N'ERROR',
+                StatusMessage = N'Parallel mode blocked: AG secondary replica.',
+                StatsFound = 0, StatsProcessed = 0, StatsSucceeded = 0, StatsFailed = 0,
+                StatsToctou = 0, StatsSkipped = 0, StatsRemaining = 0,
+                DatabasesProcessed = @database_count,
+                DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
+                StopReason = N'AG_SECONDARY', RunLabel = @run_label,
+                Version = @procedure_version;
+            IF @StatsInParallel = N'N'
+                DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
+            /* gh-423: restore CONTEXT_INFO on early exit.
+               SET CONTEXT_INFO rejects NULL -- coerce to 0x when caller had no context set. */
+            IF @context_info_set = 1
+            BEGIN
+                IF @original_context_info IS NULL
+                    SET CONTEXT_INFO 0x;
+                ELSE
+                    SET CONTEXT_INFO @original_context_info;
+            END;
+            RETURN 1;
+        END;
+
+        /* gh-428 Check 2: Orphan row backlog warning.
+           A large number of QueueStatistic rows stuck in started-but-never-finished
+           state indicates a prior parallel run was killed without cleanup.
+           Warn the operator -- the gh-425 stale-sweep on the leader path will
+           remove rows older than 24h, but a recent kill may leave recent orphans. */
+        IF OBJECT_ID(N'dbo.QueueStatistic', N'U') IS NOT NULL
+        BEGIN
+            DECLARE @orphan_qs_count int = 0;
+            SELECT @orphan_qs_count = COUNT_BIG(*)
+            FROM dbo.QueueStatistic AS qs
+            WHERE qs.TableStartTime < DATEADD(HOUR, -24, SYSDATETIME())
+            AND   NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM sys.dm_exec_sessions AS ses
+                      WHERE ses.session_id = qs.SessionID
+                      AND   (qs.ClaimLoginTime IS NULL OR ses.login_time = qs.ClaimLoginTime)
+                  );
+
+            IF @orphan_qs_count > 100
+            BEGIN
+                DECLARE @orphan_warn nvarchar(500);
+                SET @orphan_warn =
+                    N'WARNING: ' + CONVERT(nvarchar(10), @orphan_qs_count)
+                    + N' orphan QueueStatistic row(s) detected (started >24h ago, session gone). '
+                    + N' The leader will sweep these on queue claim. (gh-428)';
+                RAISERROR(@orphan_warn, 10, 1) WITH NOWAIT;
+                SET @WarningsOut = ISNULL(@WarningsOut, N'') + N'PARALLEL_ORPHAN_BACKLOG: '
+                    + CONVERT(nvarchar(10), @orphan_qs_count) + N' orphan row(s); ';
+                SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'PARALLEL_ORPHAN_BACKLOG';
+            END;
+        END;
+    END; /* gh-428 pre-flight */
+
+        /*
     ============================================================================
     PARALLEL MODE: QUEUE INITIALIZATION
     ============================================================================
@@ -5255,7 +5463,34 @@ OPTION (RECOMPILE);';
                 */
                 RAISERROR(N'  Claimed queue leadership - populating work items...', 10, 1) WITH NOWAIT;
 
-                /*
+                /* gh-425 Part B: Cross-QueueID stale row sweep.
+                   Rows from past runs of any QueueID where the claiming session
+                   no longer exists in sys.dm_exec_sessions are dead weight and
+                   prevent accurate active-worker counts.  Sweep them now that
+                   we hold queue leadership. */
+                DECLARE @stale_queue_sweep_count int = 0;
+                DELETE qs
+                FROM dbo.QueueStatistic AS qs
+                WHERE qs.TableStartTime < DATEADD(HOUR, -24, SYSDATETIME())
+                AND   NOT EXISTS
+                      (
+                          SELECT 1
+                          FROM sys.dm_exec_sessions AS ses
+                          WHERE ses.session_id = qs.SessionID
+                          AND   (qs.ClaimLoginTime IS NULL OR ses.login_time = qs.ClaimLoginTime)
+                      );
+                SET @stale_queue_sweep_count = @@ROWCOUNT;
+                IF @stale_queue_sweep_count > 0
+                BEGIN
+                    DECLARE @sweep_msg nvarchar(200);
+                    SET @sweep_msg = N'  gh-425: Removed ' + CONVERT(nvarchar(10), @stale_queue_sweep_count)
+                        + N' stale QueueStatistic row(s) from orphaned prior runs.';
+                    RAISERROR(@sweep_msg, 10, 1) WITH NOWAIT;
+                    SET @warnings += N'STALE_QUEUE_SWEEP: ' + CONVERT(nvarchar(10), @stale_queue_sweep_count) + N' row(s) removed; ';
+                    SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'STALE_QUEUE_SWEEP';
+                END;
+
+                                /*
                 Clear any stale entries from previous (failed/killed) runs
                 */
                 DELETE FROM
@@ -5475,6 +5710,7 @@ OPTION (RECOMPILE);';
                 /* Backup started after our run began */
                 RAISERROR(N'  Note: %d backup(s) now running (started after sp_StatUpdate). I/O contention possible.', 10, 1, @mid_run_backups) WITH NOWAIT;
                 SET @warnings += N'BACKUP_STARTED_MID_RUN: ' + CONVERT(nvarchar(10), @mid_run_backups) + N' backup(s); ';
+                SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'BACKUP_STARTED_MID_RUN';
             END;
         END;
 
@@ -5668,6 +5904,7 @@ OPTION (RECOMPILE);';
                         RAISERROR(@log_msg, 10, 1) WITH NOWAIT;
                         SET @warnings += N'LOG_SPACE_HIGH: ' + @log_check_db + N'('
                             + CONVERT(nvarchar(10), CONVERT(int, @log_used_pct)) + N'%); ';
+                        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'LOG_SPACE_HIGH';
 
                         /* @FailFast integration: abort when log pressure is critical */
                         IF @FailFast = 1
@@ -6000,16 +6237,16 @@ OPTION (RECOMPILE);';
                                   AND   ri.index_id IN (0, 1)
                                   AND   rfg.is_read_only = 1
                               )
-                        /* v2.27: Skip tables with columnstore indexes (defense-in-depth) */
+                        /* gh-427: Per-type columnstore skip for lazy mop-up discovery */
                         AND   (
-                                  @i_skip_tables_with_columnstore_param = N''N''
+                                  @i_skip_ncci_param = N''N''
                                OR NOT EXISTS
-                                  (
-                                      SELECT 1
-                                      FROM sys.indexes AS ci
-                                      WHERE ci.object_id = s.object_id
-                                      AND   ci.type IN (5, 6)
-                                  )
+                                  (SELECT 1 FROM sys.indexes AS ci WHERE ci.object_id = s.object_id AND ci.type = 6)
+                              )
+                        AND   (
+                                  @i_skip_cci_param = N''N''
+                               OR NOT EXISTS
+                                  (SELECT 1 FROM sys.indexes AS ci WHERE ci.object_id = s.object_id AND ci.type = 5)
                               )
                         /* v2.27: Minimum page count filter (defense-in-depth) */
                         AND   (@i_min_page_count_param IS NULL OR ISNULL(pgs.total_pages, 0) >= @i_min_page_count_param)
@@ -6042,7 +6279,7 @@ OPTION (RECOMPILE);';
                             )
                             EXECUTE sys.sp_executesql
                                 @lazy_mop_sql,
-                                N'@object_id_param int, @i_include_system_objects_param nvarchar(1), @i_include_indexed_views_param nvarchar(1), @TargetNorecompute_param nvarchar(10), @Tables_param nvarchar(max), @ExcludeTables_param nvarchar(max), @ExcludeStatistics_param nvarchar(max), @i_filtered_stats_mode_param nvarchar(10), @i_skip_tables_with_columnstore_param nchar(1), @i_min_page_count_param bigint, @start_time_param datetime2(7)',
+                                N'@object_id_param int, @i_include_system_objects_param nvarchar(1), @i_include_indexed_views_param nvarchar(1), @TargetNorecompute_param nvarchar(10), @Tables_param nvarchar(max), @ExcludeTables_param nvarchar(max), @ExcludeStatistics_param nvarchar(max), @i_filtered_stats_mode_param nvarchar(10), @i_skip_tables_with_columnstore_param nchar(1), @i_skip_ncci_param nchar(1), @i_skip_cci_param nchar(1), @i_min_page_count_param bigint, @start_time_param datetime2(7)',
                                 @object_id_param = @claimed_table_object_id,
                                 @i_include_system_objects_param = @i_include_system_objects,
                                 @i_include_indexed_views_param = @i_include_indexed_views,
@@ -6052,6 +6289,8 @@ OPTION (RECOMPILE);';
                                 @ExcludeStatistics_param = @ExcludeStatistics,
                                 @i_filtered_stats_mode_param = @i_filtered_stats_mode,
                                 @i_skip_tables_with_columnstore_param = @i_skip_tables_with_columnstore,
+                                @i_skip_ncci_param = @i_skip_ncci,
+                                @i_skip_cci_param = @i_skip_cci,
                                 @i_min_page_count_param = @i_min_page_count,
                                 @start_time_param = @start_time;
 
@@ -6533,6 +6772,7 @@ OPTION (RECOMPILE);';
             RAISERROR(@p246_msg, 10, 1) WITH NOWAIT;
             SET @warnings += N'PERSIST_SAMPLE_INADEQUATE: [' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name
                 + N'] persisted ' + CONVERT(nvarchar(10), @p246_pct) + N'% yields ' + CONVERT(nvarchar(20), @absolute_sampled_rows) + N' rows; ';
+            SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'PERSIST_SAMPLE_INADEQUATE';
         END;
 
         /*
@@ -7453,6 +7693,7 @@ OPTION (RECOMPILE);';
                     RAISERROR(N'  Run DBCC CHECKDB on database [%s] to assess corruption extent.', 10, 1, @current_database) WITH NOWAIT;
                     SELECT @stop_reason = N'IO_CORRUPTION';
                     SET @warnings = @warnings + N'IO_CORRUPTION: Error ' + CONVERT(nvarchar(10), @current_error_number) + N' on [' + @current_database + N']; ';
+                    SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'IO_CORRUPTION';
                     BREAK;
                 END;
 
@@ -7682,16 +7923,14 @@ OPTION (RECOMPILE);';
                        OR (@i_filtered_stats_mode_param = N''''EXCLUDE'''' AND s.has_filter = 0)
                        OR (@i_filtered_stats_mode_param = N''''ONLY'''' AND s.has_filter = 1)
                       )
-                /* v2.27: Skip tables with columnstore indexes */
+                /* gh-427: Per-type columnstore skip (NCCI=6, CCI=5) */
                 AND   (
-                          @i_skip_tables_with_columnstore_param = N''''N''''
-                       OR NOT EXISTS
-                          (
-                              SELECT 1
-                              FROM sys.indexes AS ci
-                              WHERE ci.object_id = s.object_id
-                              AND   ci.type IN (5, 6)
-                          )
+                          @i_skip_ncci_param = N''''N''''
+                       OR NOT EXISTS (SELECT 1 FROM sys.indexes AS ci WHERE ci.object_id = s.object_id AND ci.type = 6)
+                      )
+                AND   (
+                          @i_skip_cci_param = N''''N''''
+                       OR NOT EXISTS (SELECT 1 FROM sys.indexes AS ci WHERE ci.object_id = s.object_id AND ci.type = 5)
                       )
                 /* v2.27: Minimum page count filter */
                 AND   (@i_min_page_count_param IS NULL OR ISNULL(pgs.total_pages, 0) >= @i_min_page_count_param)
@@ -7905,6 +8144,8 @@ OPTION (RECOMPILE);';
                         @ExcludeStatistics_param nvarchar(max),
                         @i_filtered_stats_mode_param nvarchar(10),
                         @i_skip_tables_with_columnstore_param nchar(1),
+                        @i_skip_ncci_param nchar(1),
+                        @i_skip_cci_param nchar(1),
                         @i_min_page_count_param bigint,
                         @start_time_param datetime2(7)';
 
@@ -7937,6 +8178,8 @@ OPTION (RECOMPILE);';
                             @ExcludeStatistics_param = @ExcludeStatistics,
                             @i_filtered_stats_mode_param = @i_filtered_stats_mode,
                             @i_skip_tables_with_columnstore_param = @i_skip_tables_with_columnstore,
+                            @i_skip_ncci_param = @i_skip_ncci,
+                            @i_skip_cci_param = @i_skip_cci,
                             @i_min_page_count_param = @i_min_page_count,
                             @start_time_param = @start_time;
                     END TRY
@@ -8215,6 +8458,8 @@ OPTION (RECOMPILE);';
                     @ExcludeStatistics_param nvarchar(max),
                     @i_filtered_stats_mode_param nvarchar(10),
                     @i_skip_tables_with_columnstore_param nchar(1),
+                    @i_skip_ncci_param nchar(1),
+                    @i_skip_cci_param nchar(1),
                     @i_min_page_count_param bigint,
                     @start_time_param datetime2(7)';
 
@@ -8247,6 +8492,8 @@ OPTION (RECOMPILE);';
                         @ExcludeStatistics_param = @ExcludeStatistics,
                         @i_filtered_stats_mode_param = @i_filtered_stats_mode,
                         @i_skip_tables_with_columnstore_param = @i_skip_tables_with_columnstore,
+                        @i_skip_ncci_param = @i_skip_ncci,
+                        @i_skip_cci_param = @i_skip_cci,
                         @i_min_page_count_param = @i_min_page_count,
                         @start_time_param = @start_time;
                 END TRY
@@ -8383,6 +8630,7 @@ OPTION (RECOMPILE);';
                 + N'Consider setting @i_max_seconds_per_stat to guard against large-table overshoot. (#333)';
             RAISERROR(@p333_msg, 10, 1) WITH NOWAIT;
             SET @warnings += N'STOPBYTIME_OVERSHOOT: ' + CONVERT(nvarchar(10), @p333_overshoot_sec) + N's past ' + @StopByTime + N'; ';
+            SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'STOPBYTIME_OVERSHOOT';
         END;
     END;
 
@@ -8519,6 +8767,7 @@ OPTION (RECOMPILE);';
                 + CONVERT(nvarchar(10), @qs_forced_total)
                 + N' forced plan(s) on updated tables -- verify plan quality: '
                 + RTRIM(@qs_forced_details) + N'; ';
+            SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'QS_FORCED_PLANS';
             RAISERROR(N'', 10, 1) WITH NOWAIT;
             RAISERROR(N'WARNING: %d Query Store forced plan(s) on tables with updated statistics: %s', 10, 1, @qs_forced_total, @qs_forced_details) WITH NOWAIT;
             RAISERROR(N'         Stats changes may affect forced plan quality. Review with sys.query_store_plan.', 10, 1) WITH NOWAIT;
@@ -8624,7 +8873,10 @@ OPTION (RECOMPILE);';
     ============================================================================
     */
     IF @stats_toctou > 0
+    BEGIN
         SET @warnings = @warnings + N'TOCTOU_SKIPS: ' + CONVERT(nvarchar(10), @stats_toctou) + N' stat(s) skipped (objects dropped during run); ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'TOCTOU_SKIPS';
+    END;
 
     SELECT
         @StatsFoundOut = @total_stats,
@@ -8634,6 +8886,8 @@ OPTION (RECOMPILE);';
         @StatsRemainingOut = @remaining_stats,
         @DurationSecondsOut = @duration_seconds,
         @WarningsOut = NULLIF(@warnings, N''),
+        /* gh-426: stable code tokens -- NULLIF so empty string becomes NULL */
+        @WarningsCodesOut = NULLIF(@WarningsCodesOut, N''),
         /* #179: If databases were skipped, append to stop reason so automation sees partial completion */
         @StopReasonOut = CASE
             WHEN @warnings LIKE N'%DB_SKIPPED:%' AND @stop_reason = N'COMPLETED'
@@ -8707,6 +8961,16 @@ OPTION (RECOMPILE);';
     BEGIN
         DELETE FROM dbo.StatUpdateLock
         WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
+    END;
+
+    /* gh-423: Restore caller's CONTEXT_INFO before exit.
+       SET CONTEXT_INFO rejects NULL -- coerce to 0x when caller had no context set. */
+    IF @context_info_set = 1
+    BEGIN
+        IF @original_context_info IS NULL
+            SET CONTEXT_INFO 0x;
+        ELSE
+            SET CONTEXT_INFO @original_context_info;
     END;
 
     RETURN @return_code;
