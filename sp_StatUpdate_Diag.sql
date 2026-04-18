@@ -36,9 +36,19 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.04.17.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.04.18.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.04.17.1 - Diag bug batch Phase 2 (10 issues):
+History:    2026.04.18.1 - Parallel false-positive fix (c53, 3 checks):
+                           C3 TIME_LIMIT_EXHAUSTION: suppress when all non-killed runs have
+                             StatsInParallel='Y' and aggregate StatsRemaining=0 (all workers
+                             used parallel coordination; per-worker TIME_LIMIT exits with zero
+                             aggregate remaining are not a genuine time-limit signal).
+                           W3 STALE_BACKLOG: extend @w3_parallel_complete to also set=1 when
+                             @parallel_aggregate_done=1, covering TIME_LIMIT exits alongside
+                             the existing PARALLEL_COMPLETE-only path.
+                           COMPLETION grade: inherits improvement via @w3_parallel_complete
+                             (already awards score=95 when @w3_parallel_complete=1).
+            2026.04.17.1 - Diag bug batch Phase 2 (10 issues):
                            gh-471: Sync @procedure_version with header Version.
                            gh-472: Auto-upgrade StatUpdateDiagHistory via COL_LENGTH-gated ALTER.
                            gh-473: C3 denominator/numerator parity -- filter @time_limit_runs by
@@ -263,8 +273,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.04.17.1',
-        @procedure_version_date datetime = '20260417';
+        @procedure_version varchar(20) = '2026.04.18.1',
+        @procedure_version_date datetime = '20260418';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -2087,7 +2097,21 @@ BEGIN
 
     /* ======================================================================
        C3: TIME LIMIT EXHAUSTION
+       c53 fix: suppress false positives when all workers used StatsInParallel='Y'
+       and the aggregate queue was fully processed (SUM(StatsRemaining)=0).  In
+       that state individual workers exiting with TIME_LIMIT or PARALLEL_COMPLETE
+       are not a real backlog signal -- the logical run completed.
+       @parallel_aggregate_done is reused by W3 and the COMPLETION grade (via
+       @w3_parallel_complete) so the same semantics apply across all three checks.
        ====================================================================== */
+    /* c53: all-parallel deployment + zero aggregate remaining = logical run completed.
+       Set once here; W3 and COMPLETION grade reuse via @w3_parallel_complete. */
+    DECLARE @parallel_aggregate_done bit = 0;
+    IF NOT EXISTS (SELECT 1 FROM #runs WHERE IsKilled = 0 AND ISNULL(StatsInParallel, N'N') <> N'Y')
+    AND EXISTS    (SELECT 1 FROM #runs WHERE IsKilled = 0)
+    AND (SELECT SUM(ISNULL(StatsRemaining, 0)) FROM #runs WHERE IsKilled = 0) = 0
+        SET @parallel_aggregate_done = 1;
+
     DECLARE
         @total_completed_runs integer = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 0),
         /* e5x fix: also count COMPLETED runs with StatsRemaining>0 -- these are functionally
@@ -2105,7 +2129,8 @@ BEGIN
            Using MAX of historical TIME_LIMIT runs could recommend an extreme value from a one-off test run. */
         @latest_timelimit_sec integer = (SELECT TOP 1 TimeLimit FROM #runs WHERE IsKilled = 0 ORDER BY StartTime DESC);
 
-    IF @total_completed_runs > 0
+    IF @parallel_aggregate_done = 0
+    AND @total_completed_runs > 0
     AND @time_limit_runs * 100.0 / @total_completed_runs >= @TimeLimitExhaustionPct
     BEGIN
         INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
@@ -2409,7 +2434,9 @@ BEGIN
        PARALLEL_COMPLETE and the aggregate StatsRemaining across all workers
        is 0 (the work was fully distributed and completed).
        ====================================================================== */
-    /* p1n: check whether every non-killed run completed via parallel coordination */
+    /* p1n: check whether every non-killed run completed via parallel coordination.
+       c53: also set when @parallel_aggregate_done=1 (all workers used StatsInParallel='Y'
+       and aggregate remaining=0, regardless of individual StopReason values). */
     DECLARE @w3_parallel_complete bit = 0;
     IF NOT EXISTS (
         SELECT 1 FROM #runs
@@ -2417,6 +2444,10 @@ BEGIN
         AND   StopReason <> N'PARALLEL_COMPLETE'
     )
     AND (SELECT SUM(ISNULL(StatsRemaining, 0)) FROM #runs WHERE IsKilled = 0) = 0
+        SET @w3_parallel_complete = 1;
+    /* c53: second path -- all-parallel with zero aggregate remaining, even when some
+       workers exited via TIME_LIMIT (not PARALLEL_COMPLETE). */
+    IF @w3_parallel_complete = 0 AND @parallel_aggregate_done = 1
         SET @w3_parallel_complete = 1;
 
     IF @w3_parallel_complete = 0

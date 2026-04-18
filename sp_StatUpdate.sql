@@ -36,11 +36,20 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.2.1.2026.04.17 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.2.2.2026.04.17 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.2.1.2026.04.17 - Phase 5 bug fix (1 issue):
+History:    3.2.2.2026.04.17 - Internal refactors (3 issues, behavior-preserving):
+                            gh-461 @parameters_string built unconditionally in region 07B;
+                              removed duplicate construction in region 08.
+                            gh-462 mop-up discovery WHERE filter extracted into
+                              @mop_up_where_sql -- both parallel-leader and serial
+                              paths reference the shared variable.
+                            gh-465 empty-schema SELECT (WHERE 1=0 sentinel, ~35 cols)
+                              extracted into @empty_disc_select -- all 6 staged
+                              discovery bailout paths reference the shared variable.
+            3.2.1.2026.04.17 - Phase 5 bug fix (1 issue):
                             gh-492 DIRECT_STRING discovery path (@Statistics param)
                               now honors @TargetNorecompute and @ExcludeStatistics.
                               Previously both filters were only applied in the
@@ -240,7 +249,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.2.1.2026.04.17',
+        @procedure_version varchar(20) = '3.2.2.2026.04.17',
         @procedure_version_date datetime = '20260417',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -3111,10 +3120,11 @@ OPTION (RECOMPILE);';
     PARALLEL DISCOVERY SKIP: Check if another worker already populated the queue
     ============================================================================
     */
-    /* #435: Build @parameters_string BEFORE the skip check so q.Parameters matching works.
-       Previously this was built ~2000 lines later, making the skip check dead code. */
-    IF  @StatsInParallel = N'Y'
-    AND @parameters_string = N''
+    /* gh-461: Single construction site for @parameters_string.
+       Built unconditionally here for all run modes (parallel and serial).
+       Previously guarded by @StatsInParallel = N'Y', leaving non-parallel runs
+       to rebuild it in region 08.  Removed -- one construction site in 07B. */
+    IF @parameters_string = N''
     BEGIN
         SELECT
             @parameters_string =
@@ -3325,6 +3335,51 @@ OPTION (RECOMPILE);';
             */
             BEGIN
                 DECLARE @staged_sql nvarchar(max);
+                /* gh-465: Zero-row sentinel SELECT shared by all Phase 1-6 bailout paths.
+                   Column order and types are the INSERT...EXEC contract.
+                   Any schema change needs updating only here. */
+                DECLARE @empty_disc_select nvarchar(max) =
+                    N'SELECT' + CHAR(13)+CHAR(10) +
+                    N'                        database_name = DB_NAME(),' + CHAR(13)+CHAR(10) +
+                    N'                        schema_name = CONVERT(sysname, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        table_name = CONVERT(sysname, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        stat_name = CONVERT(sysname, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        object_id = CONVERT(int, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        stats_id = CONVERT(int, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        no_recompute = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        is_incremental = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        is_memory_optimized = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        is_heap = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        auto_created = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        modification_counter = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        row_count = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        days_stale = CONVERT(int, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        page_count = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        persisted_sample_percent = CONVERT(float, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        histogram_steps = CONVERT(int, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        has_filter = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        filter_definition = CONVERT(nvarchar(max), NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        unfiltered_rows = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_plan_count = CONVERT(int, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_total_executions = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_total_cpu_ms = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_total_duration_ms = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_total_logical_reads = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_total_tempdb_pages = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_total_physical_reads = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_total_logical_writes = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_total_wait_time_ms = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_max_dop = CONVERT(smallint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_active_feedback_count = CONVERT(int, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_last_execution = CONVERT(datetime2, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        qs_priority_boost = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        is_published = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        is_tracked_by_cdc = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        temporal_type = CONVERT(tinyint, NULL),' + CHAR(13)+CHAR(10) +
+                    N'                        priority = CONVERT(bigint, NULL)' + CHAR(13)+CHAR(10) +
+                    N'                    WHERE 1 = 0;';
+
 
                 SET @staged_sql = N'
                 USE ' + QUOTENAME(@CurrentDatabaseName) + N';
@@ -3511,46 +3566,7 @@ OPTION (RECOMPILE);';
                     IF @Debug_param = 1
                         RAISERROR(N''    No candidates found - skipping remaining phases'', 10, 1) WITH NOWAIT;
 
-                    SELECT
-                        database_name = DB_NAME(),
-                        schema_name = CONVERT(sysname, NULL),
-                        table_name = CONVERT(sysname, NULL),
-                        stat_name = CONVERT(sysname, NULL),
-                        object_id = CONVERT(int, NULL),
-                        stats_id = CONVERT(int, NULL),
-                        no_recompute = CONVERT(bit, NULL),
-                        is_incremental = CONVERT(bit, NULL),
-                        is_memory_optimized = CONVERT(bit, NULL),
-                        is_heap = CONVERT(bit, NULL),
-                        auto_created = CONVERT(bit, NULL),
-                        modification_counter = CONVERT(bigint, NULL),
-                        row_count = CONVERT(bigint, NULL),
-                        days_stale = CONVERT(int, NULL),
-                        page_count = CONVERT(bigint, NULL),
-                        persisted_sample_percent = CONVERT(float, NULL),
-                        histogram_steps = CONVERT(int, NULL),
-                        has_filter = CONVERT(bit, NULL),
-                        filter_definition = CONVERT(nvarchar(max), NULL),
-                        unfiltered_rows = CONVERT(bigint, NULL),
-                        qs_plan_count = CONVERT(int, NULL),
-                        qs_total_executions = CONVERT(bigint, NULL),
-                        qs_total_cpu_ms = CONVERT(bigint, NULL),
-                        qs_total_duration_ms = CONVERT(bigint, NULL),
-                        qs_total_logical_reads = CONVERT(bigint, NULL),
-                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),
-                        qs_total_tempdb_pages = CONVERT(bigint, NULL),
-                        qs_total_physical_reads = CONVERT(bigint, NULL),
-                        qs_total_logical_writes = CONVERT(bigint, NULL),
-                        qs_total_wait_time_ms = CONVERT(bigint, NULL),
-                        qs_max_dop = CONVERT(smallint, NULL),
-                        qs_active_feedback_count = CONVERT(int, NULL),
-                        qs_last_execution = CONVERT(datetime2, NULL),
-                        qs_priority_boost = CONVERT(bigint, NULL),
-                        is_published = CONVERT(bit, NULL),
-                        is_tracked_by_cdc = CONVERT(bit, NULL),
-                        temporal_type = CONVERT(tinyint, NULL),
-                        priority = CONVERT(bigint, NULL)
-                    WHERE 1 = 0;
+                    ' + @empty_disc_select + N'
 
                     DROP TABLE #stat_candidates;
                     RETURN;
@@ -3592,46 +3608,7 @@ OPTION (RECOMPILE);';
                     RAISERROR(N''    WARNING: Phase 2 enriched %d of %d candidates (<1%%) -- skipping database'', 10, 1, @phase2_count, @phase1_count) WITH NOWAIT;
 
                     /* Return empty result set to satisfy INSERT...EXEC schema */
-                    SELECT
-                        database_name = DB_NAME(),
-                        schema_name = CONVERT(sysname, NULL),
-                        table_name = CONVERT(sysname, NULL),
-                        stat_name = CONVERT(sysname, NULL),
-                        object_id = CONVERT(int, NULL),
-                        stats_id = CONVERT(int, NULL),
-                        no_recompute = CONVERT(bit, NULL),
-                        is_incremental = CONVERT(bit, NULL),
-                        is_memory_optimized = CONVERT(bit, NULL),
-                        is_heap = CONVERT(bit, NULL),
-                        auto_created = CONVERT(bit, NULL),
-                        modification_counter = CONVERT(bigint, NULL),
-                        row_count = CONVERT(bigint, NULL),
-                        days_stale = CONVERT(int, NULL),
-                        page_count = CONVERT(bigint, NULL),
-                        persisted_sample_percent = CONVERT(float, NULL),
-                        histogram_steps = CONVERT(int, NULL),
-                        has_filter = CONVERT(bit, NULL),
-                        filter_definition = CONVERT(nvarchar(max), NULL),
-                        unfiltered_rows = CONVERT(bigint, NULL),
-                        qs_plan_count = CONVERT(int, NULL),
-                        qs_total_executions = CONVERT(bigint, NULL),
-                        qs_total_cpu_ms = CONVERT(bigint, NULL),
-                        qs_total_duration_ms = CONVERT(bigint, NULL),
-                        qs_total_logical_reads = CONVERT(bigint, NULL),
-                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),
-                        qs_total_tempdb_pages = CONVERT(bigint, NULL),
-                        qs_total_physical_reads = CONVERT(bigint, NULL),
-                        qs_total_logical_writes = CONVERT(bigint, NULL),
-                        qs_total_wait_time_ms = CONVERT(bigint, NULL),
-                        qs_max_dop = CONVERT(smallint, NULL),
-                        qs_active_feedback_count = CONVERT(int, NULL),
-                        qs_last_execution = CONVERT(datetime2, NULL),
-                        qs_priority_boost = CONVERT(bigint, NULL),
-                        is_published = CONVERT(bit, NULL),
-                        is_tracked_by_cdc = CONVERT(bit, NULL),
-                        temporal_type = CONVERT(tinyint, NULL),
-                        priority = CONVERT(bigint, NULL)
-                    WHERE 1 = 0;
+                    ' + @empty_disc_select + N'
 
                     DROP TABLE #stat_candidates;
                     RETURN;
@@ -3686,46 +3663,7 @@ OPTION (RECOMPILE);';
                     /* v3: no fallback path -- log warning and continue with partial data */
                     RAISERROR(N''    WARNING: Phase 3 has NULL tier_threshold with non-NULL rows -- skipping database'', 10, 1) WITH NOWAIT;
 
-                    SELECT
-                        database_name = DB_NAME(),
-                        schema_name = CONVERT(sysname, NULL),
-                        table_name = CONVERT(sysname, NULL),
-                        stat_name = CONVERT(sysname, NULL),
-                        object_id = CONVERT(int, NULL),
-                        stats_id = CONVERT(int, NULL),
-                        no_recompute = CONVERT(bit, NULL),
-                        is_incremental = CONVERT(bit, NULL),
-                        is_memory_optimized = CONVERT(bit, NULL),
-                        is_heap = CONVERT(bit, NULL),
-                        auto_created = CONVERT(bit, NULL),
-                        modification_counter = CONVERT(bigint, NULL),
-                        row_count = CONVERT(bigint, NULL),
-                        days_stale = CONVERT(int, NULL),
-                        page_count = CONVERT(bigint, NULL),
-                        persisted_sample_percent = CONVERT(float, NULL),
-                        histogram_steps = CONVERT(int, NULL),
-                        has_filter = CONVERT(bit, NULL),
-                        filter_definition = CONVERT(nvarchar(max), NULL),
-                        unfiltered_rows = CONVERT(bigint, NULL),
-                        qs_plan_count = CONVERT(int, NULL),
-                        qs_total_executions = CONVERT(bigint, NULL),
-                        qs_total_cpu_ms = CONVERT(bigint, NULL),
-                        qs_total_duration_ms = CONVERT(bigint, NULL),
-                        qs_total_logical_reads = CONVERT(bigint, NULL),
-                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),
-                        qs_total_tempdb_pages = CONVERT(bigint, NULL),
-                        qs_total_physical_reads = CONVERT(bigint, NULL),
-                        qs_total_logical_writes = CONVERT(bigint, NULL),
-                        qs_total_wait_time_ms = CONVERT(bigint, NULL),
-                        qs_max_dop = CONVERT(smallint, NULL),
-                        qs_active_feedback_count = CONVERT(int, NULL),
-                        qs_last_execution = CONVERT(datetime2, NULL),
-                        qs_priority_boost = CONVERT(bigint, NULL),
-                        is_published = CONVERT(bit, NULL),
-                        is_tracked_by_cdc = CONVERT(bit, NULL),
-                        temporal_type = CONVERT(tinyint, NULL),
-                        priority = CONVERT(bigint, NULL)
-                    WHERE 1 = 0;
+                    ' + @empty_disc_select + N'
 
                     DROP TABLE #stat_candidates;
                     RETURN;
@@ -3838,46 +3776,7 @@ OPTION (RECOMPILE);';
                     Required: INSERT...EXEC consumes this result set, so we must
                     provide matching column schema even when returning 0 rows.
                     */
-                    SELECT
-                        database_name = DB_NAME(),
-                        schema_name = CONVERT(sysname, NULL),
-                        table_name = CONVERT(sysname, NULL),
-                        stat_name = CONVERT(sysname, NULL),
-                        object_id = CONVERT(int, NULL),
-                        stats_id = CONVERT(int, NULL),
-                        no_recompute = CONVERT(bit, NULL),
-                        is_incremental = CONVERT(bit, NULL),
-                        is_memory_optimized = CONVERT(bit, NULL),
-                        is_heap = CONVERT(bit, NULL),
-                        auto_created = CONVERT(bit, NULL),
-                        modification_counter = CONVERT(bigint, NULL),
-                        row_count = CONVERT(bigint, NULL),
-                        days_stale = CONVERT(int, NULL),
-                        page_count = CONVERT(bigint, NULL),
-                        persisted_sample_percent = CONVERT(float, NULL),
-                        histogram_steps = CONVERT(int, NULL),
-                        has_filter = CONVERT(bit, NULL),
-                        filter_definition = CONVERT(nvarchar(max), NULL),
-                        unfiltered_rows = CONVERT(bigint, NULL),
-                        qs_plan_count = CONVERT(int, NULL),
-                        qs_total_executions = CONVERT(bigint, NULL),
-                        qs_total_cpu_ms = CONVERT(bigint, NULL),
-                        qs_total_duration_ms = CONVERT(bigint, NULL),
-                        qs_total_logical_reads = CONVERT(bigint, NULL),
-                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),
-                        qs_total_tempdb_pages = CONVERT(bigint, NULL),
-                        qs_total_physical_reads = CONVERT(bigint, NULL),
-                        qs_total_logical_writes = CONVERT(bigint, NULL),
-                        qs_total_wait_time_ms = CONVERT(bigint, NULL),
-                        qs_max_dop = CONVERT(smallint, NULL),
-                        qs_active_feedback_count = CONVERT(int, NULL),
-                        qs_last_execution = CONVERT(datetime2, NULL),
-                        qs_priority_boost = CONVERT(bigint, NULL),
-                        is_published = CONVERT(bit, NULL),
-                        is_tracked_by_cdc = CONVERT(bit, NULL),
-                        temporal_type = CONVERT(tinyint, NULL),
-                        priority = CONVERT(bigint, NULL)
-                    WHERE 1 = 0;
+                    ' + @empty_disc_select + N'
 
                     DROP TABLE #stat_candidates;
                     RETURN;
@@ -3916,46 +3815,7 @@ OPTION (RECOMPILE);';
                         RAISERROR(N''    WARNING: Phase 5 has %d of %d stats with NULL page_count -- skipping database'', 10, 1,
                             @null_page_count, @phase4_qualifying) WITH NOWAIT;
 
-                        SELECT
-                            database_name = DB_NAME(),
-                            schema_name = CONVERT(sysname, NULL),
-                            table_name = CONVERT(sysname, NULL),
-                            stat_name = CONVERT(sysname, NULL),
-                            object_id = CONVERT(int, NULL),
-                            stats_id = CONVERT(int, NULL),
-                            no_recompute = CONVERT(bit, NULL),
-                            is_incremental = CONVERT(bit, NULL),
-                            is_memory_optimized = CONVERT(bit, NULL),
-                            is_heap = CONVERT(bit, NULL),
-                            auto_created = CONVERT(bit, NULL),
-                            modification_counter = CONVERT(bigint, NULL),
-                            row_count = CONVERT(bigint, NULL),
-                            days_stale = CONVERT(int, NULL),
-                            page_count = CONVERT(bigint, NULL),
-                            persisted_sample_percent = CONVERT(float, NULL),
-                            histogram_steps = CONVERT(int, NULL),
-                            has_filter = CONVERT(bit, NULL),
-                            filter_definition = CONVERT(nvarchar(max), NULL),
-                            unfiltered_rows = CONVERT(bigint, NULL),
-                            qs_plan_count = CONVERT(int, NULL),
-                            qs_total_executions = CONVERT(bigint, NULL),
-                            qs_total_cpu_ms = CONVERT(bigint, NULL),
-                            qs_total_duration_ms = CONVERT(bigint, NULL),
-                            qs_total_logical_reads = CONVERT(bigint, NULL),
-                            qs_total_memory_grant_kb = CONVERT(bigint, NULL),
-                            qs_total_tempdb_pages = CONVERT(bigint, NULL),
-                            qs_total_physical_reads = CONVERT(bigint, NULL),
-                            qs_total_logical_writes = CONVERT(bigint, NULL),
-                            qs_total_wait_time_ms = CONVERT(bigint, NULL),
-                            qs_max_dop = CONVERT(smallint, NULL),
-                            qs_active_feedback_count = CONVERT(int, NULL),
-                            qs_last_execution = CONVERT(datetime2, NULL),
-                            qs_priority_boost = CONVERT(bigint, NULL),
-                            is_published = CONVERT(bit, NULL),
-                            is_tracked_by_cdc = CONVERT(bit, NULL),
-                            temporal_type = CONVERT(tinyint, NULL),
-                            priority = CONVERT(bigint, NULL)
-                        WHERE 1 = 0;
+                        ' + @empty_disc_select + N'
 
                         DROP TABLE #stat_candidates;
                         RETURN;
@@ -3986,46 +3846,7 @@ OPTION (RECOMPILE);';
                     RAISERROR(N''    WARNING: Phase 5 kept %d of %d rows with MinPageCount=0 -- skipping database'', 10, 1,
                         @phase5_remaining, @phase4_qualifying) WITH NOWAIT;
 
-                    SELECT
-                        database_name = DB_NAME(),
-                        schema_name = CONVERT(sysname, NULL),
-                        table_name = CONVERT(sysname, NULL),
-                        stat_name = CONVERT(sysname, NULL),
-                        object_id = CONVERT(int, NULL),
-                        stats_id = CONVERT(int, NULL),
-                        no_recompute = CONVERT(bit, NULL),
-                        is_incremental = CONVERT(bit, NULL),
-                        is_memory_optimized = CONVERT(bit, NULL),
-                        is_heap = CONVERT(bit, NULL),
-                        auto_created = CONVERT(bit, NULL),
-                        modification_counter = CONVERT(bigint, NULL),
-                        row_count = CONVERT(bigint, NULL),
-                        days_stale = CONVERT(int, NULL),
-                        page_count = CONVERT(bigint, NULL),
-                        persisted_sample_percent = CONVERT(float, NULL),
-                        histogram_steps = CONVERT(int, NULL),
-                        has_filter = CONVERT(bit, NULL),
-                        filter_definition = CONVERT(nvarchar(max), NULL),
-                        unfiltered_rows = CONVERT(bigint, NULL),
-                        qs_plan_count = CONVERT(int, NULL),
-                        qs_total_executions = CONVERT(bigint, NULL),
-                        qs_total_cpu_ms = CONVERT(bigint, NULL),
-                        qs_total_duration_ms = CONVERT(bigint, NULL),
-                        qs_total_logical_reads = CONVERT(bigint, NULL),
-                        qs_total_memory_grant_kb = CONVERT(bigint, NULL),
-                        qs_total_tempdb_pages = CONVERT(bigint, NULL),
-                        qs_total_physical_reads = CONVERT(bigint, NULL),
-                        qs_total_logical_writes = CONVERT(bigint, NULL),
-                        qs_total_wait_time_ms = CONVERT(bigint, NULL),
-                        qs_max_dop = CONVERT(smallint, NULL),
-                        qs_active_feedback_count = CONVERT(int, NULL),
-                        qs_last_execution = CONVERT(datetime2, NULL),
-                        qs_priority_boost = CONVERT(bigint, NULL),
-                        is_published = CONVERT(bit, NULL),
-                        is_tracked_by_cdc = CONVERT(bit, NULL),
-                        temporal_type = CONVERT(tinyint, NULL),
-                        priority = CONVERT(bigint, NULL)
-                    WHERE 1 = 0;
+                    ' + @empty_disc_select + N'
 
                     DROP TABLE #stat_candidates;
                     RETURN;
@@ -5196,41 +5017,8 @@ OPTION (RECOMPILE);';
             ISNULL(CONVERT(nvarchar(20), @i_qs_min_executions), N'NULL'),
             ISNULL(CONVERT(nvarchar(20), @i_qs_recent_hours), N'NULL')
         );
-
-        /*
-        Build parameters string to identify this run.
-        Workers with matching parameters share the same queue.
-        May already be set by the parallel discovery skip check (v2.26).
-        */
-        IF @parameters_string = N''
-        BEGIN
-            SELECT
-                @parameters_string =
-                    N'@Databases=' + ISNULL(LTRIM(RTRIM(@Databases)), N'') +
-                    N',@Tables=' + ISNULL(LTRIM(RTRIM(@Tables)), N'') +
-                    N',@ExcludeTables=' + ISNULL(LTRIM(RTRIM(@ExcludeTables)), N'') +
-                    N',@ExcludeStatistics=' + ISNULL(LTRIM(RTRIM(@ExcludeStatistics)), N'') +
-                    N',@TargetNorecompute=' + ISNULL(LTRIM(RTRIM(@TargetNorecompute)), N'') +
-                    N',@i_modification_threshold=' + ISNULL(CONVERT(nvarchar(20), @i_modification_threshold), N'') +
-                    N',@i_min_page_count=' + ISNULL(CONVERT(nvarchar(20), @i_min_page_count), N'') +
-                    N',@i_include_system_objects=' + ISNULL(LTRIM(RTRIM(@i_include_system_objects)), N'') +
-                    N',@i_sort_order=' + ISNULL(LTRIM(RTRIM(@i_sort_order)), N'') +
-                    N',@i_tiered_thresholds=' + ISNULL(CONVERT(nvarchar(5), @i_tiered_thresholds), N'') +
-                    N',@i_filtered_stats_mode=' + ISNULL(LTRIM(RTRIM(@i_filtered_stats_mode)), N'') +
-                    N',@i_qs_enabled=' + ISNULL(LTRIM(RTRIM(@i_qs_enabled)), N'') +
-                    N',@i_threshold_logic=' + ISNULL(LTRIM(RTRIM(@i_threshold_logic)), N'') +
-                    N',@StaleHours=' + ISNULL(CONVERT(nvarchar(20), @StaleHours), N'') +
-                    N',@i_modification_percent=' + ISNULL(CONVERT(nvarchar(20), @i_modification_percent), N'') +
-                    N',@i_ascending_key_boost=' + ISNULL(LTRIM(RTRIM(@i_ascending_key_boost)), N'') +
-                    N',@i_filtered_stats_stale_factor=' + ISNULL(CONVERT(nvarchar(20), @i_filtered_stats_stale_factor), N'') +
-                    N',@i_skip_tables_with_columnstore=' + ISNULL(LTRIM(RTRIM(@i_skip_tables_with_columnstore)), N'') +
-                    N',@i_include_indexed_views=' + ISNULL(LTRIM(RTRIM(@i_include_indexed_views)), N'') +
-                    N',@i_qs_metric=' + ISNULL(LTRIM(RTRIM(@i_qs_metric)), N'') +
-                    N',@i_qs_min_executions=' + ISNULL(CONVERT(nvarchar(20), @i_qs_min_executions), N'') +
-                    N',@i_qs_recent_hours=' + ISNULL(CONVERT(nvarchar(20), @i_qs_recent_hours), N'') +
-                    N',@i_qs_top_plans=' + ISNULL(CONVERT(nvarchar(20), @i_qs_top_plans), N'');
-        END;
-
+        /* gh-461: @parameters_string is built unconditionally in region 07B now.
+           By the time execution reaches here it is always populated. */
         BEGIN TRY
             /*
             Check if Queue row already exists for these parameters
@@ -7827,6 +7615,100 @@ OPTION (RECOMPILE);';
     END;
     /*#endregion 09G-PARALLEL-COMPLETE */
     /*#endregion 09-PROCESS-LOOP */
+    /* gh-462: Shared WHERE filter for mop-up discovery (parallel-leader and serial).
+       Both paths concatenate @mop_up_where_sql then append @commandlog_3part + tail.
+       Any filter change needs updating only here -- one source of truth. */
+    DECLARE @mop_up_where_sql nvarchar(max) = CAST(N'
+                WHERE ISNULL(sp.modification_counter, 0) > 0
+                AND   (
+                          OBJECTPROPERTY(s.object_id, N''''IsUserTable'''') = 1
+                       OR @i_include_system_objects_param = N''''Y''''
+                       OR (o.type = N''''V'''' AND @i_include_indexed_views_param = N''''Y''''
+                           AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
+                      )
+                AND   (o.is_ms_shipped = 0 OR @i_include_system_objects_param = N''''Y'''')
+                AND   o.type NOT IN (N''''ET'''', N''''S'''')
+                /* v2.27: Stretch Database auto-skip (#55) */
+                AND   ISNULL(OBJECTPROPERTY(s.object_id, N''''TableHasRemoteDataArchive''''), 0) = 0
+                /* v2.27: Skip tables on READ_ONLY filegroups (#65) */
+                AND   NOT EXISTS
+                      (
+                          SELECT 1
+                          FROM sys.indexes AS ri
+                          JOIN sys.data_spaces AS rds ON rds.data_space_id = ri.data_space_id
+                          JOIN sys.filegroups AS rfg ON rfg.data_space_id = rds.data_space_id
+                          WHERE ri.object_id = s.object_id
+                          AND   ri.index_id IN (0, 1)
+                          AND   rfg.is_read_only = 1
+                      )
+                AND   (
+                          (@TargetNorecompute_param = N''''N'''' AND s.no_recompute = 0)
+                       OR (@TargetNorecompute_param = N''''Y'''' AND s.no_recompute = 1)
+                       OR @TargetNorecompute_param = N''''BOTH''''
+                      )
+                /* v2.27: Table inclusion filter */
+                AND   (
+                          @Tables_param IS NULL
+                       OR OBJECT_SCHEMA_NAME(s.object_id) + N''''.'''' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'''','''') AS ss)
+                       OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'''','''') AS ss)
+                      )
+                /* v2.26: Table exclusion filter (was missing from mop-up) */
+                AND   (
+                          @ExcludeTables_param IS NULL
+                       OR NOT EXISTS
+                          (
+                              SELECT 1
+                              FROM STRING_SPLIT(@ExcludeTables_param, N'''','''') AS ex
+                              WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''''.'''' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                          )
+                      )
+                /* v2.26: Statistics exclusion filter (was missing from mop-up) */
+                AND   (
+                          @ExcludeStatistics_param IS NULL
+                       OR NOT EXISTS
+                          (
+                              SELECT 1
+                              FROM STRING_SPLIT(@ExcludeStatistics_param, N'''','''') AS ex
+                              WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                                 OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                          )
+                      )
+                /* v2.27: Filtered stats mode filter */
+                AND   (
+                          @i_filtered_stats_mode_param = N''''INCLUDE''''
+                       OR @i_filtered_stats_mode_param = N''''PRIORITY''''
+                       OR (@i_filtered_stats_mode_param = N''''EXCLUDE'''' AND s.has_filter = 0)
+                       OR (@i_filtered_stats_mode_param = N''''ONLY'''' AND s.has_filter = 1)
+                      )
+                /* v2.27: Skip tables with columnstore indexes */
+                AND   (
+                          @i_skip_tables_with_columnstore_param = N''''N''''
+                       OR NOT EXISTS
+                          (
+                              SELECT 1
+                              FROM sys.indexes AS ci
+                              WHERE ci.object_id = s.object_id
+                              AND   ci.type IN (5, 6)
+                          )
+                      )
+                /* v2.27: Minimum page count filter */
+                AND   (@i_min_page_count_param IS NULL OR ISNULL(pgs.total_pages, 0) >= @i_min_page_count_param)
+                AND   NOT EXISTS (
+                    /* Only exclude stats still pending in priority queue (processed = 0).
+                       Failed/completed stats (processed = 1) are eligible for mop-up --
+                       the CommandLog NOT EXISTS below handles deduplication. */
+                    SELECT 1 FROM #stats_to_process AS stp
+                    WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
+                    AND   stp.object_id = s.object_id
+                    AND   stp.stats_id = s.stats_id
+                    AND   stp.processed = 0
+                )
+                AND   NOT EXISTS (
+                    SELECT 1 FROM ' + @commandlog_3part + N' AS cl
+' AS nvarchar(max));
+
     /*#region 10-MOP-UP: Broad sweep with remaining time budget */
     /*
     ============================================================================
@@ -8002,94 +7884,7 @@ OPTION (RECOMPILE);';
                         FROM sys.dm_db_partition_stats AS p
                         WHERE p.object_id = s.object_id AND p.index_id IN (0, 1)
                     ) AS pgs
-                    WHERE ISNULL(sp.modification_counter, 0) > 0
-                    AND   (
-                              OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
-                           OR @i_include_system_objects_param = N''Y''
-                           OR (o.type = N''V'' AND @i_include_indexed_views_param = N''Y''
-                               AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
-                          )
-                    AND   (o.is_ms_shipped = 0 OR @i_include_system_objects_param = N''Y'')
-                    AND   o.type NOT IN (N''ET'', N''S'')
-                    /* v2.27: Stretch Database auto-skip (#55) */
-                    AND   ISNULL(OBJECTPROPERTY(s.object_id, N''TableHasRemoteDataArchive''), 0) = 0
-                    /* v2.27: Skip tables on READ_ONLY filegroups (#65) */
-                    AND   NOT EXISTS
-                          (
-                              SELECT 1
-                              FROM sys.indexes AS ri
-                              JOIN sys.data_spaces AS rds ON rds.data_space_id = ri.data_space_id
-                              JOIN sys.filegroups AS rfg ON rfg.data_space_id = rds.data_space_id
-                              WHERE ri.object_id = s.object_id
-                              AND   ri.index_id IN (0, 1)
-                              AND   rfg.is_read_only = 1
-                          )
-                    AND   (
-                              (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
-                           OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
-                           OR @TargetNorecompute_param = N''BOTH''
-                          )
-                    /* v2.27: Table inclusion filter */
-                    AND   (
-                              @Tables_param IS NULL
-                           OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                              (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
-                           OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                              (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
-                          )
-                    /* v2.26: Table exclusion filter (was missing from mop-up) */
-                    AND   (
-                              @ExcludeTables_param IS NULL
-                           OR NOT EXISTS
-                              (
-                                  SELECT 1
-                                  FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
-                                  WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
-                              )
-                          )
-                    /* v2.26: Statistics exclusion filter (was missing from mop-up) */
-                    AND   (
-                              @ExcludeStatistics_param IS NULL
-                           OR NOT EXISTS
-                              (
-                                  SELECT 1
-                                  FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
-                                  WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
-                                     OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
-                              )
-                          )
-                    /* v2.27: Filtered stats mode filter */
-                    AND   (
-                              @i_filtered_stats_mode_param = N''INCLUDE''
-                           OR @i_filtered_stats_mode_param = N''PRIORITY''
-                           OR (@i_filtered_stats_mode_param = N''EXCLUDE'' AND s.has_filter = 0)
-                           OR (@i_filtered_stats_mode_param = N''ONLY'' AND s.has_filter = 1)
-                          )
-                    /* v2.27: Skip tables with columnstore indexes */
-                    AND   (
-                              @i_skip_tables_with_columnstore_param = N''N''
-                           OR NOT EXISTS
-                              (
-                                  SELECT 1
-                                  FROM sys.indexes AS ci
-                                  WHERE ci.object_id = s.object_id
-                                  AND   ci.type IN (5, 6)
-                              )
-                          )
-                    /* v2.27: Minimum page count filter */
-                    AND   (@i_min_page_count_param IS NULL OR ISNULL(pgs.total_pages, 0) >= @i_min_page_count_param)
-                    AND   NOT EXISTS (
-                        /* Only exclude stats still pending in priority queue (processed = 0).
-                           Failed/completed stats (processed = 1) are eligible for mop-up --
-                           the CommandLog NOT EXISTS below handles deduplication. */
-                        SELECT 1 FROM #stats_to_process AS stp
-                        WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
-                        AND   stp.object_id = s.object_id
-                        AND   stp.stats_id = s.stats_id
-                        AND   stp.processed = 0
-                    )
-                    AND   NOT EXISTS (
-                        SELECT 1 FROM ' + @commandlog_3part + N' AS cl
+                    ' + @mop_up_where_sql + N'
                         WHERE cl.CommandType = N''UPDATE_STATISTICS''
                         AND   cl.DatabaseName = DB_NAME() COLLATE DATABASE_DEFAULT
                         AND   cl.SchemaName = OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT
@@ -8399,94 +8194,7 @@ OPTION (RECOMPILE);';
                     FROM sys.dm_db_partition_stats AS p
                     WHERE p.object_id = s.object_id AND p.index_id IN (0, 1)
                 ) AS pgs
-                WHERE ISNULL(sp.modification_counter, 0) > 0
-                AND   (
-                          OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
-                       OR @i_include_system_objects_param = N''Y''
-                       OR (o.type = N''V'' AND @i_include_indexed_views_param = N''Y''
-                           AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
-                      )
-                AND   (o.is_ms_shipped = 0 OR @i_include_system_objects_param = N''Y'')
-                AND   o.type NOT IN (N''ET'', N''S'')
-                /* v2.27: Stretch Database auto-skip (#55) */
-                AND   ISNULL(OBJECTPROPERTY(s.object_id, N''TableHasRemoteDataArchive''), 0) = 0
-                /* v2.27: Skip tables on READ_ONLY filegroups (#65) */
-                AND   NOT EXISTS
-                      (
-                          SELECT 1
-                          FROM sys.indexes AS ri
-                          JOIN sys.data_spaces AS rds ON rds.data_space_id = ri.data_space_id
-                          JOIN sys.filegroups AS rfg ON rfg.data_space_id = rds.data_space_id
-                          WHERE ri.object_id = s.object_id
-                          AND   ri.index_id IN (0, 1)
-                          AND   rfg.is_read_only = 1
-                      )
-                AND   (
-                          (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
-                       OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
-                       OR @TargetNorecompute_param = N''BOTH''
-                      )
-                /* v2.27: Table inclusion filter */
-                AND   (
-                          @Tables_param IS NULL
-                       OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
-                       OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
-                      )
-                /* v2.26: Table exclusion filter (was missing from mop-up) */
-                AND   (
-                          @ExcludeTables_param IS NULL
-                       OR NOT EXISTS
-                          (
-                              SELECT 1
-                              FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
-                              WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
-                          )
-                      )
-                /* v2.26: Statistics exclusion filter (was missing from mop-up) */
-                AND   (
-                          @ExcludeStatistics_param IS NULL
-                       OR NOT EXISTS
-                          (
-                              SELECT 1
-                              FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
-                              WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
-                                 OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
-                          )
-                      )
-                /* v2.27: Filtered stats mode filter */
-                AND   (
-                          @i_filtered_stats_mode_param = N''INCLUDE''
-                       OR @i_filtered_stats_mode_param = N''PRIORITY''
-                       OR (@i_filtered_stats_mode_param = N''EXCLUDE'' AND s.has_filter = 0)
-                       OR (@i_filtered_stats_mode_param = N''ONLY'' AND s.has_filter = 1)
-                      )
-                /* v2.27: Skip tables with columnstore indexes */
-                AND   (
-                          @i_skip_tables_with_columnstore_param = N''N''
-                       OR NOT EXISTS
-                          (
-                              SELECT 1
-                              FROM sys.indexes AS ci
-                              WHERE ci.object_id = s.object_id
-                              AND   ci.type IN (5, 6)
-                          )
-                      )
-                /* v2.27: Minimum page count filter */
-                AND   (@i_min_page_count_param IS NULL OR ISNULL(pgs.total_pages, 0) >= @i_min_page_count_param)
-                AND   NOT EXISTS (
-                    /* Only exclude stats still pending in priority queue (processed = 0).
-                       Failed/completed stats (processed = 1) are eligible for mop-up --
-                       the CommandLog NOT EXISTS below handles deduplication. */
-                    SELECT 1 FROM #stats_to_process AS stp
-                    WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
-                    AND   stp.object_id = s.object_id
-                    AND   stp.stats_id = s.stats_id
-                    AND   stp.processed = 0
-                )
-                AND   NOT EXISTS (
-                    SELECT 1 FROM ' + @commandlog_3part + N' AS cl
+                ' + @mop_up_where_sql + N'
                     WHERE cl.CommandType = N''UPDATE_STATISTICS''
                     AND   cl.DatabaseName = DB_NAME() COLLATE DATABASE_DEFAULT
                     AND   cl.SchemaName = OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT
