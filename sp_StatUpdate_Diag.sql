@@ -36,9 +36,22 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.04.18.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.04.20.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.04.18.1 - Parallel false-positive fix (c53, 3 checks):
+History:    2026.04.20.1 - Fix PK_runs violation during #runs INSERT.
+                           The INSERT LEFT JOINs SP_STATUPDATE_START to
+                           SP_STATUPDATE_END on RunLabel; CommandLog can
+                           contain multiple ENDs per RunLabel (orphan-cleanup
+                           KILLED record + real END from gh-425) or duplicate
+                           STARTs (same-second retries), producing multiple
+                           rows per RunLabel and a PK violation before the
+                           existing dedup could run.  Removed CONSTRAINT
+                           PK_runs from CREATE TABLE; added UX_runs_RunLabel
+                           unique index after the dedup CTE.  Dedup tiebreaker
+                           now ORDER BY StartTime DESC, EndTime DESC so the
+                           real END is preferred over the KILLED orphan
+                           record.
+            2026.04.18.1 - Parallel false-positive fix (c53, 3 checks):
                            C3 TIME_LIMIT_EXHAUSTION: suppress when all non-killed runs have
                              StatsInParallel='Y' and aggregate StatsRemaining=0 (all workers
                              used parallel coordination; per-worker TIME_LIMIT exits with zero
@@ -273,8 +286,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.04.18.1',
-        @procedure_version_date datetime = '20260418';
+        @procedure_version varchar(20) = '2026.04.20.1',
+        @procedure_version_date datetime = '20260420';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -1196,9 +1209,16 @@ BEGIN
         MopUpProcessed integer NULL,
         /* Computed */
         IsKilled bit NOT NULL DEFAULT 0,
-        TotalGB decimal(10, 2) NULL, /* sum of PageCount * 8KB for succeeded stats in this run */
-
-        CONSTRAINT PK_runs PRIMARY KEY NONCLUSTERED (RunLabel)
+        TotalGB decimal(10, 2) NULL /* sum of PageCount * 8KB for succeeded stats in this run */
+        /*
+        v2026.04.20.1: PK constraint removed from table definition.  The
+        INSERT below LEFT JOINs START -> END on RunLabel, which can produce
+        multiple rows per label when CommandLog has duplicate STARTs (same-
+        second retries) or multiple ENDs for a single RunLabel (orphan-
+        cleanup KILLED record + a real END from gh-425).  Dedup runs a few
+        lines below; uniqueness is re-established via a unique index after
+        dedup so downstream joins still benefit from the index.
+        */
     );
 
     /* Individual stat updates */
@@ -1365,12 +1385,24 @@ BEGIN
         @days_back = @DaysBack,
         @orphan_minutes = @OrphanedRunThresholdMinutes;
 
-    /* #216: Dedup -- keep only the most recent START per RunLabel */
+    /* #216: Dedup -- keep only the most recent START per RunLabel.
+       v2026.04.20.1: EndTime DESC tiebreaker so that when a RunLabel has
+       both a KILLED orphan-cleanup END and a real END we keep the row
+       with an actual end time. */
     WITH dupes AS (
-        SELECT *, ROW_NUMBER() OVER (PARTITION BY RunLabel ORDER BY StartTime DESC) AS rn
+        SELECT *, ROW_NUMBER() OVER (
+                      PARTITION BY RunLabel
+                      ORDER BY StartTime DESC, EndTime DESC
+                  ) AS rn
         FROM #runs
     )
     DELETE FROM dupes WHERE rn > 1;
+
+    /* v2026.04.20.1: unique index replaces PK_runs (now enforced post-dedup). */
+    IF NOT EXISTS (SELECT 1 FROM tempdb.sys.indexes
+                   WHERE object_id = OBJECT_ID(N'tempdb..#runs')
+                     AND name = N'UX_runs_RunLabel')
+        CREATE UNIQUE NONCLUSTERED INDEX UX_runs_RunLabel ON #runs (RunLabel);
 
     DECLARE @run_count integer = (SELECT COUNT_BIG(*) FROM #runs);
     DECLARE @killed_count integer = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 1);
