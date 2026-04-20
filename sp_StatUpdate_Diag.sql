@@ -36,9 +36,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.04.20.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.04.20.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.04.20.1 - Fix PK_runs violation during #runs INSERT.
+History:    2026.04.20.2 - C1 KILLED_RUNS Evidence truncation fix.  When 90+
+                           killed runs existed, the STRING_AGG of all killed
+                           run StartTimes into the Evidence column overflowed
+                           nvarchar(2000) and raised Msg 2628 'String or binary
+                           data would be truncated'.  Capped to the 10 most
+                           recent dates with a "(10 most recent of N)" prefix
+                           when truncation happens.
+            2026.04.20.1 - Fix PK_runs violation during #runs INSERT.
                            The INSERT LEFT JOINs SP_STATUPDATE_START to
                            SP_STATUPDATE_END on RunLabel; CommandLog can
                            contain multiple ENDs per RunLabel (orphan-cleanup
@@ -286,7 +293,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.04.20.1',
+        @procedure_version varchar(20) = '2026.04.20.2',
         @procedure_version_date datetime = '20260420';
 
     SET @Version = @procedure_version;
@@ -2069,14 +2076,22 @@ BEGIN
        ====================================================================== */
     IF EXISTS (SELECT 1 FROM #runs WHERE IsKilled = 1)
     BEGIN
+        /* v2026.04.20.2: cap Evidence to the 10 most recent run dates so we do
+           not overflow the nvarchar(2000) column when 90+ killed runs exist. */
+        DECLARE @c1_killed_total int = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 1);
+
         INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
         SELECT
             N'CRITICAL',
             N'KILLED_RUNS',
-            N'Found ' + CONVERT(nvarchar(10), COUNT_BIG(*)) + N' killed run(s) in the last '
+            N'Found ' + CONVERT(nvarchar(10), @c1_killed_total) + N' killed run(s) in the last '
                 + CONVERT(nvarchar(10), @DaysBack) + N' days',
-            N'Run dates: ' + STRING_AGG(CONVERT(nvarchar(20), r.StartTime, 120), N', ')
-                WITHIN GROUP (ORDER BY r.StartTime DESC),
+            CASE WHEN @c1_killed_total > 10
+                 THEN N'Run dates (10 most recent of ' + CONVERT(nvarchar(10), @c1_killed_total) + N'): '
+                 ELSE N'Run dates: '
+            END
+                + STRING_AGG(CONVERT(nvarchar(20), x.StartTime, 120), N', ')
+                    WITHIN GROUP (ORDER BY x.StartTime DESC),
             N'Killed runs leave orphaned START markers and can indicate: '
                 + N'(1) SQL Agent job killed or timed out, '
                 + N'(2) Server restart during maintenance, '
@@ -2086,8 +2101,13 @@ BEGIN
                 + N'Consider adjusting @TimeLimit to complete within your maintenance window.',
             N'EXECUTE dbo.sp_StatUpdate @Preset = N''NIGHTLY'', @Databases = N''USER_DATABASES'', @TimeLimit = 3600;',
             10
-        FROM #runs AS r
-        WHERE r.IsKilled = 1;
+        FROM
+        (
+            SELECT TOP (10) r.StartTime
+            FROM #runs AS r
+            WHERE r.IsKilled = 1
+            ORDER BY r.StartTime DESC
+        ) AS x;
 
         RAISERROR(N'  [CRITICAL] C1: Killed runs detected', 10, 1) WITH NOWAIT;
     END;
