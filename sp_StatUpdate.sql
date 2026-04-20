@@ -36,11 +36,21 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.3.0.2026.04.18 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.3.1.2026.04.20 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.3.0.2026.04.18 - Additive enhancements (5 issues):
+History:    3.3.1.2026.04.20 - Deploy fix: pre-ALTER-PROCEDURE migration for
+                              dbo.QueueStatistic.  ALTER PROCEDURE body has
+                              static references to ClaimLoginTime (bd -h9a) and
+                              LastStatCompletedAt (v2.3); upgrades from v2.26 or
+                              earlier failed compilation with "Invalid column
+                              name".  In-proc runtime migrations fire only when
+                              @StatsInParallel = Y (too late for compile).  New
+                              batches between stub CREATE and ALTER PROCEDURE
+                              add both columns if the table exists without
+                              them.  Idempotent; no-op on fresh installs.
+            3.3.0.2026.04.18 - Additive enhancements (5 issues):
                             gh-423 @JobName input param -- optional context tag written
                               to CONTEXT_INFO at entry and restored at exit.  Surfaced
                               via Extended Events sessions and sys.dm_exec_requests.
@@ -166,6 +176,37 @@ BEGIN
 END;
 GO
 
+/* ============================================================================
+   PRE-DEPLOY MIGRATION: dbo.QueueStatistic schema upgrade
+   ----------------------------------------------------------------------------
+   The ALTER PROCEDURE body below contains static (non-dynamic-SQL) references
+   to columns that were added in later versions.  If an existing
+   dbo.QueueStatistic table lacks those columns (upgrades from v2.26 or
+   earlier), column binding would fail at ALTER PROCEDURE compile time with
+   "Invalid column name ...".  Add any missing columns here, BEFORE the
+   ALTER PROCEDURE batch.  In-proc runtime migrations still exist but only
+   fire when @StatsInParallel = N'Y' -- too late for compilation.
+   ============================================================================ */
+IF OBJECT_ID(N'dbo.QueueStatistic', N'U') IS NOT NULL
+AND NOT EXISTS (SELECT 1 FROM sys.columns
+                WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic')
+                  AND name = N'LastStatCompletedAt')
+BEGIN
+    ALTER TABLE dbo.QueueStatistic ADD LastStatCompletedAt datetime2(3) NULL;
+    RAISERROR(N'Pre-deploy migration: added LastStatCompletedAt to dbo.QueueStatistic (v2.3).', 10, 1) WITH NOWAIT;
+END;
+GO
+
+IF OBJECT_ID(N'dbo.QueueStatistic', N'U') IS NOT NULL
+AND NOT EXISTS (SELECT 1 FROM sys.columns
+                WHERE object_id = OBJECT_ID(N'dbo.QueueStatistic')
+                  AND name = N'ClaimLoginTime')
+BEGIN
+    ALTER TABLE dbo.QueueStatistic ADD ClaimLoginTime datetime NULL;
+    RAISERROR(N'Pre-deploy migration: added ClaimLoginTime to dbo.QueueStatistic (bd -h9a).', 10, 1) WITH NOWAIT;
+END;
+GO
+
 ALTER PROCEDURE
     dbo.sp_StatUpdate
 (
@@ -275,8 +316,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.3.0.2026.04.18',
-        @procedure_version_date datetime = '20260418',
+        @procedure_version varchar(20) = '3.3.1.2026.04.20',
+        @procedure_version_date datetime = '20260420',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
