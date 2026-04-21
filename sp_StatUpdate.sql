@@ -36,11 +36,11 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.3.2.2026.04.20 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.3.4.2026.04.20 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.3.2.2026.04.20 - Bug fix (gh-428 follow-up): removed server-level
+History:    3.3.4.2026.04.20 - Bug fix (gh-428 follow-up): removed server-level
                               AG-secondary hard-error from parallel pre-flight.
                               Previously @StatsInParallel=Y failed with severity-16
                               ERROR whenever the server hosted any AG-secondary
@@ -330,7 +330,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.3.2.2026.04.20',
+        @procedure_version varchar(20) = '3.3.4.2026.04.20',
         @procedure_version_date datetime = '20260420',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -5138,7 +5138,7 @@ OPTION (RECOMPILE);';
        Runs before queue init when @StatsInParallel = Y.
        Check: orphan row backlog warning.
 
-       v3.3.2: Removed server-level AG-secondary hard-error.  Region 04-DB-PARSE
+       v3.3.4 (gh-497): Removed server-level AG-secondary hard-error.  Region 04-DB-PARSE
        (lines ~2081-2120) already excludes AG-secondary databases from
        @tmpDatabases and hard-errors when ALL selected databases are on
        secondaries.  If we reach this point, @database_count > 0 is guaranteed
