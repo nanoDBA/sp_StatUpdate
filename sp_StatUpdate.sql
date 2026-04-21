@@ -36,11 +36,25 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.3.1.2026.04.20 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.3.2.2026.04.20 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.3.1.2026.04.20 - Deploy fix: pre-ALTER-PROCEDURE migration for
+History:    3.3.2.2026.04.20 - Bug fix (gh-428 follow-up): removed server-level
+                              AG-secondary hard-error from parallel pre-flight.
+                              Previously @StatsInParallel=Y failed with severity-16
+                              ERROR whenever the server hosted any AG-secondary
+                              replicas, even when non-AG USER_DATABASES were
+                              also present -- regressing v2 behavior of silently
+                              skipping unreadable AG databases and proceeding
+                              against the remainder.  Region 04-DB-PARSE
+                              already filters AG-secondary databases out of
+                              @tmpDatabases and short-circuits when no
+                              eligible database remains, so the pre-flight
+                              guard was both redundant and incorrect.  Kept
+                              gh-428 Check 2 (orphan QueueStatistic row
+                              backlog warning).
+            3.3.1.2026.04.20 - Deploy fix: pre-ALTER-PROCEDURE migration for
                               dbo.QueueStatistic.  ALTER PROCEDURE body has
                               static references to ClaimLoginTime (bd -h9a) and
                               LastStatCompletedAt (v2.3); upgrades from v2.26 or
@@ -316,7 +330,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.3.1.2026.04.20',
+        @procedure_version varchar(20) = '3.3.2.2026.04.20',
         @procedure_version_date datetime = '20260420',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -5122,48 +5136,20 @@ OPTION (RECOMPILE);';
     END;
     /* gh-428: Parallel pre-flight validation.
        Runs before queue init when @StatsInParallel = Y.
-       Checks (1) AG-secondary guard, (2) orphan row backlog. */
+       Check: orphan row backlog warning.
+
+       v3.3.2: Removed server-level AG-secondary hard-error.  Region 04-DB-PARSE
+       (lines ~2081-2120) already excludes AG-secondary databases from
+       @tmpDatabases and hard-errors when ALL selected databases are on
+       secondaries.  If we reach this point, @database_count > 0 is guaranteed
+       and every remaining database is non-AG or AG-primary.  The prior
+       @is_ag_secondary_server guard was server-level state and incorrectly
+       blocked runs when the server hosted AG secondaries AND non-AG
+       USER_DATABASES -- a v2 behavior regression. */
     IF @StatsInParallel = N'Y'
     BEGIN
 
-        /* gh-428 Check 1: Block if this server is an AG secondary for all groups.
-           The per-DB check in region 04-DB-PARSE already excludes individual
-           secondary databases.  This guard catches the edge case where all
-           selected databases belong to AGs where this instance is SECONDARY. */
-        IF @is_ag_secondary_server = 1
-        BEGIN
-            RAISERROR(N'ERROR: @StatsInParallel=Y blocked -- all AG databases are on secondary replicas.  Parallel mode requires primary access.', 16, 1) WITH NOWAIT;
-            SET @StopReasonOut = N'AG_SECONDARY';
-            SET @StatsFoundOut = 0;
-            SET @StatsProcessedOut = 0;
-            SET @StatsSucceededOut = 0;
-            SET @StatsFailedOut = 0;
-            SET @StatsRemainingOut = 0;
-            SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
-            SELECT
-                Status = N'ERROR',
-                StatusMessage = N'Parallel mode blocked: AG secondary replica.',
-                StatsFound = 0, StatsProcessed = 0, StatsSucceeded = 0, StatsFailed = 0,
-                StatsToctou = 0, StatsSkipped = 0, StatsRemaining = 0,
-                DatabasesProcessed = @database_count,
-                DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
-                StopReason = N'AG_SECONDARY', RunLabel = @run_label,
-                Version = @procedure_version;
-            IF @StatsInParallel = N'N'
-                DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
-            /* gh-423: restore CONTEXT_INFO on early exit.
-               SET CONTEXT_INFO rejects NULL -- coerce to 0x when caller had no context set. */
-            IF @context_info_set = 1
-            BEGIN
-                IF @original_context_info IS NULL
-                    SET CONTEXT_INFO 0x;
-                ELSE
-                    SET CONTEXT_INFO @original_context_info;
-            END;
-            RETURN 1;
-        END;
-
-        /* gh-428 Check 2: Orphan row backlog warning.
+        /* gh-428 Check: Orphan row backlog warning.
            A large number of QueueStatistic rows stuck in started-but-never-finished
            state indicates a prior parallel run was killed without cleanup.
            Warn the operator -- the gh-425 stale-sweep on the leader path will
