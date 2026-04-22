@@ -36,11 +36,18 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.3.4.2026.04.20 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.3.5.2026.04.22 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.3.4.2026.04.20 - Bug fix (gh-428 follow-up): removed server-level
+History:    3.3.5.2026.04.22 - QS forced plan check: replace CHARINDEX scan with
+                              sql_expression_dependencies integer join for compiled
+                              objects (gh-500); ad-hoc fallback retained.  Parallel
+                              mode: lead-worker gate prevents N-worker redundancy
+                              (gh-498).  Progress entries: parallel mode now shows
+                              global QueueStatistic total as denominator + GlobalStatsDone
+                              field in ExtendedInfo XML (gh-499).
+            3.3.4.2026.04.20 - Bug fix (gh-428 follow-up): removed server-level
                               AG-secondary hard-error from parallel pre-flight.
                               Previously @StatsInParallel=Y failed with severity-16
                               ERROR whenever the server hosted any AG-secondary
@@ -330,8 +337,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.3.4.2026.04.20',
-        @procedure_version_date datetime = '20260420',
+        @procedure_version varchar(20) = '3.3.5.2026.04.22',
+        @procedure_version_date datetime = '20260422',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -7553,10 +7560,30 @@ OPTION (RECOMPILE);';
                     /*
                     Progress logging at interval (for Agent job monitoring).
                     Logs SP_STATUPDATE_PROGRESS entry every N stats processed.
+                    gh-499: In parallel mode, use QueueStatistic to derive a global
+                    total so all workers share the same denominator.  The numerator
+                    remains this worker's own @stats_processed count.
                     */
                     IF  @i_progress_log_interval IS NOT NULL
                     AND @stats_processed % @i_progress_log_interval = 0
                     BEGIN
+                        DECLARE
+                            @prog_global_total int = @total_stats,
+                            @prog_global_done  int = NULL;
+
+                        /* In parallel mode derive global total from QueueStatistic. */
+                        IF @StatsInParallel = N'Y' AND @queue_id IS NOT NULL
+                        BEGIN
+                            SELECT
+                                @prog_global_total = SUM(qs.StatsCount),
+                                @prog_global_done  = SUM(
+                                    ISNULL(qs.StatsUpdated, 0)
+                                    + ISNULL(qs.StatsFailed, 0)
+                                    + ISNULL(qs.StatsSkipped, 0))
+                            FROM dbo.QueueStatistic AS qs
+                            WHERE qs.QueueID = @queue_id;
+                        END;
+
                         INSERT INTO
                             dbo.CommandLog
                         (
@@ -7576,16 +7603,26 @@ OPTION (RECOMPILE);';
                             N'dbo',
                             N'sp_StatUpdate',
                             N'P',
-                            N'Progress: ' + CONVERT(nvarchar(10), @stats_processed) + N'/' + CONVERT(nvarchar(10), @total_stats) + N' stats processed',
+                            CASE
+                                WHEN @StatsInParallel = N'Y'
+                                THEN N'Progress (worker): ' + CONVERT(nvarchar(10), @stats_processed)
+                                     + N'/' + CONVERT(nvarchar(10), ISNULL(@prog_global_total, @total_stats))
+                                     + N' stats (global total); tables done: '
+                                     + CONVERT(nvarchar(10), ISNULL(@prog_global_done, 0))
+                                ELSE N'Progress: ' + CONVERT(nvarchar(10), @stats_processed)
+                                     + N'/' + CONVERT(nvarchar(10), @total_stats) + N' stats processed'
+                            END,
                             N'SP_STATUPDATE_PROGRESS',
                             @start_time,
                             SYSDATETIME(),
                             (
                                 SELECT
-                                    @stats_processed AS StatsProcessed,
-                                    @stats_succeeded AS StatsSucceeded,
-                                    @stats_failed AS StatsFailed,
-                                    @total_stats AS StatsTotal,
+                                    @stats_processed                            AS StatsProcessed,
+                                    @stats_succeeded                            AS StatsSucceeded,
+                                    @stats_failed                               AS StatsFailed,
+                                    @total_stats                                AS StatsTotal,
+                                    ISNULL(@prog_global_total, @total_stats)    AS GlobalStatsTotal,
+                                    @prog_global_done                           AS GlobalStatsDone,
                                     DATEDIFF(SECOND, @start_time, SYSDATETIME()) AS ElapsedSeconds
                                 FOR XML RAW(N'Progress'), ELEMENTS
                             )
@@ -7623,22 +7660,42 @@ OPTION (RECOMPILE);';
                     END
                     ELSE
                     BEGIN
-                        /* Cache miss: new table — query QS and cache */
+                        /* Cache miss: new table — query QS and cache.
+                           gh-500: Use sql_expression_dependencies for compiled objects
+                           (SPs/functions) to avoid CHARINDEX on query text.  Only ad-hoc
+                           queries (object_id IS NULL) fall back to CHARINDEX. */
                         SET @qs168_sql =
                             N'SELECT @cnt = COUNT(DISTINCT qsp.plan_id)
                               FROM ' + QUOTENAME(@current_database) + N'.sys.query_store_plan AS qsp
                               INNER JOIN ' + QUOTENAME(@current_database) + N'.sys.query_store_query AS qsq
                                   ON qsq.query_id = qsp.query_id
-                              INNER JOIN ' + QUOTENAME(@current_database) + N'.sys.query_store_query_text AS qsqt
-                                  ON qsqt.query_text_id = qsq.query_text_id
                               WHERE qsp.is_forced_plan = 1
                               AND qsp.force_failure_count = 0
-                              AND CHARINDEX(@tbl COLLATE DATABASE_DEFAULT,
-                                            qsqt.query_sql_text COLLATE DATABASE_DEFAULT) > 0';
+                              AND (
+                                  /* Compiled objects: integer join via sql_expression_dependencies */
+                                  EXISTS (
+                                      SELECT 1
+                                      FROM ' + QUOTENAME(@current_database) + N'.sys.sql_expression_dependencies AS sed
+                                      WHERE sed.referencing_id  = qsq.object_id
+                                      AND   sed.referenced_id   = @obj_id
+                                      AND   sed.referenced_minor_id = 0
+                                  )
+                                  OR
+                                  /* Ad-hoc queries (object_id IS NULL): CHARINDEX fallback */
+                                  (qsq.object_id IS NULL
+                                   AND EXISTS (
+                                       SELECT 1
+                                       FROM ' + QUOTENAME(@current_database) + N'.sys.query_store_query_text AS qsqt
+                                       WHERE qsqt.query_text_id = qsq.query_text_id
+                                       AND   CHARINDEX(@tbl COLLATE DATABASE_DEFAULT,
+                                                       qsqt.query_sql_text COLLATE DATABASE_DEFAULT) > 0
+                                   ))
+                              )';
                         EXEC sp_executesql @qs168_sql,
-                            N'@tbl sysname, @cnt int OUTPUT',
-                            @tbl = @current_table_name,
-                            @cnt = @qs168_count OUTPUT;
+                            N'@tbl sysname, @obj_id int, @cnt int OUTPUT',
+                            @tbl  = @current_table_name,
+                            @obj_id = @current_object_id,
+                            @cnt  = @qs168_count OUTPUT;
                         SET @fp_cached_table = @current_table_name;
                         SET @fp_cached_db = @current_database;
                         SET @fp_cached_count = ISNULL(@qs168_count, 0);
@@ -8670,9 +8727,13 @@ OPTION (RECOMPILE);';
     Statistics changes may invalidate forced plan choices.
     ============================================================================
     */
+    /* gh-498: In parallel mode only the lead worker (the one that ran discovery
+       and populated the queue, @skip_discovery = 0) runs this check.  Non-lead
+       workers skip it entirely.  In serial mode it always runs. */
     IF  @Execute = N'Y'
     AND @stats_succeeded > 0
     AND (@i_time_limit IS NULL OR DATEDIFF(SECOND, @start_time, SYSDATETIME()) < @i_time_limit)
+    AND (@StatsInParallel = N'N' OR @skip_discovery = 0)
     BEGIN
         DECLARE
             @qs_check_db sysname = NULL,
@@ -8729,8 +8790,10 @@ OPTION (RECOMPILE);';
                 IF ISNULL(@qs_has_forced, 0) > 0
                 BEGIN
                 /*
-                P1 fix (#187): Filter forced plans first (typically very few), then check
-                if any reference updated tables via CHARINDEX on query text.
+                gh-500: Use sql_expression_dependencies to match forced plans to updated
+                tables via integer object_id joins.  Avoids full CHARINDEX scan against
+                query_sql_text for compiled objects (SPs/functions/triggers).  Only
+                ad-hoc queries (qsq.object_id IS NULL) fall through to CHARINDEX.
                 Uses 30-second LOCK_TIMEOUT to prevent indefinite blocking on QS DMVs.
                 */
                 SET @qs_check_sql = N'
@@ -8739,15 +8802,32 @@ OPTION (RECOMPILE);';
                     FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan AS qsp
                     INNER JOIN ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_query AS qsq
                         ON qsq.query_id = qsp.query_id
-                    INNER JOIN ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_query_text AS qsqt
-                        ON qsqt.query_text_id = qsq.query_text_id
                     WHERE qsp.is_forced_plan = 1
-                    AND EXISTS (
-                        SELECT 1 FROM #stats_to_process AS stp
-                        WHERE stp.database_name = @dbname COLLATE DATABASE_DEFAULT
-                        AND stp.processed = 1
-                        AND CHARINDEX(stp.table_name COLLATE DATABASE_DEFAULT,
-                                      qsqt.query_sql_text COLLATE DATABASE_DEFAULT) > 0
+                    AND (
+                        /* Compiled objects: integer join via sql_expression_dependencies */
+                        EXISTS (
+                            SELECT 1
+                            FROM ' + QUOTENAME(@qs_check_db) + N'.sys.sql_expression_dependencies AS sed
+                            INNER JOIN #stats_to_process AS stp
+                                ON  stp.object_id = sed.referenced_id
+                            WHERE sed.referencing_id      = qsq.object_id
+                            AND   sed.referenced_minor_id = 0
+                            AND   stp.database_name       = @dbname COLLATE DATABASE_DEFAULT
+                            AND   stp.processed           = 1
+                        )
+                        OR
+                        /* Ad-hoc queries (object_id IS NULL): CHARINDEX fallback */
+                        (qsq.object_id IS NULL
+                         AND EXISTS (
+                             SELECT 1
+                             FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_query_text AS qsqt
+                             INNER JOIN #stats_to_process AS stp
+                                 ON  CHARINDEX(stp.table_name COLLATE DATABASE_DEFAULT,
+                                               qsqt.query_sql_text COLLATE DATABASE_DEFAULT) > 0
+                             WHERE qsqt.query_text_id     = qsq.query_text_id
+                             AND   stp.database_name      = @dbname COLLATE DATABASE_DEFAULT
+                             AND   stp.processed          = 1
+                         ))
                     )';
 
                 EXEC sp_executesql @qs_check_sql,
