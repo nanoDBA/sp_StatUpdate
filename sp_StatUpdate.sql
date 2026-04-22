@@ -36,11 +36,19 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.3.5.2026.04.22 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.4.0.2026.04.22 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.3.5.2026.04.22 - QS forced plan check: replace CHARINDEX scan with
+History:    3.4.0.2026.04.22 - CommandLog intelligence: Phase 3B uses CommandLog
+                              ModificationCounter delta for threshold qualification
+                              instead of raw counter; stats with delta=0 skip
+                              qualification entirely (gh-502).  New sort order
+                              MODIFICATION_VELOCITY ranks by mods/hour (gh-507).
+                              Phase 5B caches QS scores from CommandLog; Phase 6
+                              skips expensive QS DMV joins for stats with fresh
+                              cached scores (gh-503).
+            3.3.5.2026.04.22 - QS forced plan check: replace CHARINDEX scan with
                               sql_expression_dependencies integer join for compiled
                               objects (gh-500); ad-hoc fallback retained.  Parallel
                               mode: lead-worker gate prevents N-worker redundancy
@@ -337,7 +345,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.3.5.2026.04.22',
+        @procedure_version varchar(20) = '3.4.0.2026.04.22',
         @procedure_version_date datetime = '20260422',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -1587,9 +1595,10 @@ BEGIN
         VALUES (N'Invalid @Preset. Use: DEFAULT, NIGHTLY, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE.', 16);
 
     IF @i_sort_order NOT IN (N'MODIFICATION_COUNTER', N'DAYS_STALE', N'PAGE_COUNT', N'RANDOM',
-                             N'QUERY_STORE', N'FILTERED_DRIFT', N'AUTO_CREATED', N'ROWS')
+                             N'QUERY_STORE', N'FILTERED_DRIFT', N'AUTO_CREATED', N'ROWS',
+                             N'MODIFICATION_VELOCITY')
         INSERT INTO @errors (error_message, error_severity)
-        VALUES (N'Invalid @SortOrder. Use: MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED, ROWS.', 16);
+        VALUES (N'Invalid @SortOrder. Use: MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED, ROWS, MODIFICATION_VELOCITY.', 16);
 
     IF @i_qs_enabled = 1
     AND @i_qs_metric NOT IN (N'CPU', N'DURATION', N'READS', N'EXECUTIONS', N'AVG_CPU',
@@ -3594,6 +3603,11 @@ OPTION (RECOMPILE);';
                     sqrt_threshold bigint NULL,
                     days_stale int NULL,
                     hours_stale int NULL,
+                    /* Phase 3B: CommandLog delta (gh-502, gh-507) */
+                    cl_last_counter bigint NULL,
+                    cl_last_update datetime2 NULL,
+                    effective_counter bigint NULL,
+                    modification_velocity float NULL,
                     /* Phase 4: qualification flag */
                     qualifies bit NOT NULL DEFAULT 0,
                     /* Phase 5: page counts */
@@ -3614,6 +3628,7 @@ OPTION (RECOMPILE);';
                     qs_active_feedback_count int NULL,
                     qs_last_execution datetime2 NULL,
                     qs_priority_boost bigint NULL,
+                    qs_cache_hit bit NOT NULL DEFAULT 0,
                     PRIMARY KEY CLUSTERED (object_id, stats_id)
                 );
 
@@ -3845,24 +3860,102 @@ OPTION (RECOMPILE);';
                     RETURN;
                 END;
 
+                /*
+                ================================================================
+                PHASE 3B: CommandLog delta enrichment (gh-502, gh-507)
+                Fetch last known modification_counter from CommandLog for each
+                stat.  Compute effective_counter (delta) and velocity.
+                Stats with delta=0 are already current -- skip them in Phase 4.
+                Stats with no CommandLog history fall back to raw counter.
+                ================================================================
+                */
+                SET @phase_timer = SYSDATETIME();
+                IF @commandlog_exists_param = 1
+                BEGIN
+                    ;WITH cl_lookup AS (
+                        SELECT
+                            sc2.object_id,
+                            sc2.stats_id,
+                            cl.ExtendedInfo.value(N''(/ExtendedInfo/ModificationCounter)[1]'', N''bigint'') AS last_counter,
+                            cl.EndTime AS last_update,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY sc2.object_id, sc2.stats_id
+                                ORDER BY cl.EndTime DESC
+                            ) AS rn
+                        FROM #stat_candidates AS sc2
+                        INNER JOIN ' + @commandlog_3part + N' AS cl
+                            ON  cl.CommandType    = N''UPDATE_STATISTICS''
+                            AND cl.DatabaseName   = DB_NAME() COLLATE DATABASE_DEFAULT
+                            AND cl.ObjectName     = sc2.table_name COLLATE DATABASE_DEFAULT
+                            AND cl.StatisticsName = sc2.stat_name COLLATE DATABASE_DEFAULT
+                            AND cl.EndTime IS NOT NULL
+                            AND cl.ErrorNumber    = 0
+                    )
+                    UPDATE sc
+                    SET sc.cl_last_counter = cl_lookup.last_counter,
+                        sc.cl_last_update  = cl_lookup.last_update,
+                        sc.effective_counter =
+                            CASE
+                                WHEN cl_lookup.last_counter IS NOT NULL
+                                     AND sc.modification_counter >= cl_lookup.last_counter
+                                THEN sc.modification_counter - cl_lookup.last_counter
+                                ELSE sc.modification_counter
+                            END,
+                        sc.modification_velocity =
+                            CASE
+                                WHEN cl_lookup.last_counter IS NOT NULL
+                                     AND sc.modification_counter >= cl_lookup.last_counter
+                                     AND DATEDIFF(MINUTE, cl_lookup.last_update, SYSDATETIME()) > 0
+                                THEN CONVERT(float, sc.modification_counter - cl_lookup.last_counter)
+                                     / (CONVERT(float, DATEDIFF(MINUTE, cl_lookup.last_update, SYSDATETIME())) / 60.0)
+                                ELSE NULL
+                            END
+                    FROM #stat_candidates AS sc
+                    INNER JOIN cl_lookup
+                        ON  cl_lookup.object_id = sc.object_id
+                        AND cl_lookup.stats_id  = sc.stats_id
+                        AND cl_lookup.rn        = 1;
+
+                    /* Stats without CommandLog history: effective_counter = raw counter */
+                    UPDATE #stat_candidates
+                    SET effective_counter = modification_counter
+                    WHERE effective_counter IS NULL;
+
+                    DECLARE @phase3b_enriched int = (SELECT COUNT(*) FROM #stat_candidates WHERE cl_last_counter IS NOT NULL);
+                    DECLARE @phase3b_zero int = (SELECT COUNT(*) FROM #stat_candidates WHERE effective_counter = 0);
+                    SET @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
+                    IF @Debug_param = 1
+                        RAISERROR(N''    Phase 3B (CommandLog delta): %d stats enriched, %d with delta=0 (%d ms)'', 10, 1, @phase3b_enriched, @phase3b_zero, @phase_ms) WITH NOWAIT;
+                END
+                ELSE
+                BEGIN
+                    /* No CommandLog -- effective_counter = raw counter for all */
+                    UPDATE #stat_candidates
+                    SET effective_counter = modification_counter;
+                END;
+
                 SET @phase_timer = SYSDATETIME();
 
                 /*
                 ================================================================
                 PHASE 4: Apply threshold filters (early elimination)
+                gh-502: Uses effective_counter (delta) instead of raw
+                modification_counter when CommandLog history is available.
+                Stats with delta=0 are already current and skip qualification.
                 ================================================================
                 */
                 /* Apply threshold logic (v3: OR is the only supported mode) */
                 UPDATE #stat_candidates
                 SET qualifies = 1
-                WHERE (
+                WHERE effective_counter > 0  /* gh-502: skip stats with delta=0 (already current) */
+                AND (
                     /* Fixed modification threshold */
-                    (@ModificationThreshold_param IS NOT NULL AND modification_counter >= @ModificationThreshold_param)
+                    (@ModificationThreshold_param IS NOT NULL AND effective_counter >= @ModificationThreshold_param)
                     /* Modification percent (non-tiered) */
                     OR (@i_tiered_thresholds_param = 0 AND @i_modification_percent_param IS NOT NULL
-                        AND modification_counter >= (@i_modification_percent_param * SQRT(CONVERT(float, ISNULL(rows, 1)))))
+                        AND effective_counter >= (@i_modification_percent_param * SQRT(CONVERT(float, ISNULL(rows, 1)))))
                     /* Tiered thresholds */
-                    OR (@i_tiered_thresholds_param = 1 AND (modification_counter >= tier_threshold OR modification_counter >= sqrt_threshold))
+                    OR (@i_tiered_thresholds_param = 1 AND (effective_counter >= tier_threshold OR effective_counter >= sqrt_threshold))
                     /* Hours stale (v2.3) */
                     OR (@StaleHours_param IS NOT NULL AND hours_stale >= @StaleHours_param)
                     /* No thresholds = include all */
@@ -4030,8 +4123,67 @@ OPTION (RECOMPILE);';
 
                 /*
                 ================================================================
+                PHASE 5B: QS score cache from CommandLog (gh-503)
+                Fetch cached QSPriorityBoost, QSTotalCpuMs, QSLastExecution from
+                the most recent CommandLog entry per stat.  If QSLastExecution is
+                within @i_qs_recent_hours, copy cached scores and mark
+                qs_cache_hit=1 so Phase 6 skips the expensive QS DMV joins.
+                ================================================================
+                */
+                IF @commandlog_exists_param = 1 AND @i_qs_enabled_param = 1
+                BEGIN
+                    SET @phase_timer = SYSDATETIME();
+
+                    ;WITH qs_cache AS (
+                        SELECT
+                            sc2.object_id,
+                            sc2.stats_id,
+                            cl.ExtendedInfo.value(N''(/ExtendedInfo/QSPriorityBoost)[1]'', N''bigint'') AS cached_boost,
+                            cl.ExtendedInfo.value(N''(/ExtendedInfo/QSTotalCpuMs)[1]'', N''bigint'') AS cached_cpu,
+                            cl.ExtendedInfo.value(N''(/ExtendedInfo/QSLastExecution)[1]'', N''datetime2'') AS cached_qs_last_exec,
+                            cl.ExtendedInfo.value(N''(/ExtendedInfo/QSTotalExecutions)[1]'', N''bigint'') AS cached_executions,
+                            cl.ExtendedInfo.value(N''(/ExtendedInfo/QSPlanCount)[1]'', N''int'') AS cached_plan_count,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY sc2.object_id, sc2.stats_id
+                                ORDER BY cl.EndTime DESC
+                            ) AS rn
+                        FROM #stat_candidates AS sc2
+                        INNER JOIN ' + @commandlog_3part + N' AS cl
+                            ON  cl.CommandType    = N''UPDATE_STATISTICS''
+                            AND cl.DatabaseName   = DB_NAME() COLLATE DATABASE_DEFAULT
+                            AND cl.ObjectName     = sc2.table_name COLLATE DATABASE_DEFAULT
+                            AND cl.StatisticsName = sc2.stat_name COLLATE DATABASE_DEFAULT
+                            AND cl.EndTime IS NOT NULL
+                            AND cl.ErrorNumber    = 0
+                    )
+                    UPDATE sc
+                    SET sc.qs_priority_boost    = ISNULL(qs_cache.cached_boost, 0),
+                        sc.qs_total_cpu_ms      = qs_cache.cached_cpu,
+                        sc.qs_total_executions  = qs_cache.cached_executions,
+                        sc.qs_plan_count        = qs_cache.cached_plan_count,
+                        sc.qs_last_execution    = qs_cache.cached_qs_last_exec,
+                        sc.qs_cache_hit         = 1
+                    FROM #stat_candidates AS sc
+                    INNER JOIN qs_cache
+                        ON  qs_cache.object_id = sc.object_id
+                        AND qs_cache.stats_id  = sc.stats_id
+                        AND qs_cache.rn        = 1
+                    WHERE qs_cache.cached_qs_last_exec >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME())
+                    AND   qs_cache.cached_boost IS NOT NULL;
+
+                    DECLARE @qs_cache_hits int = (SELECT COUNT(*) FROM #stat_candidates WHERE qs_cache_hit = 1);
+                    DECLARE @qs_cache_total int = (SELECT COUNT(*) FROM #stat_candidates);
+                    SET @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
+                    IF @Debug_param = 1
+                        RAISERROR(N''    Phase 5B (QS cache): %d of %d stats have fresh cached QS scores (%d ms)'', 10, 1, @qs_cache_hits, @qs_cache_total, @phase_ms) WITH NOWAIT;
+                END;
+
+                /*
+                ================================================================
                 PHASE 6: Add Query Store data (only if enabled)
                 P2 #20: Skip QS operations when QS is disabled.
+                gh-503: Skips stats with qs_cache_hit=1 (fresh scores from
+                CommandLog).  Only queries QS DMVs for cache misses.
                 ================================================================
                 */
                 /*
@@ -4199,7 +4351,8 @@ OPTION (RECOMPILE);';
                                 ELSE 0
                             END
                     FROM #stat_candidates AS sc
-                    INNER JOIN QSByTable AS qs ON qs.object_id = sc.object_id;
+                    INNER JOIN QSByTable AS qs ON qs.object_id = sc.object_id
+                    WHERE sc.qs_cache_hit = 0; /* gh-503: skip stats with fresh cached QS scores */
 
                     /* Mark unenriched stats: 0 = enrichment ran, no matching QS plans
                        (vs NULL = enrichment skipped/bailed out).  Allows diag proc W5
@@ -4390,7 +4543,8 @@ OPTION (RECOMPILE);';
                                  ELSE 0
                             END +
                             CASE @i_sort_order_param
-                                WHEN N''MODIFICATION_COUNTER'' THEN modification_counter + ISNULL(qs_priority_boost, 0)
+                                WHEN N''MODIFICATION_COUNTER'' THEN ISNULL(effective_counter, modification_counter) + ISNULL(qs_priority_boost, 0)
+                                WHEN N''MODIFICATION_VELOCITY'' THEN ISNULL(CONVERT(bigint, modification_velocity), 0) + ISNULL(qs_priority_boost, 0)
                                 WHEN N''DAYS_STALE'' THEN days_stale + ISNULL(qs_priority_boost, 0)
                                 WHEN N''PAGE_COUNT'' THEN ISNULL(page_count, 0) + ISNULL(qs_priority_boost, 0)
                                 WHEN N''RANDOM'' THEN CHECKSUM(NEWID())
@@ -4518,6 +4672,7 @@ OPTION (RECOMPILE);';
                       @i_include_indexed_views_param nvarchar(1),
                       @i_ascending_key_boost_param nvarchar(1),
                       @i_qs_top_plans_param integer,
+                      @commandlog_exists_param bit,
                       @Debug_param bit',
                     @i_sort_order_param = @i_sort_order,
                     @TargetNorecompute_param = @TargetNorecompute,
@@ -4542,6 +4697,7 @@ OPTION (RECOMPILE);';
                     @i_include_indexed_views_param = @i_include_indexed_views,
                     @i_ascending_key_boost_param = @i_ascending_key_boost,
                     @i_qs_top_plans_param = @i_qs_top_plans,
+                    @commandlog_exists_param = @commandlog_exists,
                     @Debug_param = @Debug;
             END; /* End of staged discovery */
             /*#endregion 07D-DISC-PHASES-5-6 */
@@ -5533,7 +5689,12 @@ OPTION (RECOMPILE);';
 
                 /*
                 Insert one row per table needing stats updates.
-                Tables ordered by max modification_counter (most stale first).
+                gh-505: Use longest-processing-time-first (LPT) scheduling
+                when CommandLog has historical duration data.  This assigns
+                estimated-longest tables to the front of the queue so all
+                workers stay busy -- prevents worker starvation where one
+                worker gets stuck on a slow table at the end.
+                Falls back to priority ordering when no history exists.
                 */
                 INSERT INTO
                     dbo.QueueStatistic
@@ -5549,21 +5710,58 @@ OPTION (RECOMPILE);';
                 )
                 SELECT
                     QueueID = @queue_id,
-                    DatabaseName = stp.database_name,
-                    SchemaName = stp.schema_name,
-                    ObjectName = stp.table_name,
-                    ObjectID = stp.object_id,
+                    DatabaseName = tbl.database_name,
+                    SchemaName = tbl.schema_name,
+                    ObjectName = tbl.table_name,
+                    ObjectID = tbl.object_id,
                     TablePriority = ROW_NUMBER() OVER (
-                        ORDER BY MIN(stp.priority) ASC
+                        ORDER BY
+                            /* LPT: estimated total seconds DESC (longest first) when history exists */
+                            COALESCE(tbl.est_total_seconds, 0) DESC,
+                            /* Fallback: original priority ordering */
+                            tbl.min_priority ASC
                     ),
-                    StatsCount = COUNT_BIG(*),
-                    MaxModificationCounter = MAX(stp.modification_counter)
-                FROM #stats_to_process AS stp
-                GROUP BY
-                    stp.database_name,
-                    stp.schema_name,
-                    stp.table_name,
-                    stp.object_id;
+                    StatsCount = tbl.stats_count,
+                    MaxModificationCounter = tbl.max_mod_counter
+                FROM (
+                    SELECT
+                        stp.database_name,
+                        stp.schema_name,
+                        stp.table_name,
+                        stp.object_id,
+                        min_priority = MIN(stp.priority),
+                        stats_count = COUNT_BIG(*),
+                        max_mod_counter = MAX(stp.modification_counter),
+                        est_total_seconds =
+                            CASE WHEN cl_dur.avg_seconds_per_stat IS NOT NULL
+                                 THEN CONVERT(bigint, COUNT_BIG(*) * cl_dur.avg_seconds_per_stat)
+                                 ELSE NULL
+                            END
+                    FROM #stats_to_process AS stp
+                    LEFT JOIN (
+                        /* gh-505: historical avg duration per table from CommandLog */
+                        SELECT
+                            cl.DatabaseName,
+                            cl.ObjectName,
+                            avg_seconds_per_stat = AVG(CONVERT(float, DATEDIFF(MILLISECOND, cl.StartTime, cl.EndTime)) / 1000.0),
+                            run_count = COUNT(*)
+                        FROM dbo.CommandLog AS cl
+                        WHERE cl.CommandType = N'UPDATE_STATISTICS'
+                        AND   cl.EndTime IS NOT NULL
+                        AND   cl.ErrorNumber = 0
+                        AND   cl.StartTime >= DATEADD(DAY, -@i_command_log_retention_days, SYSDATETIME())
+                        GROUP BY cl.DatabaseName, cl.ObjectName
+                        HAVING COUNT(*) >= 3  /* require minimum history for reliable estimate */
+                    ) AS cl_dur
+                        ON  cl_dur.DatabaseName = stp.database_name COLLATE DATABASE_DEFAULT
+                        AND cl_dur.ObjectName   = stp.table_name COLLATE DATABASE_DEFAULT
+                    GROUP BY
+                        stp.database_name,
+                        stp.schema_name,
+                        stp.table_name,
+                        stp.object_id,
+                        cl_dur.avg_seconds_per_stat
+                ) AS tbl;
 
                 DECLARE
                     @Tables_queued integer = ROWCOUNT_BIG();

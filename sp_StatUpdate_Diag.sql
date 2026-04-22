@@ -36,9 +36,13 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.04.20.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.04.22.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.04.20.2 - C1 KILLED_RUNS Evidence truncation fix.  When 90+
+History:    2026.04.22.1 - W13 PERPETUALLY_SKIPPED: new WARNING when stats are
+                           discovered but never updated across N consecutive runs
+                           due to time limits (gh-504).  Recommends @SortOrder=
+                           MODIFICATION_VELOCITY or increasing @TimeLimit.
+            2026.04.20.2 - C1 KILLED_RUNS Evidence truncation fix.  When 90+
                            killed runs existed, the STRING_AGG of all killed
                            run StartTimes into the Evidence column overflowed
                            nvarchar(2000) and raised Msg 2628 'String or binary
@@ -293,8 +297,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.04.20.2',
-        @procedure_version_date datetime = '20260420';
+        @procedure_version varchar(20) = '2026.04.22.1',
+        @procedure_version_date datetime = '20260422';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -396,7 +400,8 @@ BEGIN
                 (N'I10', N'INFO',    N'RECOMMENDED_CONFIG',    N'Synthesized parameter set balancing immediate fixes, long-term safeguards, and historical parameter usage.  Based on diagnostic findings and parameter change history.'),
                 (N'W11', N'WARNING', N'MOPUP_LOW_YIELD',       N'Mop-up pass consistently unable to process most of the stats it discovers (avg <50% yield across 3+ runs).'),
                 (N'W12', N'WARNING', N'PRIORITY_PASS_EMPTY',   N'Priority pass averages <5 stats across 3+ mop-up runs -- mop-up is doing all the work.  Lower @ModificationThreshold so the priority pass captures more stats.'),
-                (N'I15', N'INFO',    N'HEAP_TIME_BUDGET',      N'Heap tables account for >50% of total maintenance time.  @CollectHeapForwarding and heap REBUILD may help.')
+                (N'I15', N'INFO',    N'HEAP_TIME_BUDGET',      N'Heap tables account for >50% of total maintenance time.  @CollectHeapForwarding and heap REBUILD may help.'),
+                (N'W13', N'WARNING', N'PERPETUALLY_SKIPPED',   N'Stats consistently discovered but never updated across N consecutive runs due to time limits.  Increase @TimeLimit, lower @ModificationThreshold, or use @SortOrder=MODIFICATION_VELOCITY.')
         ) AS v (check_id, severity, category, description);
 
         /* Result set 3: Result set order */
@@ -1178,6 +1183,15 @@ BEGIN
     TEMP TABLES
     ============================================================================
     */
+
+    /* Defensive cleanup: if a prior call errored mid-execution, temp tables
+       with named constraints (PK_stat_updates, PK_recommendations) survive
+       in the session and block the next CREATE TABLE. */
+    DROP TABLE IF EXISTS #runs;
+    DROP TABLE IF EXISTS #stat_updates;
+    DROP TABLE IF EXISTS #recommendations;
+    DROP TABLE IF EXISTS #qs_efficacy;
+    DROP TABLE IF EXISTS #executive_dashboard;
 
     /* Run pairs: START/END matched by RunLabel */
     CREATE TABLE #runs
@@ -3427,6 +3441,104 @@ BEGIN
 
             DECLARE @i15_heap_pct_int integer = CONVERT(integer, @i15_heap_pct);
             RAISERROR(N'  [INFO] I15: Heap tables dominate maintenance time (%i%%)', 10, 1, @i15_heap_pct_int) WITH NOWAIT;
+        END;
+    END;
+
+    /* ======================================================================
+       W13: PERPETUALLY SKIPPED (gh-504)
+       Stats present in discovery (SP_STATUPDATE_START StatsFound > 0) but
+       absent from UPDATE_STATISTICS entries across N consecutive runs.
+       These stats are never reached because the time limit expires first.
+       Cross-references ProcessingPosition of the last processed stat per
+       run against the queue depth to estimate how much more time is needed.
+       ====================================================================== */
+    BEGIN
+        DECLARE @w13_min_consecutive int = 3;
+        DECLARE @w13_skipped_count int = 0;
+        DECLARE @w13_run_count int = 0;
+        DECLARE @w13_avg_last_position int = 0;
+        DECLARE @w13_avg_total int = 0;
+
+        /* Count non-killed, time-limited runs */
+        SELECT @w13_run_count = COUNT(*)
+        FROM #runs
+        WHERE IsKilled = 0
+        AND   StopReason IN (N'TIME_LIMIT', N'NATURAL_END', N'COMPLETED');
+
+        IF @w13_run_count >= @w13_min_consecutive
+        BEGIN
+            /* Find stats that appeared in discovery but were never updated.
+               A stat is "perpetually skipped" if it appears in 0 UPDATE_STATISTICS
+               entries across the most recent N completed runs, while those runs
+               DID process other stats (StatsProcessed > 0). */
+            ;WITH recent_runs AS (
+                SELECT TOP (@w13_min_consecutive)
+                    r.RunLabel,
+                    r.StatsFound,
+                    r.StatsProcessed,
+                    r.StartTime
+                FROM #runs AS r
+                WHERE r.IsKilled = 0
+                AND   r.StopReason IN (N'TIME_LIMIT', N'NATURAL_END', N'COMPLETED')
+                AND   r.StatsProcessed > 0
+                ORDER BY r.StartTime DESC
+            ),
+            updated_stats AS (
+                SELECT DISTINCT
+                    su.DatabaseName,
+                    su.ObjectName,
+                    su.StatisticsName
+                FROM #stat_updates AS su
+                INNER JOIN recent_runs AS rr
+                    ON su.RunLabel = rr.RunLabel
+                WHERE su.ErrorNumber = 0
+                   OR su.ErrorNumber IS NULL
+            ),
+            /* Get the max ProcessingPosition per run to estimate queue depth */
+            run_positions AS (
+                SELECT
+                    su.RunLabel,
+                    MAX(su.ProcessingPosition) AS max_position
+                FROM #stat_updates AS su
+                INNER JOIN recent_runs AS rr
+                    ON su.RunLabel = rr.RunLabel
+                WHERE su.ProcessingPosition IS NOT NULL
+                GROUP BY su.RunLabel
+            )
+            SELECT
+                @w13_skipped_count = (
+                    SELECT COUNT(DISTINCT su_all.DatabaseName + N'.' + su_all.ObjectName + N'.' + su_all.StatisticsName)
+                    FROM #stat_updates AS su_all
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM updated_stats AS us
+                        WHERE us.DatabaseName   = su_all.DatabaseName
+                        AND   us.ObjectName     = su_all.ObjectName
+                        AND   us.StatisticsName = su_all.StatisticsName
+                    )
+                ),
+                @w13_avg_last_position = ISNULL((SELECT AVG(max_position) FROM run_positions), 0),
+                @w13_avg_total = ISNULL((SELECT AVG(StatsFound) FROM recent_runs), 0);
+
+            IF @w13_skipped_count > 0
+            BEGIN
+                INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+                VALUES (
+                    N'WARNING',
+                    N'PERPETUALLY_SKIPPED',
+                    CONVERT(nvarchar(10), @w13_skipped_count) + N' stats never updated across '
+                        + CONVERT(nvarchar(10), @w13_min_consecutive) + N' consecutive runs',
+                    N'Discovery finds these stats but the time limit expires before they are reached.  '
+                        + N'Average last position processed: ' + CONVERT(nvarchar(10), @w13_avg_last_position)
+                        + N' of ' + CONVERT(nvarchar(10), @w13_avg_total) + N' discovered.  '
+                        + N'Stats beyond position ' + CONVERT(nvarchar(10), @w13_avg_last_position) + N' are perpetually stale.',
+                    N'Increase @TimeLimit to allow more stats to be processed, use @SortOrder=MODIFICATION_VELOCITY '
+                        + N'to prioritize high-velocity stats, or lower @ModificationThreshold so fewer stats qualify.',
+                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @SortOrder = N''MODIFICATION_VELOCITY'', @TimeLimit = 7200;',
+                    40
+                );
+
+                RAISERROR(N'  [WARNING] W13: %d stats perpetually skipped across %d runs', 10, 1, @w13_skipped_count, @w13_min_consecutive) WITH NOWAIT;
+            END;
         END;
     END;
 
