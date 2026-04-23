@@ -36,11 +36,20 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.4.1.2026.04.23 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.5.0.2026.04.23 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.4.1.2026.04.23 - @LockTimeout promoted to public parameter.
+History:    3.5.0.2026.04.23 - @CriticalTables feature: per-table sample rate
+                              override with optional priority boost (gh-508).
+                              Three new params: @CriticalTables (comma-delimited
+                              table patterns with % wildcards), @CriticalSamplePercent
+                              (1-100, forces sample rate on critical tables only),
+                              @CriticalTablesFirst (Y/N, processes critical tables
+                              before everything else regardless of @SortOrder).
+                              PERSIST_SAMPLE_PERCENT auto-enabled for critical tables.
+                              ExtendedInfo includes IsCritical + CriticalSampleOverride.
+            3.4.1.2026.04.23 - @LockTimeout promoted to public parameter.
                               Overrides preset @i_lock_timeout.  Values:
                               -1 = wait forever, 0 = no wait, N > 0 = seconds.
                               Addresses P3 Error 1222 lock-timeout failures
@@ -247,11 +256,11 @@ ALTER PROCEDURE
     /*
     ============================================================================
     v3 SIMPLIFIED API
-      36 input parameters (was 33 in v3.2) + 11 OUTPUT parameters
+      39 input parameters (was 36 in v3.2.1) + 11 OUTPUT parameters
       25 input parameters absorbed into preset-controlled @i_ internal variables.
       Explicit params always override preset defaults.
 
-    INPUT (36):  @Statistics, @JobName, @Preset, @Databases, @Tables, @ExcludeTables,
+    INPUT (39):  @Statistics, @JobName, @Preset, @Databases, @Tables, @ExcludeTables,
                  @ExcludeStatistics, @TargetNorecompute, @StaleHours, @QueryStore,
                  @TimeLimit, @StopByTime, @BatchLimit, @SortOrder, @MopUpPass,
                  @StatisticsSample, @MaxDOP, @ModificationThreshold,
@@ -259,6 +268,7 @@ ALTER PROCEDURE
                  @QueryStoreTopPlans, @QueryStoreMinExecutions, @QueryStoreRecentHours,
                  @MaxAGRedoQueueMB, @MaxAGWaitMinutes, @MinTempdbFreeMB,
                  @MopUpMinRemainingSeconds, @SkipTablesWithNCCI, @SkipTablesWithCCI,
+                 @CriticalTables, @CriticalSamplePercent, @CriticalTablesFirst,
                  @LogToTable, @Execute, @WhatIfOutputTable,
                  @FailFast, @Debug, @StatsInParallel, @Help
 
@@ -314,6 +324,11 @@ ALTER PROCEDURE
     /* MOP-UP TUNING */
     @MopUpMinRemainingSeconds integer = NULL,       /* Min seconds remaining to trigger mop-up.  NULL = preset decides (default 60). */
 
+    /* CRITICAL TABLES -- per-table sample rate override */
+    @CriticalTables nvarchar(max) = NULL,           /* comma-separated table patterns (supports %) */
+    @CriticalSamplePercent tinyint = NULL,           /* 1-100 (100=FULLSCAN) for critical tables only */
+    @CriticalTablesFirst nchar(1) = N'N',           /* Y = process critical tables before everything else */
+
     /* LOGGING & OUTPUT */
     @LogToTable nvarchar(1) = N'Y',                 /* Y = log to dbo.CommandLog, N = skip */
     @Execute nvarchar(1) = N'Y',                    /* Y = execute, N = dry run */
@@ -351,7 +366,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.4.1.2026.04.23',
+        @procedure_version varchar(20) = '3.5.0.2026.04.23',
         @procedure_version_date datetime = '20260423',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -414,6 +429,9 @@ BEGIN
             (N'@Tables',            N'nvarchar(max)',  N'NULL',      N'NULL=all tables, or Schema.Table list'),
             (N'@ExcludeTables',     N'nvarchar(max)',  N'NULL',      N'Patterns to exclude (supports %)'),
             (N'@ExcludeStatistics', N'nvarchar(max)',  N'NULL',      N'Patterns to exclude (supports %)'),
+            (N'@CriticalTables',    N'nvarchar(max)',  N'NULL',      N'Comma-separated table patterns for higher sample rate (supports %)'),
+            (N'@CriticalSamplePercent', N'tinyint',    N'NULL',      N'1-100 (100=FULLSCAN) for critical tables only'),
+            (N'@CriticalTablesFirst', N'nchar(1)',     N'N',         N'Y = process critical tables before all others'),
             (N'@TargetNorecompute', N'nvarchar(10)',   N'BOTH',      N'BOTH=all stats (default), Y=NORECOMPUTE only, N=regular only'),
             (N'@StaleHours',        N'int',            N'NULL',      N'Min hours since last update'),
             (N'@QueryStore',        N'nvarchar(20)',   N'NULL',      N'OFF or metric: CPU, DURATION, READS, EXECUTIONS, etc.'),
@@ -458,11 +476,12 @@ BEGIN
             (N'MOP-UP',        N'@MopUpPass=Y: after priority pass, sweep any stat with modification_counter>0.  Needs @TimeLimit + @LogToTable=Y.'),
             (N'DIRECT MODE',   N'@Statistics=''Schema.Table.Stat'' for ad-hoc updates. Skips discovery.  Comma-separate for multiple.'),
             (N'STALE HOURS',   N'@StaleHours=48 means skip stats updated within 48 hours.  Replaces v2 @DaysStaleThreshold/@HoursStaleThreshold.'),
-            (N'SCHEDULING',    N'SQL Agent job with @Preset=NIGHTLY + @StopByTime=0500 for a 5 AM deadline.  Use @MopUpPass=Y for thorough coverage.'),
-            (N'NORECOMPUTE',   N'NORECOMPUTE flag is PRESERVED on update (not cleared).  To clear: manually DROP+CREATE the statistic.'),
-            (N'COMMANDLOG',    N'Requires dbo.CommandLog from https://ola.hallengren.com/scripts/CommandLog.sql.  Set @LogToTable=N if not installed.'),
-            (N'DIAGNOSTICS',   N'Run sp_StatUpdate_Diag after for automated analysis.  @ExpertMode=1 for full detail, 0 for dashboard only.'),
-            (N'VERSION',       N'v3.0 -- simplified API (33 input + 10 OUTPUT vs 58 input + 10 OUTPUT in v2).  Full behavioral parity with v2.37.  Preset-first design.')
+            (N'SCHEDULING',      N'SQL Agent job with @Preset=NIGHTLY + @StopByTime=0500 for a 5 AM deadline.  Use @MopUpPass=Y for thorough coverage.'),
+            (N'NORECOMPUTE',     N'NORECOMPUTE flag is PRESERVED on update (not cleared).  To clear: manually DROP+CREATE the statistic.'),
+            (N'COMMANDLOG',      N'Requires dbo.CommandLog from https://ola.hallengren.com/scripts/CommandLog.sql.  Set @LogToTable=N if not installed.'),
+            (N'DIAGNOSTICS',     N'Run sp_StatUpdate_Diag after for automated analysis.  @ExpertMode=1 for full detail, 0 for dashboard only.'),
+            (N'CRITICAL TABLES', N'Use @CriticalTables + @CriticalSamplePercent to force higher sample rates on specific tables without affecting the rest.  Use @CriticalTablesFirst = Y to ensure critical tables are always processed first, even with QS ordering.  PERSIST_SAMPLE_PERCENT is auto-enabled for critical tables so auto-update between runs respects the sample rate.  Supports % wildcards (same syntax as @ExcludeTables).'),
+            (N'VERSION',         N'v3.0 -- simplified API (33 input + 10 OUTPUT vs 58 input + 10 OUTPUT in v2).  Full behavioral parity with v2.37.  Preset-first design.')
         ) AS t(topic, detail);
 
         RETURN;
@@ -782,6 +801,7 @@ BEGIN
         @current_is_memory_optimized bit = NULL,
         @current_is_heap bit = NULL,
         @current_auto_created bit = NULL,
+        @current_is_critical bit = NULL,
         @current_modification_counter bigint = NULL,
         @current_row_count bigint = NULL,
         @current_days_stale integer = NULL,
@@ -970,6 +990,7 @@ BEGIN
         is_memory_optimized bit NOT NULL DEFAULT 0,
         is_heap bit NOT NULL DEFAULT 0,
         auto_created bit NOT NULL DEFAULT 0,
+        is_critical bit NOT NULL DEFAULT 0,         /* matched by @CriticalTables pattern (gh-510) */
         /* Table metadata for replication/CDC/temporal awareness */
         is_published bit NOT NULL DEFAULT 0, /*transactional replication*/
         is_tracked_by_cdc bit NOT NULL DEFAULT 0, /*Change Data Capture*/
@@ -1578,6 +1599,10 @@ BEGIN
     IF @ExcludeTables IS NOT NULL AND LEN(LTRIM(RTRIM(@ExcludeTables))) = 0
         SET @ExcludeTables = NULL;
 
+    /* Normalize empty @CriticalTables to NULL */
+    IF @CriticalTables IS NOT NULL AND LEN(LTRIM(RTRIM(@CriticalTables))) = 0
+        SET @CriticalTables = NULL;
+
     /* Y/N parameter validation */
     DECLARE @yn_checks TABLE (param_name nvarchar(50), param_value nvarchar(10));
     INSERT INTO @yn_checks VALUES
@@ -1638,6 +1663,22 @@ BEGIN
     IF @LongRunningSamplePercent IS NOT NULL AND (@LongRunningSamplePercent < 1 OR @LongRunningSamplePercent > 100)
         INSERT INTO @errors (error_message, error_severity)
         VALUES (N'@LongRunningSamplePercent must be 1-100.', 16);
+
+    IF @CriticalSamplePercent IS NOT NULL AND (@CriticalSamplePercent < 1 OR @CriticalSamplePercent > 100)
+        INSERT INTO @errors (error_message, error_severity)
+        VALUES (N'@CriticalSamplePercent must be 1-100 (100=FULLSCAN) or NULL.', 16);
+
+    IF @CriticalSamplePercent IS NOT NULL AND @CriticalTables IS NULL
+        INSERT INTO @errors (error_message, error_severity)
+        VALUES (N'@CriticalSamplePercent requires @CriticalTables to specify which tables.', 16);
+
+    IF @CriticalTablesFirst = N'Y' AND @CriticalTables IS NULL
+        INSERT INTO @errors (error_message, error_severity)
+        VALUES (N'@CriticalTablesFirst = Y requires @CriticalTables to specify which tables.', 16);
+
+    IF @CriticalTablesFirst NOT IN (N'Y', N'N')
+        INSERT INTO @errors (error_message, error_severity)
+        VALUES (N'@CriticalTablesFirst must be Y or N.', 16);
 
     IF @i_max_grant_percent IS NOT NULL AND (@i_max_grant_percent < 1 OR @i_max_grant_percent > 100)
         INSERT INTO @errors (error_message, error_severity)
@@ -2345,6 +2386,15 @@ BEGIN
         RAISERROR(N'  @ExcludeTables           = %s', 10, 1, @ExcludeTables) WITH NOWAIT;
     IF @ExcludeStatistics IS NOT NULL
         RAISERROR(N'  @ExcludeStatistics       = %s', 10, 1, @ExcludeStatistics) WITH NOWAIT;
+    IF @CriticalTables IS NOT NULL
+        RAISERROR(N'  @CriticalTables          = %s', 10, 1, @CriticalTables) WITH NOWAIT;
+    IF @CriticalSamplePercent IS NOT NULL
+    BEGIN
+        DECLARE @ct_sample_msg nvarchar(200) = N'  @CriticalSamplePercent   = ' + CONVERT(nvarchar(10), @CriticalSamplePercent) + N'%%';
+        RAISERROR(@ct_sample_msg, 10, 1) WITH NOWAIT;
+    END;
+    IF @CriticalTablesFirst = N'Y'
+        RAISERROR(N'  @CriticalTablesFirst     = Y', 10, 1) WITH NOWAIT;
     IF @LongRunningThresholdMinutes IS NOT NULL
     BEGIN
         RAISERROR(N'  @LongRunningThreshold    = %d minutes', 10, 1, @i_long_running_threshold_min) WITH NOWAIT;
@@ -2743,6 +2793,9 @@ BEGIN
                     @database_count AS DatabaseCount,
                     @Tables AS [Tables],
                     @ExcludeTables AS ExcludeTables,
+                    @CriticalTables AS CriticalTables,
+                    @CriticalSamplePercent AS CriticalSamplePercent,
+                    @CriticalTablesFirst AS CriticalTablesFirst,
                     @ExcludeStatistics AS ExcludeStatistics,
                     @Statistics AS [Statistics],
                     @TargetNorecompute AS TargetNorecompute,
@@ -3160,6 +3213,7 @@ INSERT INTO
     temporal_type,
     is_heap,
     auto_created,
+    is_critical,
     modification_counter,
     row_count,
     days_stale,
@@ -3198,6 +3252,17 @@ SELECT
             ELSE 0
         END,
     auto_created = s.auto_created,
+    is_critical = CASE
+        WHEN @CriticalTables_param IS NOT NULL
+             AND EXISTS (
+                 SELECT 1
+                 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                 WHERE ISNULL(ps.parsed_schema, OBJECT_SCHEMA_NAME(s.object_id)) + N''.'' + ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                    OR ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+             )
+        THEN CONVERT(bit, 1)
+        ELSE CONVERT(bit, 0)
+    END,
     modification_counter = ISNULL(sp.modification_counter, 0),
     row_count = ISNULL(sp.rows, 0),
     days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
@@ -3207,7 +3272,16 @@ SELECT
     has_filter = s.has_filter,
     filter_definition = s.filter_definition,
     unfiltered_rows = sp.unfiltered_rows,
-    priority = ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+    priority = ROW_NUMBER() OVER (ORDER BY
+        /* gh-511: Critical tables first */
+        CASE WHEN @CriticalTablesFirst_param = N''Y'' THEN
+            CASE WHEN @CriticalTables_param IS NOT NULL
+                 AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                     WHERE ISNULL(ps.parsed_schema, OBJECT_SCHEMA_NAME(s.object_id)) + N''.'' + ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                        OR ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
+            THEN 1 ELSE 0 END
+        ELSE 0 END DESC,
+        (SELECT NULL))
 FROM #parsed_stats AS ps
 JOIN sys.stats AS s
   ON s.name COLLATE DATABASE_DEFAULT = ps.parsed_stat COLLATE DATABASE_DEFAULT
@@ -3252,10 +3326,12 @@ OPTION (RECOMPILE);';
 
                 EXECUTE sys.sp_executesql
                     @direct_string_sql,
-                    N'@i_include_system_objects_param nvarchar(1), @TargetNorecompute_param nvarchar(10), @ExcludeStatistics_param nvarchar(max)',
+                    N'@i_include_system_objects_param nvarchar(1), @TargetNorecompute_param nvarchar(10), @ExcludeStatistics_param nvarchar(max), @CriticalTables_param nvarchar(max), @CriticalTablesFirst_param nchar(1)',
                     @i_include_system_objects_param = @i_include_system_objects,
                     @TargetNorecompute_param = @TargetNorecompute,
-                    @ExcludeStatistics_param = @ExcludeStatistics;
+                    @ExcludeStatistics_param = @ExcludeStatistics,
+                    @CriticalTables_param = @CriticalTables,
+                    @CriticalTablesFirst_param = @CriticalTablesFirst;
 
             END TRY
             BEGIN CATCH
@@ -4513,6 +4589,17 @@ OPTION (RECOMPILE);';
                     is_memory_optimized,
                     ISNULL(is_heap, 0) AS is_heap,
                     ISNULL(auto_created, 0) AS auto_created,
+                    is_critical = CASE
+                        WHEN @CriticalTables_param IS NOT NULL
+                             AND EXISTS (
+                                 SELECT 1
+                                 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                                 WHERE schema_name + N''.'' + table_name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                    OR table_name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                             )
+                        THEN CONVERT(bit, 1)
+                        ELSE CONVERT(bit, 0)
+                    END,
                     ISNULL(modification_counter, 0) AS modification_counter,
                     row_count = ISNULL(rows, 0),
                     ISNULL(days_stale, 9999) AS days_stale,
@@ -4541,6 +4628,14 @@ OPTION (RECOMPILE);';
                     temporal_type,
                     priority = ROW_NUMBER() OVER (
                         ORDER BY
+                            /* gh-511: Critical tables first -- when @CriticalTablesFirst=Y, process critical tables before everything else */
+                            CASE WHEN @CriticalTablesFirst_param = N''Y'' THEN
+                                CASE WHEN @CriticalTables_param IS NOT NULL
+                                     AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                                         WHERE schema_name + N''.'' + table_name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                            OR table_name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
+                                THEN 1 ELSE 0 END
+                            ELSE 0 END DESC,
                             /* #167: Filtered stats priority boost -- when @i_filtered_stats_mode=PRIORITY, boost filtered stats showing drift */
                             CASE WHEN @i_filtered_stats_mode_param = N''PRIORITY''
                                       AND has_filter = 1
@@ -4647,7 +4742,7 @@ OPTION (RECOMPILE);';
                 INSERT INTO #stats_to_process
                 (
                     database_name, schema_name, table_name, stat_name, object_id, stats_id,
-                    no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created,
+                    no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created, is_critical,
                     modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                     has_filter, filter_definition, unfiltered_rows,
                     qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
@@ -4681,7 +4776,9 @@ OPTION (RECOMPILE);';
                       @i_ascending_key_boost_param nvarchar(1),
                       @i_qs_top_plans_param integer,
                       @commandlog_exists_param bit,
-                      @Debug_param bit',
+                      @Debug_param bit,
+                      @CriticalTables_param nvarchar(max),
+                      @CriticalTablesFirst_param nchar(1)',
                     @i_sort_order_param = @i_sort_order,
                     @TargetNorecompute_param = @TargetNorecompute,
                     @ModificationThreshold_param = @i_modification_threshold,
@@ -4706,7 +4803,9 @@ OPTION (RECOMPILE);';
                     @i_ascending_key_boost_param = @i_ascending_key_boost,
                     @i_qs_top_plans_param = @i_qs_top_plans,
                     @commandlog_exists_param = @commandlog_exists,
-                    @Debug_param = @Debug;
+                    @Debug_param = @Debug,
+                    @CriticalTables_param = @CriticalTables,
+                    @CriticalTablesFirst_param = @CriticalTablesFirst;
             END; /* End of staged discovery */
             /*#endregion 07D-DISC-PHASES-5-6 */
             /*#region 07E-POST-DB-WARNINGS: RLS, wide stats, filtered index, columnstore, CDC, computed cols */
@@ -5216,6 +5315,13 @@ OPTION (RECOMPILE);';
         RAISERROR(N'  - On heaps:         %d', 10, 1, @heap_stats) WITH NOWAIT;
         RAISERROR(N'  - Memory-optimized: %d', 10, 1, @memory_optimized_stats) WITH NOWAIT;
         RAISERROR(N'  - Persisted sample: %d', 10, 1, @persisted_sample_stats) WITH NOWAIT;
+        /* gh-513: Show count of critical table stats in discovery summary */
+        IF @CriticalTables IS NOT NULL
+        BEGIN
+            DECLARE @critical_count int = (SELECT COUNT_BIG(*) FROM #stats_to_process WHERE is_critical = 1);
+            DECLARE @critical_msg nvarchar(200) = N'  Critical table stats: ' + CONVERT(nvarchar(10), @critical_count) + N' of ' + CONVERT(nvarchar(10), @total_stats) + N' stats matched @CriticalTables';
+            RAISERROR(@critical_msg, 10, 1) WITH NOWAIT;
+        END;
     END;
 
     /* #147: CDC-tracked tables warning -- stats updates can delay CDC capture */
@@ -5421,7 +5527,9 @@ OPTION (RECOMPILE);';
             /* gh-454: QS enrichment criteria affect priority ordering --
                workers with different values must not share a queue */
             ISNULL(CONVERT(nvarchar(20), @i_qs_min_executions), N'NULL'),
-            ISNULL(CONVERT(nvarchar(20), @i_qs_recent_hours), N'NULL')
+            ISNULL(CONVERT(nvarchar(20), @i_qs_recent_hours), N'NULL'),
+            /* gh-513: critical-table params affect discovery and sample rate */
+            ISNULL(@CriticalTables, N''), @CriticalSamplePercent, @CriticalTablesFirst
         );
         /* gh-461: @parameters_string is built unconditionally in region 07B now.
            By the time execution reaches here it is always populated. */
@@ -6378,6 +6486,17 @@ OPTION (RECOMPILE);';
                             is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
                             is_heap = CASE WHEN EXISTS (SELECT 1 FROM sys.indexes AS ix WHERE ix.object_id = s.object_id AND ix.index_id = 0) THEN 1 ELSE 0 END,
                             auto_created = s.auto_created,
+                            is_critical = CASE
+                                WHEN @CriticalTables_param IS NOT NULL
+                                     AND EXISTS (
+                                         SELECT 1
+                                         FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                                         WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                            OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                     )
+                                THEN CONVERT(bit, 1)
+                                ELSE CONVERT(bit, 0)
+                            END,
                             modification_counter = ISNULL(sp.modification_counter, 0),
                             row_count = ISNULL(sp.rows, 0),
                             days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
@@ -6404,7 +6523,16 @@ OPTION (RECOMPILE);';
                             is_published = ISNULL(t.is_published, 0),
                             is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
                             temporal_type = ISNULL(t.temporal_type, 0),
-                            priority = ROW_NUMBER() OVER (ORDER BY ISNULL(sp.modification_counter, 0) DESC, s.stats_id ASC)
+                            priority = ROW_NUMBER() OVER (ORDER BY
+                                /* gh-511: Critical tables first */
+                                CASE WHEN @CriticalTablesFirst_param = N''Y'' THEN
+                                    CASE WHEN @CriticalTables_param IS NOT NULL
+                                         AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                                             WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                                OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
+                                    THEN 1 ELSE 0 END
+                                ELSE 0 END DESC,
+                                ISNULL(sp.modification_counter, 0) DESC, s.stats_id ASC)
                         FROM sys.stats AS s
                         JOIN sys.objects AS o ON o.object_id = s.object_id
                         LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
@@ -6509,7 +6637,7 @@ OPTION (RECOMPILE);';
                             INSERT INTO #stats_to_process
                             (
                                 database_name, schema_name, table_name, stat_name, object_id, stats_id,
-                                no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created,
+                                no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created, is_critical,
                                 modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                                 has_filter, filter_definition, unfiltered_rows,
                                 qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
@@ -6519,7 +6647,7 @@ OPTION (RECOMPILE);';
                             )
                             EXECUTE sys.sp_executesql
                                 @lazy_mop_sql,
-                                N'@object_id_param int, @i_include_system_objects_param nvarchar(1), @i_include_indexed_views_param nvarchar(1), @TargetNorecompute_param nvarchar(10), @Tables_param nvarchar(max), @ExcludeTables_param nvarchar(max), @ExcludeStatistics_param nvarchar(max), @i_filtered_stats_mode_param nvarchar(10), @i_skip_tables_with_columnstore_param nchar(1), @i_skip_ncci_param nchar(1), @i_skip_cci_param nchar(1), @i_min_page_count_param bigint, @start_time_param datetime2(7)',
+                                N'@object_id_param int, @i_include_system_objects_param nvarchar(1), @i_include_indexed_views_param nvarchar(1), @TargetNorecompute_param nvarchar(10), @Tables_param nvarchar(max), @ExcludeTables_param nvarchar(max), @ExcludeStatistics_param nvarchar(max), @i_filtered_stats_mode_param nvarchar(10), @i_skip_tables_with_columnstore_param nchar(1), @i_skip_ncci_param nchar(1), @i_skip_cci_param nchar(1), @i_min_page_count_param bigint, @start_time_param datetime2(7), @CriticalTables_param nvarchar(max), @CriticalTablesFirst_param nchar(1)',
                                 @object_id_param = @claimed_table_object_id,
                                 @i_include_system_objects_param = @i_include_system_objects,
                                 @i_include_indexed_views_param = @i_include_indexed_views,
@@ -6532,7 +6660,9 @@ OPTION (RECOMPILE);';
                                 @i_skip_ncci_param = @i_skip_ncci,
                                 @i_skip_cci_param = @i_skip_cci,
                                 @i_min_page_count_param = @i_min_page_count,
-                                @start_time_param = @start_time;
+                                @start_time_param = @start_time,
+                                @CriticalTables_param = @CriticalTables,
+                                @CriticalTablesFirst_param = @CriticalTablesFirst;
 
                             SET @lazy_mop_found = ROWCOUNT_BIG();
 
@@ -6648,6 +6778,7 @@ OPTION (RECOMPILE);';
             @current_is_memory_optimized = stp.is_memory_optimized,
             @current_is_heap = stp.is_heap,
             @current_auto_created = stp.auto_created,
+            @current_is_critical = stp.is_critical,
             @current_modification_counter = stp.modification_counter,
             @current_row_count = stp.row_count,
             @current_days_stale = stp.days_stale,
@@ -6832,6 +6963,31 @@ OPTION (RECOMPILE);';
                 WHEN @i_statistics_sample IS NOT NULL THEN N'EXPLICIT'
                 ELSE N'AUTO'
             END;
+
+        /*
+        gh-512: CRITICAL TABLE SAMPLE OVERRIDE
+        When @CriticalSamplePercent is set and this stat is on a critical table,
+        override the sample rate.  Takes precedence over @i_statistics_sample (global)
+        but NOT over adaptive sampling (long-running stats need lower sample, not higher).
+        Also auto-enables PERSIST_SAMPLE_PERCENT for critical tables so auto-update
+        between job runs respects the higher sample rate.
+        */
+        IF  @CriticalSamplePercent IS NOT NULL
+        AND @current_is_critical = 1
+        BEGIN
+            SET @effective_sample_percent = @CriticalSamplePercent;
+            SET @sample_source = N'CRITICAL';
+
+            IF @Debug = 1
+            BEGIN
+                DECLARE @ct_msg nvarchar(500);
+                SET @ct_msg =
+                    N'  Critical Table: forcing ' + CONVERT(nvarchar(10), @CriticalSamplePercent)
+                    + N'%% sample on [' + @current_schema_name + N'].[' + @current_table_name
+                    + N'].[' + @current_stat_name + N']';
+                RAISERROR(@ct_msg, 10, 1) WITH NOWAIT;
+            END;
+        END;
 
         /*
         ADAPTIVE SAMPLING: Check if this stat is historically long-running
@@ -7248,7 +7404,7 @@ OPTION (RECOMPILE);';
           3. NOT using RESAMPLE (RESAMPLE and PERSIST_SAMPLE_PERCENT are mutually exclusive - Error 1052)
         PERSIST_SAMPLE_PERCENT cannot be used alone - it must accompany FULLSCAN or SAMPLE.
         */
-        IF  @i_persist_sample_percent = N'Y'
+        IF  (@i_persist_sample_percent = N'Y' OR @sample_source = N'CRITICAL')  /* gh-512: auto-persist for critical tables */
         AND @supports_persist_sample = 1
         AND @has_with_option = 1  /* Only add if FULLSCAN/SAMPLE already specified */
         AND @with_clause NOT LIKE N'%RESAMPLE%'  /* RESAMPLE and PERSIST_SAMPLE_PERCENT conflict (Error 1052) */
@@ -7690,6 +7846,9 @@ OPTION (RECOMPILE);';
                                 ISNULL(@current_forwarded_records, 0) AS ForwardedRecords,
                                 @current_is_memory_optimized AS IsMemoryOptimized,
                                 @current_auto_created AS AutoCreated,
+                                @current_is_critical AS IsCritical,
+                                CASE WHEN @current_is_critical = 1 AND @CriticalSamplePercent IS NOT NULL
+                                     THEN @CriticalSamplePercent ELSE NULL END AS CriticalSampleOverride,
                                 @current_histogram_steps AS HistogramSteps,
                                 /* Persisted sample metadata (P1c, v2.4) */
                                 @current_persisted_sample_percent AS PersistedSamplePercent,
@@ -8377,6 +8536,17 @@ OPTION (RECOMPILE);';
                         is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
                         is_heap = CASE WHEN EXISTS (SELECT 1 FROM sys.indexes AS ix WHERE ix.object_id = s.object_id AND ix.index_id = 0) THEN 1 ELSE 0 END,
                         auto_created = s.auto_created,
+                        is_critical = CASE
+                            WHEN @CriticalTables_param IS NOT NULL
+                                 AND EXISTS (
+                                     SELECT 1
+                                     FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                                     WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                        OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                 )
+                            THEN CONVERT(bit, 1)
+                            ELSE CONVERT(bit, 0)
+                        END,
                         modification_counter = ISNULL(sp.modification_counter, 0),
                         row_count = ISNULL(sp.rows, 0),
                         days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
@@ -8403,7 +8573,16 @@ OPTION (RECOMPILE);';
                         is_published = ISNULL(t.is_published, 0),
                         is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
                         temporal_type = ISNULL(t.temporal_type, 0),
-                        priority = ROW_NUMBER() OVER (ORDER BY ISNULL(sp.modification_counter, 0) DESC, s.object_id ASC, s.stats_id ASC)
+                        priority = ROW_NUMBER() OVER (ORDER BY
+                            /* gh-511: Critical tables first */
+                            CASE WHEN @CriticalTablesFirst_param = N''Y'' THEN
+                                CASE WHEN @CriticalTables_param IS NOT NULL
+                                     AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                                         WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                            OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
+                                THEN 1 ELSE 0 END
+                            ELSE 0 END DESC,
+                            ISNULL(sp.modification_counter, 0) DESC, s.object_id ASC, s.stats_id ASC)
                     FROM sys.stats AS s
                     JOIN sys.objects AS o ON o.object_id = s.object_id
                     LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
@@ -8437,7 +8616,9 @@ OPTION (RECOMPILE);';
                         @i_skip_ncci_param nchar(1),
                         @i_skip_cci_param nchar(1),
                         @i_min_page_count_param bigint,
-                        @start_time_param datetime2(7)';
+                        @start_time_param datetime2(7),
+                        @CriticalTables_param nvarchar(max),
+                        @CriticalTablesFirst_param nchar(1)';
 
                     IF @Debug = 1
                     BEGIN
@@ -8449,7 +8630,7 @@ OPTION (RECOMPILE);';
                         INSERT INTO #stats_to_process
                         (
                             database_name, schema_name, table_name, stat_name, object_id, stats_id,
-                            no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created,
+                            no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created, is_critical,
                             modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                             has_filter, filter_definition, unfiltered_rows,
                             qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
@@ -8471,7 +8652,9 @@ OPTION (RECOMPILE);';
                             @i_skip_ncci_param = @i_skip_ncci,
                             @i_skip_cci_param = @i_skip_cci,
                             @i_min_page_count_param = @i_min_page_count,
-                            @start_time_param = @start_time;
+                            @start_time_param = @start_time,
+                            @CriticalTables_param = @CriticalTables,
+                            @CriticalTablesFirst_param = @CriticalTablesFirst;
                     END TRY
                     BEGIN CATCH
                         IF @Debug = 1
@@ -8691,6 +8874,17 @@ OPTION (RECOMPILE);';
                     is_memory_optimized = ISNULL(t.is_memory_optimized, 0),
                     is_heap = CASE WHEN EXISTS (SELECT 1 FROM sys.indexes AS ix WHERE ix.object_id = s.object_id AND ix.index_id = 0) THEN 1 ELSE 0 END,
                     auto_created = s.auto_created,
+                    is_critical = CASE
+                        WHEN @CriticalTables_param IS NOT NULL
+                             AND EXISTS (
+                                 SELECT 1
+                                 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                                 WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                    OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                             )
+                        THEN CONVERT(bit, 1)
+                        ELSE CONVERT(bit, 0)
+                    END,
                     modification_counter = ISNULL(sp.modification_counter, 0),
                     row_count = ISNULL(sp.rows, 0),
                     days_stale = ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999),
@@ -8717,7 +8911,16 @@ OPTION (RECOMPILE);';
                     is_published = ISNULL(t.is_published, 0),
                     is_tracked_by_cdc = ISNULL(t.is_tracked_by_cdc, 0),
                     temporal_type = ISNULL(t.temporal_type, 0),
-                    priority = ROW_NUMBER() OVER (ORDER BY ISNULL(sp.modification_counter, 0) DESC, s.object_id ASC, s.stats_id ASC)
+                    priority = ROW_NUMBER() OVER (ORDER BY
+                        /* gh-511: Critical tables first */
+                        CASE WHEN @CriticalTablesFirst_param = N''Y'' THEN
+                            CASE WHEN @CriticalTables_param IS NOT NULL
+                                 AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                                     WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                        OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
+                            THEN 1 ELSE 0 END
+                        ELSE 0 END DESC,
+                        ISNULL(sp.modification_counter, 0) DESC, s.object_id ASC, s.stats_id ASC)
                 FROM sys.stats AS s
                 JOIN sys.objects AS o ON o.object_id = s.object_id
                 LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
@@ -8751,7 +8954,9 @@ OPTION (RECOMPILE);';
                     @i_skip_ncci_param nchar(1),
                     @i_skip_cci_param nchar(1),
                     @i_min_page_count_param bigint,
-                    @start_time_param datetime2(7)';
+                    @start_time_param datetime2(7),
+                    @CriticalTables_param nvarchar(max),
+                    @CriticalTablesFirst_param nchar(1)';
 
                 IF @Debug = 1
                 BEGIN
@@ -8763,7 +8968,7 @@ OPTION (RECOMPILE);';
                     INSERT INTO #stats_to_process
                     (
                         database_name, schema_name, table_name, stat_name, object_id, stats_id,
-                        no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created,
+                        no_recompute, is_incremental, is_memory_optimized, is_heap, auto_created, is_critical,
                         modification_counter, row_count, days_stale, page_count, persisted_sample_percent, histogram_steps,
                         has_filter, filter_definition, unfiltered_rows,
                         qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
@@ -8785,7 +8990,9 @@ OPTION (RECOMPILE);';
                         @i_skip_ncci_param = @i_skip_ncci,
                         @i_skip_cci_param = @i_skip_cci,
                         @i_min_page_count_param = @i_min_page_count,
-                        @start_time_param = @start_time;
+                        @start_time_param = @start_time,
+                        @CriticalTables_param = @CriticalTables,
+                        @CriticalTablesFirst_param = @CriticalTablesFirst;
                 END TRY
                 BEGIN CATCH
                     IF @Debug = 1
