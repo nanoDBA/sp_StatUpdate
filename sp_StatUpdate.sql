@@ -36,11 +36,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.4.0.2026.04.22 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.4.1.2026.04.23 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.4.0.2026.04.22 - CommandLog intelligence: Phase 3B uses CommandLog
+History:    3.4.1.2026.04.23 - @LockTimeout promoted to public parameter.
+                              Overrides preset @i_lock_timeout.  Values:
+                              -1 = wait forever, 0 = no wait, N > 0 = seconds.
+                              Addresses P3 Error 1222 lock-timeout failures
+                              observed in 2026-04-22 diagnostic run.
+            3.4.0.2026.04.22 - CommandLog intelligence: Phase 3B uses CommandLog
                               ModificationCounter delta for threshold qualification
                               instead of raw counter; stats with delta=0 skip
                               qualification entirely (gh-502).  New sort order
@@ -291,6 +296,7 @@ ALTER PROCEDURE
     @MopUpPass nvarchar(1) = NULL,                  /* Y/N. NULL = preset decides.  Broad sweep after priority pass. */
     @StatisticsSample integer = NULL,               /* 1-100 (100=FULLSCAN), NULL = let SQL decide */
     @MaxDOP integer = NULL,                         /* MAXDOP for UPDATE STATISTICS (SQL 2016 SP2+). NULL = server default */
+    @LockTimeout integer = NULL,                    /* SET LOCK_TIMEOUT seconds.  -1 = wait forever, 0 = no wait, >0 = seconds.  NULL = preset decides (default: no override). */
     @ModificationThreshold bigint = NULL,           /* Override preset mod threshold floor (large tables). NULL = preset decides */
     @LongRunningThresholdMinutes integer = NULL,    /* Stats historically slower than this get forced sample rate. NULL = disabled */
     @LongRunningSamplePercent integer = NULL,        /* Sample percent for long-running stats (default preset: 10%). NULL = preset decides */
@@ -345,8 +351,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.4.0.2026.04.22',
-        @procedure_version_date datetime = '20260422',
+        @procedure_version varchar(20) = '3.4.1.2026.04.23',
+        @procedure_version_date datetime = '20260423',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -1491,6 +1497,8 @@ BEGIN
     /* #402: Must check the PUBLIC param (was checking @i_ which is always NULL here) */
     IF @LongRunningThresholdMinutes IS NOT NULL SET @i_long_running_threshold_min = @LongRunningThresholdMinutes;
     IF @LongRunningSamplePercent IS NOT NULL SET @i_long_running_sample_pct = @LongRunningSamplePercent;
+    /* gh-508: @LockTimeout public override for preset-driven @i_lock_timeout */
+    IF @LockTimeout IS NOT NULL SET @i_lock_timeout = @LockTimeout;
 
     /* #387: @QueryStoreTopPlans override -- controls Phase 6 XML plan parsing limit */
     IF @QueryStoreTopPlans IS NOT NULL SET @i_qs_top_plans = @QueryStoreTopPlans;
@@ -2328,7 +2336,7 @@ BEGIN
         DECLARE @MinTempdbFreeMB_display nvarchar(20) = CONVERT(nvarchar(20), @i_min_tempdb_free_mb);
         RAISERROR(N'  @MinTempdbFreeMB          = %s MB', 10, 1, @MinTempdbFreeMB_display) WITH NOWAIT;
     END;
-    RAISERROR(N'  LockTimeout               = %s seconds', 10, 1, @LockTimeout_display) WITH NOWAIT;
+    RAISERROR(N'  @LockTimeout              = %s seconds', 10, 1, @LockTimeout_display) WITH NOWAIT;
     RAISERROR(N'  @SortOrder                = %s', 10, 1, @i_sort_order) WITH NOWAIT;
     RAISERROR(N'  @StatsInParallel         = %s', 10, 1, @StatsInParallel) WITH NOWAIT;
     RAISERROR(N'  @Execute                 = %s', 10, 1, @Execute) WITH NOWAIT;
