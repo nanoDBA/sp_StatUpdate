@@ -36,11 +36,21 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.5.0.2026.04.23 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.5.1.2026.05.07 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.5.0.2026.04.23 - @CriticalTables feature: per-table sample rate
+History:    3.5.1.2026.05.07 - Bug fix (gh-515): failed UPDATE STATISTICS rows
+                              now write ExtendedInfo with RunLabel + full
+                              discovery context to CommandLog. Previously the
+                              per-stat CATCH branch UPDATE'd EndTime / ErrorNumber
+                              / ErrorMessage but left ExtendedInfo NULL, so
+                              sp_StatUpdate_Diag's C2 (REPEATED_FAILURES) check
+                              -- which extracts RunLabel from XML -- silently
+                              missed every failure.  TOCTOU rows (errors 208,
+                              15009, 2767) intentionally keep NULL ExtendedInfo
+                              so they don't aggregate as real failures.
+            3.5.0.2026.04.23 - @CriticalTables feature: per-table sample rate
                               override with optional priority boost (gh-508).
                               Three new params: @CriticalTables (comma-delimited
                               table patterns with % wildcards), @CriticalSamplePercent
@@ -366,8 +376,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.5.0.2026.04.23',
-        @procedure_version_date datetime = '20260423',
+        @procedure_version varchar(20) = '3.5.1.2026.05.07',
+        @procedure_version_date datetime = '20260507',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -8106,10 +8116,111 @@ OPTION (RECOMPILE);';
                         @consecutive_failures += 1,
                         @claimed_table_stats_failed += CASE WHEN @StatsInParallel = N'Y' THEN 1 ELSE 0 END;
                     RAISERROR(N'  X Error %d: %s', 16, 1, @current_error_number, @current_error_message) WITH NOWAIT;
+
+                    /*
+                    gh-515: Build ExtendedInfo XML for failed stats so the row carries RunLabel and
+                    full discovery context. Without this, sp_StatUpdate_Diag's C2 (REPEATED_FAILURES)
+                    check sees NULL RunLabel and silently misses every failure. Schema mirrors the
+                    success path so consumers can use one XPath set. TOCTOU rows (208/15009/2767) are
+                    intentionally left with NULL ExtendedInfo so they don't get aggregated as real
+                    failures in the diag tool.
+                    */
+                    BEGIN TRY
+                        SELECT
+                            @current_extended_info =
+                            (
+                                SELECT
+                                    @current_object_id AS ObjectId,
+                                    @current_stats_id AS StatsId,
+                                    @current_modification_counter AS ModificationCounter,
+                                    CASE
+                                        WHEN @current_row_count > 0
+                                        THEN CONVERT(decimal(18, 2), (@current_modification_counter * 100.0 / @current_row_count))
+                                        ELSE 0
+                                    END AS ModificationPct,
+                                    @current_days_stale AS DaysStale,
+                                    @current_page_count AS PageCount,
+                                    @current_page_count / 128 AS SizeMB,
+                                    @current_row_count AS [RowCount],
+                                    @current_no_recompute AS HasNorecompute,
+                                    @current_is_incremental AS IsIncremental,
+                                    @current_is_heap AS IsHeap,
+                                    ISNULL(@current_forwarded_records, 0) AS ForwardedRecords,
+                                    @current_is_memory_optimized AS IsMemoryOptimized,
+                                    @current_auto_created AS AutoCreated,
+                                    @current_is_critical AS IsCritical,
+                                    CASE WHEN @current_is_critical = 1 AND @CriticalSamplePercent IS NOT NULL
+                                         THEN @CriticalSamplePercent ELSE NULL END AS CriticalSampleOverride,
+                                    @current_histogram_steps AS HistogramSteps,
+                                    @current_persisted_sample_percent AS PersistedSamplePercent,
+                                    @absolute_sampled_rows AS PersistedSampledRows,
+                                    @current_has_filter AS HasFilter,
+                                    LEFT(@current_filter_definition, 500) AS FilterDefinition,
+                                    @current_unfiltered_rows AS UnfilteredRows,
+                                    @current_filtered_drift_ratio AS FilteredDriftRatio,
+                                    @current_qs_plan_count AS QSPlanCount,
+                                    @current_qs_total_executions AS QSTotalExecutions,
+                                    @current_qs_total_cpu_ms AS QSTotalCpuMs,
+                                    @current_qs_total_duration_ms AS QSTotalDurationMs,
+                                    @current_qs_total_logical_reads AS QSTotalLogicalReads,
+                                    @current_qs_total_memory_grant_kb AS QSTotalMemoryGrantKB,
+                                    @current_qs_total_tempdb_pages AS QSTotalTempdbPages,
+                                    @current_qs_total_physical_reads AS QSTotalPhysicalReads,
+                                    @current_qs_total_logical_writes AS QSTotalLogicalWrites,
+                                    @current_qs_total_wait_time_ms AS QSTotalWaitTimeMs,
+                                    @current_qs_max_dop AS QSMaxDOP,
+                                    @current_qs_active_feedback_count AS QSActiveFeedbackCount,
+                                    @current_qs_last_execution AS QSLastExecution,
+                                    @current_qs_priority_boost AS QSPriorityBoost,
+                                    @i_qs_metric AS QSMetric,
+                                    CASE
+                                        WHEN @in_mop_up = 1
+                                        THEN N'MOP_UP'
+                                        WHEN @mode = N'DIRECT_STRING'
+                                        THEN N'DIRECT_MODE'
+                                        WHEN @current_qs_priority_boost > 0
+                                        THEN N'QUERY_STORE_PRIORITY'
+                                        WHEN @current_has_filter = 1
+                                        AND  @i_filtered_stats_mode = N'PRIORITY'
+                                        AND  @current_filtered_drift_ratio >= @i_filtered_stats_stale_factor
+                                        THEN N'FILTERED_DRIFT'
+                                        WHEN @current_no_recompute = 1
+                                        AND  @TargetNorecompute IN (N'Y', N'BOTH')
+                                        THEN N'NORECOMPUTE_TARGET'
+                                        WHEN (@current_days_stale * 24) >= ISNULL(@StaleHours, 999999)
+                                        THEN N'DAYS_STALE'
+                                        WHEN @i_tiered_thresholds = 1
+                                        THEN N'TIERED_THRESHOLD'
+                                        WHEN @i_modification_percent IS NOT NULL
+                                        AND  (@current_modification_counter * 100.0 / NULLIF(@current_row_count, 0)) >= @i_modification_percent
+                                        THEN N'MOD_PERCENT'
+                                        WHEN @current_modification_counter >= ISNULL(@ModificationThreshold, 0)
+                                        THEN N'MOD_COUNTER'
+                                        ELSE N'THRESHOLD_MATCH'
+                                    END AS QualifyReason,
+                                    @i_statistics_sample AS RequestedSamplePct,
+                                    @effective_sample_percent AS EffectiveSamplePct,
+                                    @sample_source AS SampleSource,
+                                    @mode AS Mode,
+                                    @run_label AS RunLabel,
+                                    @stats_processed AS ProcessingPosition,
+                                    @procedure_version AS Version
+                                FOR
+                                    XML RAW(N'ExtendedInfo'),
+                                    ELEMENTS
+                            );
+                    END TRY
+                    BEGIN CATCH
+                        /* If XML build fails, fall back to NULL -- failure UPDATE still records
+                           ErrorNumber/ErrorMessage; we just lose the rich correlation context. */
+                        SET @current_extended_info = NULL;
+                    END CATCH;
                 END;
 
                 /*
                 Update CommandLog with error (two-phase pattern: pre-exec INSERT already done above)
+                gh-515: ExtendedInfo carries RunLabel for failed stats so sp_StatUpdate_Diag C2 can
+                aggregate them. NULL for TOCTOU rows -- intentional, see ELSE branch above.
                 */
                 IF  @LogToTable = N'Y'
                 AND @commandlog_exists = 1
@@ -8119,7 +8230,8 @@ OPTION (RECOMPILE);';
                         UPDATE dbo.CommandLog
                         SET EndTime = @current_end_time,
                             ErrorNumber = @current_error_number,
-                            ErrorMessage = @current_error_message
+                            ErrorMessage = @current_error_message,
+                            ExtendedInfo = @current_extended_info
                         WHERE ID = @current_commandlog_id;
                     END TRY
                     BEGIN CATCH
