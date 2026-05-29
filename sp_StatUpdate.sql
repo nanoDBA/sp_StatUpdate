@@ -36,11 +36,21 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.5.1.2026.05.07 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.5.2.2026.05.28 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.5.1.2026.05.07 - Bug fix (gh-515): failed UPDATE STATISTICS rows
+History:    3.5.2.2026.05.28 - Bug fix (sp_StatUpdate-trla): orphaned-run
+                              cleanup added a lower bound to the orphan START
+                              candidate hunt so it only considers STARTs within
+                              the same window as #orphan_end_labels (now minus
+                              (@i_orphaned_run_threshold_hours + 24h)).  A START
+                              older than that window whose real END also
+                              predated the window was not found in
+                              #orphan_end_labels and received a fabricated
+                              KILLED end, falsely flagging long-completed
+                              parallel runs as killed.
+            3.5.1.2026.05.07 - Bug fix (gh-515): failed UPDATE STATISTICS rows
                               now write ExtendedInfo with RunLabel + full
                               discovery context to CommandLog. Previously the
                               per-stat CATCH branch UPDATE'd EndTime / ErrorNumber
@@ -376,8 +386,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.5.1.2026.05.07',
-        @procedure_version_date datetime = '20260507',
+        @procedure_version varchar(20) = '3.5.2.2026.05.28',
+        @procedure_version_date datetime = '20260528',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -3011,6 +3021,12 @@ BEGIN
         WHERE cl_start.CommandType = N'SP_STATUPDATE_START'
         /* #148: Only clean orphans older than @i_orphaned_run_threshold_hours (avoids concurrent run interference) */
         AND   cl_start.StartTime < DATEADD(HOUR, -@i_orphaned_run_threshold_hours, SYSDATETIME())
+        /* sp_StatUpdate-trla: lower bound must match the #orphan_end_labels
+           window (now - (@i_orphaned_run_threshold_hours + 24h)).  Without it,
+           a START older than that window whose real END also predates the
+           window is not found in #orphan_end_labels and gets a fabricated
+           KILLED end -- falsely flagging long-completed runs as killed. */
+        AND   cl_start.StartTime >= DATEADD(HOUR, -(@i_orphaned_run_threshold_hours + 24), SYSDATETIME())
         /* Must have ExtendedInfo with RunLabel to avoid NULL=NULL matching */
         AND   cl_start.ExtendedInfo IS NOT NULL
         AND   cl_start.ExtendedInfo.exist('(/Parameters/RunLabel)[1]') = 1
