@@ -36,9 +36,24 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.04.22.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.05.28.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.04.22.1 - W13 PERPETUALLY_SKIPPED: new WARNING when stats are
+History:    2026.05.28.1 - Two parallel-mode false-positive fixes.
+                           (1) sp_StatUpdate-772k: #runs dedup tiebreaker is now
+                           ORDER BY StartTime DESC, IsKilled ASC, EndTime DESC.
+                           The prior 2026.04.20.1 EndTime DESC ordering could
+                           pick a synthetic KILLED orphan-cleanup END over the
+                           real END (the KILLED row often has a later EndTime),
+                           falsely flagging completed parallel runs as killed.
+                           IsKilled ASC guarantees the real END (IsKilled = 0)
+                           wins.
+                           (2) sp_StatUpdate-3j5l: completion_pct now returns
+                           100.0 when StopReason IN (COMPLETED, PARALLEL_COMPLETE).
+                           In parallel mode StatsFound is the whole-queue total
+                           while StatsProcessed is this worker's slice, so the
+                           raw ratio understated completion (e.g. 50%) and
+                           dragged down the 40%-weighted run-health grade.
+            2026.04.22.1 - W13 PERPETUALLY_SKIPPED: new WARNING when stats are
                            discovered but never updated across N consecutive runs
                            due to time limits (gh-504).  Recommends @SortOrder=
                            MODIFICATION_VELOCITY or increasing @TimeLimit.
@@ -297,8 +312,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.04.22.1',
-        @procedure_version_date datetime = '20260422';
+        @procedure_version varchar(20) = '2026.05.28.1',
+        @procedure_version_date datetime = '20260528';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -1407,13 +1422,15 @@ BEGIN
         @orphan_minutes = @OrphanedRunThresholdMinutes;
 
     /* #216: Dedup -- keep only the most recent START per RunLabel.
-       v2026.04.20.1: EndTime DESC tiebreaker so that when a RunLabel has
-       both a KILLED orphan-cleanup END and a real END we keep the row
-       with an actual end time. */
+       sp_StatUpdate-772k: IsKilled ASC tiebreaker so a real END (IsKilled = 0)
+       always wins over a synthetic KILLED orphan-cleanup END (IsKilled = 1)
+       for the same RunLabel.  The prior v2026.04.20.1 EndTime DESC ordering
+       could pick the newer synthetic KILLED row, falsely flagging completed
+       parallel runs as killed. */
     WITH dupes AS (
         SELECT *, ROW_NUMBER() OVER (
                       PARTITION BY RunLabel
-                      ORDER BY StartTime DESC, EndTime DESC
+                      ORDER BY StartTime DESC, IsKilled ASC, EndTime DESC
                   ) AS rn
         FROM #runs
     )
@@ -3776,6 +3793,13 @@ BEGIN
                               ELSE NULL
                           END,
         completion_pct  = CASE
+                              /* sp_StatUpdate-3j5l: a run that reached a clean
+                                 stop is 100% complete regardless of the
+                                 StatsProcessed / StatsFound ratio.  In parallel
+                                 mode StatsFound is the whole-queue total while
+                                 StatsProcessed is this worker's slice, so the
+                                 raw ratio understates completion (e.g. 50%). */
+                              WHEN r.StopReason IN (N'COMPLETED', N'PARALLEL_COMPLETE') THEN 100.0
                               WHEN r.StatsFound > 0
                               THEN CONVERT(decimal(5, 1), ISNULL(r.StatsProcessed, 0) * 100.0 / r.StatsFound)
                               ELSE NULL
