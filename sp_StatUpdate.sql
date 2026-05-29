@@ -36,11 +36,22 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.5.2.2026.05.28 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.5.3.2026.05.29 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.5.2.2026.05.28 - Bug fix (sp_StatUpdate-trla): orphaned-run
+History:    3.5.3.2026.05.29 - Bug fix (sp_StatUpdate-isa2): @total_stats was
+                              initialized by a CASE inside a multi-variable
+                              DECLARE whose parallel branch reads the optional
+                              dbo.QueueStatistic table.  A CASE in a DECLARE is a
+                              single always-compiled statement, so SQL Server
+                              name-resolved the QueueStatistic branch even on
+                              non-parallel runs and failed with Msg 208 when the
+                              table was absent (it is auto-created only when
+                              @StatsInParallel = Y).  @total_stats is now assigned
+                              via IF/ELSE so the QueueStatistic reference is only
+                              resolved in parallel mode where the table exists.
+            3.5.2.2026.05.28 - Bug fix (sp_StatUpdate-trla): orphaned-run
                               cleanup added a lower bound to the orphan START
                               candidate hunt so it only considers STARTs within
                               the same window as #orphan_end_labels (now minus
@@ -386,8 +397,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.5.2.2026.05.28',
-        @procedure_version_date datetime = '20260528',
+        @procedure_version varchar(20) = '3.5.3.2026.05.29',
+        @procedure_version_date datetime = '20260529',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -5300,27 +5311,35 @@ OPTION (RECOMPILE);';
     END;
 
     DECLARE
-        @total_stats integer =
-        CASE WHEN @skip_discovery = 1
-        THEN
-        (
-            SELECT ISNULL(SUM(qs.StatsCount), 0)
-            FROM dbo.QueueStatistic AS qs
-            WHERE qs.QueueID = @queue_id
-            AND   qs.TableEndTime IS NULL
-        )
-        ELSE
-        (
-            SELECT
-                COUNT_BIG(*)
-            FROM #stats_to_process
-        )
-        END,
+        @total_stats integer = 0,
         @norecompute_stats integer = 0,
         @incremental_stats integer = 0,
         @heap_stats integer = 0,
         @memory_optimized_stats integer = 0,
         @persisted_sample_stats integer = 0;
+
+    /* sp_StatUpdate-isa2: assign @total_stats via IF/ELSE rather than a CASE inside
+       the DECLARE.  The parallel branch reads dbo.QueueStatistic, which is optional
+       (auto-created only when @StatsInParallel = Y).  A CASE inside a DECLARE is a
+       single always-compiled statement, so SQL Server name-resolves the
+       QueueStatistic branch even on non-parallel runs and fails with Msg 208 when the
+       table is absent.  Splitting into separate statements defers name resolution so
+       the QueueStatistic reference is only resolved when @skip_discovery = 1 (parallel
+       mode, where the table is guaranteed to exist). */
+    IF @skip_discovery = 1
+        SET @total_stats =
+        (
+            SELECT ISNULL(SUM(qs.StatsCount), 0)
+            FROM dbo.QueueStatistic AS qs
+            WHERE qs.QueueID = @queue_id
+            AND   qs.TableEndTime IS NULL
+        );
+    ELSE
+        SET @total_stats =
+        (
+            SELECT COUNT_BIG(*)
+            FROM #stats_to_process
+        );
 
     /* gh-463: single scan of #stats_to_process populates all five counters
        (was five separate COUNT_BIG full-scans). */
