@@ -36,9 +36,34 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.05.28.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.06.08.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.05.28.1 - Two parallel-mode false-positive fixes.
+History:    2026.06.08.1 - sp_StatUpdate-6x80: W5/I10 QS-parallel refinements.
+                           (1) W5 parallel-aware: when all QS-priority runs use
+                           @StatsInParallel='Y' and QS CPU data IS present in
+                           stat updates (QSTotalCpuMs > 0), W5's zero-data-runs
+                           branch is suppressed -- per-worker ProcessingPosition
+                           counters make the "QS data not captured" signal
+                           unreliable in parallel mode.  A softer INFO note is
+                           inserted instead of a WARNING.
+                           (2) I10 W5-conditional QS drop: I10 now only reverts
+                           @SortOrder to MODIFICATION_COUNTER and clears
+                           @QueryStore when W5 fired due to genuine absence of
+                           QS data (not a parallel-ordering artifact).  When W5
+                           fired but runs are parallel AND QS CPU data was
+                           observed, I10 keeps @SortOrder=QUERY_STORE and
+                           @QueryStore=CPU.
+                           (3) TimeLimit jitter normalization: when MAX-MIN of
+                           TimeLimit across recent non-killed runs is < 300 s,
+                           I10 rounds to the nearest minute
+                           (ROUND(AVG / 60.0, 0) * 60) to avoid echoing jittery
+                           @StopByTime-derived values like 21599/21598.
+                           (4) @CriticalTables hint: when W9
+                           LOCK_TIMEOUT_INEFFECTIVE has fired, I10 appends a
+                           suggested @CriticalTables comment to the recommended
+                           EXEC call listing the top contended tables so the
+                           operator can apply per-table priority boost.
+            2026.05.28.1 - Two parallel-mode false-positive fixes.
                            (1) sp_StatUpdate-772k: #runs dedup tiebreaker is now
                            ORDER BY StartTime DESC, IsKilled ASC, EndTime DESC.
                            The prior 2026.04.20.1 EndTime DESC ordering could
@@ -312,8 +337,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.05.28.1',
-        @procedure_version_date datetime = '20260528';
+        @procedure_version varchar(20) = '2026.06.08.1',
+        @procedure_version_date datetime = '20260608';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -1306,7 +1331,9 @@ BEGIN
         Finding nvarchar(500) NOT NULL,
         Evidence nvarchar(2000) NULL,
         Recommendation nvarchar(2000) NULL,
-        ExampleCall nvarchar(1000) NULL,
+        /* sp_StatUpdate-6x80: widened from nvarchar(1000) to accommodate
+           @CriticalTables hint appended by I10 RECOMMENDED_CONFIG */
+        ExampleCall nvarchar(2000) NULL,
         SortPriority integer NOT NULL DEFAULT 50,
 
         CONSTRAINT PK_recommendations PRIMARY KEY CLUSTERED (FindingID)
@@ -2618,25 +2645,76 @@ BEGIN
             WHERE su.QSPlanCount IS NOT NULL /* 0 = enrichment ran (no match), >0 = matched; NULL = skipped */
         );
 
+        /* sp_StatUpdate-6x80: detect whether ALL QS-priority runs are parallel.
+           In parallel mode, ProcessingPosition is a per-worker counter (not a
+           global rank), so the absence of per-stat QS data in stat updates does
+           NOT reliably signal that QS enrichment failed -- it may simply mean
+           the per-stat ExtendedInfo rows aren't tagged with QSPlanCount in a
+           way that crosses workers.  Check whether any stat updates carry actual
+           CPU data (QSTotalCpuMs > 0) as the definitive "QS enrichment worked"
+           signal regardless of QSPlanCount NULL/0 ambiguity. */
+        DECLARE @w5_all_parallel bit = (
+            SELECT CASE
+                WHEN COUNT(*) > 0
+                 AND SUM(CASE WHEN ISNULL(r.StatsInParallel, N'N') = N'Y' THEN 1 ELSE 0 END) = COUNT(*)
+                THEN CONVERT(bit, 1) ELSE CONVERT(bit, 0) END
+            FROM #runs AS r
+            WHERE r.IsKilled = 0 AND r.QueryStorePriority = N'Y'
+        );
+        /* QS CPU data present = enrichment actually ran and matched at least one stat */
+        DECLARE @w5_qs_cpu_present bit = (
+            SELECT CASE WHEN SUM(ISNULL(su.QSTotalCpuMs, 0)) > 0
+                        THEN CONVERT(bit, 1) ELSE CONVERT(bit, 0) END
+            FROM #stat_updates AS su
+        );
+
         IF @w5_qs_data_runs = 0
         BEGIN
-            /* Original W5: QS enabled but zero data */
-            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
-            VALUES
-            (
-                N'WARNING', N'QS_NOT_EFFECTIVE',
-                N'Query Store priority enabled but no QS data captured in stat updates',
-                N'QS prioritization was configured (@QueryStore in v3, @QueryStorePriority in v2) but QS enrichment did not run in any stat updates (QSPlanCount IS NULL in all). '
-                    + N'This typically means Query Store is disabled, read-only, purged, or has no recent runtime stats.',
-                N'Verify Query Store is enabled and in READ_WRITE mode on target databases: '
-                    + N'SELECT name, is_query_store_on FROM sys.databases. '
-                    + N'If QS is intentionally disabled, set @QueryStore = NULL (v3) to avoid unnecessary overhead. '
-                    /* #278: capture mode guidance */
-                    + N'Also verify CAPTURE_MODE is AUTO or CUSTOM, not ALL (SELECT actual_state_desc, query_capture_mode_desc FROM sys.database_query_store_options).',
-                N'/* Check: SELECT name, is_query_store_on FROM sys.databases WHERE state_desc = N''ONLINE''; */',
-                35
-            );
-            RAISERROR(N'  [WARNING] W5: Query Store not effective', 10, 1) WITH NOWAIT;
+            /* sp_StatUpdate-6x80: when all QS-priority runs are parallel AND QS
+               CPU data was observed in stat updates, the zero-QSPlanCount signal
+               is unreliable (parallel per-worker position counters mask global
+               rank).  Emit a softer INFO note and do NOT insert QS_NOT_EFFECTIVE
+               so that I10 does not revert @SortOrder on a false premise. */
+            IF @w5_all_parallel = 1 AND @w5_qs_cpu_present = 1
+            BEGIN
+                INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+                VALUES
+                (
+                    N'INFO', N'QS_PARALLEL_UNRELIABLE',
+                    N'QS plan-count data absent in parallel mode -- unreliable signal',
+                    N'QS prioritization is configured and QS CPU data WAS captured (QSTotalCpuMs > 0 in stat updates). '
+                        + N'However, QSPlanCount IS NULL for all stat updates, which in parallel mode may reflect '
+                        + N'per-worker ExtendedInfo tagging rather than true QS enrichment failure. '
+                        + N'The mhje fix (v3.5.4) corrected TablePriority ordering so QS-top stats are processed '
+                        + N'first in parallel mode.  Monitor QS efficacy (RS 10/11) over the next few runs.',
+                    N'No action required if RS 10 QS efficacy trend shows IMPROVING or STABLE. '
+                        + N'If truly no QS data is collected, verify QS is READ_WRITE: '
+                        + N'SELECT actual_state_desc FROM sys.database_query_store_options.',
+                    NULL,
+                    40
+                );
+                RAISERROR(N'  [INFO] W5: QS data absent in parallel mode -- possible artifact, not firing WARNING', 10, 1) WITH NOWAIT;
+            END
+            ELSE
+            BEGIN
+                /* Original W5: QS enabled but zero data (non-parallel or no CPU data) */
+                INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+                VALUES
+                (
+                    N'WARNING', N'QS_NOT_EFFECTIVE',
+                    N'Query Store priority enabled but no QS data captured in stat updates',
+                    N'QS prioritization was configured (@QueryStore in v3, @QueryStorePriority in v2) but QS enrichment did not run in any stat updates (QSPlanCount IS NULL in all). '
+                        + N'This typically means Query Store is disabled, read-only, purged, or has no recent runtime stats.',
+                    N'Verify Query Store is enabled and in READ_WRITE mode on target databases: '
+                        + N'SELECT name, is_query_store_on FROM sys.databases. '
+                        + N'If QS is intentionally disabled, set @QueryStore = NULL (v3) to avoid unnecessary overhead. '
+                        /* #278: capture mode guidance */
+                        + N'Also verify CAPTURE_MODE is AUTO or CUSTOM, not ALL (SELECT actual_state_desc, query_capture_mode_desc FROM sys.database_query_store_options).',
+                    N'/* Check: SELECT name, is_query_store_on FROM sys.databases WHERE state_desc = N''ONLINE''; */',
+                    35
+                );
+                RAISERROR(N'  [WARNING] W5: Query Store not effective', 10, 1) WITH NOWAIT;
+            END;
         END
         ELSE IF @w5_qs_data_runs < @w5_qs_runs
             AND @w5_qs_data_runs * 100.0 / @w5_qs_runs BETWEEN 10 AND 90
@@ -4299,7 +4377,9 @@ BEGIN
                 @rc_long_pct        integer,
                 @rc_parallel        nvarchar(1),
                 @rc_fail_fast       bit,
-                @rc_call            nvarchar(1000),
+                /* sp_StatUpdate-6x80: widened from nvarchar(1000) to nvarchar(max) to
+                   accommodate @CriticalTables hint which can carry multiple table names */
+                @rc_call            nvarchar(max),
                 @rc_rationale       nvarchar(2000) = N'',
                 @rc_safeguards      nvarchar(500);
 
@@ -4315,6 +4395,24 @@ BEGIN
                 @rc_fail_fast     = FailFast
             FROM #runs
             WHERE RunLabel = @rc_baseline;
+
+            /* sp_StatUpdate-6x80: TimeLimit jitter normalization.
+               When @StopByTime is used, each run derives its TimeLimit from
+               DATEDIFF(SECOND, start_time, stop_by_time), so a job that starts
+               at 23:00:01 vs 23:00:02 yields 21599 vs 21598 instead of 21600.
+               If the spread across recent non-killed runs with non-NULL TimeLimit
+               is < 300 s (5 min), round to the nearest minute to produce a clean
+               value (e.g. 21600 instead of 21599). */
+            DECLARE @rc_tl_spread integer = (
+                SELECT MAX(TimeLimit) - MIN(TimeLimit)
+                FROM #runs
+                WHERE IsKilled = 0 AND TimeLimit IS NOT NULL
+            );
+            IF @rc_tl_spread IS NOT NULL AND @rc_tl_spread < 300
+                SET @rc_timelimit = CONVERT(integer, ROUND(
+                    (SELECT AVG(CONVERT(decimal(12, 2), TimeLimit))
+                     FROM #runs WHERE IsKilled = 0 AND TimeLimit IS NOT NULL)
+                    / 60.0, 0) * 60);
 
             /* ---- Adjust based on fired checks ---- */
 
@@ -4338,12 +4436,24 @@ BEGIN
                 SET @rc_rationale += N'TimeLimit raised from <1h to 5h (too short for workload). ';
             END;
 
-            /* W5: QS not effective -- revert to MODIFICATION_COUNTER */
+            /* sp_StatUpdate-6x80: W5-conditional QS drop.
+               Only revert @SortOrder and clear @QueryStore when W5 fired due to
+               genuine QS absence (QS_NOT_EFFECTIVE category).  When W5 fired as
+               a parallel-ordering artifact (QS_PARALLEL_UNRELIABLE category),
+               QS CPU data WAS observed so keeping @SortOrder=QUERY_STORE is
+               correct -- the mhje fix (v3.5.4) corrected TablePriority ordering
+               so the root cause is already resolved on the proc side. */
             IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'QS_NOT_EFFECTIVE')
             BEGIN
+                /* True QS absence: revert sort and disable QS */
                 SET @rc_sort   = N'MODIFICATION_COUNTER';
                 SET @rc_qs_pri = N'N';
                 SET @rc_rationale += N'QS disabled (W5: no QS data captured). ';
+            END
+            ELSE IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'QS_PARALLEL_UNRELIABLE')
+            BEGIN
+                /* Parallel artifact only -- keep QS, note that mhje fix applies */
+                SET @rc_rationale += N'QS kept (W5 was parallel artifact -- v3.5.4 TablePriority fix applies). ';
             END;
 
             /* W1a: Always recommend tiered thresholds */
@@ -4421,6 +4531,40 @@ BEGIN
             )
             AND ISNULL(@rc_parallel, N'N') = N'N'
                 SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @MopUpPass = N''Y''';
+
+            /* sp_StatUpdate-6x80: @CriticalTables hint.
+               When W9 LOCK_TIMEOUT_INEFFECTIVE has fired, the contended tables
+               are strong @CriticalTables candidates (per-table sample-rate
+               override + priority boost in v3.5.0+).  Append a commented-out
+               suggestion with the top 3 most-blocked tables so the operator can
+               uncomment and tune.  Uses the same lock_timeouts CTE logic as W9
+               but limited to top 3 tables ordered by hit count.
+               Assumption: schema.table granularity is sufficient (stat names
+               are omitted since @CriticalTables accepts table patterns). */
+            IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'LOCK_TIMEOUT_INEFFECTIVE')
+            BEGIN
+                DECLARE @rc_critical_tables nvarchar(500) = STUFF((
+                    SELECT TOP (3) N', ' + su.SchemaName + N'.' + su.ObjectName
+                    FROM (
+                        SELECT su2.SchemaName, su2.ObjectName,
+                               hit_count = COUNT(DISTINCT su2.RunLabel)
+                        FROM #stat_updates AS su2
+                        WHERE su2.ErrorNumber = 1222
+                        GROUP BY su2.SchemaName, su2.ObjectName
+                        HAVING COUNT(DISTINCT su2.RunLabel) >= 3
+                    ) AS su
+                    ORDER BY su.hit_count DESC
+                    FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N'');
+
+                IF @rc_critical_tables IS NOT NULL
+                    SET @rc_call += NCHAR(13) + NCHAR(10)
+                        + N'  /* Suggested (W9 lock contention -- uncomment and tune):'
+                        + NCHAR(13) + NCHAR(10)
+                        + N'  , @CriticalTables = N''' + @rc_critical_tables + N''''
+                        + NCHAR(13) + NCHAR(10)
+                        + N'  */'
+                        ;
+            END;
 
             SET @rc_call += N';';
 
