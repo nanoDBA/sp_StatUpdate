@@ -36,11 +36,36 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.5.3.2026.05.29 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.5.4.2026.06.08 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.5.3.2026.05.29 - Bug fix (sp_StatUpdate-isa2): @total_stats was
+History:    3.5.4.2026.06.08 - Two fixes (sp_StatUpdate-mhje, sp_StatUpdate-mknv):
+                            mhje: parallel TablePriority ordering inverted gh-505
+                              LPT vs the user's explicit @SortOrder.  LPT was
+                              PRIMARY (est_total_seconds DESC) and min_priority
+                              (which embeds @SortOrder=QUERY_STORE intent) was
+                              fallback.  On mature fleets with CommandLog
+                              history, LPT silently overrode QS prioritization
+                              -- QS-top stats landed at ProcessingPosition
+                              285-296 instead of 1-10.  Now: min_priority is
+                              PRIMARY, LPT is tiebreaker.  Preserves gh-505's
+                              wall-clock optimization within priority bands
+                              while honoring user @SortOrder.
+                            mknv: new @FirstTimeFullScanCapRows public param
+                              caps unbounded FULLSCAN on very large stats
+                              that have no CommandLog history yet.  Adaptive
+                              sampling (@LongRunningThresholdMinutes) only
+                              helps after a prior slow run is logged; first
+                              encounters on 770M-15.9B-row tables ran 3000+s
+                              FULLSCANs.  When @FirstTimeFullScanCapRows is
+                              set and @current_row_count exceeds it AND the
+                              stat has no completed CommandLog entry, the
+                              cap formula (CEILING(10M / row_count * 100),
+                              min 1%) overrides the FULLSCAN.  Default NULL
+                              = disabled (non-breaking).  Critical-table
+                              override (@CriticalSamplePercent) still wins.
+            3.5.3.2026.05.29 - Bug fix (sp_StatUpdate-isa2): @total_stats was
                               initialized by a CASE inside a multi-variable
                               DECLARE whose parallel branch reads the optional
                               dbo.QueueStatistic table.  A CASE in a DECLARE is a
@@ -341,6 +366,7 @@ ALTER PROCEDURE
     @ModificationThreshold bigint = NULL,           /* Override preset mod threshold floor (large tables). NULL = preset decides */
     @LongRunningThresholdMinutes integer = NULL,    /* Stats historically slower than this get forced sample rate. NULL = disabled */
     @LongRunningSamplePercent integer = NULL,        /* Sample percent for long-running stats (default preset: 10%). NULL = preset decides */
+    @FirstTimeFullScanCapRows bigint = NULL,         /* sp_StatUpdate-mknv: Cap FULLSCAN to sampled rate when row count exceeds this AND stat has no successful CommandLog entry yet.  Uses same 10M-row cap formula as adaptive sampling.  Critical-table override wins.  NULL = disabled (non-breaking). */
 
     /* QUERY STORE TUNING */
     @QueryStoreTopPlans integer = NULL,             /* Limit Phase 6 XML plan parsing to top N plans. NULL = preset decides (default 500). */
@@ -397,8 +423,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.5.3.2026.05.29',
-        @procedure_version_date datetime = '20260529',
+        @procedure_version varchar(20) = '3.5.4.2026.06.08',
+        @procedure_version_date datetime = '20260608',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -476,6 +502,7 @@ BEGIN
             (N'@ModificationThreshold', N'bigint',     N'NULL',      N'Override preset mod threshold floor. NULL=preset decides'),
             (N'@LongRunningThresholdMinutes', N'integer', N'NULL',   N'Stats slower than this get forced sample. NULL=disabled'),
             (N'@LongRunningSamplePercent', N'integer',  N'NULL',     N'Sample pct for long-running stats. NULL=preset (10%)'),
+            (N'@FirstTimeFullScanCapRows', N'bigint',   N'NULL',     N'Cap FULLSCAN when row count exceeds this AND no CommandLog history. NULL=disabled'),
             (N'@QueryStoreTopPlans', N'integer',       N'NULL',      N'Limit Phase 6 XML plan parsing. NULL=preset (500)'),
             (N'@QueryStoreMinExecutions', N'integer',  N'NULL',      N'Min plan executions for QS boost. NULL=preset (100)'),
             (N'@QueryStoreRecentHours', N'integer',    N'NULL',      N'QS plans from last N hours. NULL=preset (168=7d)'),
@@ -998,6 +1025,22 @@ BEGIN
         max_duration_minutes int NOT NULL,
         last_occurrence datetime2(7) NOT NULL,
         occurrence_count int NOT NULL DEFAULT 1,
+        PRIMARY KEY NONCLUSTERED (database_name, schema_name, table_name, stat_name)
+    );
+
+    /*
+    sp_StatUpdate-mknv: Known-stats table (for first-time FULLSCAN cap)
+    Populated ONLY when @FirstTimeFullScanCapRows IS NOT NULL.
+    Holds stats with at least one successful CommandLog entry within retention,
+    so the per-stat first-time check can NOT EXISTS against an in-memory set
+    instead of scanning CommandLog per stat.
+    */
+    DECLARE @known_stats TABLE
+    (
+        database_name sysname NOT NULL,
+        schema_name sysname NOT NULL,
+        table_name sysname NOT NULL,
+        stat_name sysname NOT NULL,
         PRIMARY KEY NONCLUSTERED (database_name, schema_name, table_name, stat_name)
     );
 
@@ -1694,6 +1737,11 @@ BEGIN
     IF @LongRunningSamplePercent IS NOT NULL AND (@LongRunningSamplePercent < 1 OR @LongRunningSamplePercent > 100)
         INSERT INTO @errors (error_message, error_severity)
         VALUES (N'@LongRunningSamplePercent must be 1-100.', 16);
+
+    /* sp_StatUpdate-mknv: @FirstTimeFullScanCapRows must be a positive row count. */
+    IF @FirstTimeFullScanCapRows IS NOT NULL AND @FirstTimeFullScanCapRows < 1
+        INSERT INTO @errors (error_message, error_severity)
+        VALUES (N'@FirstTimeFullScanCapRows must be >= 1 row.  NULL = disabled.', 16);
 
     IF @CriticalSamplePercent IS NOT NULL AND (@CriticalSamplePercent < 1 OR @CriticalSamplePercent > 100)
         INSERT INTO @errors (error_message, error_severity)
@@ -2431,6 +2479,9 @@ BEGIN
         RAISERROR(N'  @LongRunningThreshold    = %d minutes', 10, 1, @i_long_running_threshold_min) WITH NOWAIT;
         RAISERROR(N'  @LongRunningSamplePct    = %d%%', 10, 1, @i_long_running_sample_pct) WITH NOWAIT;
     END;
+    /* sp_StatUpdate-mknv: first-time FULLSCAN cap */
+    IF @FirstTimeFullScanCapRows IS NOT NULL
+        RAISERROR(N'  @FirstTimeFullScanCap    = %I64d rows (cap FULLSCAN for stats with no CommandLog history)', 10, 1, @FirstTimeFullScanCapRows) WITH NOWAIT;
 
     /*
     Query Store parameters (when enabled)
@@ -2881,6 +2932,8 @@ BEGIN
                     /* Adaptive sampling */
                     @LongRunningThresholdMinutes AS LongRunningThresholdMinutes,
                     @LongRunningSamplePercent AS LongRunningSamplePercent,
+                    /* sp_StatUpdate-mknv: first-time FULLSCAN cap */
+                    @FirstTimeFullScanCapRows AS FirstTimeFullScanCapRows,
 
                     /* Environmental safety */
                     @i_max_ag_redo_queue_mb AS MaxAGRedoQueueMB,
@@ -3140,6 +3193,52 @@ BEGIN
             RAISERROR(@lr_msg, 10, 1) WITH NOWAIT;
             RAISERROR(N'', 10, 1) WITH NOWAIT;
         END;
+    END;
+
+    /*
+    sp_StatUpdate-mknv: KNOWN-STATS PREFETCH FOR FIRST-TIME CAP
+    Populate @known_stats with stats that have at least one completed CommandLog
+    entry within retention.  Used by the per-stat first-time check to avoid
+    scanning CommandLog row-by-row inside the process loop.  Only runs when
+    @FirstTimeFullScanCapRows is set -- skip the prefetch cost otherwise.
+    */
+    IF  @FirstTimeFullScanCapRows IS NOT NULL
+    AND @commandlog_exists = 1
+    BEGIN
+        INSERT INTO @known_stats
+        (
+            database_name,
+            schema_name,
+            table_name,
+            stat_name
+        )
+        SELECT DISTINCT
+            cl.DatabaseName,
+            cl.SchemaName,
+            cl.ObjectName,
+            COALESCE(
+                cl.ExtendedInfo.value('(/StatInfo/StatisticName)[1]', 'sysname'),
+                cl.StatisticsName,
+                cl.IndexName
+            )
+        FROM dbo.CommandLog AS cl
+        WHERE cl.CommandType = N'UPDATE_STATISTICS'
+        AND   cl.EndTime IS NOT NULL
+        AND   cl.ErrorNumber = 0
+        AND   cl.StartTime >= DATEADD(DAY, -@i_command_log_retention_days, SYSDATETIME())
+        AND   cl.DatabaseName IS NOT NULL
+        AND   cl.SchemaName   IS NOT NULL
+        AND   cl.ObjectName   IS NOT NULL
+        AND   COALESCE(
+                  cl.ExtendedInfo.value('(/StatInfo/StatisticName)[1]', 'sysname'),
+                  cl.StatisticsName,
+                  cl.IndexName
+              ) IS NOT NULL;
+
+        DECLARE @known_stats_count int = (SELECT COUNT(*) FROM @known_stats);
+
+        IF @Debug = 1
+            RAISERROR(N'First-Time Cap: prefetched %d stats with prior CommandLog history (threshold = %I64d rows)', 10, 1, @known_stats_count, @FirstTimeFullScanCapRows) WITH NOWAIT;
     END;
 
     /*#endregion 07A-ADAPTIVE */
@@ -3442,7 +3541,10 @@ OPTION (RECOMPILE);';
                 N',@i_qs_metric=' + ISNULL(LTRIM(RTRIM(@i_qs_metric)), N'') +
                 N',@i_qs_min_executions=' + ISNULL(CONVERT(nvarchar(20), @i_qs_min_executions), N'') +
                 N',@i_qs_recent_hours=' + ISNULL(CONVERT(nvarchar(20), @i_qs_recent_hours), N'') +
-                N',@i_qs_top_plans=' + ISNULL(CONVERT(nvarchar(20), @i_qs_top_plans), N'');
+                N',@i_qs_top_plans=' + ISNULL(CONVERT(nvarchar(20), @i_qs_top_plans), N'') +
+                /* sp_StatUpdate-mknv: first-time cap affects sample rates -- workers with different
+                   values must not share a parallel queue */
+                N',@FirstTimeFullScanCapRows=' + ISNULL(CONVERT(nvarchar(20), @FirstTimeFullScanCapRows), N'');
     END;
 
     DECLARE @skip_discovery bit = 0;
@@ -5574,7 +5676,9 @@ OPTION (RECOMPILE);';
             ISNULL(CONVERT(nvarchar(20), @i_qs_min_executions), N'NULL'),
             ISNULL(CONVERT(nvarchar(20), @i_qs_recent_hours), N'NULL'),
             /* gh-513: critical-table params affect discovery and sample rate */
-            ISNULL(@CriticalTables, N''), @CriticalSamplePercent, @CriticalTablesFirst
+            ISNULL(@CriticalTables, N''), @CriticalSamplePercent, @CriticalTablesFirst,
+            /* sp_StatUpdate-mknv: first-time cap affects sample rate -- include in fingerprint */
+            ISNULL(CONVERT(nvarchar(20), @FirstTimeFullScanCapRows), N'NULL')
         );
         /* gh-461: @parameters_string is built unconditionally in region 07B now.
            By the time execution reaches here it is always populated. */
@@ -5850,12 +5954,21 @@ OPTION (RECOMPILE);';
 
                 /*
                 Insert one row per table needing stats updates.
-                gh-505: Use longest-processing-time-first (LPT) scheduling
-                when CommandLog has historical duration data.  This assigns
-                estimated-longest tables to the front of the queue so all
-                workers stay busy -- prevents worker starvation where one
-                worker gets stuck on a slow table at the end.
-                Falls back to priority ordering when no history exists.
+
+                Ordering (sp_StatUpdate-mhje):
+                  PRIMARY: min_priority ASC -- user-intent ordering.  Embeds the
+                          @SortOrder choice (e.g., QS workload rank when
+                          @SortOrder=QUERY_STORE).  Ranks set in region 09 by
+                          the priority ROW_NUMBER() over #stats_to_process.
+                  TIEBREAKER: COALESCE(est_total_seconds, 0) DESC -- gh-505 LPT
+                          (longest-processing-time-first) acts WITHIN priority
+                          bands when history exists.  Keeps workers busy when
+                          QS-priority ties otherwise force alphabetical order.
+
+                Prior to mhje, LPT was PRIMARY and silently overrode the user's
+                explicit @SortOrder on mature fleets (CommandLog history >= 3
+                runs per table).  QS-top stats landed at ProcessingPosition
+                285-296 instead of 1-10.  See bd: sp_StatUpdate-mhje.
                 */
                 INSERT INTO
                     dbo.QueueStatistic
@@ -5877,10 +5990,17 @@ OPTION (RECOMPILE);';
                     ObjectID = tbl.object_id,
                     TablePriority = ROW_NUMBER() OVER (
                         ORDER BY
-                            /* LPT: estimated total seconds DESC (longest first) when history exists */
-                            COALESCE(tbl.est_total_seconds, 0) DESC,
-                            /* Fallback: original priority ordering */
-                            tbl.min_priority ASC
+                            /* sp_StatUpdate-mhje: PRIMARY sort honors the user's explicit @SortOrder
+                               by ranking on min_priority (which embeds the chosen ordering -- e.g.,
+                               QS workload rank when @SortOrder=QUERY_STORE).  Previously LPT was
+                               primary and silently overrode QS prioritization on mature fleets with
+                               CommandLog history (gh-505), so QS-top stats landed at
+                               ProcessingPosition 285-296 instead of 1-10.  LPT now acts as a
+                               tiebreaker within priority bands, preserving gh-505's wall-clock
+                               benefit without inverting user intent. */
+                            tbl.min_priority ASC,
+                            /* gh-505 LPT tiebreaker: longest-estimated table first when history exists */
+                            COALESCE(tbl.est_total_seconds, 0) DESC
                     ),
                     StatsCount = tbl.stats_count,
                     MaxModificationCounter = tbl.max_mod_counter
@@ -7032,6 +7152,57 @@ OPTION (RECOMPILE);';
                     + N'].[' + @current_stat_name + N']';
                 RAISERROR(@ct_msg, 10, 1) WITH NOWAIT;
             END;
+        END;
+
+        /*
+        sp_StatUpdate-mknv: FIRST-TIME FULLSCAN CAP (size-based)
+        Caps unbounded FULLSCAN on very large stats that have NO completed
+        CommandLog history yet.  Adaptive sampling cannot help on first
+        encounter (no history to consult).  Once a successful run logs an
+        entry, subsequent runs use that history via adaptive sampling.
+
+        Conditions to apply the cap:
+          - @FirstTimeFullScanCapRows configured (NULL = disabled)
+          - row count exceeds the threshold
+          - critical-table override not in play (critical wins -- explicit user intent)
+          - effective sample currently 100 (FULLSCAN-bound, e.g., from a preset)
+          - stat has no entry in @known_stats (no successful prior run within retention)
+
+        Cap formula mirrors adaptive sampling: target ~10M rows sampled, min 1%.
+        */
+        IF  @FirstTimeFullScanCapRows IS NOT NULL
+        AND @current_row_count IS NOT NULL
+        AND @current_row_count > @FirstTimeFullScanCapRows
+        AND @current_is_critical = 0
+        AND @effective_sample_percent = 100
+        AND NOT EXISTS
+        (
+            SELECT 1
+            FROM @known_stats AS ks
+            WHERE ks.database_name = @current_database
+            AND   ks.schema_name = @current_schema_name
+            AND   ks.table_name = @current_table_name
+            AND   ks.stat_name = @current_stat_name
+        )
+        BEGIN
+            SELECT @effective_sample_percent =
+                CASE
+                    WHEN @current_row_count <= 10000000 THEN 10
+                    ELSE CONVERT(int, CEILING(10000000.0 / @current_row_count * 100))
+                END;
+
+            /* Ensure minimum 1% (SQL Server requirement for SAMPLE PERCENT) */
+            IF @effective_sample_percent < 1
+                SELECT @effective_sample_percent = 1;
+
+            SET @sample_source = N'FIRST_TIME_CAPPED';
+
+            DECLARE @ftc_msg nvarchar(500);
+            SET @ftc_msg =
+                N'  First-Time Cap: ' + @current_stat_name +
+                N' (row_count=' + CONVERT(nvarchar(20), @current_row_count) +
+                N', no history, forcing ' + CONVERT(nvarchar(10), @effective_sample_percent) + N'%% sample)';
+            RAISERROR(@ftc_msg, 10, 1) WITH NOWAIT;
         END;
 
         /*
