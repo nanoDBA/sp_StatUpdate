@@ -36,9 +36,11 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.06.08.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.06.08.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.06.08.1 - sp_StatUpdate-6x80: W5/I10 QS-parallel refinements.
+History:    2026.06.08.2 - Cosmetic: added QS_PARALLEL_UNRELIABLE to diagnostic
+                           checks catalog (sp_StatUpdate-g4c0).
+            2026.06.08.1 - sp_StatUpdate-6x80: W5/I10 QS-parallel refinements.
                            (1) W5 parallel-aware: when all QS-priority runs use
                            @StatsInParallel='Y' and QS CPU data IS present in
                            stat updates (QSTotalCpuMs > 0), W5's zero-data-runs
@@ -337,7 +339,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.06.08.1',
+        @procedure_version varchar(20) = '2026.06.08.2',
         @procedure_version_date datetime = '20260608';
 
     SET @Version = @procedure_version;
@@ -428,6 +430,7 @@ BEGIN
                 (N'W3', N'WARNING',  N'STALE_BACKLOG',         N'Persistent backlog of unprocessed qualifying stats'),
                 (N'W4', N'WARNING',  N'OVERLAPPING_RUNS',      N'Multiple runs active simultaneously'),
                 (N'W5', N'WARNING',  N'QS_NOT_EFFECTIVE',      N'Query Store priority enabled but no QS data captured'),
+                (N'I9b', N'INFO',     N'QS_PARALLEL_UNRELIABLE', N'W5 emitted INFO when QS-priority runs are all parallel AND QS CPU data IS present in stat updates -- per-worker ProcessingPosition counters make the zero-QSPlanCount-runs signal unreliable in parallel mode, so this softer note replaces the WARNING.'),
                 (N'W6', N'WARNING',  N'EXCESSIVE_OVERHEAD',    N'Discovery/environment checks consuming disproportionate time vs actual UPDATE STATISTICS'),
                 (N'I1', N'INFO',     N'RUN_HEALTH',            N'Completion rate, duration trend, StopReason distribution'),
                 (N'I2', N'INFO',     N'PARAMETER_HISTORY',     N'How parameters changed across runs'),

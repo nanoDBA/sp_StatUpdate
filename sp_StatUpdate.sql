@@ -36,11 +36,28 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.5.4.2026.06.08 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.5.5.2026.06.08 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.5.4.2026.06.08 - Two fixes (sp_StatUpdate-mhje, sp_StatUpdate-mknv):
+History:    3.5.5.2026.06.08 - Bug fix (sp_StatUpdate-i7by): false ALREADY_RUNNING
+                              on consecutive calls after a validation-error exit.
+                              Three-part fix in the re-entrancy guard:
+                              (S) When the existing lock holder is the caller's own
+                              session (SessionID = @@SPID), the row is unconditionally
+                              stale -- the prior call has by definition ended (we are
+                              now executing in that same session) so reclaim.
+                              Required because callers that wrap EXEC in TRY/CATCH
+                              catch the validation-error RAISERROR before the proc
+                              reaches its DELETE cleanup, leaving the row.
+                              (A) For DIFFERENT sessions: dead-holder reclaim treats
+                              a session as dead when it has no active request AND its
+                              last request finished > 60 seconds ago (catches async
+                              TCP teardown where the SPID lingers briefly in
+                              sys.dm_exec_sessions after client disconnect).
+                              (D) TTL guard: any lock row with AcquiredAt > 8 hours
+                              old reclaims unconditionally regardless of session state.
+            3.5.4.2026.06.08 - Two fixes (sp_StatUpdate-mhje, sp_StatUpdate-mknv):
                             mhje: parallel TablePriority ordering inverted gh-505
                               LPT vs the user's explicit @SortOrder.  LPT was
                               PRIMARY (est_total_seconds DESC) and min_priority
@@ -423,7 +440,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.5.4.2026.06.08',
+        @procedure_version varchar(20) = '3.5.5.2026.06.08',
         @procedure_version_date datetime = '20260608',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -604,11 +621,11 @@ BEGIN
         DECLARE @my_login_time datetime =
             (SELECT s.login_time FROM sys.dm_exec_sessions AS s WHERE s.session_id = @@SPID);
 
-        DECLARE @existing_sid smallint, @existing_lt datetime;
+        DECLARE @existing_sid smallint, @existing_lt datetime, @existing_acquired_at datetime2(3);
 
         BEGIN TRANSACTION;
 
-        SELECT @existing_sid = SessionID, @existing_lt = LoginTime
+        SELECT @existing_sid = SessionID, @existing_lt = LoginTime, @existing_acquired_at = AcquiredAt
         FROM dbo.StatUpdateLock WITH (UPDLOCK, HOLDLOCK)
         WHERE Resource = N'sp_StatUpdate';
 
@@ -617,32 +634,98 @@ BEGIN
             INSERT INTO dbo.StatUpdateLock (Resource, SessionID, LoginTime)
             VALUES (N'sp_StatUpdate', @@SPID, @my_login_time);
         END
-        ELSE IF EXISTS (
-            SELECT 1 FROM sys.dm_exec_sessions
-            WHERE session_id = @existing_sid AND login_time = @existing_lt
-        )
-        BEGIN
-            COMMIT TRANSACTION;
-            RAISERROR(N'Another instance of sp_StatUpdate is already running (non-parallel mode). Use @StatsInParallel=''Y'' for concurrent execution.', 16, 1);
-            SET @StopReasonOut = N'ALREADY_RUNNING';
-            SET @StatsFoundOut = 0;
-            SET @StatsProcessedOut = 0;
-            SET @StatsSucceededOut = 0;
-            SET @StatsFailedOut = 0;
-            SET @StatsRemainingOut = 0;
-            SET @DurationSecondsOut = 0;
-            SELECT
-                Status = N'ERROR', StatusMessage = N'Another instance already running.',
-                StatsFound = 0, StatsProcessed = 0, StatsSucceeded = 0, StatsFailed = 0,
-                StatsToctou = 0, StatsSkipped = 0, StatsRemaining = 0,
-                DatabasesProcessed = 0, DurationSeconds = 0,
-                StopReason = N'ALREADY_RUNNING', RunLabel = CONVERT(nvarchar(100), NULL),
-                Version = @procedure_version;
-            RETURN;
-        END
         ELSE
         BEGIN
-            /* Dead holder -- reclaim */
+            /*
+            sp_StatUpdate-i7by: expanded dead-holder detection.
+
+            Three failure modes addressed:
+
+            S. Same-session stale row (PRIMARY case).  When the lock row was inserted
+               by the caller's own session in a prior call, and the prior call's
+               cleanup did not run (e.g., the caller wrapped EXEC in TRY/CATCH and
+               the CATCH caught the validation-error RAISERROR before the proc
+               reached its own DELETE), the row lingers.  By definition the prior
+               call has ended -- we are now executing in that same session -- so
+               the row is unconditionally stale.  Skip the liveness probes
+               (dm_exec_requests would return TRUE because OUR OWN session has an
+               active request -- this one) and reclaim.
+
+            A. Idle-time heuristic: a DIFFERENT session is in dm_exec_sessions AND
+               login_time matches BUT has no active request (no row in
+               dm_exec_requests) AND last_request_end_time was > 60 seconds ago.
+               Any real sp_StatUpdate sends heartbeat-style RAISERRORs every few
+               seconds; if it's been idle for 60+ seconds it has either finished
+               or crashed.  Treat as dead.
+
+            D. TTL guard: AcquiredAt older than 8 hours reclaims unconditionally.
+               No sp_StatUpdate run legitimately runs for 8+ hours (preset WAREHOUSE
+               is the only unlimited preset, and even that is manually stopped).
+               Belt-and-suspenders for rows that survive all other cleanup paths.
+            */
+            DECLARE @holder_is_alive bit = 0;
+
+            /* Option S: same-session row is unconditionally stale.
+               Only run the dm_exec_sessions / dm_exec_requests probes when the
+               holder is a DIFFERENT session. */
+            IF @existing_sid <> @@SPID
+            BEGIN
+                /* Option D: TTL guard -- older than 8 hours is unconditionally stale */
+                IF @existing_acquired_at IS NOT NULL
+                AND DATEDIFF(HOUR, @existing_acquired_at, SYSDATETIME()) < 8
+                BEGIN
+                    /* Option A: idle-time heuristic */
+                    IF EXISTS (
+                        SELECT 1 FROM sys.dm_exec_sessions AS s
+                        WHERE s.session_id = @existing_sid
+                        AND   s.login_time = @existing_lt
+                        AND   EXISTS (
+                            /* active request means genuinely running */
+                            SELECT 1 FROM sys.dm_exec_requests AS r
+                            WHERE r.session_id = s.session_id
+                        )
+                    )
+                    BEGIN
+                        SET @holder_is_alive = 1;
+                    END
+                    ELSE IF EXISTS (
+                        SELECT 1 FROM sys.dm_exec_sessions AS s
+                        WHERE s.session_id = @existing_sid
+                        AND   s.login_time = @existing_lt
+                        AND   (s.last_request_end_time IS NULL
+                               OR DATEDIFF(SECOND, s.last_request_end_time, SYSDATETIME()) <= 60)
+                    )
+                    BEGIN
+                        /* Session present, no active request, but idle < 60 s --
+                           could be between stats updates.  Treat as alive. */
+                        SET @holder_is_alive = 1;
+                    END;
+                    /* else: session absent OR idle > 60 s -- dead, reclaim below */
+                END;
+            END;
+
+            IF @holder_is_alive = 1
+            BEGIN
+                COMMIT TRANSACTION;
+                RAISERROR(N'Another instance of sp_StatUpdate is already running (non-parallel mode). Use @StatsInParallel=''Y'' for concurrent execution.', 16, 1);
+                SET @StopReasonOut = N'ALREADY_RUNNING';
+                SET @StatsFoundOut = 0;
+                SET @StatsProcessedOut = 0;
+                SET @StatsSucceededOut = 0;
+                SET @StatsFailedOut = 0;
+                SET @StatsRemainingOut = 0;
+                SET @DurationSecondsOut = 0;
+                SELECT
+                    Status = N'ERROR', StatusMessage = N'Another instance already running.',
+                    StatsFound = 0, StatsProcessed = 0, StatsSucceeded = 0, StatsFailed = 0,
+                    StatsToctou = 0, StatsSkipped = 0, StatsRemaining = 0,
+                    DatabasesProcessed = 0, DurationSeconds = 0,
+                    StopReason = N'ALREADY_RUNNING', RunLabel = CONVERT(nvarchar(100), NULL),
+                    Version = @procedure_version;
+                RETURN;
+            END;
+
+            /* Dead holder (session gone, idle > 60 s, or TTL expired) -- reclaim */
             UPDATE dbo.StatUpdateLock
             SET SessionID = @@SPID, LoginTime = @my_login_time, AcquiredAt = SYSDATETIME()
             WHERE Resource = N'sp_StatUpdate';
