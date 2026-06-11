@@ -36,9 +36,20 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.06.08.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.06.10.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.06.08.2 - Cosmetic: added QS_PARALLEL_UNRELIABLE to diagnostic
+History:    2026.06.10.1 - Catalog completion (sp_StatUpdate-8gzw follow-on to
+                           g4c0): added the 10 emitted-but-undocumented checks
+                           to the @Help checks catalog -- W7
+                           HIGH_IMPACT_STATS_DEPRIORITIZED, W8 MOPUP_INEFFECTIVE,
+                           W9 LOCK_TIMEOUT_INEFFECTIVE, W10 PARAMETER_CHURN,
+                           C5 SAMPLE_RATE_DEGRADATION, I9 WORKLOAD_CONCENTRATION,
+                           I11 FAILURE_CLUSTERING, I12 QS_COVERAGE_DRIFT,
+                           I13 PARALLEL_OPPORTUNITY, I14 MOPUP_MISSING_PAGECOUNT.
+                           All ten existed as real checks (v2.29 generation +
+                           Phase 3) but never appeared in @Help.  No behavior
+                           change to the checks themselves.
+            2026.06.08.2 - Cosmetic: added QS_PARALLEL_UNRELIABLE to diagnostic
                            checks catalog (sp_StatUpdate-g4c0).
             2026.06.08.1 - sp_StatUpdate-6x80: W5/I10 QS-parallel refinements.
                            (1) W5 parallel-aware: when all QS-priority runs use
@@ -339,8 +350,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.06.08.2',
-        @procedure_version_date datetime = '20260608';
+        @procedure_version varchar(20) = '2026.06.10.1',
+        @procedure_version_date datetime = '20260610';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -432,6 +443,16 @@ BEGIN
                 (N'W5', N'WARNING',  N'QS_NOT_EFFECTIVE',      N'Query Store priority enabled but no QS data captured'),
                 (N'I9b', N'INFO',     N'QS_PARALLEL_UNRELIABLE', N'W5 emitted INFO when QS-priority runs are all parallel AND QS CPU data IS present in stat updates -- per-worker ProcessingPosition counters make the zero-QSPlanCount-runs signal unreliable in parallel mode, so this softer note replaces the WARNING.'),
                 (N'W6', N'WARNING',  N'EXCESSIVE_OVERHEAD',    N'Discovery/environment checks consuming disproportionate time vs actual UPDATE STATISTICS'),
+                (N'W7', N'WARNING',  N'HIGH_IMPACT_STATS_DEPRIORITIZED', N'High workload-impact stats consistently processed late in the run -- sort order may not match workload'),
+                (N'W8', N'WARNING',  N'MOPUP_INEFFECTIVE',     N'Mop-up passes repeatedly find 0 qualifying stats -- pure discovery overhead'),
+                (N'W9', N'WARNING',  N'LOCK_TIMEOUT_INEFFECTIVE', N'Same stat hits lock timeout (error 1222) across 3+ runs -- persistent blocking victim'),
+                (N'W10', N'WARNING', N'PARAMETER_CHURN',       N'Parameters changed frequently across recent runs -- unstable configuration'),
+                (N'C5', N'CRITICAL', N'SAMPLE_RATE_DEGRADATION', N'Effective sample rates trending down on large stats -- estimate quality at risk'),
+                (N'I9', N'INFO',     N'WORKLOAD_CONCENTRATION', N'Few tables drive most measured query CPU -- prioritization opportunity'),
+                (N'I11', N'INFO',    N'FAILURE_CLUSTERING',    N'Failures cluster on one dominant ErrorNumber -- single root cause likely'),
+                (N'I12', N'INFO',    N'QS_COVERAGE_DRIFT',     N'QS workload coverage percentage trending down across runs'),
+                (N'I13', N'INFO',    N'PARALLEL_OPPORTUNITY',  N'Serial runs are long enough that @StatsInParallel would cut wall-clock time'),
+                (N'I14', N'INFO',    N'MOPUP_MISSING_PAGECOUNT', N'Mop-up discovered stats lack page counts -- size-aware ordering unavailable in mop-up'),
                 (N'I1', N'INFO',     N'RUN_HEALTH',            N'Completion rate, duration trend, StopReason distribution'),
                 (N'I2', N'INFO',     N'PARAMETER_HISTORY',     N'How parameters changed across runs'),
                 (N'I3', N'INFO',     N'TOP_TABLES',            N'Tables consuming the most maintenance time'),

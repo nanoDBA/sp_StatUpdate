@@ -36,11 +36,47 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.5.5.2026.06.08 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.5.6.2026.06.10 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.5.5.2026.06.08 - Bug fix (sp_StatUpdate-i7by): false ALREADY_RUNNING
+History:    3.5.6.2026.06.10 - Code-review batch (sp_StatUpdate-r77t, -orec, -mc03):
+                            r77t (P1 bug): fingerprint conflict check hoisted out
+                              of the queue-CREATOR branch so it also runs for
+                              queue JOINERS.  Previously any worker whose first
+                              non-locking Queue SELECT found an existing queue
+                              bypassed the @stored_fingerprint comparison
+                              entirely, so fingerprint-only params (gh-513
+                              critical-table params, mop-up params) could differ
+                              silently between members of one queue.
+                              Intentionally NOT fixed by adding those params to
+                              @parameters_string: differing strings would create
+                              separate queues that each process the full stat
+                              set (duplicate work).  FINGERPRINT_CONFLICT
+                              refusal is the designed semantic.
+                            orec (P2 bug): CONTEXT_INFO is now restored on all
+                              7 early-return paths after it is set (gh-423):
+                              PARAMETER_ERROR, NO_DATABASES, AG_SECONDARY,
+                              NO_QUALIFYING_STATS, FINGERPRINT_CONFLICT,
+                              MAX_WORKERS, QUEUE_INIT_ERROR.  Previously only
+                              FINALIZE restored it, so pooled sessions kept a
+                              stale sp_StatUpdate|... tag after early exits.
+                            mc03 (P3 batch): (a) removed the dead
+                              /StatInfo/StatisticName XPath limb from the three
+                              CommandLog readers (adaptive lookup + known-stats
+                              prefetch x2) -- no writer ever produced that XML
+                              shape; the StatisticsName column is authoritative.
+                              (b) @FirstTimeFullScanCapRows now also intercepts
+                              the RESAMPLE-of-persisted-100 path: a stat with
+                              PERSIST_SAMPLE_PERCENT = 100 under
+                              @StatisticsSample NULL previously re-ran an
+                              effective FULLSCAN via RESAMPLE that the
+                              =100 cap branch never saw.  (c) reworded the
+                              re-entrancy guard branch-A comment (a running call
+                              always has an active request; the branch guards
+                              the post-call idle window, not "between stats").
+                              (d) two em dashes in comments replaced with --.
+            3.5.5.2026.06.08 - Bug fix (sp_StatUpdate-i7by): false ALREADY_RUNNING
                               on consecutive calls after a validation-error exit.
                               Three-part fix in the re-entrancy guard:
                               (S) When the existing lock holder is the caller's own
@@ -440,8 +476,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.5.5.2026.06.08',
-        @procedure_version_date datetime = '20260608',
+        @procedure_version varchar(20) = '3.5.6.2026.06.10',
+        @procedure_version_date datetime = '20260610',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -696,8 +732,14 @@ BEGIN
                                OR DATEDIFF(SECOND, s.last_request_end_time, SYSDATETIME()) <= 60)
                     )
                     BEGIN
-                        /* Session present, no active request, but idle < 60 s --
-                           could be between stats updates.  Treat as alive. */
+                        /* Session present, no active request, idle < 60 s.
+                           sp_StatUpdate-mc03 (c): a RUNNING sp_StatUpdate call is one
+                           request, so "no active request" only occurs AFTER a call
+                           ends.  This branch therefore protects the brief window
+                           where a session's call just finished (cleanup may still
+                           be in flight) -- e.g. an idle pooled connection whose
+                           prior call exited abnormally.  After 60 s of idle, the
+                           ELSE below reclaims.  Treat as alive for now. */
                         SET @holder_is_alive = 1;
                     END;
                     /* else: session absent OR idle > 60 s -- dead, reclaim below */
@@ -2051,6 +2093,8 @@ BEGIN
             StopReason = N'PARAMETER_ERROR', RunLabel = @run_label,
             Version = @procedure_version;
 
+        /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+        IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
         IF @StatsInParallel = N'N'
             DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
         RETURN 50000;
@@ -2280,6 +2324,8 @@ BEGIN
             DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
             StopReason = N'PARAMETER_ERROR', RunLabel = @run_label,
             Version = @procedure_version;
+        /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+        IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
         IF @StatsInParallel = N'N'
             DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
         RETURN 1;
@@ -2355,6 +2401,8 @@ BEGIN
             StopReason = N'AG_SECONDARY',
             RunLabel = @run_label,
             Version = @procedure_version;
+        /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+        IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
         IF @StatsInParallel = N'N'
             DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
         RETURN 1;
@@ -3223,8 +3271,10 @@ BEGIN
                 database_name = cl.DatabaseName,
                 schema_name = cl.SchemaName,
                 table_name = cl.ObjectName,
+                /* sp_StatUpdate-mc03: StatisticsName column is authoritative -- no
+                   writer ever produced a /StatInfo XML root, so the former XPath
+                   COALESCE limb was dead weight (parsed XML per row, matched never). */
                 stat_name = COALESCE(
-                    cl.ExtendedInfo.value('(/StatInfo/StatisticName)[1]', 'sysname'),
                     cl.StatisticsName,
                     cl.IndexName
                 ),
@@ -3299,8 +3349,8 @@ BEGIN
             cl.DatabaseName,
             cl.SchemaName,
             cl.ObjectName,
+            /* sp_StatUpdate-mc03: column-only -- the /StatInfo XPath limb was dead (see 07A note) */
             COALESCE(
-                cl.ExtendedInfo.value('(/StatInfo/StatisticName)[1]', 'sysname'),
                 cl.StatisticsName,
                 cl.IndexName
             )
@@ -3313,7 +3363,6 @@ BEGIN
         AND   cl.SchemaName   IS NOT NULL
         AND   cl.ObjectName   IS NOT NULL
         AND   COALESCE(
-                  cl.ExtendedInfo.value('(/StatInfo/StatisticName)[1]', 'sysname'),
                   cl.StatisticsName,
                   cl.IndexName
               ) IS NOT NULL;
@@ -5636,6 +5685,8 @@ OPTION (RECOMPILE);';
                 RunLabel = @run_label,
                 Version = @procedure_version;
 
+            /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+            IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
             IF @StatsInParallel = N'N'
                 DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
             RETURN 0;
@@ -5828,51 +5879,68 @@ OPTION (RECOMPILE);';
 
                 COMMIT TRANSACTION;
 
-                /* v2.3: After transaction, check parameter fingerprint for conflict detection */
-                /* (Done outside transaction to avoid leaving open txn on conflict RETURN) */
-                /* Uses dynamic SQL to avoid compile-time column validation when column doesn't exist yet */
-                BEGIN TRY
-                    IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.Queue') AND name = N'ParameterFingerprint')
-                    BEGIN
-                        DECLARE @stored_fingerprint int;
-                        EXEC sp_executesql
-                            N'SELECT @fp = ParameterFingerprint FROM dbo.Queue WHERE QueueID = @qid;',
-                            N'@fp int OUTPUT, @qid int',
-                            @fp = @stored_fingerprint OUTPUT,
-                            @qid = @queue_id;
-
-                        IF  @stored_fingerprint IS NOT NULL
-                        AND @stored_fingerprint <> @parameter_fingerprint
-                        BEGIN
-                            RAISERROR(N'Conflicting sp_StatUpdate parameters detected. Worker cannot join existing queue initialized with different threshold parameters. (Stored fingerprint: %d, This worker: %d)', 16, 1,
-                                @stored_fingerprint, @parameter_fingerprint);
-                            /* gh-451: populate OUTPUT params + summary result set on early return */
-                            SET @StopReasonOut = N'FINGERPRINT_CONFLICT';
-                            SET @StatsFoundOut = 0;
-                            SET @StatsProcessedOut = 0;
-                            SET @StatsSucceededOut = 0;
-                            SET @StatsFailedOut = 0;
-                            SET @StatsRemainingOut = 0;
-                            SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
-                            SELECT
-                                Status = N'ERROR',
-                                StatusMessage = N'Conflicting parameter fingerprint on existing queue.',
-                                StatsFound = 0, StatsProcessed = 0, StatsSucceeded = 0, StatsFailed = 0,
-                                StatsToctou = 0, StatsSkipped = 0, StatsRemaining = 0,
-                                DatabasesProcessed = 0,
-                                DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
-                                StopReason = N'FINGERPRINT_CONFLICT', RunLabel = @run_label,
-                                Version = @procedure_version;
-                            IF @StatsInParallel = N'N'
-                                DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
-                            RETURN 50001;
-                        END;
-                    END;
-                END TRY
-                BEGIN CATCH
-                    /* Non-blocking: if fingerprint check fails, proceed to join the queue */
-                END CATCH;
             END;
+
+            /*
+            sp_StatUpdate-r77t: fingerprint conflict check, hoisted OUT of the
+            creator-only branch above so it runs for QUEUE JOINERS too.
+            Previously the check sat inside IF @queue_id IS NULL, so any worker
+            whose first non-locking SELECT found the existing queue (the normal
+            joiner path, including the region-07B skip-discovery path) bypassed
+            it entirely.  Fingerprint-only params (gh-513 critical-table params,
+            mop-up params) could then differ silently between queue members.
+            Creators that just INSERTed pass trivially (stored = computed).
+            Intentionally NOT solved by adding those params to
+            @parameters_string: differing strings would create SEPARATE queues
+            that each process the full stat set (duplicate work).  Refusing the
+            join with FINGERPRINT_CONFLICT is the designed semantic.
+            (Done outside any transaction to avoid leaving an open txn on the
+            conflict RETURN.  Dynamic SQL avoids compile-time column validation
+            when the ParameterFingerprint column does not exist yet.)
+            */
+            BEGIN TRY
+                IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.Queue') AND name = N'ParameterFingerprint')
+                BEGIN
+                    DECLARE @stored_fingerprint int;
+                    EXEC sp_executesql
+                        N'SELECT @fp = ParameterFingerprint FROM dbo.Queue WHERE QueueID = @qid;',
+                        N'@fp int OUTPUT, @qid int',
+                        @fp = @stored_fingerprint OUTPUT,
+                        @qid = @queue_id;
+
+                    IF  @stored_fingerprint IS NOT NULL
+                    AND @stored_fingerprint <> @parameter_fingerprint
+                    BEGIN
+                        RAISERROR(N'Conflicting sp_StatUpdate parameters detected. Worker cannot join existing queue initialized with different threshold parameters. (Stored fingerprint: %d, This worker: %d)', 16, 1,
+                            @stored_fingerprint, @parameter_fingerprint);
+                        /* gh-451: populate OUTPUT params + summary result set on early return */
+                        SET @StopReasonOut = N'FINGERPRINT_CONFLICT';
+                        SET @StatsFoundOut = 0;
+                        SET @StatsProcessedOut = 0;
+                        SET @StatsSucceededOut = 0;
+                        SET @StatsFailedOut = 0;
+                        SET @StatsRemainingOut = 0;
+                        SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
+                        SELECT
+                            Status = N'ERROR',
+                            StatusMessage = N'Conflicting parameter fingerprint on existing queue.',
+                            StatsFound = 0, StatsProcessed = 0, StatsSucceeded = 0, StatsFailed = 0,
+                            StatsToctou = 0, StatsSkipped = 0, StatsRemaining = 0,
+                            DatabasesProcessed = 0,
+                            DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
+                            StopReason = N'FINGERPRINT_CONFLICT', RunLabel = @run_label,
+                            Version = @procedure_version;
+                        /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+                        IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
+                        IF @StatsInParallel = N'N'
+                            DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
+                        RETURN 50001;
+                    END;
+                END;
+            END TRY
+            BEGIN CATCH
+                /* Non-blocking: if fingerprint check fails, proceed to join the queue */
+            END CATCH;
 
             /*
             #181: Max worker count coordination.
@@ -5928,6 +5996,8 @@ OPTION (RECOMPILE);';
                         DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
                         StopReason = N'MAX_WORKERS', RunLabel = @run_label,
                         Version = @procedure_version;
+                    /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+                    IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
                     IF @StatsInParallel = N'N'
                         DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
                     RETURN 0;
@@ -6175,6 +6245,8 @@ OPTION (RECOMPILE);';
                 DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
                 StopReason = N'QUEUE_INIT_ERROR', RunLabel = @run_label,
                 Version = @procedure_version;
+            /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+            IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
             IF @StatsInParallel = N'N'
                 DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
             RETURN -1;
@@ -7426,6 +7498,54 @@ OPTION (RECOMPILE);';
                 @has_with_option = 1;
         END;
         /*
+        sp_StatUpdate-mc03 (b): FIRST-TIME CAP, RESAMPLE-of-persisted-100 path.
+        A stat with PERSIST_SAMPLE_PERCENT = 100 under @i_statistics_sample NULL
+        falls through to the RESAMPLE branch below, which re-runs the persisted
+        100% -- an effective FULLSCAN that the @effective_sample_percent = 100
+        cap (earlier block) never sees.  When the operator set
+        @FirstTimeFullScanCapRows and this stat is over the threshold with no
+        successful CommandLog history, apply the same capped sample instead of
+        RESAMPLE.  Critical tables keep their explicit override; stats with
+        history fall through to normal RESAMPLE.
+        */
+        ELSE IF @effective_sample_percent IS NULL
+        AND     @current_persisted_sample_percent IS NOT NULL
+        AND     CONVERT(int, ROUND(@current_persisted_sample_percent, 0)) = 100
+        AND     @FirstTimeFullScanCapRows IS NOT NULL
+        AND     @current_row_count IS NOT NULL
+        AND     @current_row_count > @FirstTimeFullScanCapRows
+        AND     @current_is_critical = 0
+        AND     @is_long_running_stat = 0
+        AND     NOT EXISTS (
+                    SELECT 1
+                    FROM @known_stats AS ks
+                    WHERE ks.database_name = @current_database
+                    AND   ks.schema_name = @current_schema_name
+                    AND   ks.table_name = @current_table_name
+                    AND   ks.stat_name = @current_stat_name
+                )
+        BEGIN
+            SELECT @effective_sample_percent =
+                CASE
+                    WHEN @current_row_count <= 10000000 THEN 10
+                    ELSE CONVERT(int, CEILING(10000000.0 / @current_row_count * 100))
+                END;
+            IF @effective_sample_percent < 1
+                SELECT @effective_sample_percent = 1;
+
+            SELECT
+                @with_clause = N'SAMPLE ' + CONVERT(nvarchar(10), @effective_sample_percent) + N' PERCENT',
+                @has_with_option = 1,
+                @sample_source = N'FIRST_TIME_CAPPED';
+
+            DECLARE @ftc_persist_msg nvarchar(500);
+            SET @ftc_persist_msg =
+                N'  First-Time Cap: ' + @current_stat_name +
+                N' (persisted 100%% sample, row_count=' + CONVERT(nvarchar(20), @current_row_count) +
+                N', no history, forcing ' + CONVERT(nvarchar(10), @effective_sample_percent) + N'%% sample instead of RESAMPLE)';
+            RAISERROR(@ftc_persist_msg, 10, 1) WITH NOWAIT;
+        END
+        /*
         RESPECT PERSISTED SAMPLE PERCENT
         When @i_statistics_sample is NULL and the stat has a persisted sample,
         honor the existing setting by using RESAMPLE.
@@ -8316,7 +8436,7 @@ OPTION (RECOMPILE);';
                     DECLARE @qs168_count int = 0, @qs168_sql nvarchar(max), @qs168_msg nvarchar(1000);
                     DECLARE @fp_cached_table sysname, @fp_cached_db sysname, @fp_cached_count int;
 
-                    /* Cache hit: same table+db as last stat — reuse cached count */
+                    /* Cache hit: same table+db as last stat -- reuse cached count */
                     IF  @current_table_name = @fp_cached_table
                     AND @current_database = @fp_cached_db
                     BEGIN
@@ -8324,7 +8444,7 @@ OPTION (RECOMPILE);';
                     END
                     ELSE
                     BEGIN
-                        /* Cache miss: new table — query QS and cache.
+                        /* Cache miss: new table -- query QS and cache.
                            gh-500: Use sql_expression_dependencies for compiled objects
                            (SPs/functions) to avoid CHARINDEX on query text.  Only ad-hoc
                            queries (object_id IS NULL) fall back to CHARINDEX. */
