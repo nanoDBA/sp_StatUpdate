@@ -36,9 +36,37 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.06.10.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.06.12.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.06.10.1 - Catalog completion (sp_StatUpdate-8gzw follow-on to
+History:    2026.06.12.1 - Silent no-op parallel run detection (sp_StatUpdate-kzx0,
+                           validated against the -v31y zombie-queue incident).
+                           (1) New CRITICAL check C6 SILENT_NOOP_RUN: flags
+                           non-killed runs that report a normal-completion
+                           StopReason (PARALLEL_COMPLETE/COMPLETED/NATURAL_END)
+                           with StatsFound > 0 but StatsProcessed = 0, when no
+                           other worker in the same time window processed
+                           anything and no sp_StatUpdate UPDATE_STATISTICS
+                           activity overlaps the run window.  Catches zombied
+                           queue leadership and any future claim-nothing
+                           failure that self-reports success.
+                           (2) W3 STALE_BACKLOG un-suppressed when the C6
+                           signature is present: @w3_parallel_complete is
+                           forced 0 so the backstop check and the COMPLETION
+                           grade-A fast path no longer trust PARALLEL_COMPLETE
+                           blindly (also closes the grade-A hole for zombie
+                           joiners that report StatsRemaining = 0 from an
+                           empty skip-discovery temp table).
+                           (3) #qs_efficacy completion math: PARALLEL_COMPLETE
+                           with StatsRemaining > 0 is self-contradictory
+                           telemetry -- CompletionPct now cross-checks the
+                           worker group (overlapping parallel runs) and uses
+                           SUM(StatsProcessed) / MAX(StatsFound) instead of a
+                           constant 100.0 when the group did not drain the
+                           queue.  WorkloadCoveragePct same treatment.
+                           Genuinely-drained runs (group SUM(processed) >=
+                           MAX(found), or remaining = 0) keep the 3j5l
+                           (2026.05.28.1) behavior -- no false-F regression.
+            2026.06.10.1 - Catalog completion (sp_StatUpdate-8gzw follow-on to
                            g4c0): added the 10 emitted-but-undocumented checks
                            to the @Help checks catalog -- W7
                            HIGH_IMPACT_STATS_DEPRIORITIZED, W8 MOPUP_INEFFECTIVE,
@@ -350,8 +378,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.06.10.1',
-        @procedure_version_date datetime = '20260610';
+        @procedure_version varchar(20) = '2026.06.12.1',
+        @procedure_version_date datetime = '20260612';
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -448,6 +476,7 @@ BEGIN
                 (N'W9', N'WARNING',  N'LOCK_TIMEOUT_INEFFECTIVE', N'Same stat hits lock timeout (error 1222) across 3+ runs -- persistent blocking victim'),
                 (N'W10', N'WARNING', N'PARAMETER_CHURN',       N'Parameters changed frequently across recent runs -- unstable configuration'),
                 (N'C5', N'CRITICAL', N'SAMPLE_RATE_DEGRADATION', N'Effective sample rates trending down on large stats -- estimate quality at risk'),
+                (N'C6', N'CRITICAL', N'SILENT_NOOP_RUN',        N'Run self-reported normal completion (PARALLEL_COMPLETE/COMPLETED) with StatsFound > 0 but zero stats processed across the worker window -- zombied parallel queue or claim-nothing failure masquerading as success'),
                 (N'I9', N'INFO',     N'WORKLOAD_CONCENTRATION', N'Few tables drive most measured query CPU -- prioritization opportunity'),
                 (N'I11', N'INFO',    N'FAILURE_CLUSTERING',    N'Failures cluster on one dominant ErrorNumber -- single root cause likely'),
                 (N'I12', N'INFO',    N'QS_COVERAGE_DRIFT',     N'QS workload coverage percentage trending down across runs'),
@@ -2399,6 +2428,118 @@ BEGIN
         RAISERROR(N'  [CRITICAL] C4: Degrading throughput detected', 10, 1) WITH NOWAIT;
 
     /* ======================================================================
+       C6: SILENT NO-OP RUN (sp_StatUpdate-kzx0)
+       Validated against the sp_StatUpdate-v31y zombie-queue incident: a
+       drained parallel queue whose leadership could not be re-claimed made
+       every new worker join, claim nothing, and exit PARALLEL_COMPLETE with
+       StatsFound > 0 and StatsProcessed = 0 -- maintenance silently stopped
+       while every run self-reported success.
+
+       Signature: non-killed run, normal-completion StopReason, StatsFound > 0,
+       StatsProcessed = 0, AND no evidence anyone else did the work:
+         (a) no overlapping non-killed run with StatsProcessed > 0 (healthy
+             late joiners overlap the busy workers that drained the queue), and
+         (b) no sp_StatUpdate UPDATE_STATISTICS activity (RunLabel-tagged rows)
+             overlapping the run window -- covers in-flight workers whose END
+             row does not exist yet at analysis time.
+       Windows are padded +/- 5 minutes; unfinished stat rows are bounded to
+       60 minutes so ancient killed-run rows cannot mask detection.
+       3j5l guard: runs whose window group genuinely drained the queue
+       (any overlapping worker processed > 0, or own StatsProcessed > 0) are
+       never flagged -- no regression of the parallel grade-A fix.
+       ====================================================================== */
+    DECLARE @c6_silent_noop bit = 0;
+    DECLARE @c6_count integer = 0;
+
+    SELECT @c6_count = COUNT_BIG(*)
+    FROM #runs AS r
+    WHERE r.IsKilled = 0
+    AND   r.StopReason IN (N'PARALLEL_COMPLETE', N'COMPLETED', N'NATURAL_END')
+    AND   r.StatsFound > 0
+    AND   ISNULL(r.StatsProcessed, 0) = 0
+    AND   NOT EXISTS
+          (
+              SELECT 1
+              FROM #runs AS r2
+              WHERE r2.RunLabel <> r.RunLabel
+              AND   r2.IsKilled = 0
+              AND   ISNULL(r2.StatsProcessed, 0) > 0
+              AND   r2.StartTime <= DATEADD(MINUTE, 5, ISNULL(r.EndTime, r.StartTime))
+              AND   ISNULL(r2.EndTime, DATEADD(SECOND, ISNULL(r2.TimeLimit, 18000), r2.StartTime)) >= DATEADD(MINUTE, -5, r.StartTime)
+          )
+    AND   NOT EXISTS
+          (
+              SELECT 1
+              FROM #stat_updates AS su
+              WHERE su.RunLabel IS NOT NULL
+              AND   su.StartTime <= DATEADD(MINUTE, 5, ISNULL(r.EndTime, r.StartTime))
+              AND   ISNULL(su.EndTime, DATEADD(MINUTE, 60, su.StartTime)) >= DATEADD(MINUTE, -5, r.StartTime)
+          );
+
+    IF @c6_count > 0
+    BEGIN
+        SET @c6_silent_noop = 1;
+
+        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+        SELECT
+            N'CRITICAL',
+            N'SILENT_NOOP_RUN',
+            CONVERT(nvarchar(10), @c6_count) + N' run(s) self-reported normal completion but processed 0 of their qualifying statistics',
+            CASE WHEN @c6_count > 10
+                 THEN N'Runs (10 most recent of ' + CONVERT(nvarchar(10), @c6_count) + N'): '
+                 ELSE N'Runs: '
+            END
+                + STRING_AGG(
+                      CONVERT(nvarchar(20), x.StartTime, 120) + N' (' + x.StopReason
+                      + N', found ' + CONVERT(nvarchar(10), x.StatsFound) + N', processed 0)',
+                      N'; ')
+                      WITHIN GROUP (ORDER BY x.StartTime DESC),
+            N'Statistics maintenance is silently NOT happening -- these runs found work, '
+                + N'processed none of it, and no other worker in the same window did either. '
+                + N'Known cause: zombied parallel queue leadership (fixed in sp_StatUpdate 3.5.7) -- '
+                + N'a drained queue whose leader SessionID was recycled refused re-claim, so every '
+                + N'new worker joined, claimed nothing, and exited PARALLEL_COMPLETE. '
+                + N'(1) Upgrade sp_StatUpdate to 3.5.7+. '
+                + N'(2) Inspect dbo.Queue / dbo.QueueStatistic for rows referencing dead sessions. '
+                + N'(3) If stale, clear the queue state so the next run claims leadership fresh.',
+            N'SELECT q.QueueID, q.SessionID, q.QueueStartTime, qs.DatabaseName, qs.ObjectName, qs.SessionID, qs.TableStartTime, qs.TableEndTime FROM dbo.Queue AS q LEFT JOIN dbo.QueueStatistic AS qs ON qs.QueueID = q.QueueID WHERE q.ObjectName = N''sp_StatUpdate'';',
+            5
+        FROM
+        (
+            SELECT TOP (10)
+                r.StartTime,
+                r.StopReason,
+                r.StatsFound
+            FROM #runs AS r
+            WHERE r.IsKilled = 0
+            AND   r.StopReason IN (N'PARALLEL_COMPLETE', N'COMPLETED', N'NATURAL_END')
+            AND   r.StatsFound > 0
+            AND   ISNULL(r.StatsProcessed, 0) = 0
+            AND   NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM #runs AS r2
+                      WHERE r2.RunLabel <> r.RunLabel
+                      AND   r2.IsKilled = 0
+                      AND   ISNULL(r2.StatsProcessed, 0) > 0
+                      AND   r2.StartTime <= DATEADD(MINUTE, 5, ISNULL(r.EndTime, r.StartTime))
+                      AND   ISNULL(r2.EndTime, DATEADD(SECOND, ISNULL(r2.TimeLimit, 18000), r2.StartTime)) >= DATEADD(MINUTE, -5, r.StartTime)
+                  )
+            AND   NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM #stat_updates AS su
+                      WHERE su.RunLabel IS NOT NULL
+                      AND   su.StartTime <= DATEADD(MINUTE, 5, ISNULL(r.EndTime, r.StartTime))
+                      AND   ISNULL(su.EndTime, DATEADD(MINUTE, 60, su.StartTime)) >= DATEADD(MINUTE, -5, r.StartTime)
+                  )
+            ORDER BY r.StartTime DESC
+        ) AS x;
+
+        RAISERROR(N'  [CRITICAL] C6: Silent no-op run(s) detected (%i)', 10, 1, @c6_count) WITH NOWAIT;
+    END;
+
+    /* ======================================================================
        W1: SUBOPTIMAL PARAMETERS (checks against most recent run)
        ====================================================================== */
     DECLARE @latest_run_label nvarchar(100) = (SELECT TOP (1) RunLabel FROM #runs ORDER BY StartTime DESC);
@@ -2583,6 +2724,13 @@ BEGIN
        workers exited via TIME_LIMIT (not PARALLEL_COMPLETE). */
     IF @w3_parallel_complete = 0 AND @parallel_aggregate_done = 1
         SET @w3_parallel_complete = 1;
+    /* kzx0: C6 SILENT_NOOP_RUN un-suppresses W3 -- PARALLEL_COMPLETE cannot be
+       trusted when a run in the window found work and nobody processed any of
+       it.  Also closes the COMPLETION grade-A fast path (which reuses this
+       flag) for zombie joiners that report StatsRemaining = 0 from an empty
+       skip-discovery temp table. */
+    IF @c6_silent_noop = 1
+        SET @w3_parallel_complete = 0;
 
     IF @w3_parallel_complete = 0
     AND EXISTS (
@@ -3885,7 +4033,15 @@ BEGIN
         workload_pct    = CASE
                               WHEN ISNULL(rm.qs_stat_count, 0) = 0 THEN NULL
                               WHEN rm.processed_cpu_ms <= 0 THEN NULL
-                              WHEN r.StopReason IN (N'COMPLETED', N'PARALLEL_COMPLETE') OR r.StatsFound = ISNULL(r.StatsProcessed, 0) THEN 100.0
+                              /* kzx0: same worker-group cross-check as completion_pct --
+                                 PARALLEL_COMPLETE with leftovers only counts as full
+                                 coverage when the group drained the queue; otherwise
+                                 fall through to the extrapolation branch. */
+                              WHEN (r.StopReason IN (N'COMPLETED', N'PARALLEL_COMPLETE') OR r.StatsFound = ISNULL(r.StatsProcessed, 0))
+                              AND  NOT (r.StopReason = N'PARALLEL_COMPLETE'
+                                        AND ISNULL(r.StatsRemaining, 0) > 0
+                                        AND ISNULL(grp.sum_processed, 0) < ISNULL(grp.max_found, 0))
+                              THEN 100.0
                               WHEN r.StatsFound > 0 AND ISNULL(r.StatsProcessed, 0) > 0
                               THEN CONVERT(decimal(5, 1),
                                   rm.processed_cpu_ms * 100.0 /
@@ -3895,6 +4051,18 @@ BEGIN
                               ELSE NULL
                           END,
         completion_pct  = CASE
+                              /* sp_StatUpdate-kzx0: PARALLEL_COMPLETE with
+                                 StatsRemaining > 0 is self-contradictory
+                                 telemetry -- only score 100 when the worker
+                                 group (overlapping parallel runs, this one
+                                 included) actually drained the queue.  A
+                                 zombied queue (v31y signature: found > 0,
+                                 group processed = 0) scores honestly: SUM of
+                                 group processed over MAX of group found. */
+                              WHEN r.StopReason = N'PARALLEL_COMPLETE'
+                              AND  ISNULL(r.StatsRemaining, 0) > 0
+                              AND  ISNULL(grp.sum_processed, 0) < ISNULL(grp.max_found, 0)
+                              THEN CONVERT(decimal(5, 1), ISNULL(grp.sum_processed, 0) * 100.0 / NULLIF(grp.max_found, 0))
                               /* sp_StatUpdate-3j5l: a run that reached a clean
                                  stop is 100% complete regardless of the
                                  StatsProcessed / StatsFound ratio.  In parallel
@@ -3915,6 +4083,22 @@ BEGIN
     FROM #runs AS r
     LEFT JOIN run_metrics AS rm
         ON rm.RunLabel = r.RunLabel
+    /* kzx0: worker group for the PARALLEL_COMPLETE cross-check -- non-killed
+       parallel runs (param flag or stop reason) whose run window overlaps this
+       run's window.  In parallel mode StatsFound is the whole-queue total and
+       StatsProcessed is the per-worker slice, so aggregate before comparing:
+       SUM(processed) across the group vs MAX(found). */
+    OUTER APPLY
+    (
+        SELECT
+            sum_processed = SUM(ISNULL(r2.StatsProcessed, 0)),
+            max_found     = MAX(r2.StatsFound)
+        FROM #runs AS r2
+        WHERE r2.IsKilled = 0
+        AND   (ISNULL(r2.StatsInParallel, N'N') = N'Y' OR r2.StopReason = N'PARALLEL_COMPLETE')
+        AND   r2.StartTime <= ISNULL(r.EndTime, r.StartTime)
+        AND   ISNULL(r2.EndTime, DATEADD(SECOND, ISNULL(r2.TimeLimit, 18000), r2.StartTime)) >= r.StartTime
+    ) AS grp
     WHERE r.IsKilled = 0;
 
     DECLARE @qs_efficacy_count integer = (SELECT COUNT_BIG(*) FROM #qs_efficacy);
