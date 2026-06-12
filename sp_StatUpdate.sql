@@ -36,11 +36,30 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.5.6.2026.06.10 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.5.7.2026.06.12 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.5.6.2026.06.10 - Code-review batch (sp_StatUpdate-r77t, -orec, -mc03):
+History:    3.5.7.2026.06.12 - Parallel bug fix (sp_StatUpdate-v31y):
+                            Queue leadership re-claim no longer blocked by
+                            recycled SPIDs or idle pooled leader sessions.  The
+                            claim UPDATE judged liveness by bare session_id, so
+                            once a drained queue's old SessionID was reused by
+                            any live session (guaranteed sooner or later), every
+                            new worker with the same @parameters_string joined
+                            the completed queue, claimed nothing, and exited
+                            PARALLEL_COMPLETE with StatsFound > 0 but
+                            StatsProcessed = 0 -- a silent no-op maintenance
+                            run.  Liveness is now login_time-qualified
+                            (genuine claimer logged in before claiming; a
+                            recycled SPID logged in after), same-SPID rows are
+                            unconditionally stale (i7by semantics), a fully
+                            drained queue is re-claimable regardless of leader
+                            session state, and the active-worker guard is
+                            scoped to open claims (TableEndTime IS NULL).
+                            Found by ConcurrentParallel P3 on a fresh gate
+                            container.
+            3.5.6.2026.06.10 - Code-review batch (sp_StatUpdate-r77t, -orec, -mc03):
                             r77t (P1 bug): fingerprint conflict check hoisted out
                               of the queue-CREATOR branch so it also runs for
                               queue JOINERS.  Previously any worker whose first
@@ -476,8 +495,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.5.6.2026.06.10',
-        @procedure_version_date datetime = '20260610',
+        @procedure_version varchar(20) = '3.5.7.2026.06.12',
+        @procedure_version_date datetime = '20260612',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -6040,18 +6059,52 @@ OPTION (RECOMPILE);';
             FROM dbo.Queue AS q
             WHERE q.QueueID = @queue_id
             /*
-            Only claim if previous leader is dead (not in dm_exec_sessions).
-            Using dm_exec_sessions: a sleeping leader appears in dm_exec_sessions but not dm_exec_requests.
+            sp_StatUpdate-v31y: leadership liveness must survive SPID reuse and
+            pooled sessions.  A bare session_id probe deemed a recycled SPID (or
+            the leader's still-connected-but-finished pooled session) "alive",
+            which made a fully drained queue permanently un-claimable: every new
+            worker joined the completed queue, claimed nothing, and exited
+            PARALLEL_COMPLETE with 0 processed -- a silent no-op maintenance run.
+            The work-claim loop and MAX_WORKERS count were already login_time-
+            hardened (bd -h9a, gh-425); this claim was the unprotected spot.
+            ClaimLoginTime cannot be referenced here (static SQL must compile on
+            legacy QueueStatistic schemas), so liveness is qualified with
+            login_time <= claim time: a genuine claimer logged in before it
+            claimed, a recycled SPID logged in after.
             */
-            AND   NOT EXISTS
-                  (
-                      SELECT
-                          1
-                      FROM sys.dm_exec_sessions AS s
-                      WHERE s.session_id = q.SessionID
+            AND   (
+                      /*
+                      Previous leader is dead.  Same-SPID is unconditionally
+                      stale (i7by semantics): if q.SessionID = @@SPID the prior
+                      run on this session is over, because we are running now.
+                      */
+                      NOT EXISTS
+                      (
+                          SELECT
+                              1
+                          FROM sys.dm_exec_sessions AS s
+                          WHERE s.session_id = q.SessionID
+                          AND   s.login_time <= q.QueueStartTime
+                          AND   q.SessionID <> @@SPID
+                      )
+                      /*
+                      OR the queue is fully drained (no incomplete rows): a
+                      finished queue is re-claimable even while the prior
+                      leader's idle session is still connected.
+                      */
+                      OR NOT EXISTS
+                      (
+                          SELECT
+                              1
+                          FROM dbo.QueueStatistic AS qs
+                          WHERE qs.QueueID = @queue_id
+                          AND   qs.TableEndTime IS NULL
+                      )
                   )
             /*
-            And no active workers in QueueStatistic (sessions still alive in dm_exec_sessions)
+            And no live worker still holds an open claim on this queue.
+            Scoped to incomplete rows: completed rows are history, not a claim.
+            Rows claimed by this session in a prior call are stale (see above).
             */
             AND   NOT EXISTS
                   (
@@ -6059,8 +6112,11 @@ OPTION (RECOMPILE);';
                           1
                       FROM dbo.QueueStatistic AS qs
                       JOIN sys.dm_exec_sessions AS s
-                        ON s.session_id = qs.SessionID
+                        ON  s.session_id = qs.SessionID
+                        AND s.login_time <= qs.TableStartTime
                       WHERE qs.QueueID = @queue_id
+                      AND   qs.TableEndTime IS NULL
+                      AND   qs.SessionID <> @@SPID
                   );
 
             IF ROWCOUNT_BIG() = 1
