@@ -36,11 +36,31 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.5.7.2026.06.12 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.5.8.2026.06.12 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.5.7.2026.06.12 - Parallel bug fix (sp_StatUpdate-v31y):
+History:    3.5.8.2026.06.12 - Telemetry bug fix (sp_StatUpdate-rse2):
+                            Four mid-run early returns (NO_QUALIFYING_STATS,
+                            FINGERPRINT_CONFLICT, MAX_WORKERS,
+                            QUEUE_INIT_ERROR) exited after the
+                            SP_STATUPDATE_START insert without writing an
+                            SP_STATUPDATE_END row.  Healthy runs were orphaned:
+                            diag C1 raised false KILLED_RUNS criticals, orphan
+                            cleanup later fabricated END rows with
+                            StopReason=KILLED, and the RELIABILITY grade was
+                            poisoned.  All four paths now write a real END row
+                            with full Summary XML and the true StopReason.
+                            Also fixed: the FINGERPRINT_CONFLICT branch was
+                            dead code -- its severity-16 RAISERROR fired inside
+                            a TRY whose CATCH was empty, so the RETURN 50001 /
+                            result-set block never ran and conflicting workers
+                            silently joined the queue anyway.  The conflict now
+                            sets a flag inside the TRY and exits via a label
+                            outside it, so the error surfaces to the caller AND
+                            the documented refuse-the-join semantics actually
+                            execute.
+            3.5.7.2026.06.12 - Parallel bug fix (sp_StatUpdate-v31y):
                             Queue leadership re-claim no longer blocked by
                             recycled SPIDs or idle pooled leader sessions.  The
                             claim UPDATE judged liveness by bare session_id, so
@@ -495,7 +515,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.5.7.2026.06.12',
+        @procedure_version varchar(20) = '3.5.8.2026.06.12',
         @procedure_version_date datetime = '20260612',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -5670,6 +5690,54 @@ OPTION (RECOMPILE);';
             /* Mop-up disabled or insufficient time -- exit */
             RAISERROR(N'No statistics qualify for update. Exiting.', 10, 1) WITH NOWAIT;
 
+            /* sp_StatUpdate-rse2: write a real SP_STATUPDATE_END so this healthy
+               early return is not orphaned (diag C1 false KILLED critical) and
+               not later fabricated as StopReason=KILLED by orphan cleanup. */
+            IF  @LogToTable = N'Y'
+            AND @Execute = N'Y'
+            AND @commandlog_exists = 1
+            BEGIN
+                BEGIN TRY
+                    INSERT INTO dbo.CommandLog
+                    (
+                        DatabaseName, SchemaName, ObjectName, ObjectType,
+                        Command, CommandType, StartTime, EndTime, ExtendedInfo
+                    )
+                    SELECT
+                        ISNULL(@Databases, DB_NAME()), N'dbo', N'sp_StatUpdate', N'P',
+                        N'sp_StatUpdate completed: NO_QUALIFYING_STATS',
+                        N'SP_STATUPDATE_END',
+                        @start_time,
+                        SYSDATETIME(),
+                        (
+                            SELECT
+                                @procedure_version AS [Version],
+                                @run_label AS RunLabel,
+                                @@SPID AS SessionID,
+                                0 AS StatsFound,
+                                0 AS StatsProcessed,
+                                0 AS StatsSucceeded,
+                                0 AS StatsFailed,
+                                0 AS StatsToctou,
+                                0 AS StatsRemaining,
+                                DATEDIFF(SECOND, @start_time, SYSDATETIME()) AS DurationSeconds,
+                                N'NO_QUALIFYING_STATS' AS StopReason,
+                                0 AS MopUpTriggered,
+                                0 AS MopUpFound,
+                                0 AS MopUpProcessed,
+                                0 AS TotalPagesProcessed,
+                                0 AS QSEnrichmentSkipped,
+                                N'{"succeeded":0,"failed":0,"duration_seconds":'
+                                    + CONVERT(nvarchar(20), DATEDIFF(SECOND, @start_time, SYSDATETIME()))
+                                    + N',"status":"OK"}' AS JsonSummary
+                            FOR XML RAW(N'Summary'), ELEMENTS
+                        );
+                END TRY
+                BEGIN CATCH
+                    /* Logging failure must never block the early return */
+                END CATCH;
+            END;
+
             /*
             Set OUTPUT parameters before early return
             */
@@ -5833,6 +5901,14 @@ OPTION (RECOMPILE);';
             /* sp_StatUpdate-mknv: first-time cap affects sample rate -- include in fingerprint */
             ISNULL(CONVERT(nvarchar(20), @FirstTimeFullScanCapRows), N'NULL')
         );
+        /* sp_StatUpdate-rse2: conflict is flagged inside the TRY below and acted
+           on at the FingerprintConflictExit label OUTSIDE all TRY scopes.  The
+           prior code raised severity 16 directly inside the TRY, which jumped
+           to the empty fingerprint CATCH -- the RETURN 50001 / result-set block
+           was dead code and conflicting workers silently joined the queue. */
+        DECLARE @fingerprint_conflict bit = 0;
+        DECLARE @stored_fingerprint int;
+
         /* gh-461: @parameters_string is built unconditionally in region 07B now.
            By the time execution reaches here it is always populated. */
         BEGIN TRY
@@ -5920,7 +5996,6 @@ OPTION (RECOMPILE);';
             BEGIN TRY
                 IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'dbo.Queue') AND name = N'ParameterFingerprint')
                 BEGIN
-                    DECLARE @stored_fingerprint int;
                     EXEC sp_executesql
                         N'SELECT @fp = ParameterFingerprint FROM dbo.Queue WHERE QueueID = @qid;',
                         N'@fp int OUTPUT, @qid int',
@@ -5930,36 +6005,19 @@ OPTION (RECOMPILE);';
                     IF  @stored_fingerprint IS NOT NULL
                     AND @stored_fingerprint <> @parameter_fingerprint
                     BEGIN
-                        RAISERROR(N'Conflicting sp_StatUpdate parameters detected. Worker cannot join existing queue initialized with different threshold parameters. (Stored fingerprint: %d, This worker: %d)', 16, 1,
-                            @stored_fingerprint, @parameter_fingerprint);
-                        /* gh-451: populate OUTPUT params + summary result set on early return */
-                        SET @StopReasonOut = N'FINGERPRINT_CONFLICT';
-                        SET @StatsFoundOut = 0;
-                        SET @StatsProcessedOut = 0;
-                        SET @StatsSucceededOut = 0;
-                        SET @StatsFailedOut = 0;
-                        SET @StatsRemainingOut = 0;
-                        SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
-                        SELECT
-                            Status = N'ERROR',
-                            StatusMessage = N'Conflicting parameter fingerprint on existing queue.',
-                            StatsFound = 0, StatsProcessed = 0, StatsSucceeded = 0, StatsFailed = 0,
-                            StatsToctou = 0, StatsSkipped = 0, StatsRemaining = 0,
-                            DatabasesProcessed = 0,
-                            DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
-                            StopReason = N'FINGERPRINT_CONFLICT', RunLabel = @run_label,
-                            Version = @procedure_version;
-                        /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
-                        IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
-                        IF @StatsInParallel = N'N'
-                            DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
-                        RETURN 50001;
+                        /* sp_StatUpdate-rse2: flag only -- raising severity 16 here
+                           would jump to the CATCH below and skip the refuse-the-join
+                           bookkeeping.  Handled at FingerprintConflictExit. */
+                        SET @fingerprint_conflict = 1;
                     END;
                 END;
             END TRY
             BEGIN CATCH
                 /* Non-blocking: if fingerprint check fails, proceed to join the queue */
             END CATCH;
+
+            IF @fingerprint_conflict = 1
+                GOTO FingerprintConflictExit;
 
             /*
             #181: Max worker count coordination.
@@ -6006,6 +6064,55 @@ OPTION (RECOMPILE);';
                     SET @StatsFailedOut = 0;
                     SET @StatsRemainingOut = 0;
                     SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
+
+                    /* sp_StatUpdate-rse2: MAX_WORKERS rejections are by-design --
+                       write a real SP_STATUPDATE_END so parallel fleets do not
+                       accumulate orphaned STARTs that diag C1 flags as killed. */
+                    IF  @LogToTable = N'Y'
+                    AND @Execute = N'Y'
+                    AND @commandlog_exists = 1
+                    BEGIN
+                        BEGIN TRY
+                            INSERT INTO dbo.CommandLog
+                            (
+                                DatabaseName, SchemaName, ObjectName, ObjectType,
+                                Command, CommandType, StartTime, EndTime, ExtendedInfo
+                            )
+                            SELECT
+                                ISNULL(@Databases, DB_NAME()), N'dbo', N'sp_StatUpdate', N'P',
+                                N'sp_StatUpdate completed: MAX_WORKERS',
+                                N'SP_STATUPDATE_END',
+                                @start_time,
+                                SYSDATETIME(),
+                                (
+                                    SELECT
+                                        @procedure_version AS [Version],
+                                        @run_label AS RunLabel,
+                                        @@SPID AS SessionID,
+                                        0 AS StatsFound,
+                                        0 AS StatsProcessed,
+                                        0 AS StatsSucceeded,
+                                        0 AS StatsFailed,
+                                        0 AS StatsToctou,
+                                        0 AS StatsRemaining,
+                                        DATEDIFF(SECOND, @start_time, SYSDATETIME()) AS DurationSeconds,
+                                        N'MAX_WORKERS' AS StopReason,
+                                        0 AS MopUpTriggered,
+                                        0 AS MopUpFound,
+                                        0 AS MopUpProcessed,
+                                        0 AS TotalPagesProcessed,
+                                        0 AS QSEnrichmentSkipped,
+                                        N'{"succeeded":0,"failed":0,"duration_seconds":'
+                                            + CONVERT(nvarchar(20), DATEDIFF(SECOND, @start_time, SYSDATETIME()))
+                                            + N',"status":"OK"}' AS JsonSummary
+                                    FOR XML RAW(N'Summary'), ELEMENTS
+                                );
+                        END TRY
+                        BEGIN CATCH
+                            /* Logging failure must never block the early return */
+                        END CATCH;
+                    END;
+
                     SELECT
                         Status = N'SUCCESS',
                         StatusMessage = @mw_msg,
@@ -6292,6 +6399,54 @@ OPTION (RECOMPILE);';
             SET @StatsFailedOut = 0;
             SET @StatsRemainingOut = 0;
             SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
+
+            /* sp_StatUpdate-rse2: write a real SP_STATUPDATE_END (true StopReason)
+               instead of leaving an orphaned START for cleanup to mislabel KILLED. */
+            IF  @LogToTable = N'Y'
+            AND @Execute = N'Y'
+            AND @commandlog_exists = 1
+            BEGIN
+                BEGIN TRY
+                    INSERT INTO dbo.CommandLog
+                    (
+                        DatabaseName, SchemaName, ObjectName, ObjectType,
+                        Command, CommandType, StartTime, EndTime, ExtendedInfo
+                    )
+                    SELECT
+                        ISNULL(@Databases, DB_NAME()), N'dbo', N'sp_StatUpdate', N'P',
+                        N'sp_StatUpdate completed: QUEUE_INIT_ERROR',
+                        N'SP_STATUPDATE_END',
+                        @start_time,
+                        SYSDATETIME(),
+                        (
+                            SELECT
+                                @procedure_version AS [Version],
+                                @run_label AS RunLabel,
+                                @@SPID AS SessionID,
+                                0 AS StatsFound,
+                                0 AS StatsProcessed,
+                                0 AS StatsSucceeded,
+                                0 AS StatsFailed,
+                                0 AS StatsToctou,
+                                0 AS StatsRemaining,
+                                DATEDIFF(SECOND, @start_time, SYSDATETIME()) AS DurationSeconds,
+                                N'QUEUE_INIT_ERROR' AS StopReason,
+                                0 AS MopUpTriggered,
+                                0 AS MopUpFound,
+                                0 AS MopUpProcessed,
+                                0 AS TotalPagesProcessed,
+                                0 AS QSEnrichmentSkipped,
+                                N'{"succeeded":0,"failed":0,"duration_seconds":'
+                                    + CONVERT(nvarchar(20), DATEDIFF(SECOND, @start_time, SYSDATETIME()))
+                                    + N',"status":"ERROR"}' AS JsonSummary
+                            FOR XML RAW(N'Summary'), ELEMENTS
+                        );
+                END TRY
+                BEGIN CATCH
+                    /* Logging failure must never block the early return */
+                END CATCH;
+            END;
+
             SELECT
                 Status = N'ERROR',
                 StatusMessage = N'Queue initialization failed: ' + ISNULL(@queue_error_message, N'(no message)'),
@@ -6307,6 +6462,87 @@ OPTION (RECOMPILE);';
                 DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
             RETURN -1;
         END CATCH;
+
+        /*
+        sp_StatUpdate-rse2: FINGERPRINT_CONFLICT exit.  Reached only via GOTO
+        from the fingerprint check above (flag set inside its TRY).  Sits
+        OUTSIDE all TRY scopes so the severity-16 RAISERROR surfaces to the
+        caller AND execution continues into the refuse-the-join bookkeeping
+        (END row, OUTPUT params, result set, RETURN 50001) -- the gh-451 block
+        this replaces was dead code because the RAISERROR jumped to an empty
+        CATCH before any of it ran.
+        */
+        FingerprintConflictExit:
+        IF @fingerprint_conflict = 1
+        BEGIN
+            RAISERROR(N'Conflicting sp_StatUpdate parameters detected. Worker cannot join existing queue initialized with different threshold parameters. (Stored fingerprint: %d, This worker: %d)', 16, 1,
+                @stored_fingerprint, @parameter_fingerprint);
+            SET @StopReasonOut = N'FINGERPRINT_CONFLICT';
+            SET @StatsFoundOut = 0;
+            SET @StatsProcessedOut = 0;
+            SET @StatsSucceededOut = 0;
+            SET @StatsFailedOut = 0;
+            SET @StatsRemainingOut = 0;
+            SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
+
+            IF  @LogToTable = N'Y'
+            AND @Execute = N'Y'
+            AND @commandlog_exists = 1
+            BEGIN
+                BEGIN TRY
+                    INSERT INTO dbo.CommandLog
+                    (
+                        DatabaseName, SchemaName, ObjectName, ObjectType,
+                        Command, CommandType, StartTime, EndTime, ExtendedInfo
+                    )
+                    SELECT
+                        ISNULL(@Databases, DB_NAME()), N'dbo', N'sp_StatUpdate', N'P',
+                        N'sp_StatUpdate completed: FINGERPRINT_CONFLICT',
+                        N'SP_STATUPDATE_END',
+                        @start_time,
+                        SYSDATETIME(),
+                        (
+                            SELECT
+                                @procedure_version AS [Version],
+                                @run_label AS RunLabel,
+                                @@SPID AS SessionID,
+                                0 AS StatsFound,
+                                0 AS StatsProcessed,
+                                0 AS StatsSucceeded,
+                                0 AS StatsFailed,
+                                0 AS StatsToctou,
+                                0 AS StatsRemaining,
+                                DATEDIFF(SECOND, @start_time, SYSDATETIME()) AS DurationSeconds,
+                                N'FINGERPRINT_CONFLICT' AS StopReason,
+                                0 AS MopUpTriggered,
+                                0 AS MopUpFound,
+                                0 AS MopUpProcessed,
+                                0 AS TotalPagesProcessed,
+                                0 AS QSEnrichmentSkipped,
+                                N'{"succeeded":0,"failed":0,"duration_seconds":'
+                                    + CONVERT(nvarchar(20), DATEDIFF(SECOND, @start_time, SYSDATETIME()))
+                                    + N',"status":"ERROR"}' AS JsonSummary
+                            FOR XML RAW(N'Summary'), ELEMENTS
+                        );
+                END TRY
+                BEGIN CATCH
+                    /* Logging failure must never block the early return */
+                END CATCH;
+            END;
+
+            SELECT
+                Status = N'ERROR',
+                StatusMessage = N'Conflicting parameter fingerprint on existing queue.',
+                StatsFound = 0, StatsProcessed = 0, StatsSucceeded = 0, StatsFailed = 0,
+                StatsToctou = 0, StatsSkipped = 0, StatsRemaining = 0,
+                DatabasesProcessed = 0,
+                DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
+                StopReason = N'FINGERPRINT_CONFLICT', RunLabel = @run_label,
+                Version = @procedure_version;
+            /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+            IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
+            RETURN 50001;
+        END;
 
         RAISERROR(N'', 10, 1) WITH NOWAIT;
     END;
