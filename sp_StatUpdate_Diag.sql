@@ -36,9 +36,46 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.02.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.02.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.07.02.1 - Phase-B diagnostic batch (70hh, 1h2l, 8gws, xmxs, 4g9s, t8lj):
+History:    2026.07.02.2 - Phase-C diagnostic batch (sw82, 9ufm, atk1, 9axc):
+                           (sw82) @CriticalTables coverage: ingest CriticalTables /
+                           CriticalSamplePercent / CriticalTablesFirst into #runs; ingest
+                           IsCritical / CriticalSampleOverride into #stat_updates (both cache
+                           and direct paths).  New W16 CRITICAL_TABLES_NO_MATCH: fires when
+                           CriticalTables configured but zero IsCritical=1 stat rows in that
+                           run.  New I17 CRITICAL_TABLES_COVERAGE: leadership-friendly summary
+                           when critical stats exist (count updated, avg ProcessingPosition,
+                           override count).  Both checks registered in the @Help catalog.
+                           Cache auto-upgrade adds IsCritical / CriticalSampleOverride columns.
+                           (9ufm) Version-aware param gating: #runs gains HasFullParamsLog
+                           (1 when the run's sp_StatUpdate version >= 2.15, the full-parameter-
+                           logging era).  W1a / W1b / I4a / I4c / I4d only reason about absent
+                           parameter elements on such runs -- there, FOR XML omitting NULL
+                           params means absence IS the signal (TimeLimit absent = genuinely
+                           unlimited).  Pre-2.15 runs are excluded from param reasoning, so they
+                           no longer produce false UNUSED_FEATURES / SUBOPTIMAL_PARAMS findings.
+                           (Per-element .exist() gating was rejected: it gates each check on
+                           the very element whose absence the check detects.)
+                           (atk1) Executive Dashboard TIME_LIMIT annotation: COMPLETION Headline
+                           gains a ' [!] Time limit exhausted in N% of runs' banner when the
+                           C3 threshold is met; COMPLETION Detail gains a CompletionReason clause;
+                           OVERALL Detail gains a short flag.  Score/grade math unchanged;
+                           12 existing structure tests remain valid.
+                           (9axc) History watermark robustness: StatUpdateDiagHistory gains
+                           MaxStartTime datetime2(3) NULL via ALTER-if-missing pattern.
+                           Watermark WRITE now records both MaxCommandLogID and MaxStartTime.
+                           Watermark READ selects MAX(MaxStartTime) into @history_max_run_start.
+                           NOT EXISTS on RunLabel remains the final duplicate guard.
+                           (hardening) All three #stat_updates ingestion builds now start with
+                           a CONVERT(nvarchar(max), N'') operand: sub-4000-char literal pieces
+                           previously made intermediate concats nvarchar(4000), silently
+                           truncating the assembled batch at 4000 chars -- the direct-path
+                           batch lost its WHERE tail and every ingest failed with
+                           'Incorrect syntax near AND' while the proc kept running with an
+                           empty #stat_updates.  Cache CREATE path brought into lockstep with
+                           the upgrade ALTERs (IsCritical / CriticalSampleOverride).
+            2026.07.02.1 - Phase-B diagnostic batch (70hh, 1h2l, 8gws, xmxs, 4g9s, t8lj):
                            (70hh) Skip-row ingestion fix: SKIPPED: Command and TOCTOU_SKIP
                            ErrorMessage rows excluded at cache and direct-path ingestion
                            layers.  They no longer pollute duration/appearance/top-table
@@ -408,7 +445,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.02.1',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.02.2',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260612';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -527,7 +564,9 @@ BEGIN
                 (N'W13', N'WARNING', N'PERPETUALLY_SKIPPED',   N'Stats consistently discovered but never updated across N consecutive runs due to time limits.  Increase @TimeLimit, lower @ModificationThreshold, or use @SortOrder=MODIFICATION_VELOCITY.'),
                 (N'W14', N'WARNING', N'RECURRING_SAFETY_STOP', N'The same safety-stop StopReason (TEMPDB_PRESSURE, AG_REDO_QUEUE, LOG_SPACE_HIGH, IO_CORRUPTION, FAIL_FAST, CONSECUTIVE_FAILURES, BATCH_LIMIT) appears in >= 2 runs within the analysis window.  Each recurring reason produces one finding row with reason-specific remediation. (4g9s)'),
                 (N'W15', N'WARNING', N'RECURRING_RUNTIME_WARNING', N'An environmental/actionable WarningsCodes token from END Summary XML appears in >= 3 runs or >= 50%% of runs.  Codes: BACKUP_RUNNING, BACKUP_STARTED_MID_RUN, LOG_SPACE_HIGH, IO_CORRUPTION, CONTAINER_MEMORY, RCSI_VERSION_STORE, ELASTIC_POOL, PEAK_HOURS, STOPBYTIME_OVERSHOOT, CONSECUTIVE_FAILURES_ELEVATED, PERSIST_SAMPLE_INADEQUATE, PARALLEL_ORPHAN_BACKLOG, STALE_QUEUE_SWEEP, DB_SKIPPED, BACKUP_STARTED_MID_RUN.  Old runs without WarningsCodes produce no findings. (t8lj)'),
-                (N'I16', N'INFO',    N'RECURRING_RUNTIME_WARNING', N'A purely informational WarningsCodes token appears in >= 3 runs or >= 50%% of runs.  Codes: CDC_TABLES, REPLICATION_MAJORITY, COLUMNSTORE_TABLES, RLS_DETECTED, FILTER_MISMATCH, CASE_SENSITIVE_COLLATION, AZURE_SQL_DB/MI/EDGE, LOW_UPTIME, TOCTOU_SKIPS, EMPTY_STRING_PARAM, DEAD_WORKER_TIMEOUT_NULL_COERCED, and any unrecognized codes.  Old runs without WarningsCodes produce no findings. (t8lj)')
+                (N'W16', N'WARNING', N'CRITICAL_TABLES_NO_MATCH', N'@CriticalTables is configured (non-NULL) in a recent non-killed run but ZERO stat rows in that run carry IsCritical=1.  The pattern matched nothing -- a silent misconfiguration.  Verify the LIKE patterns match actual table names and that the parameter was logged by a v3.5.0+ sp_StatUpdate version. (sw82)'),
+                (N'I16', N'INFO',    N'RECURRING_RUNTIME_WARNING', N'A purely informational WarningsCodes token appears in >= 3 runs or >= 50%% of runs.  Codes: CDC_TABLES, REPLICATION_MAJORITY, COLUMNSTORE_TABLES, RLS_DETECTED, FILTER_MISMATCH, CASE_SENSITIVE_COLLATION, AZURE_SQL_DB/MI/EDGE, LOW_UPTIME, TOCTOU_SKIPS, EMPTY_STRING_PARAM, DEAD_WORKER_TIMEOUT_NULL_COERCED, and any unrecognized codes.  Old runs without WarningsCodes produce no findings. (t8lj)'),
+                (N'I17', N'INFO',    N'CRITICAL_TABLES_COVERAGE', N'@CriticalTables is configured and critical stats exist in the analysis window.  Leadership-friendly summary: count of critical stats updated, avg ProcessingPosition when CriticalTablesFirst=Y (early positions prove the priority worked), count with CriticalSampleOverride applied. (sw82)')
         ) AS v (check_id, severity, category, description);
 
         /* Result set 3: Result set order */
@@ -1112,6 +1151,8 @@ BEGIN
                     DurationSeconds integer         NULL,
                     IsQSRun         bit             NOT NULL DEFAULT 0,
                     DiagVersion     varchar(20)     NOT NULL,
+                    /* 9axc: StartTime-based watermark for purge/archive robustness */
+                    MaxStartTime    datetime2(3)    NULL,
 
                     CONSTRAINT PK_StatUpdateDiagHistory PRIMARY KEY CLUSTERED (SnapshotID) WITH (DATA_COMPRESSION = PAGE),
                     INDEX IX_StatUpdateDiagHistory_RunLabel UNIQUE NONCLUSTERED (RunLabel) WITH (DATA_COMPRESSION = PAGE)
@@ -1142,13 +1183,17 @@ BEGIN
                     ALTER TABLE ' + @history_ref + N' ADD HighCpuFirstQuartilePct decimal(5,1) NULL;
                 IF COL_LENGTH(''' + @history_ref + N''', ''MinutesToHighCpuComplete'') IS NULL
                     ALTER TABLE ' + @history_ref + N' ADD MinutesToHighCpuComplete decimal(10,1) NULL;
+                /* 9axc: MaxStartTime for StartTime-based watermark (purge/archive-resistant) */
+                IF COL_LENGTH(''' + @history_ref + N''', ''MaxStartTime'') IS NULL
+                    ALTER TABLE ' + @history_ref + N' ADD MaxStartTime datetime2(3) NULL;
             ';
             EXECUTE sys.sp_executesql @sql;
 
-            /* Get watermark: max CommandLog ID already processed */
+            /* 9axc: Read watermark -- prefer MaxStartTime (robust to ID gaps from purge/archive);
+               fall back to MaxCommandLogID only when MaxStartTime IS NULL (pre-9axc history rows). */
             SET @sql = N'
-                SELECT @max_id = ISNULL(MAX(MaxCommandLogID), 0),
-                       @max_start = MAX(StartTime)
+                SELECT @max_id    = ISNULL(MAX(MaxCommandLogID), 0),
+                       @max_start = MAX(MaxStartTime)   /* 9axc: NULL on pre-9axc rows; checked below */
                 FROM ' + @history_ref + N';
             ';
 
@@ -1254,6 +1299,11 @@ BEGIN
                     ProcessingPosition  integer         NULL,
                     ObjectId            integer         NULL,
                     StatsId             integer         NULL,
+                    /* sw82: keep the CREATE path in lockstep with the upgrade ALTERs below --
+                       the auto-create test drops this table, so a CREATE missing columns
+                       breaks the very next cache write (caught 2026-07-02). */
+                    IsCritical          bit             NULL,
+                    CriticalSampleOverride bit          NULL,
 
                     CONSTRAINT PK_StatUpdateDiagCache PRIMARY KEY CLUSTERED (CommandLogID)
                         WITH (DATA_COMPRESSION = PAGE)
@@ -1279,6 +1329,11 @@ BEGIN
                     ALTER TABLE ' + @cache_ref + N' ADD QSTotalMemoryGrantKB bigint NULL;
                 IF COL_LENGTH(N''' + REPLACE(@cache_ref, N'''', N'''''') + N''', N''QSTotalTempdbPages'') IS NULL
                     ALTER TABLE ' + @cache_ref + N' ADD QSTotalTempdbPages bigint NULL;
+                /* sw82: IsCritical / CriticalSampleOverride added in this batch */
+                IF COL_LENGTH(N''' + REPLACE(@cache_ref, N'''', N'''''') + N''', N''IsCritical'') IS NULL
+                    ALTER TABLE ' + @cache_ref + N' ADD IsCritical bit NULL;
+                IF COL_LENGTH(N''' + REPLACE(@cache_ref, N'''', N'''''') + N''', N''CriticalSampleOverride'') IS NULL
+                    ALTER TABLE ' + @cache_ref + N' ADD CriticalSampleOverride bit NULL;
             ';
             EXECUTE sys.sp_executesql @col_check_sql;
 
@@ -1359,6 +1414,15 @@ BEGIN
         QSEnrichmentSkipped bit NULL,           /* Summary/QSEnrichmentSkipped -- 1 when QS phase was skipped (v3+) */
         /* Recurring-warning support (t8lj) */
         WarningsCodes nvarchar(max) NULL,       /* Summary/WarningsCodes -- pipe-delimited code tokens (v3.5.9+) */
+        /* sw82: CriticalTables parameters (v3.5.0+); NULL on older rows (absent element) */
+        CriticalTables nvarchar(max) NULL,      /* Parameters/CriticalTables -- LIKE patterns for priority-boosted tables */
+        CriticalSamplePercent tinyint NULL,     /* Parameters/CriticalSamplePercent -- FULLSCAN override sample rate */
+        CriticalTablesFirst nvarchar(1) NULL,   /* Parameters/CriticalTablesFirst -- Y/N: critical tables processed before others */
+        /* sw82: element-presence flags for parameters consumed by checks (9ufm) */
+        HasFullParamsLog bit NOT NULL DEFAULT 0,      /* 9ufm: 1 when the run's sp_StatUpdate version is >= 2.15
+                                                          (full parameter logging) -- absent param element then means
+                                                          genuinely NULL, so param-history checks may reason on absence.
+                                                          0 = pre-2.15 run: excluded from param reasoning. */
         /* Computed */
         IsKilled bit NOT NULL DEFAULT 0,
         TotalGB decimal(10, 2) NULL /* sum of PageCount * 8KB for succeeded stats in this run */
@@ -1409,6 +1473,9 @@ BEGIN
         ProcessingPosition integer NULL,
         ObjectId integer NULL,           /* #268: from ExtendedInfo v2.20+ */
         StatsId integer NULL,            /* #268: from ExtendedInfo v2.20+ */
+        /* sw82: CriticalTables per-stat markers (v3.5.0+); NULL on older rows */
+        IsCritical bit NULL,                /* ExtendedInfo/IsCritical -- 1 when stat matched a CriticalTables pattern */
+        CriticalSampleOverride bit NULL,    /* ExtendedInfo/CriticalSampleOverride -- 1 when per-table sample override was applied */
         /* 70hh: skip-row flag -- 1 when Command begins 'SKIPPED:' or ErrorMessage begins 'TOCTOU_SKIP'.
            Rows with IsSkip=1 are excluded from duration/appearance/success aggregates. */
         IsSkip bit NOT NULL DEFAULT 0,
@@ -1481,6 +1548,8 @@ BEGIN
         FilteredStatsMode, BatchLimit, FailFast,
         MopUpTriggered, MopUpFound, MopUpProcessed,
         StatsToctou, QSEnrichmentSkipped, WarningsCodes,
+        CriticalTables, CriticalSamplePercent, CriticalTablesFirst,
+        HasFullParamsLog,
         IsKilled
     )
     SELECT
@@ -1529,6 +1598,26 @@ BEGIN
         qs_enrichment_skipped = e.ExtendedInfo.value(N''(Summary/QSEnrichmentSkipped)[1]'', N''bit''),
         /* t8lj: pipe-delimited warning code tokens from END Summary XML (v3.5.9+); NULL on older rows */
         warnings_codes      = e.ExtendedInfo.value(N''(Summary/WarningsCodes)[1]'', N''nvarchar(max)''),
+        /* sw82: CriticalTables params from START XML (v3.5.0+); NULL on older rows */
+        critical_tables         = s.ExtendedInfo.value(N''(Parameters/CriticalTables)[1]'', N''nvarchar(max)''),
+        critical_sample_pct     = s.ExtendedInfo.value(N''(Parameters/CriticalSamplePercent)[1]'', N''tinyint''),
+        critical_tables_first   = s.ExtendedInfo.value(N''(Parameters/CriticalTablesFirst)[1]'', N''nvarchar(1)''),
+        /* 9ufm: version-derived full-logging flag.  Per-element .exist() gating is WRONG here:
+           FOR XML omits NULL-valued params, so an absent element is exactly the signal the
+           param checks detect (TimeLimit absent = genuinely unlimited) -- gating on element
+           presence would permanently suppress those checks.  Full parameter logging shipped
+           in v2.15 (Mar 2026), so runs from >= 2.15 log every non-NULL public param and
+           absence there means NULL; older runs are excluded from param reasoning. */
+        has_full_params_log = CONVERT(bit, CASE
+            WHEN TRY_CONVERT(int, LEFT(vx.ver, NULLIF(CHARINDEX(N''.'', vx.ver), 0) - 1)) > 2 THEN 1
+            WHEN TRY_CONVERT(int, LEFT(vx.ver, NULLIF(CHARINDEX(N''.'', vx.ver), 0) - 1)) = 2
+             AND TRY_CONVERT(int, SUBSTRING(vx.ver, CHARINDEX(N''.'', vx.ver) + 1,
+                    CASE WHEN CHARINDEX(N''.'', vx.ver, CHARINDEX(N''.'', vx.ver) + 1) = 0
+                         THEN 10
+                         ELSE CHARINDEX(N''.'', vx.ver, CHARINDEX(N''.'', vx.ver) + 1) - CHARINDEX(N''.'', vx.ver) - 1
+                    END)) >= 15 THEN 1
+            ELSE 0
+        END),
         is_killed           = CASE
                                   WHEN e.ID IS NULL THEN 1
                                   WHEN e.ExtendedInfo.value(N''(Summary/StopReason)[1]'', N''nvarchar(50)'') = N''KILLED'' THEN 1
@@ -1539,6 +1628,7 @@ BEGIN
         ON  e.CommandType = N''SP_STATUPDATE_END''
         AND e.ExtendedInfo.value(N''(Summary/RunLabel)[1]'', N''nvarchar(100)'') =
             s.ExtendedInfo.value(N''(Parameters/RunLabel)[1]'', N''nvarchar(100)'')
+    CROSS APPLY (SELECT ver = s.ExtendedInfo.value(N''(Parameters/Version)[1]'', N''nvarchar(30)'')) AS vx
     WHERE s.CommandType = N''SP_STATUPDATE_START''
     AND   s.StartTime >= DATEADD(DAY, -@days_back, GETDATE())
     AND   NOT (e.ID IS NULL AND DATEDIFF(MINUTE, s.StartTime, GETDATE()) < @orphan_minutes);
@@ -1599,7 +1689,11 @@ BEGIN
     IF @SkipHistory = 0 AND @cache_exists = 1
     BEGIN
         /* Step 1: Populate cache with new rows (ID > watermark) */
-        SET @sql = N'
+        /* CONVERT(nvarchar(max), ...) first operand: without it, sub-4000-char literal
+           pieces make every intermediate concat nvarchar(4000) and the assembled batch
+           silently TRUNCATES at 4000 chars (caught 2026-07-02: the direct-path batch
+           lost its WHERE tail and failed 'Incorrect syntax near AND'). */
+        SET @sql = CONVERT(nvarchar(max), N'') + N'
         INSERT INTO ' + @cache_ref + N'
         (
             CommandLogID, RunLabel, DatabaseName, SchemaName, ObjectName, StatisticsName,
@@ -1609,7 +1703,8 @@ BEGIN
             QSPlanCount, QSTotalExecutions, QSTotalCpuMs,
             QSTotalMemoryGrantKB, QSTotalTempdbPages,
             EffectiveSamplePct, SampleSource, HasFilter, FilteredDriftRatio, IsIncremental,
-            ProcessingPosition, ObjectId, StatsId
+            ProcessingPosition, ObjectId, StatsId,
+            IsCritical, CriticalSampleOverride
         )
         SELECT
             c.ID,
@@ -1640,7 +1735,10 @@ BEGIN
             c.ExtendedInfo.value(N''(ExtendedInfo/IsIncremental)[1]'', N''bit''),
             c.ExtendedInfo.value(N''(ExtendedInfo/ProcessingPosition)[1]'', N''int''),
             c.ExtendedInfo.value(N''(ExtendedInfo/ObjectId)[1]'', N''int''),
-            c.ExtendedInfo.value(N''(ExtendedInfo/StatsId)[1]'', N''int'')
+            c.ExtendedInfo.value(N''(ExtendedInfo/StatsId)[1]'', N''int''),
+            /* sw82: IsCritical + CriticalSampleOverride from per-stat ExtendedInfo (v3.5.0+) */
+            c.ExtendedInfo.value(N''(ExtendedInfo/IsCritical)[1]'', N''bit''),
+            c.ExtendedInfo.value(N''(ExtendedInfo/CriticalSampleOverride)[1]'', N''bit'')
         FROM ' + @commandlog_ref + N' AS c
         WHERE c.CommandType = N''UPDATE_STATISTICS''
         AND   c.ID > @watermark
@@ -1658,7 +1756,7 @@ BEGIN
             RAISERROR(N'  Cached %i new CommandLog rows', 10, 1, @cache_new_rows) WITH NOWAIT;
 
         /* Step 2: Read from cache (fast typed column reads, no XML parsing) */
-        SET @sql = N'
+        SET @sql = CONVERT(nvarchar(max), N'') + N'   /* max-typed first operand -- see Step 1 note */
         INSERT INTO #stat_updates
         (
             ID, RunLabel, DatabaseName, SchemaName, ObjectName, StatisticsName,
@@ -1668,7 +1766,8 @@ BEGIN
             QSPlanCount, QSTotalExecutions, QSTotalCpuMs,
             QSTotalMemoryGrantKB, QSTotalTempdbPages,
             EffectiveSamplePct, SampleSource, HasFilter, FilteredDriftRatio, IsIncremental,
-            ProcessingPosition, ObjectId, StatsId
+            ProcessingPosition, ObjectId, StatsId,
+            IsCritical, CriticalSampleOverride
         )
         SELECT
             ca.CommandLogID, ca.RunLabel, ca.DatabaseName, ca.SchemaName, ca.ObjectName, ca.StatisticsName,
@@ -1678,7 +1777,9 @@ BEGIN
             ca.QSPlanCount, ca.QSTotalExecutions, ca.QSTotalCpuMs,
             ca.QSTotalMemoryGrantKB, ca.QSTotalTempdbPages,
             ca.EffectiveSamplePct, ca.SampleSource, ca.HasFilter, ca.FilteredDriftRatio, ca.IsIncremental,
-            ca.ProcessingPosition, ca.ObjectId, ca.StatsId
+            ca.ProcessingPosition, ca.ObjectId, ca.StatsId,
+            /* sw82: read from cache when present; NULL when cache rows predate sw82 (column upgrade handles this) */
+            ca.IsCritical, ca.CriticalSampleOverride
         FROM ' + @cache_ref + N' AS ca
         WHERE ca.StartTime >= DATEADD(DAY, -@days_back, GETDATE());
         ';
@@ -1690,7 +1791,7 @@ BEGIN
     ELSE
     BEGIN
         /* Direct XML extraction (no cache available or @SkipHistory=1) */
-        SET @sql = N'
+        SET @sql = CONVERT(nvarchar(max), N'') + N'   /* max-typed first operand -- see cache Step 1 note */
         INSERT INTO #stat_updates
         (
             ID, RunLabel, DatabaseName, SchemaName, ObjectName, StatisticsName,
@@ -1700,7 +1801,8 @@ BEGIN
             QSPlanCount, QSTotalExecutions, QSTotalCpuMs,
             QSTotalMemoryGrantKB, QSTotalTempdbPages,
             EffectiveSamplePct, SampleSource, HasFilter, FilteredDriftRatio, IsIncremental,
-            ProcessingPosition, ObjectId, StatsId
+            ProcessingPosition, ObjectId, StatsId,
+            IsCritical, CriticalSampleOverride
         )
         SELECT
             id                  = c.ID,
@@ -1735,7 +1837,10 @@ BEGIN
             is_incremental      = c.ExtendedInfo.value(N''(ExtendedInfo/IsIncremental)[1]'', N''bit''),
             processing_position = c.ExtendedInfo.value(N''(ExtendedInfo/ProcessingPosition)[1]'', N''int''),
             object_id           = c.ExtendedInfo.value(N''(ExtendedInfo/ObjectId)[1]'', N''int''),
-            stats_id            = c.ExtendedInfo.value(N''(ExtendedInfo/StatsId)[1]'', N''int'')
+            stats_id            = c.ExtendedInfo.value(N''(ExtendedInfo/StatsId)[1]'', N''int''),
+            /* sw82: IsCritical + CriticalSampleOverride from per-stat ExtendedInfo (v3.5.0+) */
+            is_critical              = c.ExtendedInfo.value(N''(ExtendedInfo/IsCritical)[1]'', N''bit''),
+            critical_sample_override = c.ExtendedInfo.value(N''(ExtendedInfo/CriticalSampleOverride)[1]'', N''bit'')
         FROM ' + @commandlog_ref + N' AS c
         WHERE c.CommandType = N''UPDATE_STATISTICS''
         AND   c.StartTime >= DATEADD(DAY, -@days_back, GETDATE())
@@ -2615,7 +2720,9 @@ BEGIN
             @latest_sort_order nvarchar(50),
             @latest_first_time_fullscan_cap_rows bigint,  /* 8gws: I4 detection for v3.5.4+ param */
             @latest_critical_tables nvarchar(max),        /* 8gws: I4 detection for v3.5.0+ param */
-            @latest_abort_on_integrity bit;               /* 8gws: I4 detection for v3.5.9+ param */
+            @latest_abort_on_integrity bit,               /* 8gws: I4 detection for v3.5.9+ param */
+            /* 9ufm: element-presence flags from #runs for the most recent run */
+            @latest_has_full_params_log bit = 0;
 
         SELECT
             @latest_tiered = TieredThresholds,
@@ -2626,12 +2733,17 @@ BEGIN
             @latest_preset = Preset,
             @latest_long_run_min = LongRunningThresholdMinutes,
             /* GroupByJoinPattern no longer read from #runs (xmxs) */
-            @latest_sort_order = SortOrder
+            @latest_sort_order = SortOrder,
+            /* 9ufm: element-presence flags */
+            @latest_has_full_params_log         = HasFullParamsLog
         FROM #runs
         WHERE RunLabel = @latest_run_label;
 
-        /* W1a: TieredThresholds disabled */
+        /* W1a: TieredThresholds disabled
+           9ufm gate: skip when the Parameters element is absent (pre-v2 run); a NULL
+           TieredThresholds value from an absent element is not evidence of misconfiguration. */
         IF @latest_tiered IN (N'0', N'False')
+        AND @latest_has_full_params_log = 1   /* 9ufm: version-gated */
         BEGIN
             INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
             VALUES
@@ -2645,8 +2757,12 @@ BEGIN
             );
         END;
 
-        /* W1b: No TimeLimit */
+        /* W1b: No TimeLimit
+           9ufm gate: skip when the TimeLimit element is absent (pre-v2 run or was never logged).
+           An absent element produces NULL just like an explicitly set NULL; only fire when
+           the element was present and its value is NULL. */
         IF @latest_time_limit IS NULL
+        AND @latest_has_full_params_log = 1   /* 9ufm: version-gated */
         BEGIN
             INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
             VALUES
@@ -3914,8 +4030,12 @@ BEGIN
             @ct   = @latest_critical_tables OUTPUT,
             @aoi  = @latest_abort_on_integrity OUTPUT;
 
-        /* I4a: No preset */
+        /* I4a: No preset
+           9ufm gate: only surface when the Parameters element exists AND the Preset element
+           was explicitly present (even if NULL) -- absent element means this is a pre-preset
+           run, not evidence the operator omitted the parameter. */
         IF @latest_preset IS NULL
+        AND @latest_has_full_params_log = 1   /* 9ufm: version-gated */
         BEGIN
             INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
             VALUES
@@ -3949,8 +4069,10 @@ BEGIN
 
         /* 8gws -- I4c: @FirstTimeFullScanCapRows (v3.5.4) not in use.
            This parameter caps rows forced to FULLSCAN on first-time stat qualification,
-           preventing runaway FULLSCAN on enormous tables when @StatisticsSample is NULL. */
+           preventing runaway FULLSCAN on enormous tables when @StatisticsSample is NULL.
+           9ufm gate: only surface when the element was present (v3.5.4+ run). */
         IF @latest_first_time_fullscan_cap_rows IS NULL
+        AND @latest_has_full_params_log = 1   /* 9ufm: version-gated */
         AND @stat_update_count > 0
         BEGIN
             INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
@@ -3970,8 +4092,11 @@ BEGIN
         /* 8gws -- I4d: @CriticalTables (v3.5.0) not in use.
            This parameter specifies table patterns that receive priority boost and
            per-table sample-rate override -- highly valuable for tables with known
-           workload importance or lock-contention history. */
+           workload importance or lock-contention history.
+           9ufm gate: only surface when the Parameters element has CriticalTables present;
+           absent means pre-v3.5.0 run (parameter did not exist yet). */
         IF @latest_critical_tables IS NULL
+        AND @latest_has_full_params_log = 1   /* 9ufm: version-gated */
         AND @stat_update_count > 0
         BEGIN
             INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
@@ -5228,6 +5353,161 @@ BEGIN
             RAISERROR(N'  [INFO] I16: %i recurring informational warning code(s) detected', 10, 1, @i16_fires) WITH NOWAIT;
     END;
 
+    /* ======================================================================
+       W16: CRITICAL_TABLES_NO_MATCH (sw82)
+
+       Fires when a recent non-killed run has CriticalTables configured (non-NULL)
+       but ZERO stat rows in that run carry IsCritical=1.  The pattern matched
+       nothing -- a silent misconfiguration.
+
+       "Recent" = any non-killed run within the analysis window that has the
+       CriticalTables value non-NULL (element presence is implied -- FOR XML omits NULL params).
+       We pick the most recent such run for the evidence.
+       ====================================================================== */
+    IF EXISTS (
+        SELECT 1
+        FROM #runs AS r
+        WHERE r.IsKilled = 0
+        AND   r.CriticalTables IS NOT NULL
+        AND   r.CriticalTables IS NOT NULL   /* element presence implied by non-NULL value */
+        AND   NOT EXISTS (
+            SELECT 1
+            FROM #stat_updates AS su
+            WHERE su.RunLabel = r.RunLabel
+            AND   su.IsCritical = 1
+        )
+    )
+    BEGIN
+        DECLARE
+            @w16_run_label nvarchar(100),
+            @w16_pattern nvarchar(max),
+            @w16_stat_count integer;
+
+        SELECT TOP (1)
+            @w16_run_label = r.RunLabel,
+            @w16_pattern   = r.CriticalTables
+        FROM #runs AS r
+        WHERE r.IsKilled = 0
+        AND   r.CriticalTables IS NOT NULL
+        AND   r.CriticalTables IS NOT NULL   /* element presence implied by non-NULL value */
+        AND   NOT EXISTS (
+            SELECT 1
+            FROM #stat_updates AS su
+            WHERE su.RunLabel = r.RunLabel
+            AND   su.IsCritical = 1
+        )
+        ORDER BY r.StartTime DESC;
+
+        SET @w16_stat_count = (
+            SELECT COUNT_BIG(*)
+            FROM #stat_updates AS su
+            WHERE su.RunLabel = @w16_run_label
+        );
+
+        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+        VALUES
+        (
+            N'WARNING',
+            N'CRITICAL_TABLES_NO_MATCH',
+            N'@CriticalTables configured but matched no stats in recent run',
+            N'Run ' + @w16_run_label + N': CriticalTables = ''' + ISNULL(@w16_pattern, N'(NULL)') + N'''. '
+                + CONVERT(nvarchar(10), @w16_stat_count) + N' stat(s) processed -- none carry IsCritical=1. '
+                + N'Patterns use LIKE syntax; verify they match actual table names (case-insensitive, wildcards supported).',
+            N'Confirm the CriticalTables patterns produce matches: '
+                + N'SELECT name FROM sys.objects WHERE OBJECT_ID IN (SELECT object_id FROM sys.stats) '
+                + N'AND (name LIKE N''<your pattern>''). '
+                + N'Requires sp_StatUpdate v3.5.0+ to log IsCritical in per-stat ExtendedInfo.',
+            N'EXECUTE dbo.sp_StatUpdate @CriticalTables = N''dbo.Orders,dbo.OrderItems'', @Databases = N''USER_DATABASES'';',
+            28
+        );
+
+        RAISERROR(N'  [WARNING] W16: CriticalTables configured but matched no stats', 10, 1) WITH NOWAIT;
+    END;
+
+    /* ======================================================================
+       I17: CRITICAL_TABLES_COVERAGE (sw82)
+
+       When CriticalTables is configured AND critical stats exist, emit a
+       leadership-friendly summary: count updated, avg ProcessingPosition
+       (when CriticalTablesFirst=Y -- early positions prove priority worked),
+       count with CriticalSampleOverride applied.
+       ====================================================================== */
+    IF EXISTS (
+        SELECT 1
+        FROM #runs AS r
+        WHERE r.IsKilled = 0
+        AND   r.CriticalTables IS NOT NULL
+        AND   r.CriticalTables IS NOT NULL   /* element presence implied by non-NULL value */
+        AND   EXISTS (
+            SELECT 1
+            FROM #stat_updates AS su
+            WHERE su.RunLabel = r.RunLabel
+            AND   su.IsCritical = 1
+        )
+    )
+    BEGIN
+        DECLARE
+            @i17_critical_count integer,
+            @i17_override_count integer,
+            @i17_avg_position decimal(10, 1),
+            @i17_pattern nvarchar(max),
+            @i17_first nvarchar(1);
+
+        SELECT
+            @i17_critical_count = COUNT_BIG(CASE WHEN su.IsCritical = 1 THEN 1 END),
+            @i17_override_count = COUNT_BIG(CASE WHEN su.CriticalSampleOverride = 1 THEN 1 END),
+            @i17_avg_position   = AVG(CASE WHEN su.IsCritical = 1 AND su.ProcessingPosition IS NOT NULL
+                                           THEN CONVERT(decimal(10, 1), su.ProcessingPosition)
+                                      END)
+        FROM #stat_updates AS su
+        INNER JOIN #runs AS r
+            ON r.RunLabel = su.RunLabel
+            AND r.IsKilled = 0
+            AND r.CriticalTables IS NOT NULL
+            AND r.CriticalTables IS NOT NULL;
+
+        /* Pull pattern and CriticalTablesFirst from most recent qualifying run */
+        SELECT TOP (1)
+            @i17_pattern = r.CriticalTables,
+            @i17_first   = r.CriticalTablesFirst
+        FROM #runs AS r
+        WHERE r.IsKilled = 0
+        AND   r.CriticalTables IS NOT NULL
+        AND   r.CriticalTables IS NOT NULL   /* element presence implied by non-NULL value */
+        ORDER BY r.StartTime DESC;
+
+        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+        VALUES
+        (
+            N'INFO',
+            N'CRITICAL_TABLES_COVERAGE',
+            N'@CriticalTables is active: '
+                + CONVERT(nvarchar(10), @i17_critical_count) + N' critical stat update(s) recorded'
+                + CASE WHEN @i17_first = N'Y' AND @i17_avg_position IS NOT NULL
+                       THEN N', avg position ' + CONVERT(nvarchar(10), @i17_avg_position)
+                            + N' (low position = early in run = priority is working)'
+                       ELSE N''
+                  END
+                + CASE WHEN @i17_override_count > 0
+                       THEN N', ' + CONVERT(nvarchar(10), @i17_override_count) + N' with sample-rate override applied'
+                       ELSE N''
+                  END + N'.',
+            N'Configured pattern(s): ' + ISNULL(@i17_pattern, N'(NULL)')
+                + N'. CriticalTablesFirst: ' + ISNULL(@i17_first, N'(not set)')
+                + CASE WHEN @i17_avg_position IS NOT NULL
+                       THEN N'. Avg ProcessingPosition of critical stats: ' + CONVERT(nvarchar(10), @i17_avg_position)
+                            + N'. Positions close to 1 confirm the priority boost is taking effect.'
+                       ELSE N'. ProcessingPosition not available (requires @CriticalTablesFirst = N''Y'').'
+                  END,
+            N'Critical tables are being processed. Monitor via RS 5 Top Tables and RS 4 Run Detail. '
+                + N'If positions are not early enough, verify @CriticalTablesFirst = N''Y'' and that @SortOrder is compatible.',
+            N'EXECUTE dbo.sp_StatUpdate @CriticalTables = N''' + ISNULL(REPLACE(@i17_pattern, N'''', N''''''), N'dbo.Orders') + N''', @CriticalTablesFirst = N''Y'', @Databases = N''USER_DATABASES'';',
+            72
+        );
+
+        RAISERROR(N'  [INFO] I17: CriticalTables coverage (%i critical stat updates)', 10, 1, @i17_critical_count) WITH NOWAIT;
+    END;
+
     RAISERROR(N'', 10, 1) WITH NOWAIT;
     RAISERROR(N'Diagnostic checks complete.', 10, 1) WITH NOWAIT;
 
@@ -5465,7 +5745,15 @@ BEGIN
             + CASE WHEN @has_overrides = 1 THEN N' [Overrides active]' ELSE N'' END,
         CONVERT(nvarchar(10), @run_count) + N' runs analyzed over ' + CONVERT(nvarchar(10), @DaysBack) + N' days. '
             + CONVERT(nvarchar(10), @stat_update_count) + N' individual stat updates. '
-            + CASE WHEN @qs_run_count > 0 THEN CONVERT(nvarchar(10), @qs_run_count) + N' runs using Query Store prioritization.' ELSE N'Query Store prioritization not in use.' END,
+            + CASE WHEN @qs_run_count > 0 THEN CONVERT(nvarchar(10), @qs_run_count) + N' runs using Query Store prioritization.' ELSE N'Query Store prioritization not in use.' END
+            /* atk1: short flag in OVERALL Detail when time limit is dominant (not Headline, only Detail) */
+            + CASE WHEN @parallel_aggregate_done = 0
+                        AND @total_completed_runs > 0
+                        AND @tl_run_pct >= @TimeLimitExhaustionPct
+                   THEN N' Note: ' + CONVERT(nvarchar(10), CONVERT(integer, @tl_run_pct))
+                        + N'% of runs budget-capped by TIME_LIMIT -- see COMPLETION category.'
+                   ELSE N''
+              END,
         @overall_trend,
         1
     ),
@@ -5490,9 +5778,28 @@ BEGIN
                 WHEN @score_completion >= 60 THEN N'A significant portion of statistics are not being reached within the maintenance window.'
                 WHEN @score_completion >= 40 THEN N'Less than half of qualifying statistics are being updated. Increase time limit or reduce scope.'
                 ELSE N'Very few statistics are being updated. Maintenance window is severely undersized for the workload.'
-            END,
+            END
+            /* atk1: TIME_LIMIT banner -- annotation only; does NOT change score/grade.
+               Fires when the share of recent non-killed TIME_LIMIT runs meets @TimeLimitExhaustionPct,
+               reusing @tl_run_pct and @time_limit_runs already computed by the C3 block above. */
+            + CASE WHEN @parallel_aggregate_done = 0
+                        AND @total_completed_runs > 0
+                        AND @tl_run_pct >= @TimeLimitExhaustionPct
+                   THEN N' [!] Time limit exhausted in ' + CONVERT(nvarchar(10), CONVERT(integer, @tl_run_pct))
+                        + N'% of runs -- completion is budget-capped, not workload-complete.'
+                   ELSE N''
+              END,
         N'Average completion rate: ' + ISNULL(CONVERT(nvarchar(10), @avg_completion), N'N/A') + N'% of qualifying statistics updated per run.'
-            + CASE WHEN @override_completion IN ('A','B','C','D','F') THEN N' (actual score: ' + CONVERT(nvarchar(10), @score_completion) + N')' ELSE N'' END,
+            + CASE WHEN @override_completion IN ('A','B','C','D','F') THEN N' (actual score: ' + CONVERT(nvarchar(10), @score_completion) + N')' ELSE N'' END
+            /* atk1: Completion-reason clause in Detail when time limit dominates */
+            + CASE WHEN @parallel_aggregate_done = 0
+                        AND @total_completed_runs > 0
+                        AND @tl_run_pct >= @TimeLimitExhaustionPct
+                   THEN N' CompletionReason: ' + CONVERT(nvarchar(10), @time_limit_runs) + N' of '
+                        + CONVERT(nvarchar(10), @total_completed_runs) + N' runs stopped at TIME_LIMIT; '
+                        + N'true qualifying-stats count may exceed StatsFound.'
+                   ELSE N''
+              END,
         NULL,
         2
     ),
@@ -5608,14 +5915,20 @@ BEGIN
         /* BUG-C fix: Compute per-run HealthScore inline instead of using aggregate @health_score.
            Each run gets its own score based on its completion, speed, and workload metrics.
            Grading scale: A=90-100, B=75-89, C=60-74, D=40-59, F=0-39 */
+        /* 9axc: @new_max_start = the most recent StartTime among all #runs rows being processed.
+           Written to MaxStartTime so future watermark reads can use WHERE StartTime > @watermark_time,
+           which is stable even when CommandLog IDs are renumbered after purge/archive. */
+        DECLARE @new_max_start datetime2(3) = (SELECT MAX(r.StartTime) FROM #runs AS r WHERE r.IsKilled = 0);
+
         SET @sql = N'
             INSERT INTO ' + @history_ref + N'
-            (MaxCommandLogID, RunLabel, StartTime, HealthScore, OverallGrade,
+            (MaxCommandLogID, MaxStartTime, RunLabel, StartTime, HealthScore, OverallGrade,
              CompletionPct, AvgSecPerStat, WorkloadCoveragePct, HighCpuFirstQuartilePct,
              MinutesToHighCpuComplete, StatsFound, StatsProcessed, StatsFailed,
              StopReason, DurationSeconds, IsQSRun, DiagVersion)
             SELECT
                 @max_id,
+                @max_start,     /* 9axc: MaxStartTime watermark -- robust to ID gaps after purge/archive */
                 e.RunLabel,
                 e.StartTime,
                 /* Per-run HealthScore: weighted composite of completion + speed + workload focus */
@@ -5707,9 +6020,10 @@ BEGIN
 
         EXECUTE sys.sp_executesql
             @sql,
-            N'@max_id integer, @version varchar(20)',
-            @max_id = @new_max_id,
-            @version = @procedure_version;
+            N'@max_id integer, @max_start datetime2(3), @version varchar(20)',
+            @max_id   = @new_max_id,
+            @max_start = @new_max_start,
+            @version  = @procedure_version;
 
         SET @rows_inserted = @@ROWCOUNT;
 
