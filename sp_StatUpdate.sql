@@ -36,11 +36,43 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.5.8.2026.06.12 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.5.9.2026.07.02 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.5.8.2026.06.12 - Telemetry bug fix (sp_StatUpdate-rse2):
+History:    3.5.9.2026.07.02 - Three fixes (sp_StatUpdate-7pqu, -f14h, -lh23):
+                            (1) gh-550: statistics that have NEVER been computed
+                            (dm_db_stats_properties returns last_updated NULL /
+                            modification_counter NULL) over POPULATED tables were
+                            silently never updated -- the Phase 4 outer gate
+                            effective_counter > 0 excluded them from every
+                            qualification branch including @StaleHours.  Fresh
+                            candidates now get a targeted sys.partitions row
+                            count (physical_row_count, fresh stats only) and a
+                            NEVER_UPDATED rescue branch in Phase 4; QualifyReason
+                            reports NEVER_UPDATED.  Fresh stats on EMPTY tables
+                            still do not qualify.  Same root cause as Ola
+                            IndexOptimize #990.  Mop-up pass intentionally
+                            unchanged (still requires modification_counter > 0).
+                            (2) gh-549: new @AbortOnIntegrityError bit = 1
+                            parameter -- default 1 preserves the existing
+                            abort-on-823/824/825 behavior; 0 emits the CHECKDB
+                            advisory + IO_CORRUPTION warning code (deduped),
+                            counts the stat as failed, and continues.  @FailFast
+                            = 1 still aborts regardless.  TOCTOU CATCH skips
+                            (208/15009/2767) now close their pre-inserted
+                            CommandLog row (EndTime + TOCTOU_SKIP message;
+                            ErrorNumber intentionally NULL so diag failure
+                            aggregations ignore them) instead of leaving it
+                            dangling with NULL EndTime like a killed stat.
+                            (3) gh-544: @QueryStore = WAITS filtered
+                            wait_category IN (3, 12, 15) = Lock, Preemptive,
+                            Network IO -- classes stats updates cannot influence.
+                            Corrected to 5, 6, 17, 21 (Buffer Latch, Buffer IO,
+                            Memory, Other Disk IO) and centralized into
+                            @qs_wait_categories ({{WAITS_CATEGORIES}} token) so
+                            the three consumer sites can no longer drift.
+            3.5.8.2026.06.12 - Telemetry bug fix (sp_StatUpdate-rse2):
                             Four mid-run early returns (NO_QUALIFYING_STATS,
                             FINGERPRINT_CONFLICT, MAX_WORKERS,
                             QUEUE_INIT_ERROR) exited after the
@@ -408,7 +440,7 @@ ALTER PROCEDURE
       25 input parameters absorbed into preset-controlled @i_ internal variables.
       Explicit params always override preset defaults.
 
-    INPUT (39):  @Statistics, @JobName, @Preset, @Databases, @Tables, @ExcludeTables,
+    INPUT (40):  @Statistics, @JobName, @Preset, @Databases, @Tables, @ExcludeTables,
                  @ExcludeStatistics, @TargetNorecompute, @StaleHours, @QueryStore,
                  @TimeLimit, @StopByTime, @BatchLimit, @SortOrder, @MopUpPass,
                  @StatisticsSample, @MaxDOP, @ModificationThreshold,
@@ -418,7 +450,7 @@ ALTER PROCEDURE
                  @MopUpMinRemainingSeconds, @SkipTablesWithNCCI, @SkipTablesWithCCI,
                  @CriticalTables, @CriticalSamplePercent, @CriticalTablesFirst,
                  @LogToTable, @Execute, @WhatIfOutputTable,
-                 @FailFast, @Debug, @StatsInParallel, @Help
+                 @FailFast, @AbortOnIntegrityError, @Debug, @StatsInParallel, @Help
 
     OUTPUT (11): @Version, @VersionDate, @StatsFoundOut, @StatsProcessedOut,
                  @StatsSucceededOut, @StatsFailedOut, @StatsRemainingOut,
@@ -483,6 +515,7 @@ ALTER PROCEDURE
     @Execute nvarchar(1) = N'Y',                    /* Y = execute, N = dry run */
     @WhatIfOutputTable nvarchar(500) = NULL,         /* table for commands when @Execute = N */
     @FailFast bit = 0,                              /* 1 = abort on first error */
+    @AbortOnIntegrityError bit = 1,                 /* 1 = abort run on 823/824/825 (default); 0 = emit advisory + IO_CORRUPTION warning code, count as failure, and continue */
     @Debug bit = 0,                                 /* 1 = verbose output */
 
     /* PARALLEL EXECUTION */
@@ -515,8 +548,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.5.8.2026.06.12',
-        @procedure_version_date datetime = '20260612',
+        @procedure_version varchar(20) = '3.5.9.2026.07.02',
+        @procedure_version_date datetime = '20260702',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -605,10 +638,11 @@ BEGIN
             (N'@LogToTable',        N'nvarchar(1)',    N'Y',         N'Log to dbo.CommandLog'),
             (N'@Execute',           N'nvarchar(1)',    N'Y',         N'Y=execute, N=dry run'),
             (N'@WhatIfOutputTable', N'nvarchar(500)',  N'NULL',      N'Table for dry-run commands'),
-            (N'@FailFast',          N'bit',            N'0',         N'Abort on first error'),
-            (N'@Debug',             N'bit',            N'0',         N'Verbose output'),
-            (N'@StatsInParallel',   N'nvarchar(1)',    N'N',         N'Queue-based parallel processing'),
-            (N'@Help',              N'nvarchar(50)',   N'0',         N'1 = show this help')
+            (N'@FailFast',               N'bit',            N'0',   N'Abort on first error'),
+            (N'@AbortOnIntegrityError', N'bit',            N'1',   N'1 = abort run and surface IO_CORRUPTION on error 823/824/825 (default); 0 = emit CHECKDB advisory + IO_CORRUPTION warning code, count stat as failed, and continue processing'),
+            (N'@Debug',                 N'bit',            N'0',   N'Verbose output'),
+            (N'@StatsInParallel',       N'nvarchar(1)',    N'N',   N'Queue-based parallel processing'),
+            (N'@Help',                  N'nvarchar(50)',   N'0',   N'1 = show this help')
         ) AS r(parameter, data_type, default_value, description);
 
         /* RS 4: Help topics */
@@ -622,7 +656,7 @@ BEGIN
             (N'COLUMNSTORE',   N'@SkipTablesWithNCCI=Y (default) skips tables with nonclustered columnstore (plan stability).  @SkipTablesWithCCI=N (default) updates CCI tables.'),
             (N'WARNINGS',      N'@WarningsCodesOut returns pipe-delimited codes (e.g. AG_REDO_ELEVATED|TEMPDB_LOW) for programmatic parsing.  @WarningsOut is human-readable.'),
             (N'PARALLEL',      N'@StatsInParallel=Y. Requires dbo.Queue + dbo.QueueStatistic (auto-created). Run same EXEC from multiple Agent steps. AG-secondary guard and orphan-row sweep run at startup.'),
-            (N'QUERY STORE',   N'@QueryStore=CPU/DURATION/READS/etc. to prioritize stats on high-workload tables.  OFF to disable.'),
+            (N'QUERY STORE',   N'@QueryStore=CPU/DURATION/READS/etc. to prioritize stats on high-workload tables.  WAITS filters to Buffer Latch, Buffer IO, Memory, Other Disk IO -- wait classes statistics quality can influence.  OFF to disable.'),
             (N'MOP-UP',        N'@MopUpPass=Y: after priority pass, sweep any stat with modification_counter>0.  Needs @TimeLimit + @LogToTable=Y.'),
             (N'DIRECT MODE',   N'@Statistics=''Schema.Table.Stat'' for ad-hoc updates. Skips discovery.  Comma-separate for multiple.'),
             (N'STALE HOURS',   N'@StaleHours=48 means skip stats updated within 48 hours.  Replaces v2 @DaysStaleThreshold/@HoursStaleThreshold.'),
@@ -631,6 +665,7 @@ BEGIN
             (N'COMMANDLOG',      N'Requires dbo.CommandLog from https://ola.hallengren.com/scripts/CommandLog.sql.  Set @LogToTable=N if not installed.'),
             (N'DIAGNOSTICS',     N'Run sp_StatUpdate_Diag after for automated analysis.  @ExpertMode=1 for full detail, 0 for dashboard only.'),
             (N'CRITICAL TABLES', N'Use @CriticalTables + @CriticalSamplePercent to force higher sample rates on specific tables without affecting the rest.  Use @CriticalTablesFirst = Y to ensure critical tables are always processed first, even with QS ordering.  PERSIST_SAMPLE_PERCENT is auto-enabled for critical tables so auto-update between runs respects the sample rate.  Supports % wildcards (same syntax as @ExcludeTables).'),
+            (N'INTEGRITY ABORT',  N'@AbortOnIntegrityError=1 (default): I/O corruption errors (823/824/825) abort the run and set StopReason=IO_CORRUPTION.  Set to 0 to emit the CHECKDB advisory and IO_CORRUPTION warning code, count the stat as failed, and continue processing remaining stats.  The IO_CORRUPTION warning code is appended at most once per run regardless of how many integrity errors occur.  Note: @FailFast = 1 aborts on ANY failure, including integrity errors, regardless of @AbortOnIntegrityError = 0.'),
             (N'VERSION',         N'v3.0 -- simplified API (33 input + 10 OUTPUT vs 58 input + 10 OUTPUT in v2).  Full behavioral parity with v2.37.  Preset-first design.')
         ) AS t(topic, detail);
 
@@ -1657,6 +1692,15 @@ BEGIN
         @i_qs_min_executions bigint = 100,
         @i_qs_recent_hours int = 168,
         @i_qs_top_plans int = 500,
+        /* gh-544: wait categories where poor statistics are causally involved.
+           sys.query_store_wait_stats.wait_category reference (Microsoft docs):
+             5  = Buffer Latch    (tempdb allocation contention from sort/spill)
+             6  = Buffer IO       (PAGEIOLATCH -- scan/spill IO from bad cardinality)
+             17 = Memory          (RESOURCE_SEMAPHORE grant waits from bad estimates)
+             21 = Other Disk IO   (IO_COMPLETION -- sort and spill IO)
+           Excluded (prior wrong set): 3=Lock, 12=Preemptive, 15=Network IO --
+           none of which statistics quality can influence. */
+        @qs_wait_categories nvarchar(30) = N'5, 6, 17, 21',
         @i_mop_up_pass nvarchar(1) = N'N',
         @i_mop_up_min_remaining int = 60,
         @i_time_limit int = 18000,
@@ -2591,6 +2635,7 @@ BEGIN
         @TieredThresholds_int integer = @i_tiered_thresholds,
         @UpdateIncremental_int integer = @i_update_incremental,
         @FailFast_int integer = @FailFast,
+        @AbortOnIntegrityError_int integer = @AbortOnIntegrityError,
         @Debug_int integer = @Debug;
 
     IF @Preset IS NOT NULL
@@ -2631,6 +2676,7 @@ BEGIN
     RAISERROR(N'  @StatsInParallel         = %s', 10, 1, @StatsInParallel) WITH NOWAIT;
     RAISERROR(N'  @Execute                 = %s', 10, 1, @Execute) WITH NOWAIT;
     RAISERROR(N'  @FailFast                = %d', 10, 1, @FailFast_int) WITH NOWAIT;
+    RAISERROR(N'  @AbortOnIntegrityError   = %d', 10, 1, @AbortOnIntegrityError_int) WITH NOWAIT;
     IF @ExcludeTables IS NOT NULL
         RAISERROR(N'  @ExcludeTables           = %s', 10, 1, @ExcludeTables) WITH NOWAIT;
     IF @ExcludeStatistics IS NOT NULL
@@ -3097,7 +3143,7 @@ BEGIN
                     @i_mop_up_pass AS MopUpPass,
                     @i_mop_up_min_remaining AS MopUpMinRemainingSeconds,
                     @FailFast AS FailFast,
-
+                    @AbortOnIntegrityError AS AbortOnIntegrityError,
 
                     /* Adaptive sampling */
                     @LongRunningThresholdMinutes AS LongRunningThresholdMinutes,
@@ -3992,6 +4038,12 @@ OPTION (RECOMPILE);';
                     unfiltered_rows bigint NULL,
                     persisted_sample_percent float NULL,
                     histogram_steps int NULL,
+                    /* gh-550: physical row count for NEVER-UPDATED (fresh) stats.
+                       sys.dm_db_stats_properties returns rows=NULL/modification_counter=NULL
+                       for stats that have never been computed, so we need an alternate
+                       row-count source (sys.partitions) to distinguish empty tables from
+                       populated tables that just never had statistics computed. */
+                    physical_row_count bigint NULL,
                     /* Phase 3: tier thresholds */
                     tier_threshold bigint NULL,
                     sqrt_threshold bigint NULL,
@@ -4182,6 +4234,33 @@ OPTION (RECOMPILE);';
                     RAISERROR(N''    Phase 2 (enriched): %d stats (%d ms)'', 10, 1, @phase2_count, @phase_ms) WITH NOWAIT;
 
                 /*
+                gh-550 (Phase 2b): Fresh-stat physical row-count lookup.
+                sys.dm_db_stats_properties returns NULL for stats that have never
+                been computed (fresh CREATE STATISTICS + populated INSERT with no
+                subsequent query touching the column).  These stats fall through
+                Phase 4 qualification because ISNULL(sp.rows, 0) = 0 and
+                ISNULL(sp.modification_counter, 0) = 0 make every threshold branch
+                false.  Look up a physical row count from sys.partitions so Phase 4
+                can distinguish never-computed-on-populated-table (should qualify)
+                from never-computed-on-empty-table (should NOT qualify).
+
+                Scoped to sc.last_updated IS NULL to keep this lookup targeted --
+                fresh stats are rare, so a blanket join to sys.partitions is
+                unwarranted.  index_id IN (0, 1) covers heap and clustered
+                (the base storage), matching the Phase 5 page_count pattern.
+                */
+                UPDATE sc
+                SET sc.physical_row_count = pr.physical_rows
+                FROM #stat_candidates AS sc
+                OUTER APPLY (
+                    SELECT physical_rows = SUM(p.rows)
+                    FROM sys.partitions AS p
+                    WHERE p.object_id = sc.object_id
+                    AND   p.index_id IN (0, 1)
+                ) AS pr
+                WHERE sc.last_updated IS NULL;
+
+                /*
                 VALIDATION: CROSS APPLY filters out stats with no properties.
                 This is expected for never-updated stats. Log if significant.
                 Unexpected total loss (enrichment <1% of candidates) emits a WARNING and
@@ -4338,11 +4417,31 @@ OPTION (RECOMPILE);';
                 Stats with delta=0 are already current and skip qualification.
                 ================================================================
                 */
-                /* Apply threshold logic (v3: OR is the only supported mode) */
+                /* Apply threshold logic (v3: OR is the only supported mode).
+                   gh-550: Fresh stats (last_updated IS NULL) with physical rows > 0
+                   ALSO pass the outer gate and qualify.  These are stats that have
+                   NEVER been computed against a populated table -- silently skipping
+                   them leaves the optimizer with a phantom "0 rows" histogram.
+                   Fresh stats on EMPTY tables (physical_row_count = 0 or NULL) still
+                   do NOT qualify.  Stats that HAVE been updated before but currently
+                   show 0 modifications are still gated out (re-updating an
+                   unmodified histogram is pointless).
+
+                   PARENTHESIZATION NOTE: this WHERE clause has a history of
+                   operator-precedence bugs (v1.5.2026.0120 gh-#41 wrapped the OR-chain
+                   in an outer paren to keep table/exclusion filters applying to
+                   both threshold modes).  The outer WHERE is `(gate1 OR gate2) AND (branch1 OR ...)`;
+                   the fresh-stat rescue is added to BOTH sides so it survives both
+                   the outer gate AND the inner threshold-branch test. */
                 UPDATE #stat_candidates
                 SET qualifies = 1
-                WHERE effective_counter > 0  /* gh-502: skip stats with delta=0 (already current) */
-                AND (
+                WHERE
+                (
+                    effective_counter > 0  /* gh-502: skip stats with delta=0 (already current) */
+                    OR (last_updated IS NULL AND ISNULL(physical_row_count, 0) > 0)  /* gh-550: NEVER_UPDATED rescue */
+                )
+                AND
+                (
                     /* Fixed modification threshold */
                     (@ModificationThreshold_param IS NOT NULL AND effective_counter >= @ModificationThreshold_param)
                     /* Modification percent (non-tiered) */
@@ -4352,10 +4451,31 @@ OPTION (RECOMPILE);';
                     OR (@i_tiered_thresholds_param = 1 AND (effective_counter >= tier_threshold OR effective_counter >= sqrt_threshold))
                     /* Hours stale (v2.3) */
                     OR (@StaleHours_param IS NOT NULL AND hours_stale >= @StaleHours_param)
+                    /* gh-550: NEVER_UPDATED branch -- fresh stats with physical rows always qualify */
+                    OR (last_updated IS NULL AND ISNULL(physical_row_count, 0) > 0)
                     /* No thresholds = include all */
                     OR (@ModificationThreshold_param IS NULL AND @i_modification_percent_param IS NULL
                         AND @i_tiered_thresholds_param = 0 AND @StaleHours_param IS NULL)
                 );
+
+                /* gh-550: Report fresh-qualified count when @Debug=1.
+                   Counted AFTER the qualification UPDATE so we see the real rescue count. */
+                IF @Debug_param = 1
+                BEGIN
+                    DECLARE @fresh_qualified int =
+                        (SELECT COUNT(*) FROM #stat_candidates
+                         WHERE qualifies = 1
+                         AND   last_updated IS NULL
+                         AND   ISNULL(physical_row_count, 0) > 0);
+                    IF @fresh_qualified > 0
+                    BEGIN
+                        DECLARE @fresh_msg nvarchar(200) =
+                            N''    Phase 4: NEVER_UPDATED rescue qualified '' +
+                            CONVERT(nvarchar(20), @fresh_qualified) +
+                            N'' fresh stat(s) on populated tables (gh-550)'';
+                        RAISERROR(@fresh_msg, 10, 1) WITH NOWAIT;
+                    END;
+                END;
 
                 /*
                 #143: Ascending key boost -- identity column stats with ANY modifications
@@ -4802,7 +4922,9 @@ OPTION (RECOMPILE);';
                     IF OBJECT_ID(N''sys.query_store_wait_stats'') IS NOT NULL
                     AND @i_qs_metric_param = N''WAITS''
                     BEGIN
-                        /* #431: compute TopPlanIds for WAITS FIRST, then parse XML only for those plans */
+                        /* #431: compute TopPlanIds for WAITS FIRST, then parse XML only for those plans.
+                           gh-544: wait_category filtered via {{WAITS_CATEGORIES}} token
+                           (Buffer Latch=5, Buffer IO=6, Memory=17, Other Disk IO=21). */
                         ;WITH WaitTopPlanIds AS (
                             SELECT TOP (ISNULL(@i_qs_top_plans_param, 2147483647))
                                 qsp2.plan_id
@@ -4810,7 +4932,7 @@ OPTION (RECOMPILE);';
                             JOIN sys.query_store_wait_stats AS qsws2 ON qsws2.plan_id = qsp2.plan_id
                             JOIN sys.query_store_runtime_stats_interval AS qsrsi2
                                 ON qsrsi2.runtime_stats_interval_id = qsws2.runtime_stats_interval_id
-                            WHERE qsws2.wait_category IN (3, 12, 15)
+                            WHERE qsws2.wait_category IN ({{WAITS_CATEGORIES}})
                               AND qsrsi2.end_time >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME())
                             GROUP BY qsp2.plan_id
                             ORDER BY SUM(qsws2.total_query_wait_time_ms) DESC
@@ -4846,7 +4968,7 @@ OPTION (RECOMPILE);';
                             JOIN sys.query_store_runtime_stats_interval AS qsrsi
                                 ON qsrsi.runtime_stats_interval_id = qsws.runtime_stats_interval_id
                             WHERE qsrsi.end_time >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME())
-                            AND qsws.wait_category IN (3, 12, 15) /* BufferIO, Memory, SortAndTempDb */
+                            AND qsws.wait_category IN ({{WAITS_CATEGORIES}}) /* gh-544: Buffer Latch=5, Buffer IO=6, Memory=17, Other Disk IO=21 */
                             GROUP BY wfr.object_id
                         )
                         UPDATE sc
@@ -4911,7 +5033,15 @@ OPTION (RECOMPILE);';
                         ELSE CONVERT(bit, 0)
                     END,
                     ISNULL(modification_counter, 0) AS modification_counter,
-                    row_count = ISNULL(rows, 0),
+                    /* gh-550: for fresh stats (last_updated IS NULL), sp.rows is NULL and
+                       ISNULL coerces it to 0.  Fall back to physical_row_count (from
+                       sys.partitions) so downstream row_count reflects reality -- otherwise
+                       QualifyReason and other row-based logic see a phantom 0-row table. */
+                    row_count = CASE
+                                    WHEN last_updated IS NULL AND ISNULL(rows, 0) = 0
+                                    THEN ISNULL(physical_row_count, 0)
+                                    ELSE ISNULL(rows, 0)
+                                END,
                     ISNULL(days_stale, 9999) AS days_stale,
                     ISNULL(page_count, 0) AS page_count,
                     persisted_sample_percent,
@@ -5018,9 +5148,16 @@ OPTION (RECOMPILE);';
                     ELSE N'SUM(CONVERT(float, 0))'
                     END);
 
+                /* gh-544: Inject stats-relevant wait categories (centralized in @qs_wait_categories).
+                   Replaces {{WAITS_CATEGORIES}} in the per-database staged_sql body (sites 1 and 2:
+                   WaitTopPlanIds and WaitByTable CTEs).  Numeric constant -- not user input. */
+                SET @staged_sql = REPLACE(@staged_sql, N'{{WAITS_CATEGORIES}}', @qs_wait_categories);
+
                 /* Version-gate WAITS: sys.query_store_wait_stats added in SQL 2017 (14.x).
                    bd -iqw: pre-aggregate wait stats in a CTE + LEFT JOIN instead of
-                   a correlated subquery in the ORDER BY (O(N+M) vs O(N*M) on large QS). */
+                   a correlated subquery in the ORDER BY (O(N+M) vs O(N*M) on large QS).
+                   gh-544: wait_category list sourced from @qs_wait_categories
+                   (Buffer Latch=5, Buffer IO=6, Memory=17, Other Disk IO=21). */
                 SET @staged_sql = REPLACE(@staged_sql, N'{{WAITS_CTE}}',
                     CASE WHEN @sql_major_version >= 14
                     THEN N'WaitsByPlan AS (
@@ -5028,7 +5165,7 @@ OPTION (RECOMPILE);';
                         FROM sys.query_store_wait_stats AS qsws
                         JOIN sys.query_store_runtime_stats_interval AS qsrsi2
                             ON qsrsi2.runtime_stats_interval_id = qsws.runtime_stats_interval_id
-                        WHERE qsws.wait_category IN (3, 12, 15)
+                        WHERE qsws.wait_category IN (' + @qs_wait_categories + N')
                           AND qsrsi2.end_time >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME())
                         GROUP BY qsws.plan_id
                     ),
@@ -5899,7 +6036,9 @@ OPTION (RECOMPILE);';
             /* gh-513: critical-table params affect discovery and sample rate */
             ISNULL(@CriticalTables, N''), @CriticalSamplePercent, @CriticalTablesFirst,
             /* sp_StatUpdate-mknv: first-time cap affects sample rate -- include in fingerprint */
-            ISNULL(CONVERT(nvarchar(20), @FirstTimeFullScanCapRows), N'NULL')
+            ISNULL(CONVERT(nvarchar(20), @FirstTimeFullScanCapRows), N'NULL'),
+            /* f14h: abort behavior on integrity errors -- divergent workers must not share a queue */
+            CONVERT(nvarchar(1), @AbortOnIntegrityError)
         );
         /* sp_StatUpdate-rse2: conflict is flagged inside the TRY below and acted
            on at the FingerprintConflictExit label OUTSIDE all TRY scopes.  The
@@ -8590,6 +8729,17 @@ OPTION (RECOMPILE);';
                                     THEN N'MOP_UP'
                                     WHEN @mode = N'DIRECT_STRING'
                                     THEN N'DIRECT_MODE'
+                                    /* gh-550: NEVER_UPDATED rescue.  Ordered ABOVE QUERY_STORE_PRIORITY
+                                       and DAYS_STALE because it is a stronger, more specific signal
+                                       (the stat has NEVER been computed -- no histogram exists),
+                                       but BELOW mop-up/direct which describe processing mode.
+                                       days_stale = 9999 exactly: that is the ISNULL sentinel for
+                                       last_updated IS NULL; >= would also match genuinely ancient
+                                       stats (> 27 years) entering via DIRECT_STRING. */
+                                    WHEN @current_modification_counter = 0
+                                    AND  @current_days_stale = 9999
+                                    AND  @current_row_count > 0
+                                    THEN N'NEVER_UPDATED'
                                     WHEN @current_qs_priority_boost > 0
                                     THEN N'QUERY_STORE_PRIORITY'
                                     WHEN @current_has_filter = 1
@@ -8809,6 +8959,37 @@ OPTION (RECOMPILE);';
                 BEGIN
                     SELECT @stats_toctou += 1;
                     RAISERROR(N'  ~ TOCTOU skip (error %d): object/statistic no longer exists -- not counted as failure.', 10, 1, @current_error_number) WITH NOWAIT;
+
+                    /*
+                    GAP 2 (f14h): Close the pre-execution CommandLog row that was inserted above
+                    (Ola two-phase pattern).  Without this, the row has NULL EndTime and is
+                    indistinguishable from a killed stat in sp_StatUpdate_Diag C1 / orphan cleanup.
+                    Convention mirrors the pre-execution TOCTOU check (~line 8343): ErrorMessage
+                    uses the TOCTOU_SKIP marker so downstream consumers see one consistent label.
+                    ExtendedInfo intentionally left NULL (v3.5.1 design: TOCTOU rows must not
+                    carry rich XML so the diag tool cannot aggregate them as real failures).
+                    ErrorNumber intentionally left NULL: sp_StatUpdate_Diag treats ErrorNumber > 0
+                    as a genuine failure (failure clustering, failing-stats result set, reliability
+                    grade), so a TOCTOU skip must not carry one.  The raw error number is preserved
+                    in the ErrorMessage text for forensics.
+                    */
+                    IF  @LogToTable = N'Y'
+                    AND @commandlog_exists = 1
+                    AND @current_commandlog_id IS NOT NULL
+                    BEGIN
+                        BEGIN TRY
+                            UPDATE dbo.CommandLog
+                            SET EndTime      = @current_end_time,
+                                ErrorMessage = N'TOCTOU_SKIP (error ' + CONVERT(nvarchar(10), @current_error_number) + N'): object/statistic no longer exists (dropped between discovery and execution)'
+                            WHERE ID = @current_commandlog_id;
+                        END TRY
+                        BEGIN CATCH
+                            /* Non-critical -- ignore; row will be swept by orphan cleanup */
+                        END CATCH;
+                        /* Null out ID so the general CATCH CommandLog update below
+                           does not overwrite the TOCTOU_SKIP closure we just wrote. */
+                        SET @current_commandlog_id = NULL;
+                    END;
                 END;
                 ELSE
                 BEGIN
@@ -8879,6 +9060,12 @@ OPTION (RECOMPILE);';
                                         THEN N'MOP_UP'
                                         WHEN @mode = N'DIRECT_STRING'
                                         THEN N'DIRECT_MODE'
+                                        /* gh-550: NEVER_UPDATED rescue (mirrors success-path CASE;
+                                           = 9999 is the ISNULL sentinel for last_updated IS NULL) */
+                                        WHEN @current_modification_counter = 0
+                                        AND  @current_days_stale = 9999
+                                        AND  @current_row_count > 0
+                                        THEN N'NEVER_UPDATED'
                                         WHEN @current_qs_priority_boost > 0
                                         THEN N'QUERY_STORE_PRIORITY'
                                         WHEN @current_has_filter = 1
@@ -8945,18 +9132,35 @@ OPTION (RECOMPILE);';
                     @return_code = @current_error_number;
 
                 /*
-                I/O corruption (823/824/825): Abort immediately and advise CHECKDB (#222).
-                Continuing stats maintenance on a database with I/O corruption risks further damage.
+                I/O corruption (823/824/825): advise CHECKDB and either abort or continue
+                depending on @AbortOnIntegrityError (#222, f14h).
+                Default (@AbortOnIntegrityError = 1): abort immediately -- continuing stats
+                maintenance on a corrupt database risks further damage.
+                Optional (@AbortOnIntegrityError = 0): emit advisory, append warning code
+                (deduplicated), count stat as failed (already done in ELSE branch above),
+                and continue processing remaining stats.
                 */
                 IF @current_error_number IN (823, 824, 825)
                 BEGIN
                     RAISERROR(N'', 10, 1) WITH NOWAIT;
-                    RAISERROR(N'CRITICAL: I/O corruption detected (error %d). Aborting stats maintenance.', 16, 1, @current_error_number) WITH NOWAIT;
                     RAISERROR(N'  Run DBCC CHECKDB on database [%s] to assess corruption extent.', 10, 1, @current_database) WITH NOWAIT;
-                    SELECT @stop_reason = N'IO_CORRUPTION';
-                    SET @warnings = @warnings + N'IO_CORRUPTION: Error ' + CONVERT(nvarchar(10), @current_error_number) + N' on [' + @current_database + N']; ';
-                    SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'IO_CORRUPTION';
-                    BREAK;
+                    /* Deduplicate IO_CORRUPTION warning code -- append at most once per run */
+                    IF ISNULL(@WarningsCodesOut, N'') NOT LIKE N'%IO_CORRUPTION%'
+                    BEGIN
+                        SET @warnings = @warnings + N'IO_CORRUPTION: Error ' + CONVERT(nvarchar(10), @current_error_number) + N' on [' + @current_database + N']; ';
+                        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'IO_CORRUPTION';
+                    END;
+                    IF @AbortOnIntegrityError = 1
+                    BEGIN
+                        RAISERROR(N'CRITICAL: I/O corruption detected (error %d). Aborting stats maintenance.', 16, 1, @current_error_number) WITH NOWAIT;
+                        SELECT @stop_reason = N'IO_CORRUPTION';
+                        BREAK;
+                    END;
+                    ELSE
+                    BEGIN
+                        RAISERROR(N'WARNING: I/O corruption detected (error %d). @AbortOnIntegrityError=0 -- continuing processing. Investigate immediately.', 10, 1, @current_error_number) WITH NOWAIT;
+                        /* Stat already counted as failed in ELSE branch above; no BREAK. */
+                    END;
                 END;
 
                 /*
