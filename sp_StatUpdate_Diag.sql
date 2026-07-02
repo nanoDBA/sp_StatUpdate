@@ -36,9 +36,39 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.06.12.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.02.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.06.12.1 - Silent no-op parallel run detection (sp_StatUpdate-kzx0,
+History:    2026.07.02.1 - Phase-B diagnostic batch (70hh, 1h2l, 8gws, xmxs, 4g9s, t8lj):
+                           (70hh) Skip-row ingestion fix: SKIPPED: Command and TOCTOU_SKIP
+                           ErrorMessage rows excluded at cache and direct-path ingestion
+                           layers.  They no longer pollute duration/appearance/top-table
+                           aggregates.  StatsToctou ingested from END Summary XML into
+                           #runs and surfaced in RS4 Run Detail.
+                           (1h2l) QSEnrichmentSkipped ingested from END Summary XML into
+                           #runs.  W5 QS_NOT_EFFECTIVE now uses it as the primary signal
+                           (direct element read); inference via QSPlanCount/CPU fallback
+                           retained for older rows where element is absent.
+                           (8gws) I4 UNUSED_FEATURES catalog refresh: added I4c
+                           (@FirstTimeFullScanCapRows, v3.5.4), I4d (@CriticalTables,
+                           v3.5.0), I4e (@AbortOnIntegrityError, v3.5.9 -- only
+                           surfaces when IO_CORRUPTION stop reason is seen in history).
+                           (xmxs) Removed dead v2 leftover: GroupByJoinPattern XPath
+                           extraction, @latest_group_join variable, and GroupByJoinPattern
+                           column from #runs and RS8 Parameter History.  Element is absent
+                           in v3 START XML and variable had zero consumers.
+                           (4g9s) New W14 RECURRING_SAFETY_STOP: fires when the same
+                           safety StopReason (TEMPDB_PRESSURE, AG_REDO_QUEUE,
+                           LOG_SPACE_HIGH, IO_CORRUPTION, FAIL_FAST,
+                           CONSECUTIVE_FAILURES, BATCH_LIMIT) appears in >= 2 runs.
+                           One finding row per recurring reason with reason-specific
+                           remediation.  Evidence caps at 10 most-recent StartTimes.
+                           (t8lj) New WarningsCodes column in #runs, ingested from END
+                           Summary XML (pipe-delimited tokens, v3.5.9+).  New W15
+                           RECURRING_RUNTIME_WARNING (environmental/actionable codes)
+                           and I16 RECURRING_RUNTIME_WARNING (informational codes) fire
+                           when a code appears in >= 3 runs or >= 50%% of non-killed
+                           runs.  Old runs without element produce zero findings.
+            2026.06.12.1 - Silent no-op parallel run detection (sp_StatUpdate-kzx0,
                            validated against the -v31y zombie-queue incident).
                            (1) New CRITICAL check C6 SILENT_NOOP_RUN: flags
                            non-killed runs that report a normal-completion
@@ -378,8 +408,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.06.12.1',
-        @procedure_version_date datetime = '20260612';
+        @procedure_version varchar(20) = '2026.07.02.1',  /* orchestrator bumps this */
+        @procedure_version_date datetime = '20260612';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -494,7 +524,10 @@ BEGIN
                 (N'W11', N'WARNING', N'MOPUP_LOW_YIELD',       N'Mop-up pass consistently unable to process most of the stats it discovers (avg <50% yield across 3+ runs).'),
                 (N'W12', N'WARNING', N'PRIORITY_PASS_EMPTY',   N'Priority pass averages <5 stats across 3+ mop-up runs -- mop-up is doing all the work.  Lower @ModificationThreshold so the priority pass captures more stats.'),
                 (N'I15', N'INFO',    N'HEAP_TIME_BUDGET',      N'Heap tables account for >50% of total maintenance time.  @CollectHeapForwarding and heap REBUILD may help.'),
-                (N'W13', N'WARNING', N'PERPETUALLY_SKIPPED',   N'Stats consistently discovered but never updated across N consecutive runs due to time limits.  Increase @TimeLimit, lower @ModificationThreshold, or use @SortOrder=MODIFICATION_VELOCITY.')
+                (N'W13', N'WARNING', N'PERPETUALLY_SKIPPED',   N'Stats consistently discovered but never updated across N consecutive runs due to time limits.  Increase @TimeLimit, lower @ModificationThreshold, or use @SortOrder=MODIFICATION_VELOCITY.'),
+                (N'W14', N'WARNING', N'RECURRING_SAFETY_STOP', N'The same safety-stop StopReason (TEMPDB_PRESSURE, AG_REDO_QUEUE, LOG_SPACE_HIGH, IO_CORRUPTION, FAIL_FAST, CONSECUTIVE_FAILURES, BATCH_LIMIT) appears in >= 2 runs within the analysis window.  Each recurring reason produces one finding row with reason-specific remediation. (4g9s)'),
+                (N'W15', N'WARNING', N'RECURRING_RUNTIME_WARNING', N'An environmental/actionable WarningsCodes token from END Summary XML appears in >= 3 runs or >= 50%% of runs.  Codes: BACKUP_RUNNING, BACKUP_STARTED_MID_RUN, LOG_SPACE_HIGH, IO_CORRUPTION, CONTAINER_MEMORY, RCSI_VERSION_STORE, ELASTIC_POOL, PEAK_HOURS, STOPBYTIME_OVERSHOOT, CONSECUTIVE_FAILURES_ELEVATED, PERSIST_SAMPLE_INADEQUATE, PARALLEL_ORPHAN_BACKLOG, STALE_QUEUE_SWEEP, DB_SKIPPED, BACKUP_STARTED_MID_RUN.  Old runs without WarningsCodes produce no findings. (t8lj)'),
+                (N'I16', N'INFO',    N'RECURRING_RUNTIME_WARNING', N'A purely informational WarningsCodes token appears in >= 3 runs or >= 50%% of runs.  Codes: CDC_TABLES, REPLICATION_MAJORITY, COLUMNSTORE_TABLES, RLS_DETECTED, FILTER_MISMATCH, CASE_SENSITIVE_COLLATION, AZURE_SQL_DB/MI/EDGE, LOW_UPTIME, TOCTOU_SKIPS, EMPTY_STRING_PARAM, DEAD_WORKER_TIMEOUT_NULL_COERCED, and any unrecognized codes.  Old runs without WarningsCodes produce no findings. (t8lj)')
         ) AS v (check_id, severity, category, description);
 
         /* Result set 3: Result set order */
@@ -1313,7 +1346,7 @@ BEGIN
         Preset nvarchar(30) NULL,
         LongRunningThresholdMinutes integer NULL,
         LongRunningSamplePercent integer NULL,
-        GroupByJoinPattern nvarchar(1) NULL,
+        /* GroupByJoinPattern removed (v3 no-op -- element absent from v3 START XML; xmxs) */
         FilteredStatsMode nvarchar(10) NULL,
         BatchLimit integer NULL,
         FailFast bit NULL,
@@ -1321,6 +1354,11 @@ BEGIN
         MopUpTriggered bit NULL,
         MopUpFound integer NULL,
         MopUpProcessed integer NULL,
+        /* END Summary fields added in this batch (70hh, 1h2l) */
+        StatsToctou integer NULL,               /* Summary/StatsToctou  -- count of TOCTOU_SKIP catches per run (v3.5.9+) */
+        QSEnrichmentSkipped bit NULL,           /* Summary/QSEnrichmentSkipped -- 1 when QS phase was skipped (v3+) */
+        /* Recurring-warning support (t8lj) */
+        WarningsCodes nvarchar(max) NULL,       /* Summary/WarningsCodes -- pipe-delimited code tokens (v3.5.9+) */
         /* Computed */
         IsKilled bit NOT NULL DEFAULT 0,
         TotalGB decimal(10, 2) NULL /* sum of PageCount * 8KB for succeeded stats in this run */
@@ -1371,6 +1409,9 @@ BEGIN
         ProcessingPosition integer NULL,
         ObjectId integer NULL,           /* #268: from ExtendedInfo v2.20+ */
         StatsId integer NULL,            /* #268: from ExtendedInfo v2.20+ */
+        /* 70hh: skip-row flag -- 1 when Command begins 'SKIPPED:' or ErrorMessage begins 'TOCTOU_SKIP'.
+           Rows with IsSkip=1 are excluded from duration/appearance/success aggregates. */
+        IsSkip bit NOT NULL DEFAULT 0,
 
         CONSTRAINT PK_stat_updates PRIMARY KEY NONCLUSTERED (ID)
     );
@@ -1437,8 +1478,10 @@ BEGIN
         [Version], [Databases], TimeLimit, ModificationThreshold, TieredThresholds,
         ThresholdLogic, SortOrder, QueryStorePriority, StatisticsSample,
         StatsInParallel, Preset, LongRunningThresholdMinutes, LongRunningSamplePercent,
-        GroupByJoinPattern, FilteredStatsMode, BatchLimit, FailFast,
-        MopUpTriggered, MopUpFound, MopUpProcessed, IsKilled
+        FilteredStatsMode, BatchLimit, FailFast,
+        MopUpTriggered, MopUpFound, MopUpProcessed,
+        StatsToctou, QSEnrichmentSkipped, WarningsCodes,
+        IsKilled
     )
     SELECT
         run_label           = ISNULL(s.ExtendedInfo.value(N''(Parameters/RunLabel)[1]'', N''nvarchar(100)''),
@@ -1473,13 +1516,19 @@ BEGIN
         preset              = s.ExtendedInfo.value(N''(Parameters/Preset)[1]'', N''nvarchar(30)''),
         long_run_min        = s.ExtendedInfo.value(N''(Parameters/LongRunningThresholdMinutes)[1]'', N''int''),
         long_run_pct        = s.ExtendedInfo.value(N''(Parameters/LongRunningSamplePercent)[1]'', N''int''),
-        group_join          = s.ExtendedInfo.value(N''(Parameters/GroupByJoinPattern)[1]'', N''nvarchar(1)''),
+        /* GroupByJoinPattern extraction removed (xmxs): element absent in v3 START XML; variable was never consumed */
         filtered_mode       = s.ExtendedInfo.value(N''(Parameters/FilteredStatsMode)[1]'', N''nvarchar(10)''),
         batch_limit         = s.ExtendedInfo.value(N''(Parameters/BatchLimit)[1]'', N''int''),
         fail_fast           = s.ExtendedInfo.value(N''(Parameters/FailFast)[1]'', N''bit''),
         mop_up_triggered    = e.ExtendedInfo.value(N''(Summary/MopUpTriggered)[1]'', N''bit''),
         mop_up_found        = e.ExtendedInfo.value(N''(Summary/MopUpFound)[1]'', N''int''),
         mop_up_processed    = e.ExtendedInfo.value(N''(Summary/MopUpProcessed)[1]'', N''int''),
+        /* 70hh: TOCTOU skip count from END Summary XML (v3.5.9+); NULL on older rows */
+        stats_toctou        = e.ExtendedInfo.value(N''(Summary/StatsToctou)[1]'', N''int''),
+        /* 1h2l: QSEnrichmentSkipped from END Summary XML; NULL on older rows (absent element) */
+        qs_enrichment_skipped = e.ExtendedInfo.value(N''(Summary/QSEnrichmentSkipped)[1]'', N''bit''),
+        /* t8lj: pipe-delimited warning code tokens from END Summary XML (v3.5.9+); NULL on older rows */
+        warnings_codes      = e.ExtendedInfo.value(N''(Summary/WarningsCodes)[1]'', N''nvarchar(max)''),
         is_killed           = CASE
                                   WHEN e.ID IS NULL THEN 1
                                   WHEN e.ExtendedInfo.value(N''(Summary/StopReason)[1]'', N''nvarchar(50)'') = N''KILLED'' THEN 1
@@ -1594,7 +1643,11 @@ BEGIN
             c.ExtendedInfo.value(N''(ExtendedInfo/StatsId)[1]'', N''int'')
         FROM ' + @commandlog_ref + N' AS c
         WHERE c.CommandType = N''UPDATE_STATISTICS''
-        AND   c.ID > @watermark;
+        AND   c.ID > @watermark
+        /* 70hh: exclude skip markers -- Command begins SKIPPED: (pre-check path)
+                 or ErrorMessage begins TOCTOU_SKIP (CATCH-path v3.5.9+).
+                 These carry 0ms duration and pollute duration/appearance/top-table aggregates. */
+        AND   NOT (c.Command LIKE N''SKIPPED:%'' OR ISNULL(c.ErrorMessage, N'''') LIKE N''TOCTOU_SKIP%'');
         ';
 
         DECLARE @cache_new_rows integer;
@@ -1685,7 +1738,9 @@ BEGIN
             stats_id            = c.ExtendedInfo.value(N''(ExtendedInfo/StatsId)[1]'', N''int'')
         FROM ' + @commandlog_ref + N' AS c
         WHERE c.CommandType = N''UPDATE_STATISTICS''
-        AND   c.StartTime >= DATEADD(DAY, -@days_back, GETDATE());
+        AND   c.StartTime >= DATEADD(DAY, -@days_back, GETDATE())
+        /* 70hh: exclude skip markers (same filter as cache path) */
+        AND   NOT (c.Command LIKE N''SKIPPED:%'' OR ISNULL(c.ErrorMessage, N'''') LIKE N''TOCTOU_SKIP%'');
         ';
 
         EXECUTE sys.sp_executesql
@@ -1694,9 +1749,11 @@ BEGIN
             @days_back = @DaysBack;
     END;
 
+    /* 70hh: IsSkip is always 0 at this point (skip rows excluded at ingestion).
+       @stat_update_count = real updates only; skip rows never enter #stat_updates. */
     DECLARE @stat_update_count integer = (SELECT COUNT_BIG(*) FROM #stat_updates);
 
-    RAISERROR(N'  Stat updates found: %i', 10, 1, @stat_update_count) WITH NOWAIT;
+    RAISERROR(N'  Stat updates found: %i (skip rows excluded at ingestion -- 70hh)', 10, 1, @stat_update_count) WITH NOWAIT;
 
     IF @Debug = 1
     BEGIN
@@ -2554,8 +2611,11 @@ BEGIN
             @latest_parallel nvarchar(1),
             @latest_preset nvarchar(30),
             @latest_long_run_min integer,
-            @latest_group_join nvarchar(1),
-            @latest_sort_order nvarchar(50);
+            /* @latest_group_join removed (xmxs): GroupByJoinPattern has no v3 equivalent */
+            @latest_sort_order nvarchar(50),
+            @latest_first_time_fullscan_cap_rows bigint,  /* 8gws: I4 detection for v3.5.4+ param */
+            @latest_critical_tables nvarchar(max),        /* 8gws: I4 detection for v3.5.0+ param */
+            @latest_abort_on_integrity bit;               /* 8gws: I4 detection for v3.5.9+ param */
 
         SELECT
             @latest_tiered = TieredThresholds,
@@ -2565,7 +2625,7 @@ BEGIN
             @latest_parallel = StatsInParallel,
             @latest_preset = Preset,
             @latest_long_run_min = LongRunningThresholdMinutes,
-            @latest_group_join = GroupByJoinPattern,
+            /* GroupByJoinPattern no longer read from #runs (xmxs) */
             @latest_sort_order = SortOrder
         FROM #runs
         WHERE RunLabel = @latest_run_label;
@@ -2817,6 +2877,18 @@ BEGIN
             WHERE su.QSPlanCount IS NOT NULL /* 0 = enrichment ran (no match), >0 = matched; NULL = skipped */
         );
 
+        /* 1h2l: QSEnrichmentSkipped direct signal from END Summary XML (v3+ only).
+           When present, use as the authoritative skip indicator.  Inference via
+           QSPlanCount/QSTotalCpuMs stays as fallback for older rows where the element
+           is absent (QSEnrichmentSkipped IS NULL). */
+        DECLARE @w5_enrichment_skipped_runs integer = (
+            SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 0 AND QSEnrichmentSkipped = 1
+        );
+        DECLARE @w5_enrichment_element_present bit = (
+            SELECT CASE WHEN COUNT(*) > 0 THEN CONVERT(bit, 1) ELSE CONVERT(bit, 0) END
+            FROM #runs WHERE IsKilled = 0 AND QSEnrichmentSkipped IS NOT NULL
+        );
+
         /* sp_StatUpdate-6x80: detect whether ALL QS-priority runs are parallel.
            In parallel mode, ProcessingPosition is a per-worker counter (not a
            global rank), so the absence of per-stat QS data in stat updates does
@@ -2840,7 +2912,15 @@ BEGIN
             FROM #stat_updates AS su
         );
 
-        IF @w5_qs_data_runs = 0
+        /* 1h2l: Primary signal -- when QSEnrichmentSkipped element is present in END rows
+           AND indicates skipping in ALL non-killed QS-priority runs, treat as definitive skip.
+           Inference (QSPlanCount/CPU) is fallback when element is absent (old rows). */
+        DECLARE @w5_definitive_skipped bit = 0;
+        IF @w5_enrichment_element_present = 1
+            AND @w5_enrichment_skipped_runs = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 0 AND QueryStorePriority = N'Y')
+            SET @w5_definitive_skipped = 1;
+
+        IF @w5_definitive_skipped = 1 OR @w5_qs_data_runs = 0
         BEGIN
             /* sp_StatUpdate-6x80: when all QS-priority runs are parallel AND QS
                CPU data was observed in stat updates, the zero-QSPlanCount signal
@@ -3814,6 +3894,26 @@ BEGIN
        ====================================================================== */
     IF @latest_run_label IS NOT NULL
     BEGIN
+        /* 8gws: Extract newer v3 parameters from the most recent START record.
+           These are not stored in #runs columns (added in v3.5.0/v3.5.4/v3.5.9)
+           so we pull them directly from CommandLog XML here. */
+        SET @sql = N'
+        SELECT
+            @ftfs = cl.ExtendedInfo.value(N''(Parameters/FirstTimeFullScanCapRows)[1]'', N''bigint''),
+            @ct   = cl.ExtendedInfo.value(N''(Parameters/CriticalTables)[1]'', N''nvarchar(max)''),
+            @aoi  = cl.ExtendedInfo.value(N''(Parameters/AbortOnIntegrityError)[1]'', N''bit'')
+        FROM ' + @commandlog_ref + N' AS cl
+        WHERE cl.CommandType = N''SP_STATUPDATE_START''
+          AND cl.ExtendedInfo.value(N''(Parameters/RunLabel)[1]'', N''nvarchar(100)'') = @run_label;
+        ';
+        EXECUTE sys.sp_executesql
+            @sql,
+            N'@run_label nvarchar(100), @ftfs bigint OUTPUT, @ct nvarchar(max) OUTPUT, @aoi bit OUTPUT',
+            @run_label = @latest_run_label,
+            @ftfs = @latest_first_time_fullscan_cap_rows OUTPUT,
+            @ct   = @latest_critical_tables OUTPUT,
+            @aoi  = @latest_abort_on_integrity OUTPUT;
+
         /* I4a: No preset */
         IF @latest_preset IS NULL
         BEGIN
@@ -3844,6 +3944,80 @@ BEGIN
                 N'Adaptive sampling uses CommandLog history to identify slow stats and apply reduced sampling.',
                 N'EXECUTE dbo.sp_StatUpdate @LongRunningThresholdMinutes = 15, @LongRunningSamplePercent = 10;',
                 65
+            );
+        END;
+
+        /* 8gws -- I4c: @FirstTimeFullScanCapRows (v3.5.4) not in use.
+           This parameter caps rows forced to FULLSCAN on first-time stat qualification,
+           preventing runaway FULLSCAN on enormous tables when @StatisticsSample is NULL. */
+        IF @latest_first_time_fullscan_cap_rows IS NULL
+        AND @stat_update_count > 0
+        BEGIN
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES
+            (
+                N'INFO', N'UNUSED_FEATURES',
+                N'@FirstTimeFullScanCapRows not configured (v3.5.4+)',
+                N'@FirstTimeFullScanCapRows limits FULLSCAN on first-time stat qualification to tables below the cap. '
+                    + N'Without it, fresh statistics on very large tables can trigger unbounded FULLSCAN operations.',
+                N'Set @FirstTimeFullScanCapRows to the maximum table row count that should get FULLSCAN on first qualification. '
+                    + N'Larger tables fall back to auto-sample. Recommended starting point: 10,000,000 rows.',
+                N'EXECUTE dbo.sp_StatUpdate @FirstTimeFullScanCapRows = 10000000, @Databases = N''USER_DATABASES'';',
+                67
+            );
+        END;
+
+        /* 8gws -- I4d: @CriticalTables (v3.5.0) not in use.
+           This parameter specifies table patterns that receive priority boost and
+           per-table sample-rate override -- highly valuable for tables with known
+           workload importance or lock-contention history. */
+        IF @latest_critical_tables IS NULL
+        AND @stat_update_count > 0
+        BEGIN
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES
+            (
+                N'INFO', N'UNUSED_FEATURES',
+                N'@CriticalTables not configured (v3.5.0+)',
+                N'@CriticalTables accepts comma-separated table patterns (LIKE syntax) that receive a processing '
+                    + N'priority boost and optional per-table FULLSCAN override. Particularly useful for tables '
+                    + N'identified via W7 HIGH_IMPACT_STATS_DEPRIORITIZED or W9 LOCK_TIMEOUT_INEFFECTIVE.',
+                N'Specify critical tables to ensure they are always updated early in the run, regardless of sort order.',
+                N'EXECUTE dbo.sp_StatUpdate @CriticalTables = N''dbo.Orders,dbo.OrderItems'', @Databases = N''USER_DATABASES'';',
+                68
+            );
+        END;
+
+        /* 8gws -- I4e: @AbortOnIntegrityError (v3.5.9) -- recommend only when IO_CORRUPTION is visible.
+           Do not surface this if there is no sign of IO errors in the run history.
+           IO_CORRUPTION is visible in TWO places: StopReason (abort mode, @AbortOnIntegrityError = 1)
+           OR the WarningsCodes element (continue mode, @AbortOnIntegrityError = 0 -- run completes
+           with a benign StopReason and the code only lands in Summary/WarningsCodes). */
+        IF @latest_abort_on_integrity IS NULL
+        AND EXISTS
+            (
+                SELECT 1
+                FROM #runs
+                WHERE IsKilled = 0
+                AND
+                (
+                       StopReason = N'IO_CORRUPTION'
+                    OR WarningsCodes LIKE N'%IO_CORRUPTION%'
+                )
+            )
+        BEGIN
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES
+            (
+                N'INFO', N'UNUSED_FEATURES',
+                N'@AbortOnIntegrityError not configured -- IO_CORRUPTION stop reason seen in history (v3.5.9+)',
+                N'One or more runs stopped with StopReason=IO_CORRUPTION. @AbortOnIntegrityError=1 halts the run '
+                    + N'immediately when a CHECKDB-style integrity error is detected during UPDATE STATISTICS, '
+                    + N'preventing statistics from masking an underlying corruption. Investigate with DBCC CHECKDB.',
+                N'Enable @AbortOnIntegrityError after investigating the corruption root cause with DBCC CHECKDB. '
+                    + N'Fix the underlying storage issue before re-enabling statistics maintenance.',
+                N'EXECUTE dbo.sp_StatUpdate @AbortOnIntegrityError = 1, @Databases = N''USER_DATABASES'';',
+                50
             );
         END;
     END;
@@ -4802,6 +4976,258 @@ BEGIN
         END;
     END;
 
+    /* ======================================================================
+       W14: RECURRING SAFETY STOPS (4g9s)
+       Fires when the same safety-stop StopReason appears in >= 2 runs.
+       Safety StopReasons: TEMPDB_PRESSURE, AG_REDO_QUEUE, LOG_SPACE_HIGH,
+       IO_CORRUPTION, FAIL_FAST, CONSECUTIVE_FAILURES.
+       Each repeated reason produces one finding row.  Evidence lists up to
+       10 most-recent run StartTimes (mirrors C1 evidence-cap convention).
+       ====================================================================== */
+    IF @run_count >= 2
+    BEGIN
+        DECLARE @w14_safety_reasons TABLE
+        (
+            StopReason   nvarchar(50)    NOT NULL,
+            HitCount     integer         NOT NULL,
+            MostRecent   datetime2(3)    NULL,
+            EvidenceList nvarchar(2000)  NULL
+        );
+
+        INSERT INTO @w14_safety_reasons (StopReason, HitCount, MostRecent, EvidenceList)
+        SELECT
+            r.StopReason,
+            HitCount    = COUNT_BIG(*),
+            MostRecent  = MAX(r.StartTime),
+            EvidenceList = CASE
+                WHEN COUNT_BIG(*) > 10
+                THEN N'(' + CONVERT(nvarchar(10), COUNT_BIG(*)) + N' occurrences, 10 most recent): '
+                     + STUFF((
+                         SELECT TOP (10) N', ' + CONVERT(nvarchar(30), r2.StartTime, 120)
+                         FROM #runs AS r2
+                         WHERE r2.StopReason = r.StopReason
+                           AND r2.IsKilled = 0
+                         ORDER BY r2.StartTime DESC
+                         FOR XML PATH(N'')
+                       ), 1, 2, N'')
+                ELSE STUFF((
+                         SELECT TOP (10) N', ' + CONVERT(nvarchar(30), r2.StartTime, 120)
+                         FROM #runs AS r2
+                         WHERE r2.StopReason = r.StopReason
+                           AND r2.IsKilled = 0
+                         ORDER BY r2.StartTime DESC
+                         FOR XML PATH(N'')
+                       ), 1, 2, N'')
+                END
+        FROM #runs AS r
+        WHERE r.IsKilled = 0
+          AND r.StopReason IN (
+                N'TEMPDB_PRESSURE', N'AG_REDO_QUEUE', N'LOG_SPACE_HIGH',
+                N'IO_CORRUPTION', N'FAIL_FAST', N'CONSECUTIVE_FAILURES', N'BATCH_LIMIT'
+              )
+        GROUP BY r.StopReason
+        HAVING COUNT_BIG(*) >= 2;
+
+        IF EXISTS (SELECT 1 FROM @w14_safety_reasons)
+        BEGIN
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            SELECT
+                N'WARNING',
+                N'RECURRING_SAFETY_STOP',
+                N'Safety stop ''' + w.StopReason + N''' in ' + CONVERT(nvarchar(10), w.HitCount) + N' of '
+                    + CONVERT(nvarchar(10), @run_count) + N' runs in the last '
+                    + CONVERT(nvarchar(10), @DaysBack) + N' days',
+                w.EvidenceList,
+                CASE w.StopReason
+                    WHEN N'TEMPDB_PRESSURE'       THEN N'tempdb free space fell below @MinTempdbFreeMB threshold repeatedly. Expand tempdb data files or increase @MinTempdbFreeMB to detect pressure earlier. CHECKDB tempdb for corruption.'
+                    WHEN N'AG_REDO_QUEUE'         THEN N'AG secondary redo queue exceeded @MaxAGRedoQueueMB. Investigate AG latency, network throughput, or secondary IO. Consider increasing @MaxAGWaitMinutes or reducing @MaxAGRedoQueueMB to match actual redo capacity.'
+                    WHEN N'LOG_SPACE_HIGH'        THEN N'Transaction log space fell below threshold during maintenance. Expand log file or add log backup frequency. Ensure log backup job is not blocked during maintenance window.'
+                    WHEN N'IO_CORRUPTION'         THEN N'UPDATE STATISTICS triggered IO integrity errors. Run DBCC CHECKDB immediately on affected databases. Do not re-enable stats maintenance until corruption is resolved.'
+                    WHEN N'FAIL_FAST'             THEN N'@FailFast=1 aborted on repeated errors. Investigate ErrorNumber distribution in RS6 Failing Statistics. Consider lowering @FailFast threshold or disabling for non-critical workloads.'
+                    WHEN N'CONSECUTIVE_FAILURES'  THEN N'Run aborted after N consecutive stat failures (@MaxConsecutiveFailures). Check RS6 for error clustering. Investigate lock contention (error 1222), permission issues (error 262), or transient IO errors.'
+                    WHEN N'BATCH_LIMIT'           THEN N'@BatchLimit cap reached repeatedly. Consider increasing @BatchLimit or switching to time-based limiting via @TimeLimit.'
+                    ELSE N'Investigate root cause of repeated ' + w.StopReason + N' safety stops.'
+                END,
+                NULL,
+                32
+            FROM @w14_safety_reasons AS w;
+
+            DECLARE @w14_count integer = (SELECT COUNT_BIG(*) FROM @w14_safety_reasons);
+            RAISERROR(N'  [WARNING] W14: %i recurring safety stop reason(s) detected', 10, 1, @w14_count) WITH NOWAIT;
+        END;
+    END;
+
+    /* ======================================================================
+       W15 / I16: RECURRING RUNTIME WARNINGS (t8lj)
+
+       Ingests WarningsCodes from END Summary XML (pipe-delimited tokens,
+       v3.5.9+).  Splits codes, counts frequency across non-killed runs.
+
+       Threshold: fires when a code appears in >= 3 runs OR >= 50% of
+       non-killed runs (whichever is smaller), minimum 2 occurrences.
+
+       Severity tiering:
+         WARNING (W15) -- environmental/actionable codes that indicate
+           operational problems the DBA can address.
+         INFO    (I16) -- purely informational codes that are useful for
+           context but do not require immediate action.
+
+       Old runs without WarningsCodes element produce zero findings.
+       ====================================================================== */
+    DECLARE @w15_non_killed_runs integer = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 0);
+    DECLARE @w15_coded_runs integer = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 0 AND WarningsCodes IS NOT NULL);
+
+    IF @w15_coded_runs >= 2   /* at least 2 non-killed runs have the element */
+    BEGIN
+        /* Threshold: fires when count >= 3 OR >= 50% of non-killed runs, min 2 */
+        DECLARE @w15_freq_threshold integer = CASE
+            WHEN @w15_non_killed_runs > 0
+            THEN CASE
+                     WHEN CONVERT(decimal(5,1), @w15_non_killed_runs * 0.5) < 3
+                     THEN 2   /* small window: use 2 (minimum) */
+                     ELSE 3   /* otherwise use 3 */
+                 END
+            ELSE 2
+        END;
+
+        DECLARE @w15_pct_threshold decimal(5,1) = 50.0;
+
+        /* Build code-frequency table */
+        DECLARE @warning_code_freq TABLE
+        (
+            WarningCode   nvarchar(100)   NOT NULL,
+            HitCount      integer         NOT NULL,
+            HitPct        decimal(5,1)    NOT NULL
+        );
+
+        INSERT INTO @warning_code_freq (WarningCode, HitCount, HitPct)
+        SELECT
+            codes.value,
+            HitCount = COUNT_BIG(DISTINCT r.RunLabel),
+            HitPct   = CONVERT(decimal(5,1), COUNT_BIG(DISTINCT r.RunLabel) * 100.0 / NULLIF(@w15_non_killed_runs, 0))
+        FROM #runs AS r
+        CROSS APPLY STRING_SPLIT(r.WarningsCodes, N'|') AS codes
+        WHERE r.IsKilled = 0
+          AND r.WarningsCodes IS NOT NULL
+          AND LTRIM(RTRIM(codes.value)) <> N''
+        GROUP BY codes.value
+        HAVING COUNT_BIG(DISTINCT r.RunLabel) >= @w15_freq_threshold
+            OR CONVERT(decimal(5,1), COUNT_BIG(DISTINCT r.RunLabel) * 100.0 / NULLIF(@w15_non_killed_runs, 0)) >= @w15_pct_threshold;
+
+        /* W15: environmental/actionable codes */
+        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+        SELECT
+            N'WARNING',
+            N'RECURRING_RUNTIME_WARNING',
+            wc.WarningCode + N' in ' + CONVERT(nvarchar(10), wc.HitCount) + N' of ' + CONVERT(nvarchar(10), @w15_non_killed_runs) + N' runs -- '
+                + CASE wc.WarningCode
+                    WHEN N'BACKUP_RUNNING'              THEN N'maintenance window overlaps backups'
+                    WHEN N'BACKUP_STARTED_MID_RUN'      THEN N'backup started while stats maintenance was running'
+                    WHEN N'LOG_SPACE_HIGH'              THEN N'log space consistently low during maintenance'
+                    WHEN N'CONTAINER_MEMORY'            THEN N'container memory pressure during maintenance'
+                    WHEN N'RCSI_VERSION_STORE'          THEN N'RCSI version store pressure during maintenance'
+                    WHEN N'ELASTIC_POOL'                THEN N'elastic pool DTU/eDTU pressure during maintenance'
+                    WHEN N'PEAK_HOURS'                  THEN N'maintenance running during identified peak hours'
+                    WHEN N'IO_CORRUPTION'               THEN N'IO integrity errors detected during maintenance'
+                    WHEN N'STOPBYTIME_OVERSHOOT'        THEN N'@StopByTime deadline repeatedly overshot'
+                    WHEN N'CONSECUTIVE_FAILURES_ELEVATED' THEN N'elevated consecutive failure rate'
+                    WHEN N'PERSIST_SAMPLE_INADEQUATE'   THEN N'PERSIST_SAMPLE_PERCENT too low for workload'
+                    WHEN N'PARALLEL_ORPHAN_BACKLOG'     THEN N'orphaned parallel worker entries accumulating'
+                    WHEN N'STALE_QUEUE_SWEEP'           THEN N'stale queue entries swept on each run'
+                    WHEN N'DB_SKIPPED'                  THEN N'one or more databases skipped repeatedly'
+                    ELSE wc.WarningCode + N' recurring'
+                  END,
+            N'Code ' + wc.WarningCode + N' appeared in ' + CONVERT(nvarchar(10), wc.HitCount) + N' run(s) ('
+                + CONVERT(nvarchar(10), CONVERT(integer, wc.HitPct)) + N'%).',
+            CASE wc.WarningCode
+                    WHEN N'BACKUP_RUNNING'              THEN N'Adjust your maintenance window to avoid backup overlap. Check msdb job schedules.'
+                    WHEN N'BACKUP_STARTED_MID_RUN'      THEN N'Reorder Agent jobs so backups start after maintenance completes, or extend @TimeLimit to finish before backup window.'
+                    WHEN N'LOG_SPACE_HIGH'              THEN N'Increase log file autogrowth, add more frequent log backups, or reduce @TimeLimit so maintenance ends earlier.'
+                    WHEN N'CONTAINER_MEMORY'            THEN N'Increase container memory limits or reduce @MaxDOP to lower per-query memory grant.'
+                    WHEN N'RCSI_VERSION_STORE'          THEN N'Long-running transactions may be holding the version store open. Check sys.dm_tran_active_snapshot_database_transactions.'
+                    WHEN N'ELASTIC_POOL'                THEN N'Schedule maintenance during elastic pool low-activity periods, or move the database to a higher-tier pool.'
+                    WHEN N'PEAK_HOURS'                  THEN N'Reschedule maintenance outside peak hours. Use @StopByTime to enforce a hard deadline.'
+                    WHEN N'IO_CORRUPTION'               THEN N'Run DBCC CHECKDB immediately. Do not re-enable stats maintenance until corruption is resolved.'
+                    WHEN N'STOPBYTIME_OVERSHOOT'        THEN N'The run consistently exceeds @StopByTime. Set @TimeLimit to a value shorter than the overshoot margin.'
+                    WHEN N'CONSECUTIVE_FAILURES_ELEVATED' THEN N'Check RS6 Failing Statistics for error clustering. Reduce @MaxConsecutiveFailures or investigate lock/permission issues.'
+                    WHEN N'PERSIST_SAMPLE_INADEQUATE'   THEN N'Increase @StatisticsSample or use FULLSCAN for high-volatility tables flagged in RS5 Top Tables.'
+                    WHEN N'PARALLEL_ORPHAN_BACKLOG'     THEN N'Run sp_StatUpdate with @CleanupOrphanedRuns=Y or manually delete stale QueueStatistic entries.'
+                    WHEN N'STALE_QUEUE_SWEEP'           THEN N'Stale queue entries from prior killed runs accumulate. Ensure @CleanupOrphanedRuns=Y runs between parallel jobs.'
+                    WHEN N'DB_SKIPPED'                  THEN N'Check @Databases filter and verify all target databases are accessible (HAS_DBACCESS).'
+                    ELSE N'Investigate root cause of recurring code ' + wc.WarningCode + N'.'
+                  END,
+            NULL,
+            33
+        FROM @warning_code_freq AS wc
+        WHERE wc.WarningCode IN (
+            N'BACKUP_RUNNING', N'BACKUP_STARTED_MID_RUN', N'LOG_SPACE_HIGH',
+            N'CONTAINER_MEMORY', N'RCSI_VERSION_STORE', N'ELASTIC_POOL',
+            N'PEAK_HOURS', N'IO_CORRUPTION', N'STOPBYTIME_OVERSHOOT',
+            N'CONSECUTIVE_FAILURES_ELEVATED', N'PERSIST_SAMPLE_INADEQUATE',
+            N'PARALLEL_ORPHAN_BACKLOG', N'STALE_QUEUE_SWEEP', N'DB_SKIPPED'
+        );
+
+        DECLARE @w15_fires integer = @@ROWCOUNT;
+        IF @w15_fires > 0
+            RAISERROR(N'  [WARNING] W15: %i recurring environmental warning code(s) detected', 10, 1, @w15_fires) WITH NOWAIT;
+
+        /* I16: informational codes */
+        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+        SELECT
+            N'INFO',
+            N'RECURRING_RUNTIME_WARNING',
+            wc.WarningCode + N' in ' + CONVERT(nvarchar(10), wc.HitCount) + N' of ' + CONVERT(nvarchar(10), @w15_non_killed_runs) + N' runs -- '
+                + CASE wc.WarningCode
+                    WHEN N'CDC_TABLES'                  THEN N'CDC-tracked tables encountered (FULLSCAN advisory applied)'
+                    WHEN N'REPLICATION_MAJORITY'        THEN N'majority of target tables are replicated'
+                    WHEN N'COLUMNSTORE_TABLES'          THEN N'columnstore tables present (modification_counter underreporting possible)'
+                    WHEN N'RLS_DETECTED'                THEN N'Row Level Security active on target tables (histogram bias risk)'
+                    WHEN N'FILTER_MISMATCH'             THEN N'filtered stats with filter/index mismatch detected'
+                    WHEN N'CASE_SENSITIVE_COLLATION'    THEN N'case-sensitive collation on instance'
+                    WHEN N'AZURE_SQL_DB'                THEN N'running on Azure SQL DB'
+                    WHEN N'AZURE_SQL_MI'                THEN N'running on Azure SQL MI'
+                    WHEN N'AZURE_SQL_EDGE'              THEN N'running on Azure SQL Edge'
+                    WHEN N'LOW_UPTIME'                  THEN N'server uptime low when maintenance ran'
+                    WHEN N'TOCTOU_SKIPS'                THEN N'TOCTOU (time-of-check-to-time-of-use) skips logged'
+                    WHEN N'EMPTY_STRING_PARAM'          THEN N'one or more parameters passed as empty string instead of NULL'
+                    WHEN N'DEAD_WORKER_TIMEOUT_NULL_COERCED' THEN N'@DeadWorkerTimeoutMinutes coerced from NULL to default'
+                    ELSE wc.WarningCode + N' recurring (informational)'
+                  END,
+            N'Code ' + wc.WarningCode + N' appeared in ' + CONVERT(nvarchar(10), wc.HitCount) + N' run(s) ('
+                + CONVERT(nvarchar(10), CONVERT(integer, wc.HitPct)) + N'%).',
+            CASE wc.WarningCode
+                    WHEN N'CDC_TABLES'                  THEN N'sp_StatUpdate applies FULLSCAN for CDC-tracked tables to avoid biased histograms. No action required unless CDC overhead is a concern.'
+                    WHEN N'REPLICATION_MAJORITY'        THEN N'Replicated tables have schema constraints on UPDATE STATISTICS. Monitor for schema-lock contention.'
+                    WHEN N'COLUMNSTORE_TABLES'          THEN N'modification_counter on columnstore indexes underreports row churn. Consider lower @ModificationThreshold for columnstore-heavy workloads.'
+                    WHEN N'RLS_DETECTED'                THEN N'RLS predicates may cause biased histograms if data distribution differs by security context. Use @StatisticsSample = 100 for RLS-protected tables.'
+                    WHEN N'FILTER_MISMATCH'             THEN N'A filtered statistic uses a different filter than its matching filtered index. Update statistics and index together when possible.'
+                    WHEN N'CASE_SENSITIVE_COLLATION'    THEN N'Parameter matching uses COLLATE DATABASE_DEFAULT. Verify database and instance collations align.'
+                    WHEN N'AZURE_SQL_DB'                THEN N'On Azure SQL DB, @StatsInParallel=Y is not supported. Use serial mode.'
+                    WHEN N'AZURE_SQL_MI'                THEN N'Azure SQL MI supports most features. Verify @IncludeSystemObjects behavior on MI.'
+                    WHEN N'AZURE_SQL_EDGE'              THEN N'Azure SQL Edge has reduced DMV coverage. Some discovery features may return empty.'
+                    WHEN N'LOW_UPTIME'                  THEN N'Maintenance ran shortly after server restart. Buffer pool may be cold; duration metrics for these runs are inflated.'
+                    WHEN N'TOCTOU_SKIPS'                THEN N'TOCTOU skips mean a stat was claimed by another worker between discovery and execution. Normal in parallel mode; investigate if occurring in serial runs.'
+                    WHEN N'EMPTY_STRING_PARAM'          THEN N'An empty string parameter was coerced. Review sp_StatUpdate call for @Databases or @Tables set to empty string.'
+                    WHEN N'DEAD_WORKER_TIMEOUT_NULL_COERCED' THEN N'@DeadWorkerTimeoutMinutes = NULL was coerced to the internal default. Set explicitly to avoid jitter in parallel dead-worker detection.'
+                    ELSE N'Informational code ' + wc.WarningCode + N' -- review sp_StatUpdate run log for context.'
+                  END,
+            NULL,
+            72
+        FROM @warning_code_freq AS wc
+        WHERE wc.WarningCode NOT IN (
+            /* environmental codes already emitted as W15 */
+            N'BACKUP_RUNNING', N'BACKUP_STARTED_MID_RUN', N'LOG_SPACE_HIGH',
+            N'CONTAINER_MEMORY', N'RCSI_VERSION_STORE', N'ELASTIC_POOL',
+            N'PEAK_HOURS', N'IO_CORRUPTION', N'STOPBYTIME_OVERSHOOT',
+            N'CONSECUTIVE_FAILURES_ELEVATED', N'PERSIST_SAMPLE_INADEQUATE',
+            N'PARALLEL_ORPHAN_BACKLOG', N'STALE_QUEUE_SWEEP', N'DB_SKIPPED'
+        );
+
+        DECLARE @i16_fires integer = @@ROWCOUNT;
+        IF @i16_fires > 0
+            RAISERROR(N'  [INFO] I16: %i recurring informational warning code(s) detected', 10, 1, @i16_fires) WITH NOWAIT;
+    END;
+
     RAISERROR(N'', 10, 1) WITH NOWAIT;
     RAISERROR(N'Diagnostic checks complete.', 10, 1) WITH NOWAIT;
 
@@ -5550,6 +5976,8 @@ BEGIN
             r.MopUpTriggered,
             r.MopUpFound,
             r.MopUpProcessed,
+            /* 70hh: TOCTOU skip count per run (NULL on older rows without this element) */
+            r.StatsToctou,
             r.TotalGB,
             GBPerMin = CASE WHEN r.DurationSeconds > 0 AND r.TotalGB IS NOT NULL
                 THEN CONVERT(decimal(10, 2), r.TotalGB / (r.DurationSeconds / 60.0)) ELSE NULL END,
@@ -5600,6 +6028,7 @@ BEGIN
                     MopUpTriggered          = r2.MopUpTriggered,
                     MopUpFound              = r2.MopUpFound,
                     MopUpProcessed          = r2.MopUpProcessed,
+                    StatsToctou             = r2.StatsToctou,
                     TotalGB                 = r2.TotalGB,
                     GBPerMin                = CASE WHEN r2.DurationSeconds > 0 AND r2.TotalGB IS NOT NULL
                                                 THEN CONVERT(decimal(10, 2), r2.TotalGB / (r2.DurationSeconds / 60.0)) ELSE NULL END,
@@ -5908,7 +6337,7 @@ BEGIN
             Preset,
             LongRunningThresholdMinutes,
             LongRunningSamplePercent,
-            GroupByJoinPattern,
+            /* GroupByJoinPattern removed from RS8 (xmxs): column dropped from #runs */
             FilteredStatsMode,
             BatchLimit,
             FailFast
@@ -5938,7 +6367,7 @@ BEGIN
                     Preset                      = r2.Preset,
                     LongRunningThresholdMinutes = r2.LongRunningThresholdMinutes,
                     LongRunningSamplePercent    = r2.LongRunningSamplePercent,
-                    GroupByJoinPattern          = r2.GroupByJoinPattern,
+                    /* GroupByJoinPattern removed (xmxs) */
                     FilteredStatsMode           = r2.FilteredStatsMode,
                     BatchLimit                  = r2.BatchLimit,
                     FailFast                    = r2.FailFast

@@ -36,11 +36,37 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.5.9.2026.07.02 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.6.0.2026.07.02 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.5.9.2026.07.02 - Three fixes (sp_StatUpdate-7pqu, -f14h, -lh23):
+History:    3.6.0.2026.07.02 - Telemetry contract batch (sp_StatUpdate-mvgb, -r2d0,
+                            -ibyc, -6zvp, -wuq2, -hdls):
+                            (1) mvgb: END Summary XML gains a WarningsCodes
+                            element (pipe-delimited, same tokens as
+                            @WarningsCodesOut) on all five live END writers --
+                            the four early-return paths and the normal finalize.
+                            The orphan-cleanup fabricated END keeps no element
+                            (no live warnings context).  TOCTOU_SKIPS append
+                            moved above the Summary build so it lands in the
+                            element.  (2) r2d0: COMPLETED_WITH_SKIPPED_DBS is
+                            now applied to @stop_reason BEFORE the END row is
+                            written -- CommandLog previously always recorded
+                            plain COMPLETED and only the OUTPUT param showed
+                            the upgraded reason.  (3) gh-546: new
+                            @max_consecutive_failures_seen peak tracker +
+                            CONSECUTIVE_FAILURES_ELEVATED warning code (peak
+                            >= 3 without hitting the bailout); @Help WARNINGS
+                            topic expanded into the full format contract (all
+                            code tokens enumerated; codes may be added, never
+                            renamed/removed without a major version bump).
+                            (4) gh-518/545: EngineEdition 9 now emits
+                            AZURE_SQL_EDGE (DB/MI split shipped earlier).
+                            (5) gh-516: per-stat progress line gains wall-clock
+                            + ETA suffix (after 5 completed stats); startup
+                            advisory for the dangerous combo of a 0-1s lock
+                            timeout with @MaxConsecutiveFailures = 1.
+            3.5.9.2026.07.02 - Three fixes (sp_StatUpdate-7pqu, -f14h, -lh23):
                             (1) gh-550: statistics that have NEVER been computed
                             (dm_db_stats_properties returns last_updated NULL /
                             modification_counter NULL) over POPULATED tables were
@@ -548,7 +574,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.5.9.2026.07.02',
+        @procedure_version varchar(20) = '3.6.0.2026.07.02',
         @procedure_version_date datetime = '20260702',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -654,7 +680,7 @@ BEGIN
             (N'PRESETS',       N'DEFAULT=balanced, NIGHTLY=1h+QS+mop-up, WEEKLY_FULL=4h+FULLSCAN, OLTP_LIGHT=30m+high-thresh, WAREHOUSE=unlimited+FULLSCAN.'),
             (N'CONTEXT_INFO',  N'@JobName=NMyJobName sets CONTEXT_INFO on entry, restored on exit.  Visible in XE sessions, dm_exec_requests, and any session-level monitoring.'),
             (N'COLUMNSTORE',   N'@SkipTablesWithNCCI=Y (default) skips tables with nonclustered columnstore (plan stability).  @SkipTablesWithCCI=N (default) updates CCI tables.'),
-            (N'WARNINGS',      N'@WarningsCodesOut returns pipe-delimited codes (e.g. AG_REDO_ELEVATED|TEMPDB_LOW) for programmatic parsing.  @WarningsOut is human-readable.'),
+            (N'WARNINGS',      N'@WarningsCodesOut returns pipe-delimited codes for programmatic parsing.  @WarningsOut is human-readable.  Same codes appear in END row Summary/WarningsCodes element.  Policy: codes may be added in any release, never renamed/removed without a major version bump.  Current tokens: AG_SECONDARY_SERVER|ELASTIC_POOL|RCSI_VERSION_STORE|DEAD_WORKER_TIMEOUT_NULL_COERCED|EMPTY_STRING_PARAM|AZURE_SQL_DB|AZURE_SQL_MI|AZURE_SQL_EDGE|CASE_SENSITIVE_COLLATION|LOW_UPTIME|BACKUP_RUNNING|PEAK_HOURS|CONTAINER_MEMORY|DB_SKIPPED|RLS_DETECTED|RLS_CHECK_FAILED|WIDESTAT_CHECK_FAILED|FILTER_MISMATCH|FILTER_CHECK_FAILED|COLUMNSTORE_TABLES|COLUMNSTORE_CHECK_FAILED|COMPRESSED_CHECK_FAILED|COMPUTEDCOL_CHECK_FAILED|CDC_TABLES|REPLICATION_MAJORITY|PARALLEL_ORPHAN_BACKLOG|STALE_QUEUE_SWEEP|BACKUP_STARTED_MID_RUN|LOG_SPACE_HIGH|PERSIST_SAMPLE_INADEQUATE|IO_CORRUPTION|STOPBYTIME_OVERSHOOT|QS_FORCED_PLANS|TOCTOU_SKIPS|CONSECUTIVE_FAILURES_ELEVATED'),
             (N'PARALLEL',      N'@StatsInParallel=Y. Requires dbo.Queue + dbo.QueueStatistic (auto-created). Run same EXEC from multiple Agent steps. AG-secondary guard and orphan-row sweep run at startup.'),
             (N'QUERY STORE',   N'@QueryStore=CPU/DURATION/READS/etc. to prioritize stats on high-workload tables.  WAITS filters to Buffer Latch, Buffer IO, Memory, Other Disk IO -- wait classes statistics quality can influence.  OFF to disable.'),
             (N'MOP-UP',        N'@MopUpPass=Y: after priority pass, sweep any stat with modification_counter>0.  Needs @TimeLimit + @LogToTable=Y.'),
@@ -1163,6 +1189,7 @@ BEGIN
         @stats_toctou integer = 0,
         @stats_skipped integer = 0,
         @consecutive_failures integer = 0,
+        @max_consecutive_failures_seen integer = 0, /* #ibyc: peak value for CONSECUTIVE_FAILURES_ELEVATED warning */
         @total_pages_processed bigint = 0, /* v2.24: accumulated page count for volume reporting */
         @warnings nvarchar(max) = N''; /* Collected warnings for @WarningsOut OUTPUT */
 
@@ -2561,6 +2588,14 @@ BEGIN
             RAISERROR(N'  vCore consumption still applies during maintenance windows.', 10, 1) WITH NOWAIT;
             SET @warnings += N'AZURE_SQL_MI: vCore impact during maintenance; ';
             SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'AZURE_SQL_MI';
+        END
+        ELSE IF @engine_edition = 9
+        BEGIN
+            /* #6zvp/#wuq2: Azure SQL Edge -- limited SQL Server subset, no QS, no HA features */
+            RAISERROR(N'  Note: Azure SQL Edge -- limited feature set (no Query Store, no AG, no Resource Governor).', 10, 1) WITH NOWAIT;
+            RAISERROR(N'  Statistics maintenance is supported but advanced features may be unavailable.', 10, 1) WITH NOWAIT;
+            SET @warnings += N'AZURE_SQL_EDGE: limited feature set (no QS, no AG, no RG); ';
+            SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'AZURE_SQL_EDGE';
         END;
     END;
 
@@ -3051,6 +3086,21 @@ BEGIN
     IF @Debug = 1 AND @i_persist_sample_percent = N'Y' AND @i_statistics_sample IS NULL
     BEGIN
         RAISERROR(N'Note: @i_persist_sample_percent=Y ignored (no @i_statistics_sample specified)', 10, 1) WITH NOWAIT;
+    END;
+
+    /*
+    #hdls: Dangerous-combo advisory -- lock timeout of 0 or 1 second combined with
+    max-consecutive-failures = 1 means the very first lock wait can abort the
+    entire run.  Console-only (severity 10, no warning code).
+    */
+    IF  ISNULL(@i_lock_timeout, -1) IN (0, 1)
+    AND ISNULL(@i_max_consecutive_failures, 999) = 1
+    BEGIN
+        DECLARE @danger_combo_msg nvarchar(500) =
+            N'ADVISORY: LockTimeout=' + CONVERT(nvarchar(10), ISNULL(@i_lock_timeout, -1))
+            + N's and MaxConsecutiveFailures=1 -- the first lock wait on any stat will '
+            + N'immediately abort the entire run.  Consider raising LockTimeout or MaxConsecutiveFailures.';
+        RAISERROR(@danger_combo_msg, 10, 1) WITH NOWAIT;
     END;
 
     RAISERROR(N'', 10, 1) WITH NOWAIT;
@@ -5864,6 +5914,7 @@ OPTION (RECOMPILE);';
                                 0 AS MopUpProcessed,
                                 0 AS TotalPagesProcessed,
                                 0 AS QSEnrichmentSkipped,
+                                NULLIF(@WarningsCodesOut, N'') AS WarningsCodes,
                                 N'{"succeeded":0,"failed":0,"duration_seconds":'
                                     + CONVERT(nvarchar(20), DATEDIFF(SECOND, @start_time, SYSDATETIME()))
                                     + N',"status":"OK"}' AS JsonSummary
@@ -6241,6 +6292,7 @@ OPTION (RECOMPILE);';
                                         0 AS MopUpProcessed,
                                         0 AS TotalPagesProcessed,
                                         0 AS QSEnrichmentSkipped,
+                                        NULLIF(@WarningsCodesOut, N'') AS WarningsCodes,
                                         N'{"succeeded":0,"failed":0,"duration_seconds":'
                                             + CONVERT(nvarchar(20), DATEDIFF(SECOND, @start_time, SYSDATETIME()))
                                             + N',"status":"OK"}' AS JsonSummary
@@ -6575,6 +6627,7 @@ OPTION (RECOMPILE);';
                                 0 AS MopUpProcessed,
                                 0 AS TotalPagesProcessed,
                                 0 AS QSEnrichmentSkipped,
+                                NULLIF(@WarningsCodesOut, N'') AS WarningsCodes,
                                 N'{"succeeded":0,"failed":0,"duration_seconds":'
                                     + CONVERT(nvarchar(20), DATEDIFF(SECOND, @start_time, SYSDATETIME()))
                                     + N',"status":"ERROR"}' AS JsonSummary
@@ -6658,6 +6711,7 @@ OPTION (RECOMPILE);';
                                 0 AS MopUpProcessed,
                                 0 AS TotalPagesProcessed,
                                 0 AS QSEnrichmentSkipped,
+                                NULLIF(@WarningsCodesOut, N'') AS WarningsCodes,
                                 N'{"succeeded":0,"failed":0,"duration_seconds":'
                                     + CONVERT(nvarchar(20), DATEDIFF(SECOND, @start_time, SYSDATETIME()))
                                     + N',"status":"ERROR"}' AS JsonSummary
@@ -8394,6 +8448,25 @@ OPTION (RECOMPILE);';
                 END +
                 N', NORECOMPUTE: ' + @norecompute_display + N')';
 
+        /* #hdls: append wall-clock time and compact ETA to progress line.
+           ETA is derived from the ETR tracking variables (avg ms per completed stat).
+           Condition: at least 5 stats must have completed and there must be remaining stats. */
+        DECLARE @prog_eta_suffix nvarchar(50) = N'';
+        IF @etr_completed >= 5
+        BEGIN
+            DECLARE @prog_remaining int = @total_stats - @stats_processed;
+            IF @prog_remaining > 0 AND @etr_avg_ms > 0
+            BEGIN
+                DECLARE @prog_eta_ms bigint = CONVERT(bigint, @prog_remaining) * @etr_avg_ms;
+                DECLARE @prog_eta_min int = CONVERT(int, @prog_eta_ms / 60000);
+                SET @prog_eta_suffix = N' ETA ~' + CONVERT(nvarchar(10), @prog_eta_min) + N'm';
+            END;
+        END;
+        SET @progress_msg = @progress_msg
+            + N' | '
+            + LEFT(CONVERT(nvarchar(8), SYSDATETIME(), 108), 5)
+            + @prog_eta_suffix;
+
         RAISERROR(@progress_msg, 10, 1) WITH NOWAIT;
 
         /* SQL 2022+ plan feedback warning (#369) */
@@ -8997,6 +9070,9 @@ OPTION (RECOMPILE);';
                         @stats_failed += 1,
                         @consecutive_failures += 1,
                         @claimed_table_stats_failed += CASE WHEN @StatsInParallel = N'Y' THEN 1 ELSE 0 END;
+                    /* #ibyc: track peak so CONSECUTIVE_FAILURES_ELEVATED can fire post-loop */
+                    IF @consecutive_failures > @max_consecutive_failures_seen
+                        SET @max_consecutive_failures_seen = @consecutive_failures;
                     RAISERROR(N'  X Error %d: %s', 16, 1, @current_error_number, @current_error_message) WITH NOWAIT;
 
                     /*
@@ -10318,6 +10394,45 @@ OPTION (RECOMPILE);';
 
     /*
     ============================================================================
+    PRE-LOG WARNING FINALISATION
+    Must run BEFORE @summary_xml is built so all codes land in the END row.
+    ============================================================================
+    */
+
+    /* #mvgb/r2d0: TOCTOU_SKIPS must be appended before @summary_xml is built
+       so the code appears in the WarningsCodes element.  (Previously placed
+       after the INSERT -- that caused the code to be absent from CommandLog.) */
+    IF @stats_toctou > 0
+    BEGIN
+        SET @warnings = @warnings + N'TOCTOU_SKIPS: ' + CONVERT(nvarchar(10), @stats_toctou) + N' stat(s) skipped (objects dropped during run); ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'TOCTOU_SKIPS';
+    END;
+
+    /* #ibyc: append CONSECUTIVE_FAILURES_ELEVATED when peak seen >= 3 and the
+       run did NOT already abort due to consecutive failures or fail-fast. */
+    IF  @max_consecutive_failures_seen >= 3
+    AND @stop_reason NOT IN (N'CONSECUTIVE_FAILURES', N'FAIL_FAST')
+    BEGIN
+        DECLARE @cfe_msg nvarchar(500) =
+            N'WARNING: Peak consecutive failures during run = '
+            + CONVERT(nvarchar(10), @max_consecutive_failures_seen)
+            + N' (threshold = '
+            + ISNULL(CONVERT(nvarchar(10), @i_max_consecutive_failures), N'none')
+            + N').  Investigate error causes even though the run completed.';
+        RAISERROR(@cfe_msg, 10, 1) WITH NOWAIT;
+        SET @warnings = @warnings + N'CONSECUTIVE_FAILURES_ELEVATED: peak '
+            + CONVERT(nvarchar(10), @max_consecutive_failures_seen) + N' consecutive failure(s); ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'CONSECUTIVE_FAILURES_ELEVATED';
+    END;
+
+    /* #r2d0: hoist COMPLETED_WITH_SKIPPED_DBS upgrade here so the END row
+       Command string picks up the correct stop reason automatically.
+       The OUTPUT assignment below passes @stop_reason through unchanged. */
+    IF @warnings LIKE N'%DB_SKIPPED:%' AND @stop_reason = N'COMPLETED'
+        SET @stop_reason = N'COMPLETED_WITH_SKIPPED_DBS';
+
+    /*
+    ============================================================================
     LOG RUN_FOOTER TO COMMANDLOG
     ============================================================================
     */
@@ -10362,6 +10477,7 @@ OPTION (RECOMPILE);';
                         AND  NOT EXISTS (SELECT 1 FROM #stats_to_process WHERE qs_priority_boost > 0)
                         THEN 1 ELSE 0
                     END AS QSEnrichmentSkipped,
+                    NULLIF(@WarningsCodesOut, N'') AS WarningsCodes,
                     @json_summary_str AS JsonSummary
                 FOR
                     XML RAW(N'Summary'),
@@ -10409,12 +10525,6 @@ OPTION (RECOMPILE);';
     POPULATE OUTPUT PARAMETERS (for automation)
     ============================================================================
     */
-    IF @stats_toctou > 0
-    BEGIN
-        SET @warnings = @warnings + N'TOCTOU_SKIPS: ' + CONVERT(nvarchar(10), @stats_toctou) + N' stat(s) skipped (objects dropped during run); ';
-        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'TOCTOU_SKIPS';
-    END;
-
     SELECT
         @StatsFoundOut = @total_stats,
         @StatsProcessedOut = @stats_processed,
@@ -10425,12 +10535,8 @@ OPTION (RECOMPILE);';
         @WarningsOut = NULLIF(@warnings, N''),
         /* gh-426: stable code tokens -- NULLIF so empty string becomes NULL */
         @WarningsCodesOut = NULLIF(@WarningsCodesOut, N''),
-        /* #179: If databases were skipped, append to stop reason so automation sees partial completion */
-        @StopReasonOut = CASE
-            WHEN @warnings LIKE N'%DB_SKIPPED:%' AND @stop_reason = N'COMPLETED'
-            THEN N'COMPLETED_WITH_SKIPPED_DBS'
-            ELSE @stop_reason
-        END;
+        /* #r2d0: @stop_reason already upgraded above if COMPLETED_WITH_SKIPPED_DBS applies */
+        @StopReasonOut = @stop_reason;
 
     /*
     ============================================================================
