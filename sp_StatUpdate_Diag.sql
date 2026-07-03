@@ -36,9 +36,24 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.02.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.03.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.07.02.2 - Phase-C diagnostic batch (sw82, 9ufm, atk1, 9axc):
+History:    2026.07.03.1 - I8/RS13 DataStatus surface (w5p2 / gh-532):
+                           I8 and RS13 no longer go silently empty when Query Store
+                           CPU history is sparse or absent.  New @i8_data_status
+                           (AVAILABLE / INSUFFICIENT_HISTORY / UNAVAILABLE) computed
+                           from QS-CPU-bearing runs and tracked-stat counts.  Sparse
+                           I8 findings carry a machine-readable suffix:
+                           [DataStatus: X; QSCpuRuns: N; TrackedStats: N] (AVAILABLE
+                           findings unchanged -- no suffix).  RS13 returns a single
+                           [NO DATA] sentinel row (full production column list, reason
+                           text in StatisticsName) instead of zero rows whenever
+                           status <> AVAILABLE, on both the multi-result-set and
+                           @SingleResultSet paths.  The empty-CommandLog early return
+                           emits the same I8 UNAVAILABLE finding and RS13 sentinel so
+                           first-run users get the explanation too.  @Help I8 catalog
+                           entry updated.
+            2026.07.02.2 - Phase-C diagnostic batch (sw82, 9ufm, atk1, 9axc):
                            (sw82) @CriticalTables coverage: ingest CriticalTables /
                            CriticalSamplePercent / CriticalTablesFirst into #runs; ingest
                            IsCritical / CriticalSampleOverride into #stat_updates (both cache
@@ -445,8 +460,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.02.2',  /* orchestrator bumps this */
-        @procedure_version_date datetime = '20260612';     /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.03.1',  /* orchestrator bumps this */
+        @procedure_version_date datetime = '20260703';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -556,7 +571,7 @@ BEGIN
                 (N'I5', N'INFO/WARNING', N'VERSION_HISTORY',    N'sp_StatUpdate versions used across analysis window. WARNING if multiple versions detected (version skew).'),
                 (N'I6', N'INFO',     N'QS_EFFICACY',           N'Query Store prioritization effectiveness -- what % of high-workload stats get serviced early'),
                 (N'I7', N'INFO',     N'QS_INFLECTION',         N'Before/after comparison when sort order changed to Query Store-based prioritization'),
-                (N'I8', N'INFO',     N'QS_PERFORMANCE_TREND',  N'Per-stat per-execution query CPU trend -- are queries getting faster after stat updates? Detects forced plans at risk (#292).'),
+                (N'I8', N'INFO',     N'QS_PERFORMANCE_TREND',  N'Per-stat per-execution query CPU trend -- are queries getting faster after stat updates? Detects forced plans at risk (#292). Finding text always ends with a machine-readable [DataStatus: AVAILABLE|INSUFFICIENT_HISTORY|UNAVAILABLE; QSCpuRuns: N; TrackedStats: N] suffix when data is sparse (w5p2).'),
                 (N'I10', N'INFO',    N'RECOMMENDED_CONFIG',    N'Synthesized parameter set balancing immediate fixes, long-term safeguards, and historical parameter usage.  Based on diagnostic findings and parameter change history.'),
                 (N'W11', N'WARNING', N'MOPUP_LOW_YIELD',       N'Mop-up pass consistently unable to process most of the stats it discovers (avg <50% yield across 3+ runs).'),
                 (N'W12', N'WARNING', N'PRIORITY_PASS_EMPTY',   N'Priority pass averages <5 stats across 3+ mop-up runs -- mop-up is doing all the work.  Lower @ModificationThreshold so the priority pass captures more stats.'),
@@ -1895,6 +1910,22 @@ BEGIN
             99
         );
 
+        /* w5p2 / gh-532: the main-path I8 DataStatus finding lives after this early
+           return, so emit its UNAVAILABLE form here too -- RS13 consumers get the
+           same machine-readable status whether CommandLog is sparse or empty. */
+        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+        VALUES
+        (
+            N'INFO',
+            N'QS_PERFORMANCE_TREND',
+            N'No Query Store CPU data found in any run. RS 13 (QS Performance Correlation) will be empty.'
+                + N' [DataStatus: UNAVAILABLE; QSCpuRuns: 0; TrackedStats: 0]',
+            N'0 of 0 runs contained Query Store CPU metrics. Ensure QS prioritization is configured (@QueryStore = N''CPU'' in v3) and Query Store is enabled/READ_WRITE.',
+            N'Enable QS prioritization: EXEC sp_StatUpdate @QueryStore = N''CPU''.',
+            N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStore = N''CPU'';',
+            100
+        );
+
         /* Return result sets in expected format */
         IF @SingleResultSet = 0
         BEGIN
@@ -1928,8 +1959,40 @@ BEGIN
                 SELECT WeekStart = CONVERT(date, NULL), WeekLabel = CONVERT(nvarchar(5), NULL), RunCount = CONVERT(bigint, NULL), SortStrategy = CONVERT(nvarchar(20), NULL), HighCpuFirstQuartilePct = CONVERT(decimal(5,1), NULL), AvgMinutesToHighCpu = CONVERT(decimal(10,1), NULL), WorkloadCoveragePct = CONVERT(decimal(5,1), NULL), CompletionPct = CONVERT(decimal(5,1), NULL), AvgSecPerStat = CONVERT(decimal(10,1), NULL), AvgGBPerMin = CONVERT(decimal(10,2), NULL), TrendDirection = CONVERT(nvarchar(20), NULL), Top5ConcentrationPct = CONVERT(decimal(5,1), NULL) WHERE 1 = 0;
                 SELECT RunLabel = CONVERT(nvarchar(100), NULL), StartTime = CONVERT(datetime2(3), NULL), SortStrategy = CONVERT(nvarchar(20), NULL), StatsFound = CONVERT(int, NULL), StatsProcessed = CONVERT(int, NULL), CompletionPct = CONVERT(decimal(5,1), NULL), HighCpuInFirstQuartilePct = CONVERT(decimal(5,1), NULL), MinutesToHighCpuComplete = CONVERT(decimal(10,1), NULL), WorkloadCoveragePct = CONVERT(decimal(5,1), NULL), AvgSecPerStat = CONVERT(decimal(10,1), NULL), StopReason = CONVERT(nvarchar(50), NULL), DeltaVsPrior = CONVERT(nvarchar(100), NULL) WHERE 1 = 0;
                 SELECT WorkloadRank = CONVERT(bigint, NULL), DatabaseName = CONVERT(sysname, NULL), SchemaName = CONVERT(sysname, NULL), TableName = CONVERT(sysname, NULL), StatisticsName = CONVERT(sysname, NULL), ProcessingPosition = CONVERT(int, NULL), TotalQueryCpuMs = CONVERT(bigint, NULL), TotalExecutions = CONVERT(bigint, NULL), PlanCount = CONVERT(int, NULL), UpdateDurationMs = CONVERT(int, NULL), QualifyReason = CONVERT(nvarchar(100), NULL), WorkloadRankPct = CONVERT(decimal(5,1), NULL), CumulativeCpuPct = CONVERT(decimal(5,1), NULL) WHERE 1 = 0;
-                /* RS 13 empty schema */
-                SELECT DatabaseName = CONVERT(sysname, NULL), SchemaName = CONVERT(sysname, NULL), TableName = CONVERT(sysname, NULL), StatisticsName = CONVERT(sysname, NULL), Appearances = CONVERT(bigint, NULL), FirstRunDate = CONVERT(datetime2(3), NULL), LastRunDate = CONVERT(datetime2(3), NULL), FirstCpuMs = CONVERT(bigint, NULL), LastCpuMs = CONVERT(bigint, NULL), CpuChangePct = CONVERT(decimal(10,1), NULL), CpuTrend = CONVERT(nvarchar(20), NULL), FirstCpuPerExec = CONVERT(decimal(18,4), NULL), LastCpuPerExec = CONVERT(decimal(18,4), NULL), CpuPerExecChangePct = CONVERT(decimal(10,1), NULL), FirstExecs = CONVERT(bigint, NULL), LastExecs = CONVERT(bigint, NULL), FirstPlans = CONVERT(int, NULL), LastPlans = CONVERT(int, NULL), ForcedPlanCount = CONVERT(int, NULL), PlanTrend = CONVERT(nvarchar(50), NULL), FirstMemoryGrantKB = CONVERT(bigint, NULL), LastMemoryGrantKB = CONVERT(bigint, NULL), MemoryGrantChangePct = CONVERT(decimal(10,1), NULL), MemoryGrantTrend = CONVERT(nvarchar(20), NULL), FirstTempdbPages = CONVERT(bigint, NULL), LastTempdbPages = CONVERT(bigint, NULL), TempdbChangePct = CONVERT(decimal(10,1), NULL), TempdbTrend = CONVERT(nvarchar(20), NULL) WHERE 1 = 0;
+                /* RS 13: w5p2 / gh-532 -- sentinel row (not an empty stub) so callers can
+                   distinguish 'no QS data' from 'no correlation found'.  Mirrors the
+                   main-path UNAVAILABLE sentinel column-for-column. */
+                SELECT
+                    DatabaseName            = N'[NO DATA]',
+                    SchemaName              = N'[NO DATA]',
+                    TableName               = N'[NO DATA]',
+                    StatisticsName          = CONVERT(nvarchar(max), N'No QS CPU data captured in any run within the analysis window. '
+                        + N'Enable Query Store and configure sp_StatUpdate with @QueryStore = N''CPU''. '
+                        + N'ALTER DATABASE [YourDb] SET QUERY_STORE = ON;'),
+                    Appearances             = CONVERT(integer, NULL),
+                    FirstRunDate            = CONVERT(datetime2(0), NULL),
+                    LastRunDate             = CONVERT(datetime2(0), NULL),
+                    FirstCpuMs              = CONVERT(bigint, NULL),
+                    LastCpuMs               = CONVERT(bigint, NULL),
+                    CpuChangePct            = CONVERT(decimal(10, 1), NULL),
+                    FirstCpuPerExec         = CONVERT(decimal(10, 2), NULL),
+                    LastCpuPerExec          = CONVERT(decimal(10, 2), NULL),
+                    CpuPerExecChangePct     = CONVERT(decimal(10, 1), NULL),
+                    CpuTrend                = CONVERT(nvarchar(30), NULL),
+                    FirstExecs              = CONVERT(bigint, NULL),
+                    LastExecs               = CONVERT(bigint, NULL),
+                    FirstPlans              = CONVERT(integer, NULL),
+                    LastPlans               = CONVERT(integer, NULL),
+                    ForcedPlanCount         = CONVERT(integer, NULL),
+                    PlanTrend               = CONVERT(nvarchar(50), NULL),
+                    FirstMemoryGrantKB      = CONVERT(bigint, NULL),
+                    LastMemoryGrantKB       = CONVERT(bigint, NULL),
+                    MemoryGrantChangePct    = CONVERT(decimal(10, 1), NULL),
+                    MemoryGrantTrend        = CONVERT(nvarchar(30), NULL),
+                    FirstTempdbPages        = CONVERT(bigint, NULL),
+                    LastTempdbPages         = CONVERT(bigint, NULL),
+                    TempdbChangePct         = CONVERT(decimal(10, 1), NULL),
+                    TempdbTrend             = CONVERT(nvarchar(30), NULL);
             END;
         END
         ELSE
@@ -4606,6 +4669,55 @@ BEGIN
        Raw QSTotalCpuMs is cumulative from Query Store and always grows as more
        queries execute. Per-execution CPU shows actual plan efficiency changes.
        ====================================================================== */
+
+    /* ------------------------------------------------------------------
+       w5p2 / gh-532: Pre-compute data-status so both I8 and RS13 can
+       surface a machine-readable explanation instead of silent-empty.
+       @i8_qs_cpu_runs  = distinct runs that have any QS CPU data.
+       @i8_tracked_stats = stats appearing in 2+ QS-CPU-bearing runs
+                           (the same population RS13 / first_last uses).
+       @i8_data_status  = AVAILABLE / INSUFFICIENT_HISTORY / UNAVAILABLE.
+       ------------------------------------------------------------------ */
+    DECLARE
+        @i8_qs_cpu_runs     integer = 0,
+        @i8_tracked_stats   integer = 0,
+        @i8_data_status     nvarchar(30) = N'UNAVAILABLE';
+
+    SELECT @i8_qs_cpu_runs = COUNT(DISTINCT su.RunLabel)
+    FROM #stat_updates AS su
+    WHERE su.QSTotalCpuMs IS NOT NULL
+    AND   su.QSTotalCpuMs > 0
+    AND   su.QSTotalExecutions IS NOT NULL
+    AND   su.QSTotalExecutions > 0;
+
+    IF @i8_qs_cpu_runs >= 2
+    BEGIN
+        /* Count stats that appear in 2+ qualifying runs -- same filter as I8 CTE */
+        SELECT @i8_tracked_stats = COUNT_BIG(*)
+        FROM
+        (
+            SELECT su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+            FROM #stat_updates AS su
+            WHERE su.QSTotalCpuMs IS NOT NULL
+            AND   su.QSTotalCpuMs > 0
+            AND   su.QSTotalExecutions IS NOT NULL
+            AND   su.QSTotalExecutions > 0
+            AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
+            GROUP BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+            HAVING COUNT_BIG(*) >= 2
+        ) AS qualified_stats;
+
+        SET @i8_data_status = CASE
+            WHEN @i8_tracked_stats >= 1 THEN N'AVAILABLE'
+            ELSE N'INSUFFICIENT_HISTORY'
+        END;
+    END
+    ELSE IF @i8_qs_cpu_runs >= 1
+    BEGIN
+        SET @i8_data_status = N'INSUFFICIENT_HISTORY';
+    END;
+    /* else: remains UNAVAILABLE */
+
     IF EXISTS (
         SELECT 1 FROM #stat_updates
         WHERE QSTotalCpuMs IS NOT NULL AND QSTotalCpuMs > 0
@@ -4723,7 +4835,12 @@ BEGIN
                         WHEN (SELECT COUNT(DISTINCT su2.RunLabel) FROM #stat_updates AS su2 WHERE su2.QSTotalCpuMs IS NOT NULL AND su2.QSTotalCpuMs > 0) < 2
                         THEN N' Only ' + CONVERT(nvarchar(10), (SELECT COUNT(DISTINCT su2.RunLabel) FROM #stat_updates AS su2 WHERE su2.QSTotalCpuMs IS NOT NULL AND su2.QSTotalCpuMs > 0)) + N' QS-enabled run(s) found; need 2+ for comparison.'
                         ELSE N' QS data exists across runs, but individual stats appear only once each.'
-                    END,
+                    END
+                    /* w5p2 / gh-532: machine-readable DataStatus suffix */
+                    + N' [DataStatus: ' + @i8_data_status
+                        + N'; QSCpuRuns: ' + CONVERT(nvarchar(10), @i8_qs_cpu_runs)
+                        + N'; TrackedStats: ' + CONVERT(nvarchar(10), @i8_tracked_stats)
+                        + N']',
                 N'Tracked ' + CONVERT(nvarchar(10), @i8_total_tracked) + N' statistics with 2+ appearances. At least 2 are needed for trend analysis.',
                 N'Run sp_StatUpdate with @QueryStore = N''CPU'' (v3) across multiple maintenance windows to build up comparison data.',
                 N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStore = N''CPU'';',
@@ -4840,7 +4957,12 @@ BEGIN
         INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
         VALUES (
             N'INFO', N'QS_PERFORMANCE_TREND',
-            N'No Query Store CPU data found in any run. RS 13 (QS Performance Correlation) will be empty.',
+            /* w5p2 / gh-532: preserve existing text; append machine-readable DataStatus suffix */
+            N'No Query Store CPU data found in any run. RS 13 (QS Performance Correlation) will be empty.'
+                + N' [DataStatus: ' + @i8_data_status
+                + N'; QSCpuRuns: ' + CONVERT(nvarchar(10), @i8_qs_cpu_runs)
+                + N'; TrackedStats: ' + CONVERT(nvarchar(10), @i8_tracked_stats)
+                + N']',
             N'0 of ' + CONVERT(nvarchar(10), (SELECT COUNT(*) FROM #runs))
                 + N' runs contained Query Store CPU metrics. Ensure QS prioritization is configured (@QueryStore = N''CPU'' in v3) and Query Store is enabled/READ_WRITE.',
             N'Enable QS prioritization: EXEC sp_StatUpdate @QueryStore = N''CPU''.',
@@ -7165,255 +7287,367 @@ BEGIN
     ============================================================================
     */
     /* BUG-B fix: RS13 now includes per-execution CPU normalization columns alongside raw totals */
+    /* w5p2 / gh-532: when @i8_data_status <> AVAILABLE the main CTE returns zero rows;
+       emit a single informational sentinel row so users can distinguish 'no improvement'
+       from 'no data at all'.  The AVAILABLE path is unchanged (existing tests pass). */
     IF @ExpertMode = 1 AND @SingleResultSet = 0
     BEGIN
-        ;WITH stat_trend AS
-        (
-            SELECT
-                su.DatabaseName,
-                su.SchemaName,
-                su.ObjectName,
-                su.StatisticsName,
-                su.QSTotalCpuMs,
-                su.QSTotalExecutions,
-                su.QSPlanCount,
-                su.QSTotalMemoryGrantKB,
-                su.QSTotalTempdbPages,
-                cpu_per_exec = CONVERT(decimal(18, 4), su.QSTotalCpuMs * 1.0 / NULLIF(su.QSTotalExecutions, 0)),
-                su.RunLabel,
-                r.StartTime,
-                appearance_num = ROW_NUMBER() OVER (
-                    PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
-                    ORDER BY r.StartTime
-                ),
-                total_appearances = COUNT_BIG(*) OVER (
-                    PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
-                )
-            FROM #stat_updates AS su
-            INNER JOIN #runs AS r
-                ON r.RunLabel = su.RunLabel
-            WHERE su.QSTotalCpuMs IS NOT NULL
-            AND   su.QSTotalCpuMs > 0
-            AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
-        ),
-        first_last AS
-        (
-            SELECT
-                DatabaseName, SchemaName, ObjectName, StatisticsName,
-                Appearances      = MAX(total_appearances),
-                FirstRunDate     = MAX(CASE WHEN appearance_num = 1 THEN StartTime END),
-                LastRunDate      = MAX(CASE WHEN appearance_num = total_appearances THEN StartTime END),
-                FirstCpuMs       = MAX(CASE WHEN appearance_num = 1 THEN QSTotalCpuMs END),
-                LastCpuMs        = MAX(CASE WHEN appearance_num = total_appearances THEN QSTotalCpuMs END),
-                FirstCpuPerExec  = MAX(CASE WHEN appearance_num = 1 THEN cpu_per_exec END),
-                LastCpuPerExec   = MAX(CASE WHEN appearance_num = total_appearances THEN cpu_per_exec END),
-                FirstExecs       = MAX(CASE WHEN appearance_num = 1 THEN QSTotalExecutions END),
-                LastExecs        = MAX(CASE WHEN appearance_num = total_appearances THEN QSTotalExecutions END),
-                FirstPlans       = MAX(CASE WHEN appearance_num = 1 THEN QSPlanCount END),
-                LastPlans        = MAX(CASE WHEN appearance_num = total_appearances THEN QSPlanCount END),
-                FirstMemoryGrantKB = MAX(CASE WHEN appearance_num = 1 THEN QSTotalMemoryGrantKB END),
-                LastMemoryGrantKB  = MAX(CASE WHEN appearance_num = total_appearances THEN QSTotalMemoryGrantKB END),
-                FirstTempdbPages   = MAX(CASE WHEN appearance_num = 1 THEN QSTotalTempdbPages END),
-                LastTempdbPages    = MAX(CASE WHEN appearance_num = total_appearances THEN QSTotalTempdbPages END)
-            FROM stat_trend
-            WHERE total_appearances >= 2
-            GROUP BY DatabaseName, SchemaName, ObjectName, StatisticsName
-        )
-        SELECT TOP (@TopN)
-            fl.DatabaseName,
-            fl.SchemaName,
-            TableName               = fl.ObjectName,
-            fl.StatisticsName,
-            fl.Appearances,
-            fl.FirstRunDate,
-            fl.LastRunDate,
-            fl.FirstCpuMs,
-            fl.LastCpuMs,
-            CpuChangePct            = CASE WHEN fl.FirstCpuMs > 0
-                                           THEN CONVERT(decimal(10, 1), (fl.LastCpuMs - fl.FirstCpuMs) * 100.0 / fl.FirstCpuMs)
-                                           ELSE NULL
-                                      END,
-            FirstCpuPerExec         = CONVERT(decimal(10, 2), fl.FirstCpuPerExec),
-            LastCpuPerExec          = CONVERT(decimal(10, 2), fl.LastCpuPerExec),
-            CpuPerExecChangePct     = CASE WHEN fl.FirstCpuPerExec > 0
-                                           THEN CONVERT(decimal(10, 1), (fl.LastCpuPerExec - fl.FirstCpuPerExec) * 100.0 / fl.FirstCpuPerExec)
-                                           ELSE NULL
-                                      END,
-            CpuTrend                = CASE
-                                          WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec < fl.FirstCpuPerExec * 0.95 THEN N'IMPROVING'
-                                          WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec > fl.FirstCpuPerExec * 1.05 THEN N'DEGRADING'
-                                          ELSE N'STABLE'
-                                      END,
-            fl.FirstExecs,
-            fl.LastExecs,
-            fl.FirstPlans,
-            fl.LastPlans,
-            ForcedPlanCount         = ISNULL(fp.ForcedPlanCount, 0),
-            PlanTrend               = CASE
-                                          WHEN fl.LastPlans > fl.FirstPlans AND ISNULL(fp.ForcedPlanCount, 0) > 0
-                                              THEN N'MORE PLANS (forced plan at risk)'
-                                          WHEN fl.LastPlans > fl.FirstPlans THEN N'MORE PLANS (possible regression)'
-                                          WHEN fl.LastPlans < fl.FirstPlans THEN N'FEWER PLANS (consolidating)'
-                                          ELSE N'STABLE'
-                                      END,
-            fl.FirstMemoryGrantKB,
-            fl.LastMemoryGrantKB,
-            MemoryGrantChangePct    = CASE WHEN ISNULL(fl.FirstMemoryGrantKB, 0) > 0
-                                           THEN CONVERT(decimal(10, 1), (fl.LastMemoryGrantKB - fl.FirstMemoryGrantKB) * 100.0 / fl.FirstMemoryGrantKB)
-                                           ELSE NULL
-                                      END,
-            MemoryGrantTrend        = CASE
-                                          WHEN ISNULL(fl.FirstMemoryGrantKB, 0) > 0 AND fl.LastMemoryGrantKB < fl.FirstMemoryGrantKB * 0.95 THEN N'IMPROVING'
-                                          WHEN ISNULL(fl.FirstMemoryGrantKB, 0) > 0 AND fl.LastMemoryGrantKB > fl.FirstMemoryGrantKB * 1.05 THEN N'DEGRADING'
-                                          WHEN fl.FirstMemoryGrantKB IS NULL OR fl.LastMemoryGrantKB IS NULL THEN NULL
-                                          ELSE N'STABLE'
-                                      END,
-            fl.FirstTempdbPages,
-            fl.LastTempdbPages,
-            TempdbChangePct         = CASE WHEN ISNULL(fl.FirstTempdbPages, 0) > 0
-                                           THEN CONVERT(decimal(10, 1), (fl.LastTempdbPages - fl.FirstTempdbPages) * 100.0 / fl.FirstTempdbPages)
-                                           ELSE NULL
-                                      END,
-            TempdbTrend             = CASE
-                                          WHEN ISNULL(fl.FirstTempdbPages, 0) > 0 AND fl.LastTempdbPages < fl.FirstTempdbPages * 0.95 THEN N'IMPROVING'
-                                          WHEN ISNULL(fl.FirstTempdbPages, 0) > 0 AND fl.LastTempdbPages > fl.FirstTempdbPages * 1.05 THEN N'DEGRADING'
-                                          WHEN fl.FirstTempdbPages IS NULL OR fl.LastTempdbPages IS NULL THEN NULL
-                                          ELSE N'STABLE'
-                                      END
-        FROM first_last AS fl
-        LEFT JOIN #forced_plans AS fp
-            ON fp.DatabaseName = fl.DatabaseName
-            AND fp.ObjectName = fl.ObjectName
-        ORDER BY
-            CASE
-                WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec < fl.FirstCpuPerExec * 0.95 THEN 1
-                WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec > fl.FirstCpuPerExec * 1.05 THEN 2
-                ELSE 3
-            END,
-            ISNULL(fl.FirstCpuMs, 0) DESC;
-    END
-    ELSE IF @ExpertMode = 1
-    BEGIN
-        INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
-        SELECT
-            ResultSetID   = 13,
-            ResultSetName = N'QS Performance Correlation',
-            RowNum        = ROW_NUMBER() OVER (
-                                ORDER BY
-                                    CASE
-                                        WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec < fl.FirstCpuPerExec * 0.95 THEN 1
-                                        WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec > fl.FirstCpuPerExec * 1.05 THEN 2
-                                        ELSE 3
-                                    END,
-                                    ISNULL(fl.FirstCpuMs, 0) DESC
-                            ),
-            RowData       = (
-                SELECT
-                    DatabaseName        = fl2.DatabaseName,
-                    SchemaName          = fl2.SchemaName,
-                    TableName           = fl2.ObjectName,
-                    StatisticsName      = fl2.StatisticsName,
-                    Appearances         = fl2.Appearances,
-                    FirstCpuMs          = fl2.FirstCpuMs,
-                    LastCpuMs           = fl2.LastCpuMs,
-                    CpuChangePct        = CASE WHEN fl2.FirstCpuMs > 0
-                                               THEN CONVERT(decimal(10, 1), (fl2.LastCpuMs - fl2.FirstCpuMs) * 100.0 / fl2.FirstCpuMs)
-                                               ELSE NULL
-                                          END,
-                    FirstCpuPerExec     = CONVERT(decimal(10, 2), fl2.FirstCpuPerExec),
-                    LastCpuPerExec      = CONVERT(decimal(10, 2), fl2.LastCpuPerExec),
-                    CpuPerExecChangePct = CASE WHEN fl2.FirstCpuPerExec > 0
-                                               THEN CONVERT(decimal(10, 1), (fl2.LastCpuPerExec - fl2.FirstCpuPerExec) * 100.0 / fl2.FirstCpuPerExec)
-                                               ELSE NULL
-                                          END,
-                    CpuTrend            = CASE
-                                             WHEN fl2.FirstCpuPerExec > 0 AND fl2.LastCpuPerExec < fl2.FirstCpuPerExec * 0.95 THEN N'IMPROVING'
-                                             WHEN fl2.FirstCpuPerExec > 0 AND fl2.LastCpuPerExec > fl2.FirstCpuPerExec * 1.05 THEN N'DEGRADING'
-                                             ELSE N'STABLE'
-                                         END,
-                    ForcedPlanCount     = fl2.ForcedPlanCount,
-                    PlanTrend           = CASE
-                                             WHEN fl2.LastPlans > fl2.FirstPlans AND fl2.ForcedPlanCount > 0
-                                                 THEN N'MORE PLANS (forced plan at risk)'
-                                             WHEN fl2.LastPlans > fl2.FirstPlans THEN N'MORE PLANS (possible regression)'
-                                             WHEN fl2.LastPlans < fl2.FirstPlans THEN N'FEWER PLANS (consolidating)'
-                                             ELSE N'STABLE'
-                                         END,
-                    FirstMemoryGrantKB    = fl2.FirstMemoryGrantKB,
-                    LastMemoryGrantKB     = fl2.LastMemoryGrantKB,
-                    MemoryGrantChangePct  = CASE WHEN ISNULL(fl2.FirstMemoryGrantKB, 0) > 0
-                                                 THEN CONVERT(decimal(10, 1), (fl2.LastMemoryGrantKB - fl2.FirstMemoryGrantKB) * 100.0 / fl2.FirstMemoryGrantKB)
-                                                 ELSE NULL
-                                            END,
-                    MemoryGrantTrend      = CASE
-                                                WHEN ISNULL(fl2.FirstMemoryGrantKB, 0) > 0 AND fl2.LastMemoryGrantKB < fl2.FirstMemoryGrantKB * 0.95 THEN N'IMPROVING'
-                                                WHEN ISNULL(fl2.FirstMemoryGrantKB, 0) > 0 AND fl2.LastMemoryGrantKB > fl2.FirstMemoryGrantKB * 1.05 THEN N'DEGRADING'
-                                                WHEN fl2.FirstMemoryGrantKB IS NULL OR fl2.LastMemoryGrantKB IS NULL THEN NULL
-                                                ELSE N'STABLE'
-                                            END,
-                    FirstTempdbPages      = fl2.FirstTempdbPages,
-                    LastTempdbPages        = fl2.LastTempdbPages,
-                    TempdbChangePct       = CASE WHEN ISNULL(fl2.FirstTempdbPages, 0) > 0
-                                                 THEN CONVERT(decimal(10, 1), (fl2.LastTempdbPages - fl2.FirstTempdbPages) * 100.0 / fl2.FirstTempdbPages)
-                                                 ELSE NULL
-                                            END,
-                    TempdbTrend           = CASE
-                                                WHEN ISNULL(fl2.FirstTempdbPages, 0) > 0 AND fl2.LastTempdbPages < fl2.FirstTempdbPages * 0.95 THEN N'IMPROVING'
-                                                WHEN ISNULL(fl2.FirstTempdbPages, 0) > 0 AND fl2.LastTempdbPages > fl2.FirstTempdbPages * 1.05 THEN N'DEGRADING'
-                                                WHEN fl2.FirstTempdbPages IS NULL OR fl2.LastTempdbPages IS NULL THEN NULL
-                                                ELSE N'STABLE'
-                                            END
-                FROM (SELECT fl.DatabaseName, fl.SchemaName, fl.ObjectName, fl.StatisticsName,
-                             fl.Appearances, fl.FirstCpuMs, fl.LastCpuMs, fl.FirstCpuPerExec, fl.LastCpuPerExec,
-                             fl.FirstPlans, fl.LastPlans, fl.ForcedPlanCount,
-                             fl.FirstMemoryGrantKB, fl.LastMemoryGrantKB,
-                             fl.FirstTempdbPages, fl.LastTempdbPages) AS fl2
-                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
-            )
-        FROM
-        (
-            SELECT TOP (@TopN)
-                su_fl.DatabaseName, su_fl.SchemaName, su_fl.ObjectName, su_fl.StatisticsName,
-                Appearances     = COUNT_BIG(*),
-                FirstCpuMs      = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalCpuMs END),
-                LastCpuMs       = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.QSTotalCpuMs END),
-                FirstCpuPerExec = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.cpu_per_exec END),
-                LastCpuPerExec  = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.cpu_per_exec END),
-                FirstPlans      = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSPlanCount END),
-                LastPlans       = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.QSPlanCount END),
-                ForcedPlanCount = MAX(ISNULL(fp.ForcedPlanCount, 0)),
-                FirstMemoryGrantKB = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalMemoryGrantKB END),
-                LastMemoryGrantKB  = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.QSTotalMemoryGrantKB END),
-                FirstTempdbPages   = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalTempdbPages END),
-                LastTempdbPages    = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.QSTotalTempdbPages END)
-            FROM
+        IF @i8_data_status = N'AVAILABLE'
+        BEGIN
+            ;WITH stat_trend AS
             (
                 SELECT
-                    su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName,
+                    su.DatabaseName,
+                    su.SchemaName,
+                    su.ObjectName,
+                    su.StatisticsName,
                     su.QSTotalCpuMs,
+                    su.QSTotalExecutions,
                     su.QSPlanCount,
                     su.QSTotalMemoryGrantKB,
                     su.QSTotalTempdbPages,
                     cpu_per_exec = CONVERT(decimal(18, 4), su.QSTotalCpuMs * 1.0 / NULLIF(su.QSTotalExecutions, 0)),
-                    rn  = ROW_NUMBER() OVER (
-                              PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
-                              ORDER BY r.StartTime
-                          ),
-                    cnt = COUNT_BIG(*) OVER (
-                              PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
-                          )
+                    su.RunLabel,
+                    r.StartTime,
+                    appearance_num = ROW_NUMBER() OVER (
+                        PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+                        ORDER BY r.StartTime
+                    ),
+                    total_appearances = COUNT_BIG(*) OVER (
+                        PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+                    )
                 FROM #stat_updates AS su
-                INNER JOIN #runs AS r ON r.RunLabel = su.RunLabel
-                WHERE su.QSTotalCpuMs IS NOT NULL AND su.QSTotalCpuMs > 0
+                INNER JOIN #runs AS r
+                    ON r.RunLabel = su.RunLabel
+                WHERE su.QSTotalCpuMs IS NOT NULL
+                AND   su.QSTotalCpuMs > 0
                 AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
-            ) AS su_fl
+            ),
+            first_last AS
+            (
+                SELECT
+                    DatabaseName, SchemaName, ObjectName, StatisticsName,
+                    Appearances      = MAX(total_appearances),
+                    FirstRunDate     = MAX(CASE WHEN appearance_num = 1 THEN StartTime END),
+                    LastRunDate      = MAX(CASE WHEN appearance_num = total_appearances THEN StartTime END),
+                    FirstCpuMs       = MAX(CASE WHEN appearance_num = 1 THEN QSTotalCpuMs END),
+                    LastCpuMs        = MAX(CASE WHEN appearance_num = total_appearances THEN QSTotalCpuMs END),
+                    FirstCpuPerExec  = MAX(CASE WHEN appearance_num = 1 THEN cpu_per_exec END),
+                    LastCpuPerExec   = MAX(CASE WHEN appearance_num = total_appearances THEN cpu_per_exec END),
+                    FirstExecs       = MAX(CASE WHEN appearance_num = 1 THEN QSTotalExecutions END),
+                    LastExecs        = MAX(CASE WHEN appearance_num = total_appearances THEN QSTotalExecutions END),
+                    FirstPlans       = MAX(CASE WHEN appearance_num = 1 THEN QSPlanCount END),
+                    LastPlans        = MAX(CASE WHEN appearance_num = total_appearances THEN QSPlanCount END),
+                    FirstMemoryGrantKB = MAX(CASE WHEN appearance_num = 1 THEN QSTotalMemoryGrantKB END),
+                    LastMemoryGrantKB  = MAX(CASE WHEN appearance_num = total_appearances THEN QSTotalMemoryGrantKB END),
+                    FirstTempdbPages   = MAX(CASE WHEN appearance_num = 1 THEN QSTotalTempdbPages END),
+                    LastTempdbPages    = MAX(CASE WHEN appearance_num = total_appearances THEN QSTotalTempdbPages END)
+                FROM stat_trend
+                WHERE total_appearances >= 2
+                GROUP BY DatabaseName, SchemaName, ObjectName, StatisticsName
+            )
+            SELECT TOP (@TopN)
+                fl.DatabaseName,
+                fl.SchemaName,
+                TableName               = fl.ObjectName,
+                fl.StatisticsName,
+                fl.Appearances,
+                fl.FirstRunDate,
+                fl.LastRunDate,
+                fl.FirstCpuMs,
+                fl.LastCpuMs,
+                CpuChangePct            = CASE WHEN fl.FirstCpuMs > 0
+                                               THEN CONVERT(decimal(10, 1), (fl.LastCpuMs - fl.FirstCpuMs) * 100.0 / fl.FirstCpuMs)
+                                               ELSE NULL
+                                          END,
+                FirstCpuPerExec         = CONVERT(decimal(10, 2), fl.FirstCpuPerExec),
+                LastCpuPerExec          = CONVERT(decimal(10, 2), fl.LastCpuPerExec),
+                CpuPerExecChangePct     = CASE WHEN fl.FirstCpuPerExec > 0
+                                               THEN CONVERT(decimal(10, 1), (fl.LastCpuPerExec - fl.FirstCpuPerExec) * 100.0 / fl.FirstCpuPerExec)
+                                               ELSE NULL
+                                          END,
+                CpuTrend                = CASE
+                                              WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec < fl.FirstCpuPerExec * 0.95 THEN N'IMPROVING'
+                                              WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec > fl.FirstCpuPerExec * 1.05 THEN N'DEGRADING'
+                                              ELSE N'STABLE'
+                                          END,
+                fl.FirstExecs,
+                fl.LastExecs,
+                fl.FirstPlans,
+                fl.LastPlans,
+                ForcedPlanCount         = ISNULL(fp.ForcedPlanCount, 0),
+                PlanTrend               = CASE
+                                              WHEN fl.LastPlans > fl.FirstPlans AND ISNULL(fp.ForcedPlanCount, 0) > 0
+                                                  THEN N'MORE PLANS (forced plan at risk)'
+                                              WHEN fl.LastPlans > fl.FirstPlans THEN N'MORE PLANS (possible regression)'
+                                              WHEN fl.LastPlans < fl.FirstPlans THEN N'FEWER PLANS (consolidating)'
+                                              ELSE N'STABLE'
+                                          END,
+                fl.FirstMemoryGrantKB,
+                fl.LastMemoryGrantKB,
+                MemoryGrantChangePct    = CASE WHEN ISNULL(fl.FirstMemoryGrantKB, 0) > 0
+                                               THEN CONVERT(decimal(10, 1), (fl.LastMemoryGrantKB - fl.FirstMemoryGrantKB) * 100.0 / fl.FirstMemoryGrantKB)
+                                               ELSE NULL
+                                          END,
+                MemoryGrantTrend        = CASE
+                                              WHEN ISNULL(fl.FirstMemoryGrantKB, 0) > 0 AND fl.LastMemoryGrantKB < fl.FirstMemoryGrantKB * 0.95 THEN N'IMPROVING'
+                                              WHEN ISNULL(fl.FirstMemoryGrantKB, 0) > 0 AND fl.LastMemoryGrantKB > fl.FirstMemoryGrantKB * 1.05 THEN N'DEGRADING'
+                                              WHEN fl.FirstMemoryGrantKB IS NULL OR fl.LastMemoryGrantKB IS NULL THEN NULL
+                                              ELSE N'STABLE'
+                                          END,
+                fl.FirstTempdbPages,
+                fl.LastTempdbPages,
+                TempdbChangePct         = CASE WHEN ISNULL(fl.FirstTempdbPages, 0) > 0
+                                               THEN CONVERT(decimal(10, 1), (fl.LastTempdbPages - fl.FirstTempdbPages) * 100.0 / fl.FirstTempdbPages)
+                                               ELSE NULL
+                                          END,
+                TempdbTrend             = CASE
+                                              WHEN ISNULL(fl.FirstTempdbPages, 0) > 0 AND fl.LastTempdbPages < fl.FirstTempdbPages * 0.95 THEN N'IMPROVING'
+                                              WHEN ISNULL(fl.FirstTempdbPages, 0) > 0 AND fl.LastTempdbPages > fl.FirstTempdbPages * 1.05 THEN N'DEGRADING'
+                                              WHEN fl.FirstTempdbPages IS NULL OR fl.LastTempdbPages IS NULL THEN NULL
+                                              ELSE N'STABLE'
+                                          END
+            FROM first_last AS fl
             LEFT JOIN #forced_plans AS fp
-                ON fp.DatabaseName = su_fl.DatabaseName
-                AND fp.ObjectName = su_fl.ObjectName
-            WHERE su_fl.cnt >= 2
-            GROUP BY su_fl.DatabaseName, su_fl.SchemaName, su_fl.ObjectName, su_fl.StatisticsName
-            ORDER BY MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalCpuMs END) DESC
-        ) AS fl;
+                ON fp.DatabaseName = fl.DatabaseName
+                AND fp.ObjectName = fl.ObjectName
+            ORDER BY
+                CASE
+                    WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec < fl.FirstCpuPerExec * 0.95 THEN 1
+                    WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec > fl.FirstCpuPerExec * 1.05 THEN 2
+                    ELSE 3
+                END,
+                ISNULL(fl.FirstCpuMs, 0) DESC;
+        END
+        ELSE
+        BEGIN
+            /* w5p2 / gh-532: sparse / no-data path -- return one sentinel row so callers
+               can distinguish an empty result from a result with no improvement.
+               All numeric/date columns are NULL; the reason is encoded in string columns. */
+            DECLARE @rs13_reason nvarchar(max) = CONVERT(nvarchar(max), N'');
+
+            SET @rs13_reason =
+                CASE @i8_data_status
+                    WHEN N'UNAVAILABLE'
+                    THEN N'No QS CPU data captured in any run within the analysis window. '
+                        + N'Enable Query Store and configure sp_StatUpdate with @QueryStore = N''CPU''. '
+                        + N'ALTER DATABASE [YourDb] SET QUERY_STORE = ON;'
+                    WHEN N'INSUFFICIENT_HISTORY'
+                    THEN N'Fewer than 2 runs contain matching QS CPU data ('
+                        + CONVERT(nvarchar(10), @i8_qs_cpu_runs)
+                        + N' QS-CPU run(s) found; need 2+ and at least 1 stat in 2+ runs). '
+                        + N'Run sp_StatUpdate with @QueryStore = N''CPU'' across additional maintenance windows.'
+                    ELSE N'DataStatus: ' + @i8_data_status
+                END;
+
+            SELECT
+                DatabaseName            = N'[NO DATA]',
+                SchemaName              = N'[NO DATA]',
+                TableName               = N'[NO DATA]',
+                StatisticsName          = @rs13_reason,
+                Appearances             = CONVERT(integer, NULL),
+                FirstRunDate            = CONVERT(datetime2(0), NULL),
+                LastRunDate             = CONVERT(datetime2(0), NULL),
+                FirstCpuMs              = CONVERT(bigint, NULL),
+                LastCpuMs               = CONVERT(bigint, NULL),
+                CpuChangePct            = CONVERT(decimal(10, 1), NULL),
+                FirstCpuPerExec         = CONVERT(decimal(10, 2), NULL),
+                LastCpuPerExec          = CONVERT(decimal(10, 2), NULL),
+                CpuPerExecChangePct     = CONVERT(decimal(10, 1), NULL),
+                CpuTrend                = CONVERT(nvarchar(30), NULL),
+                FirstExecs              = CONVERT(bigint, NULL),
+                LastExecs               = CONVERT(bigint, NULL),
+                FirstPlans              = CONVERT(integer, NULL),
+                LastPlans               = CONVERT(integer, NULL),
+                ForcedPlanCount         = CONVERT(integer, NULL),
+                PlanTrend               = CONVERT(nvarchar(50), NULL),
+                FirstMemoryGrantKB      = CONVERT(bigint, NULL),
+                LastMemoryGrantKB       = CONVERT(bigint, NULL),
+                MemoryGrantChangePct    = CONVERT(decimal(10, 1), NULL),
+                MemoryGrantTrend        = CONVERT(nvarchar(30), NULL),
+                FirstTempdbPages        = CONVERT(bigint, NULL),
+                LastTempdbPages         = CONVERT(bigint, NULL),
+                TempdbChangePct         = CONVERT(decimal(10, 1), NULL),
+                TempdbTrend             = CONVERT(nvarchar(30), NULL);
+        END;
+    END
+    ELSE IF @ExpertMode = 1
+    BEGIN
+        /* w5p2 / gh-532: single-result-set path -- same AVAILABLE / not-AVAILABLE split */
+        IF @i8_data_status = N'AVAILABLE'
+        BEGIN
+            INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+            SELECT
+                ResultSetID   = 13,
+                ResultSetName = N'QS Performance Correlation',
+                RowNum        = ROW_NUMBER() OVER (
+                                    ORDER BY
+                                        CASE
+                                            WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec < fl.FirstCpuPerExec * 0.95 THEN 1
+                                            WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec > fl.FirstCpuPerExec * 1.05 THEN 2
+                                            ELSE 3
+                                        END,
+                                        ISNULL(fl.FirstCpuMs, 0) DESC
+                                ),
+                RowData       = (
+                    SELECT
+                        DatabaseName        = fl2.DatabaseName,
+                        SchemaName          = fl2.SchemaName,
+                        TableName           = fl2.ObjectName,
+                        StatisticsName      = fl2.StatisticsName,
+                        Appearances         = fl2.Appearances,
+                        FirstCpuMs          = fl2.FirstCpuMs,
+                        LastCpuMs           = fl2.LastCpuMs,
+                        CpuChangePct        = CASE WHEN fl2.FirstCpuMs > 0
+                                                   THEN CONVERT(decimal(10, 1), (fl2.LastCpuMs - fl2.FirstCpuMs) * 100.0 / fl2.FirstCpuMs)
+                                                   ELSE NULL
+                                              END,
+                        FirstCpuPerExec     = CONVERT(decimal(10, 2), fl2.FirstCpuPerExec),
+                        LastCpuPerExec      = CONVERT(decimal(10, 2), fl2.LastCpuPerExec),
+                        CpuPerExecChangePct = CASE WHEN fl2.FirstCpuPerExec > 0
+                                                   THEN CONVERT(decimal(10, 1), (fl2.LastCpuPerExec - fl2.FirstCpuPerExec) * 100.0 / fl2.FirstCpuPerExec)
+                                                   ELSE NULL
+                                              END,
+                        CpuTrend            = CASE
+                                                 WHEN fl2.FirstCpuPerExec > 0 AND fl2.LastCpuPerExec < fl2.FirstCpuPerExec * 0.95 THEN N'IMPROVING'
+                                                 WHEN fl2.FirstCpuPerExec > 0 AND fl2.LastCpuPerExec > fl2.FirstCpuPerExec * 1.05 THEN N'DEGRADING'
+                                                 ELSE N'STABLE'
+                                             END,
+                        ForcedPlanCount     = fl2.ForcedPlanCount,
+                        PlanTrend           = CASE
+                                                 WHEN fl2.LastPlans > fl2.FirstPlans AND fl2.ForcedPlanCount > 0
+                                                     THEN N'MORE PLANS (forced plan at risk)'
+                                                 WHEN fl2.LastPlans > fl2.FirstPlans THEN N'MORE PLANS (possible regression)'
+                                                 WHEN fl2.LastPlans < fl2.FirstPlans THEN N'FEWER PLANS (consolidating)'
+                                                 ELSE N'STABLE'
+                                             END,
+                        FirstMemoryGrantKB    = fl2.FirstMemoryGrantKB,
+                        LastMemoryGrantKB     = fl2.LastMemoryGrantKB,
+                        MemoryGrantChangePct  = CASE WHEN ISNULL(fl2.FirstMemoryGrantKB, 0) > 0
+                                                     THEN CONVERT(decimal(10, 1), (fl2.LastMemoryGrantKB - fl2.FirstMemoryGrantKB) * 100.0 / fl2.FirstMemoryGrantKB)
+                                                     ELSE NULL
+                                                END,
+                        MemoryGrantTrend      = CASE
+                                                    WHEN ISNULL(fl2.FirstMemoryGrantKB, 0) > 0 AND fl2.LastMemoryGrantKB < fl2.FirstMemoryGrantKB * 0.95 THEN N'IMPROVING'
+                                                    WHEN ISNULL(fl2.FirstMemoryGrantKB, 0) > 0 AND fl2.LastMemoryGrantKB > fl2.FirstMemoryGrantKB * 1.05 THEN N'DEGRADING'
+                                                    WHEN fl2.FirstMemoryGrantKB IS NULL OR fl2.LastMemoryGrantKB IS NULL THEN NULL
+                                                    ELSE N'STABLE'
+                                                END,
+                        FirstTempdbPages      = fl2.FirstTempdbPages,
+                        LastTempdbPages        = fl2.LastTempdbPages,
+                        TempdbChangePct       = CASE WHEN ISNULL(fl2.FirstTempdbPages, 0) > 0
+                                                     THEN CONVERT(decimal(10, 1), (fl2.LastTempdbPages - fl2.FirstTempdbPages) * 100.0 / fl2.FirstTempdbPages)
+                                                     ELSE NULL
+                                                END,
+                        TempdbTrend           = CASE
+                                                    WHEN ISNULL(fl2.FirstTempdbPages, 0) > 0 AND fl2.LastTempdbPages < fl2.FirstTempdbPages * 0.95 THEN N'IMPROVING'
+                                                    WHEN ISNULL(fl2.FirstTempdbPages, 0) > 0 AND fl2.LastTempdbPages > fl2.FirstTempdbPages * 1.05 THEN N'DEGRADING'
+                                                    WHEN fl2.FirstTempdbPages IS NULL OR fl2.LastTempdbPages IS NULL THEN NULL
+                                                    ELSE N'STABLE'
+                                                END
+                    FROM (SELECT fl.DatabaseName, fl.SchemaName, fl.ObjectName, fl.StatisticsName,
+                                 fl.Appearances, fl.FirstCpuMs, fl.LastCpuMs, fl.FirstCpuPerExec, fl.LastCpuPerExec,
+                                 fl.FirstPlans, fl.LastPlans, fl.ForcedPlanCount,
+                                 fl.FirstMemoryGrantKB, fl.LastMemoryGrantKB,
+                                 fl.FirstTempdbPages, fl.LastTempdbPages) AS fl2
+                    FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+                )
+            FROM
+            (
+                SELECT TOP (@TopN)
+                    su_fl.DatabaseName, su_fl.SchemaName, su_fl.ObjectName, su_fl.StatisticsName,
+                    Appearances     = COUNT_BIG(*),
+                    FirstCpuMs      = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalCpuMs END),
+                    LastCpuMs       = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.QSTotalCpuMs END),
+                    FirstCpuPerExec = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.cpu_per_exec END),
+                    LastCpuPerExec  = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.cpu_per_exec END),
+                    FirstPlans      = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSPlanCount END),
+                    LastPlans       = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.QSPlanCount END),
+                    ForcedPlanCount = MAX(ISNULL(fp.ForcedPlanCount, 0)),
+                    FirstMemoryGrantKB = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalMemoryGrantKB END),
+                    LastMemoryGrantKB  = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.QSTotalMemoryGrantKB END),
+                    FirstTempdbPages   = MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalTempdbPages END),
+                    LastTempdbPages    = MAX(CASE WHEN su_fl.rn = su_fl.cnt THEN su_fl.QSTotalTempdbPages END)
+                FROM
+                (
+                    SELECT
+                        su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName,
+                        su.QSTotalCpuMs,
+                        su.QSPlanCount,
+                        su.QSTotalMemoryGrantKB,
+                        su.QSTotalTempdbPages,
+                        cpu_per_exec = CONVERT(decimal(18, 4), su.QSTotalCpuMs * 1.0 / NULLIF(su.QSTotalExecutions, 0)),
+                        rn  = ROW_NUMBER() OVER (
+                                  PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+                                  ORDER BY r.StartTime
+                              ),
+                        cnt = COUNT_BIG(*) OVER (
+                                  PARTITION BY su.DatabaseName, su.SchemaName, su.ObjectName, su.StatisticsName
+                              )
+                    FROM #stat_updates AS su
+                    INNER JOIN #runs AS r ON r.RunLabel = su.RunLabel
+                    WHERE su.QSTotalCpuMs IS NOT NULL AND su.QSTotalCpuMs > 0
+                    AND   (su.ErrorNumber = 0 OR su.ErrorNumber IS NULL)
+                ) AS su_fl
+                LEFT JOIN #forced_plans AS fp
+                    ON fp.DatabaseName = su_fl.DatabaseName
+                    AND fp.ObjectName = su_fl.ObjectName
+                WHERE su_fl.cnt >= 2
+                GROUP BY su_fl.DatabaseName, su_fl.SchemaName, su_fl.ObjectName, su_fl.StatisticsName
+                ORDER BY MAX(CASE WHEN su_fl.rn = 1 THEN su_fl.QSTotalCpuMs END) DESC
+            ) AS fl;
+        END
+        ELSE
+        BEGIN
+            /* w5p2 / gh-532: sentinel row in single-result-set mode */
+            DECLARE @rs13_srs_reason nvarchar(max) = CONVERT(nvarchar(max), N'');
+
+            SET @rs13_srs_reason =
+                CASE @i8_data_status
+                    WHEN N'UNAVAILABLE'
+                    THEN N'No QS CPU data captured in any run within the analysis window. '
+                        + N'Enable Query Store and configure sp_StatUpdate with @QueryStore = N''CPU''. '
+                        + N'ALTER DATABASE [YourDb] SET QUERY_STORE = ON;'
+                    WHEN N'INSUFFICIENT_HISTORY'
+                    THEN N'Fewer than 2 runs contain matching QS CPU data ('
+                        + CONVERT(nvarchar(10), @i8_qs_cpu_runs)
+                        + N' QS-CPU run(s) found; need 2+ and at least 1 stat in 2+ runs). '
+                        + N'Run sp_StatUpdate with @QueryStore = N''CPU'' across additional maintenance windows.'
+                    ELSE N'DataStatus: ' + @i8_data_status
+                END;
+
+            INSERT INTO #single_rs (ResultSetID, ResultSetName, RowNum, RowData)
+            SELECT
+                ResultSetID   = 13,
+                ResultSetName = N'QS Performance Correlation',
+                RowNum        = 1,
+                RowData       = (
+                    SELECT
+                        DatabaseName            = N'[NO DATA]',
+                        SchemaName              = N'[NO DATA]',
+                        TableName               = N'[NO DATA]',
+                        StatisticsName          = @rs13_srs_reason,
+                        Appearances             = CONVERT(integer, NULL),
+                        FirstCpuMs              = CONVERT(bigint, NULL),
+                        LastCpuMs               = CONVERT(bigint, NULL),
+                        CpuChangePct            = CONVERT(decimal(10, 1), NULL),
+                        FirstCpuPerExec         = CONVERT(decimal(10, 2), NULL),
+                        LastCpuPerExec          = CONVERT(decimal(10, 2), NULL),
+                        CpuPerExecChangePct     = CONVERT(decimal(10, 1), NULL),
+                        CpuTrend                = CONVERT(nvarchar(30), NULL),
+                        ForcedPlanCount         = CONVERT(integer, NULL),
+                        PlanTrend               = CONVERT(nvarchar(50), NULL),
+                        FirstMemoryGrantKB      = CONVERT(bigint, NULL),
+                        LastMemoryGrantKB       = CONVERT(bigint, NULL),
+                        MemoryGrantChangePct    = CONVERT(decimal(10, 1), NULL),
+                        MemoryGrantTrend        = CONVERT(nvarchar(30), NULL),
+                        FirstTempdbPages        = CONVERT(bigint, NULL),
+                        LastTempdbPages         = CONVERT(bigint, NULL),
+                        TempdbChangePct         = CONVERT(decimal(10, 1), NULL),
+                        TempdbTrend             = CONVERT(nvarchar(30), NULL)
+                    FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+                );
+        END;
     END;
 
     /*

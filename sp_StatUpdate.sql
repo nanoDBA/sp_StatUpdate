@@ -36,11 +36,56 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.6.0.2026.07.02 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.7.0.2026.07.03 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.6.0.2026.07.02 - Telemetry contract batch (sp_StatUpdate-mvgb, -r2d0,
+History:    3.7.0.2026.07.03 - QS attribution + guardrail batch (sp_StatUpdate-zks1,
+                            -6aa2, -sss6, -o7gf, -u6n7, -l4ui, -lfbv):
+                            (1) gh-533 (zks1): pre-run QS forced-plan baseline --
+                            #qs_forced_baseline snapshots force_failure_count per
+                            database before any stat is touched (MANUAL-only
+                            filter on SQL 2022+ via plan_forcing_type; APC noise
+                            excluded).  Post-run delta: rising failure counts
+                            emit a QS_FORCED_PLAN_FAILURE_DELTA warning naming
+                            per-database deltas, and the END Summary XML gains a
+                            ForcedPlanFailureDelta element (omitted when zero).
+                            Databases whose baseline capture failed transiently
+                            are excluded from the delta (#qs_forced_baseline_dbs
+                            success markers) so pre-existing failures are never
+                            misattributed to the run.  (2) gh-534 (6aa2):
+                            @QueryStore = WAIT_CPU -- prioritizes by CPU-category
+                            waits only (sys.query_store_wait_stats
+                            wait_category = 1); complements WAITS (all
+                            categories).  (3) gh-539 (sss6): P2c budget-guard
+                            overshoot prevention -- before starting each stat,
+                            estimates duration from CommandLog history (MAX of
+                            last 10 successful updates, not AVG -- one 4-hour
+                            outlier must count) and defers stats that cannot fit
+                            the remaining @TimeLimit/@StopByTime budget.
+                            (4) gh-551 (o7gf): denied runs (ALREADY_RUNNING) now
+                            write a durable SP_STATUPDATE_DENIED CommandLog row
+                            with denial XML (denied session, holder session,
+                            holder login time / lock acquire time); suppressed
+                            under @LogToTable = N'N'.  (5) gh-554 (u6n7):
+                            filtered-drift proof surface -- FILTERED_DRIFT now
+                            outranks QUERY_STORE_PRIORITY in QualifyReason, and
+                            @FilteredStatsMode / @FilteredStatsStaleFactor are
+                            re-promoted to public parameters (the v3.0 API
+                            collapse had absorbed them with no preset exposing
+                            EXCLUDE/ONLY/PRIORITY, leaving those modes and the
+                            FILTERED_DRIFT sort unreachable).  Public input
+                            params: 42.  (6) gh-553 (l4ui): @Help preset topic
+                            rewritten as a bounded override contract -- presets
+                            are packaged configurations; the documented override
+                            set (@TimeLimit, @ModificationThreshold, @SortOrder,
+                            @StatisticsSample, @MopUpPass, @QueryStore,
+                            @LockTimeout) is the supported surface.  (7) lfbv:
+                            IO-corruption warning (severity 823/824 pattern)
+                            deduped via flag instead of LIKE-scan; fresh-stat
+                            physical_row_count aggregated once per object
+                            (GROUP BY derived table) instead of per stat.
+            3.6.0.2026.07.02 - Telemetry contract batch (sp_StatUpdate-mvgb, -r2d0,
                             -ibyc, -6zvp, -wuq2, -hdls):
                             (1) mvgb: END Summary XML gains a WarningsCodes
                             element (pipe-delimited, same tokens as
@@ -462,13 +507,14 @@ ALTER PROCEDURE
     /*
     ============================================================================
     v3 SIMPLIFIED API
-      39 input parameters (was 36 in v3.2.1) + 11 OUTPUT parameters
-      25 input parameters absorbed into preset-controlled @i_ internal variables.
+      42 input parameters + 11 OUTPUT parameters
+      23 input parameters absorbed into preset-controlled @i_ internal variables.
       Explicit params always override preset defaults.
 
-    INPUT (40):  @Statistics, @JobName, @Preset, @Databases, @Tables, @ExcludeTables,
+    INPUT (42):  @Statistics, @JobName, @Preset, @Databases, @Tables, @ExcludeTables,
                  @ExcludeStatistics, @TargetNorecompute, @StaleHours, @QueryStore,
-                 @TimeLimit, @StopByTime, @BatchLimit, @SortOrder, @MopUpPass,
+                 @TimeLimit, @StopByTime, @BatchLimit, @SortOrder,
+                 @FilteredStatsMode, @FilteredStatsStaleFactor, @MopUpPass,
                  @StatisticsSample, @MaxDOP, @ModificationThreshold,
                  @LongRunningThresholdMinutes, @LongRunningSamplePercent,
                  @QueryStoreTopPlans, @QueryStoreMinExecutions, @QueryStoreRecentHours,
@@ -502,13 +548,15 @@ ALTER PROCEDURE
     @StaleHours int = NULL,                         /* minimum hours since last update (replaces @DaysStaleThreshold + @HoursStaleThreshold) */
 
     /* QUERY STORE -- single param replaces @QueryStorePriority + @QueryStoreMetric */
-    @QueryStore nvarchar(20) = NULL,                /* OFF or metric name: CPU, DURATION, READS, EXECUTIONS, AVG_CPU, MEMORY_GRANT, TEMPDB_SPILLS, PHYSICAL_READS, AVG_MEMORY, WAITS.  NULL = preset decides. */
+    @QueryStore nvarchar(20) = NULL,                /* OFF or metric name: CPU, DURATION, READS, EXECUTIONS, AVG_CPU, MEMORY_GRANT, TEMPDB_SPILLS, PHYSICAL_READS, AVG_MEMORY, WAITS, WAIT_CPU.  NULL = preset decides. */
 
     /* EXECUTION CONTROL */
     @TimeLimit integer = NULL,                      /* seconds. NULL = preset decides (DEFAULT=18000, NIGHTLY=3600, etc.) */
     @StopByTime nvarchar(8) = NULL,                 /* absolute stop time: HHMM, HH:MM, HH:MM:SS. Overrides @TimeLimit. */
     @BatchLimit integer = NULL,                     /* max stats per run */
     @SortOrder nvarchar(50) = NULL,                 /* NULL = preset decides. MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED, ROWS */
+    @FilteredStatsMode nvarchar(10) = NULL,         /* NULL = internal default (INCLUDE). INCLUDE, EXCLUDE, ONLY, PRIORITY (drift boost). Re-promoted in v3.7.0: the v3.0 API collapse absorbed it, leaving EXCLUDE/ONLY/PRIORITY unreachable */
+    @FilteredStatsStaleFactor float = NULL,         /* NULL = internal default (2.0). Filtered stat counts as drifted when unfiltered_rows / rows > factor */
     @MopUpPass nvarchar(1) = NULL,                  /* Y/N. NULL = preset decides.  Broad sweep after priority pass. */
     @StatisticsSample integer = NULL,               /* 1-100 (100=FULLSCAN), NULL = let SQL decide */
     @MaxDOP integer = NULL,                         /* MAXDOP for UPDATE STATISTICS (SQL 2016 SP2+). NULL = server default */
@@ -574,8 +622,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.6.0.2026.07.02',
-        @procedure_version_date datetime = '20260702',
+        @procedure_version varchar(20) = '3.7.0.2026.07.03',
+        @procedure_version_date datetime = '20260703',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -594,7 +642,7 @@ BEGIN
             (2, N'Version: ' + @procedure_version + N' (' + CONVERT(nvarchar(10), @procedure_version_date, 120) + N')'),
             (3, N'https://github.com/nanoDBA/sp_StatUpdate'),
             (4, N''),
-            (5, N'v3 simplifies the API from 58 to 33 input parameters (+ 10 OUTPUT).  Use @Preset'),
+            (5, N'v3 simplifies the API from 58 (v2) to 42 input parameters (+ 11 OUTPUT).  Use @Preset'),
             (6, N'for common configurations, override individual settings as needed.'),
             (7, N''),
             (8, N'Quick start:'),
@@ -666,6 +714,8 @@ BEGIN
             (N'@WhatIfOutputTable', N'nvarchar(500)',  N'NULL',      N'Table for dry-run commands'),
             (N'@FailFast',               N'bit',            N'0',   N'Abort on first error'),
             (N'@AbortOnIntegrityError', N'bit',            N'1',   N'1 = abort run and surface IO_CORRUPTION on error 823/824/825 (default); 0 = emit CHECKDB advisory + IO_CORRUPTION warning code, count stat as failed, and continue processing'),
+            (N'@FilteredStatsMode', N'nvarchar(10)',       N'NULL', N'Filtered-statistics scope: INCLUDE (default), EXCLUDE (skip filtered stats), ONLY (only filtered stats), PRIORITY (boost filtered stats whose selectivity drifted -- see @FilteredStatsStaleFactor).  NULL = INCLUDE.'),
+            (N'@FilteredStatsStaleFactor', N'float',       N'NULL', N'A filtered stat counts as drifted when unfiltered_rows / rows exceeds this factor (default 2.0).  Drift-qualified stats under PRIORITY mode report QualifyReason = FILTERED_DRIFT.'),
             (N'@Debug',                 N'bit',            N'0',   N'Verbose output'),
             (N'@StatsInParallel',       N'nvarchar(1)',    N'N',   N'Queue-based parallel processing'),
             (N'@Help',                  N'nvarchar(50)',   N'0',   N'1 = show this help')
@@ -676,13 +726,13 @@ BEGIN
             topic = t.topic,
             detail = t.detail
         FROM (VALUES
-            (N'QUICK START',   N'Use @Preset for a pre-tuned config.  Override individual params as needed.  @Execute=N for dry run.'),
-            (N'PRESETS',       N'DEFAULT=balanced, NIGHTLY=1h+QS+mop-up, WEEKLY_FULL=4h+FULLSCAN, OLTP_LIGHT=30m+high-thresh, WAREHOUSE=unlimited+FULLSCAN.'),
+            (N'QUICK START',   N'Choose @Preset for a packaged config (DEFAULT if omitted).  For deterministic control skip @Preset and set params explicitly.  @Execute=N for dry run.'),
+            (N'PRESETS',       N'Packaged configs: DEFAULT=balanced, NIGHTLY=1h+QS+mop-up, WEEKLY_FULL=4h+FULLSCAN, OLTP_LIGHT=30m+high-thresh, WAREHOUSE=unlimited+FULLSCAN.  Bounded overrides when using a preset: @TimeLimit, @ModificationThreshold, @SortOrder, @StatisticsSample, @MopUpPass, @QueryStore, @LockTimeout -- these are wired to override preset internals.  All other params (e.g. @Databases, @Tables, @LogToTable) are independent of presets.'),
             (N'CONTEXT_INFO',  N'@JobName=NMyJobName sets CONTEXT_INFO on entry, restored on exit.  Visible in XE sessions, dm_exec_requests, and any session-level monitoring.'),
             (N'COLUMNSTORE',   N'@SkipTablesWithNCCI=Y (default) skips tables with nonclustered columnstore (plan stability).  @SkipTablesWithCCI=N (default) updates CCI tables.'),
             (N'WARNINGS',      N'@WarningsCodesOut returns pipe-delimited codes for programmatic parsing.  @WarningsOut is human-readable.  Same codes appear in END row Summary/WarningsCodes element.  Policy: codes may be added in any release, never renamed/removed without a major version bump.  Current tokens: AG_SECONDARY_SERVER|ELASTIC_POOL|RCSI_VERSION_STORE|DEAD_WORKER_TIMEOUT_NULL_COERCED|EMPTY_STRING_PARAM|AZURE_SQL_DB|AZURE_SQL_MI|AZURE_SQL_EDGE|CASE_SENSITIVE_COLLATION|LOW_UPTIME|BACKUP_RUNNING|PEAK_HOURS|CONTAINER_MEMORY|DB_SKIPPED|RLS_DETECTED|RLS_CHECK_FAILED|WIDESTAT_CHECK_FAILED|FILTER_MISMATCH|FILTER_CHECK_FAILED|COLUMNSTORE_TABLES|COLUMNSTORE_CHECK_FAILED|COMPRESSED_CHECK_FAILED|COMPUTEDCOL_CHECK_FAILED|CDC_TABLES|REPLICATION_MAJORITY|PARALLEL_ORPHAN_BACKLOG|STALE_QUEUE_SWEEP|BACKUP_STARTED_MID_RUN|LOG_SPACE_HIGH|PERSIST_SAMPLE_INADEQUATE|IO_CORRUPTION|STOPBYTIME_OVERSHOOT|QS_FORCED_PLANS|TOCTOU_SKIPS|CONSECUTIVE_FAILURES_ELEVATED'),
             (N'PARALLEL',      N'@StatsInParallel=Y. Requires dbo.Queue + dbo.QueueStatistic (auto-created). Run same EXEC from multiple Agent steps. AG-secondary guard and orphan-row sweep run at startup.'),
-            (N'QUERY STORE',   N'@QueryStore=CPU/DURATION/READS/etc. to prioritize stats on high-workload tables.  WAITS filters to Buffer Latch, Buffer IO, Memory, Other Disk IO -- wait classes statistics quality can influence.  OFF to disable.'),
+            (N'QUERY STORE',   N'@QueryStore=CPU/DURATION/READS/etc. to prioritize stats on high-workload tables.  WAITS filters to Buffer Latch, Buffer IO, Memory, Other Disk IO -- wait classes statistics quality can influence.  WAIT_CPU: CPU-scheduler waits (SOS_SCHEDULER_YIELD) -- wait-bound queries the runtime metrics miss.  OFF to disable.'),
             (N'MOP-UP',        N'@MopUpPass=Y: after priority pass, sweep any stat with modification_counter>0.  Needs @TimeLimit + @LogToTable=Y.'),
             (N'DIRECT MODE',   N'@Statistics=''Schema.Table.Stat'' for ad-hoc updates. Skips discovery.  Comma-separate for multiple.'),
             (N'STALE HOURS',   N'@StaleHours=48 means skip stats updated within 48 hours.  Replaces v2 @DaysStaleThreshold/@HoursStaleThreshold.'),
@@ -864,6 +914,58 @@ BEGIN
                     DatabasesProcessed = 0, DurationSeconds = 0,
                     StopReason = N'ALREADY_RUNNING', RunLabel = CONVERT(nvarchar(100), NULL),
                     Version = @procedure_version;
+
+                /* o7gf (gh-551): durable denial artifact.
+                   @commandlog_exists and @run_label are declared in 03B (after this block) -- use
+                   OBJECT_ID locally and synthesize a denied_<timestamp> label.
+                   Diag ignores CommandType = SP_STATUPDATE_DENIED today; a future check can
+                   aggregate repeated denials to detect lock contention patterns.
+                   Wrapped in TRY/CATCH so a logging failure cannot mask the denial result set. */
+                IF @LogToTable = N'Y'
+                AND OBJECT_ID(N'dbo.CommandLog', N'U') IS NOT NULL
+                BEGIN
+                    DECLARE
+                        @denial_now datetime2(7) = SYSDATETIME(),
+                        @denial_label nvarchar(100),
+                        @denial_xi xml;
+
+                    SET @denial_label =
+                        CONVERT(nvarchar(128), SERVERPROPERTY(N'ServerName'))
+                        + N'_denied_'
+                        + CONVERT(nvarchar(20), @denial_now, 112)
+                        + N'_' + REPLACE(CONVERT(nvarchar(20), @denial_now, 108), N':', N'');
+
+                    BEGIN TRY
+                        SELECT @denial_xi = (
+                            SELECT
+                                @procedure_version AS Version,
+                                CONVERT(nvarchar(30), @denial_now, 121) AS DeniedAt,
+                                CONVERT(nvarchar(10), @@SPID) AS SessionID,
+                                /* Lock-holder fields from the StatUpdateLock row read above */
+                                CONVERT(nvarchar(10), @existing_sid) AS HolderSessionID,
+                                CONVERT(nvarchar(30), @existing_lt, 121) AS HolderLoginTime,
+                                CONVERT(nvarchar(30), @existing_acquired_at, 121) AS HolderAcquiredAt
+                            FOR XML RAW(N'Denial'), ELEMENTS
+                        );
+
+                        INSERT INTO dbo.CommandLog
+                            (CommandType, Command, StartTime, EndTime, ExtendedInfo)
+                        VALUES
+                            (
+                                N'SP_STATUPDATE_DENIED',
+                                N'DENIED: another instance holds dbo.StatUpdateLock',
+                                @denial_now,
+                                @denial_now,
+                                @denial_xi
+                            );
+                    END TRY
+                    BEGIN CATCH
+                        /* Non-critical -- logging failure must not mask the denial result set above */
+                        DECLARE @denial_log_err nvarchar(500) = LEFT(ERROR_MESSAGE(), 500);
+                        RAISERROR(N'Note: could not log denial artifact to CommandLog (%s)', 10, 1, @denial_log_err) WITH NOWAIT;
+                    END CATCH;
+                END;
+
                 RETURN;
             END;
 
@@ -977,11 +1079,36 @@ BEGIN
         @supports_persist_sample bit = 0,
         @supports_maxdop_stats bit = 0,
         /* SQL 2022+ feature detection (includes SQL 2025/v17+) */
-        @supports_auto_drop bit = 0;
+        @supports_auto_drop bit = 0,
+        /* zks1 / gh-533: sys.query_store_plan.plan_forcing_type column availability.
+           Column added in SQL 2022 (16.x).  When present, forced-plan baseline and
+           post-run check filter to plan_forcing_type = N'MANUAL' -- excludes
+           Automatic-Plan-Correction (APC) noise.  Detected via metadata lookup
+           (not @sql_major_version) so managed platforms that backport can pick it up. */
+        @has_plan_forcing_type bit = 0;
 
     /* Set AUTO_DROP support flag (SQL 2022+ / v16+) */
     IF @sql_major_version >= 16
         SET @supports_auto_drop = 1;
+
+    /* zks1 / gh-533: Detect plan_forcing_type once.  Metadata lookup wrapped
+       in TRY/CATCH: on any error (permissions, DMV absence) treat as unsupported
+       and leave the pre-2022 no-filter behavior in place. */
+    BEGIN TRY
+        IF EXISTS
+        (
+            SELECT 1
+            FROM sys.system_columns AS sc
+            INNER JOIN sys.system_objects AS so
+                ON so.object_id = sc.object_id
+            WHERE so.name = N'query_store_plan'
+            AND   sc.name = N'plan_forcing_type'
+        )
+            SET @has_plan_forcing_type = 1;
+    END TRY
+    BEGIN CATCH
+        SET @has_plan_forcing_type = 0;
+    END CATCH;
 
     /*
     Phase 1 Environment Detection (v2.0)
@@ -1177,7 +1304,8 @@ BEGIN
         @mop_up_stats_found int = 0, /* v2.24: mop-up candidates discovered */
         @mop_up_stats_processed int = 0, /* v2.24: mop-up stats processed (for summary XML) */
         @mop_lock_result int = NULL, /* v2.24: parallel mop-up app lock result */
-        @mop_lock_resource nvarchar(255) = NULL; /* v2.24: parallel mop-up app lock name */
+        @mop_lock_resource nvarchar(255) = NULL, /* v2.24: parallel mop-up app lock name */
+        @io_corruption_warned bit = 0; /* lfbv: deduplication flag for IO_CORRUPTION warning code (mirrors @mop_up_done idiom) */
 
     /*
     Counters
@@ -1191,7 +1319,11 @@ BEGIN
         @consecutive_failures integer = 0,
         @max_consecutive_failures_seen integer = 0, /* #ibyc: peak value for CONSECUTIVE_FAILURES_ELEVATED warning */
         @total_pages_processed bigint = 0, /* v2.24: accumulated page count for volume reporting */
-        @warnings nvarchar(max) = N''; /* Collected warnings for @WarningsOut OUTPUT */
+        @warnings nvarchar(max) = N'', /* Collected warnings for @WarningsOut OUTPUT */
+        /* zks1 / gh-533: forced-plan force_failure_count delta total across all target DBs.
+           Populated by the post-run forced-plan check when it runs; hoisted here so the
+           Summary XML builder can reference it unconditionally (NULLIF omits when zero). */
+        @qs_forced_failure_delta_total bigint = 0;
 
     /*
     Queue-based parallel processing variables
@@ -1719,14 +1851,23 @@ BEGIN
         @i_qs_min_executions bigint = 100,
         @i_qs_recent_hours int = 168,
         @i_qs_top_plans int = 500,
-        /* gh-544: wait categories where poor statistics are causally involved.
+        /* gh-544 / 6aa2: wait categories where poor statistics are causally involved.
            sys.query_store_wait_stats.wait_category reference (Microsoft docs):
+             0  = Unknown
+             1  = CPU             (SOS_SCHEDULER_YIELD -- runnable-queue pressure)
+             2  = Worker Thread
+             3  = Lock
+             4  = Latch
              5  = Buffer Latch    (tempdb allocation contention from sort/spill)
              6  = Buffer IO       (PAGEIOLATCH -- scan/spill IO from bad cardinality)
              17 = Memory          (RESOURCE_SEMAPHORE grant waits from bad estimates)
              21 = Other Disk IO   (IO_COMPLETION -- sort and spill IO)
-           Excluded (prior wrong set): 3=Lock, 12=Preemptive, 15=Network IO --
-           none of which statistics quality can influence. */
+           WAITS       => 5, 6, 17, 21  (Buffer Latch, Buffer IO, Memory, Other Disk IO)
+           WAIT_CPU    => 1             (SOS_SCHEDULER_YIELD only -- distinct from CPU runtime metric;
+                                         signals runnable-queue pressure that better stats/plans reduce).
+           Excluded (prior wrong WAITS set): 3=Lock, 12=Preemptive, 15=Network IO --
+           none of which statistics quality can influence.  The token list below defaults to
+           the WAITS set and is switched to N'1' when the effective metric is WAIT_CPU. */
         @qs_wait_categories nvarchar(30) = N'5, 6, 17, 21',
         @i_mop_up_pass nvarchar(1) = N'N',
         @i_mop_up_min_remaining int = 60,
@@ -1830,12 +1971,27 @@ BEGIN
     /* gh-508: @LockTimeout public override for preset-driven @i_lock_timeout */
     IF @LockTimeout IS NOT NULL SET @i_lock_timeout = @LockTimeout;
 
+    /* gh-554 (v3.7.0): filtered-stats knobs re-promoted to public parameters.  The v3.0
+       API collapse absorbed them into @i_ internals with NO preset ever setting a
+       non-default value, which silently made EXCLUDE / ONLY / PRIORITY modes -- and the
+       FILTERED_DRIFT qualify-reason proof surface -- unreachable from the public API. */
+    IF @FilteredStatsMode IS NOT NULL SET @i_filtered_stats_mode = UPPER(LTRIM(RTRIM(@FilteredStatsMode)));
+    IF @FilteredStatsStaleFactor IS NOT NULL SET @i_filtered_stats_stale_factor = @FilteredStatsStaleFactor;
+
     /* #387: @QueryStoreTopPlans override -- controls Phase 6 XML plan parsing limit */
     IF @QueryStoreTopPlans IS NOT NULL SET @i_qs_top_plans = @QueryStoreTopPlans;
 
     /* #394: @QueryStoreMinExecutions / @QueryStoreRecentHours overrides */
     IF @QueryStoreMinExecutions IS NOT NULL SET @i_qs_min_executions = @QueryStoreMinExecutions;
     IF @QueryStoreRecentHours IS NOT NULL SET @i_qs_recent_hours = @QueryStoreRecentHours;
+
+    /* 6aa2 / gh-534: WAIT_CPU metric reuses the WAITS token machinery but with a
+       different wait_category set.  Switch @qs_wait_categories to N'1' so all
+       downstream {{WAITS_CATEGORIES}} substitutions and CTE builds pick up the
+       CPU-scheduler wait_category (SOS_SCHEDULER_YIELD).  Must run AFTER the
+       @i_qs_metric override above and BEFORE Phase 6 staged_sql assembly. */
+    IF @i_qs_metric = N'WAIT_CPU'
+        SET @qs_wait_categories = N'1';
 
     /* #388: Safety params -- override internal defaults when caller provides explicit values */
     /* Note: @i_max_ag_redo_queue_mb defaults to NULL (disabled); caller opts in with a value */
@@ -1942,11 +2098,21 @@ BEGIN
         INSERT INTO @errors (error_message, error_severity)
         VALUES (N'Invalid @SortOrder. Use: MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED, ROWS, MODIFICATION_VELOCITY.', 16);
 
+    /* gh-554 (v3.7.0): validate the re-promoted filtered-stats knobs (effective values) */
+    IF @i_filtered_stats_mode NOT IN (N'INCLUDE', N'EXCLUDE', N'ONLY', N'PRIORITY')
+        INSERT INTO @errors (error_message, error_severity)
+        VALUES (N'Invalid @FilteredStatsMode. Use: INCLUDE, EXCLUDE, ONLY, PRIORITY.', 16);
+
+    IF @i_filtered_stats_stale_factor IS NOT NULL AND @i_filtered_stats_stale_factor <= 0
+        INSERT INTO @errors (error_message, error_severity)
+        VALUES (N'Invalid @FilteredStatsStaleFactor. Must be greater than 0 (default 2.0).', 16);
+
     IF @i_qs_enabled = 1
     AND @i_qs_metric NOT IN (N'CPU', N'DURATION', N'READS', N'EXECUTIONS', N'AVG_CPU',
-                             N'MEMORY_GRANT', N'TEMPDB_SPILLS', N'PHYSICAL_READS', N'AVG_MEMORY', N'WAITS')
+                             N'MEMORY_GRANT', N'TEMPDB_SPILLS', N'PHYSICAL_READS', N'AVG_MEMORY',
+                             N'WAITS', N'WAIT_CPU')
         INSERT INTO @errors (error_message, error_severity)
-        VALUES (N'Invalid @QueryStore metric. Use: CPU, DURATION, READS, EXECUTIONS, AVG_CPU, MEMORY_GRANT, TEMPDB_SPILLS, PHYSICAL_READS, AVG_MEMORY, WAITS, OFF.', 16);
+        VALUES (N'Invalid @QueryStore metric. Use: CPU, DURATION, READS, EXECUTIONS, AVG_CPU, MEMORY_GRANT, TEMPDB_SPILLS, PHYSICAL_READS, AVG_MEMORY, WAITS, WAIT_CPU, OFF.', 16);
 
     /* Range validation */
     IF @i_statistics_sample IS NOT NULL AND (@i_statistics_sample < 1 OR @i_statistics_sample > 100)
@@ -2032,6 +2198,14 @@ BEGIN
     IF @i_qs_metric = N'WAITS' AND @sql_major_version < 14
         INSERT INTO @errors (error_message, error_severity)
         VALUES (N'@QueryStore = WAITS requires SQL 2017+.', 16);
+
+    /* 6aa2 / gh-534: WAIT_CPU shares the sys.query_store_wait_stats DMV with WAITS
+       -- same 2017+ gate.  Wait_category = 1 (SOS_SCHEDULER_YIELD) surfaces
+       runnable-queue pressure that better stats/plans reduce (distinct from CPU
+       metric which ranks by runtime avg_cpu_time). */
+    IF @i_qs_metric = N'WAIT_CPU' AND @sql_major_version < 14
+        INSERT INTO @errors (error_message, error_severity)
+        VALUES (N'@QueryStore = WAIT_CPU requires SQL 2017+.', 16);
 
     IF @i_mop_up_pass = N'Y' AND @LogToTable = N'N'
         INSERT INTO @errors (error_message, error_severity)
@@ -3508,6 +3682,158 @@ BEGIN
             RAISERROR(N'First-Time Cap: prefetched %d stats with prior CommandLog history (threshold = %I64d rows)', 10, 1, @known_stats_count, @FirstTimeFullScanCapRows) WITH NOWAIT;
     END;
 
+    /*
+    ============================================================================
+    QS FORCED-PLAN BASELINE (zks1 / gh-533)
+    ============================================================================
+    Snapshot force_failure_count for every forced plan across all selected
+    databases BEFORE the process loop.  The post-run forced-plan check
+    (region 20 / ~line 10370) LEFT JOINs this baseline and reports a DELTA:
+    if force_failure_count rose during the run, the just-updated statistics
+    are the prime suspect for post-maintenance plan-forcing regressions.
+
+    Sibling of the adaptive-sampling CommandLog lookup above -- both are
+    pre-run reads used to correlate post-run behavior.
+
+    Cheap by design: forced plans are rare; each database is one DMV read
+    with no joins, wrapped in its own TRY/CATCH so inaccessible/QS-off
+    databases skip silently.
+
+    plan_forcing_type filter (SQL 2022+): when @has_plan_forcing_type = 1
+    the baseline is limited to plan_forcing_type = N'MANUAL' -- excludes
+    Automatic-Plan-Correction (APC) noise that we cannot attribute to
+    stat maintenance.  Pre-2022 behavior unchanged (no filter).
+    */
+    CREATE TABLE #qs_forced_baseline
+    (
+        database_name sysname NOT NULL,
+        query_id bigint NOT NULL,
+        plan_id bigint NOT NULL,
+        force_failure_count bigint NOT NULL DEFAULT 0,
+        plan_forcing_type nvarchar(20) NULL,
+        PRIMARY KEY (database_name, plan_id)
+    );
+
+    /* Databases whose baseline capture SUCCEEDED.  The post-run delta must only
+       be computed for these: a database whose capture failed transiently (CATCH
+       below swallows it) would otherwise have every pre-existing
+       force_failure_count misread as a delta caused by this run. */
+    CREATE TABLE #qs_forced_baseline_dbs
+    (
+        database_name sysname NOT NULL PRIMARY KEY
+    );
+
+    IF  @i_qs_enabled = 1
+    AND @Execute = N'Y'
+    BEGIN
+        DECLARE
+            @fb_db sysname,
+            @fb_sql nvarchar(max),
+            @fb_rowcount int = 0,
+            @fb_total_rows int = 0,
+            @fb_db_count int = 0,
+            @fb_dbs_scanned int = 0,
+            @fb_msg nvarchar(2000);
+
+        /* Debug-only entry note so the baseline capture is always visible under
+           @Debug = 1 even when the target databases have zero forced plans. */
+        IF @Debug = 1
+        BEGIN
+            SET @fb_msg = N'QS forced-plan baseline: capturing force_failure_count snapshot'
+                + CASE WHEN @has_plan_forcing_type = 1
+                       THEN N' (filter: plan_forcing_type = MANUAL, SQL 2022+ column)'
+                       ELSE N' (no plan_forcing_type filter -- pre-2022 or column absent)'
+                  END
+                + N'.';
+            RAISERROR(@fb_msg, 10, 1) WITH NOWAIT;
+        END;
+
+        DECLARE fb_db_cursor CURSOR LOCAL FAST_FORWARD FOR
+            SELECT td.DatabaseName
+            FROM @tmpDatabases AS td
+            WHERE td.Selected = 1
+            ORDER BY td.DatabaseName;
+
+        OPEN fb_db_cursor;
+        FETCH NEXT FROM fb_db_cursor INTO @fb_db;
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @fb_dbs_scanned += 1;
+            BEGIN TRY
+                SET @fb_sql = CONVERT(nvarchar(max), N'')
+                    + N'INSERT INTO #qs_forced_baseline (database_name, query_id, plan_id, force_failure_count, plan_forcing_type) '
+                    + N'SELECT @dbname, qsp.query_id, qsp.plan_id, qsp.force_failure_count, '
+                    + CASE WHEN @has_plan_forcing_type = 1
+                           THEN N'qsp.plan_forcing_type '
+                           ELSE N'CONVERT(nvarchar(20), NULL) '
+                      END
+                    + N'FROM ' + QUOTENAME(@fb_db) + N'.sys.query_store_plan AS qsp '
+                    + N'WHERE qsp.is_forced_plan = 1'
+                    + CASE WHEN @has_plan_forcing_type = 1
+                           THEN N' AND qsp.plan_forcing_type = N''MANUAL'';'
+                           ELSE N';'
+                      END;
+
+                EXEC sp_executesql @fb_sql, N'@dbname sysname', @dbname = @fb_db;
+                SET @fb_rowcount = @@ROWCOUNT;
+                SET @fb_total_rows += @fb_rowcount;
+
+                /* Mark this database as successfully baselined (even with 0 forced
+                   plans) so the post-run delta knows a 0-row baseline is genuine. */
+                INSERT INTO #qs_forced_baseline_dbs (database_name)
+                VALUES (@fb_db);
+
+                IF @fb_rowcount > 0
+                    SET @fb_db_count += 1;
+
+                IF @Debug = 1 AND @fb_rowcount > 0
+                BEGIN
+                    SET @fb_msg = N'  QS forced-plan baseline: captured '
+                        + CONVERT(nvarchar(10), @fb_rowcount)
+                        + N' forced plan(s) in ['
+                        + @fb_db + N'].';
+                    RAISERROR(@fb_msg, 10, 1) WITH NOWAIT;
+                END;
+            END TRY
+            BEGIN CATCH
+                /* Inaccessible / QS off on this database -- skip silently.
+                   Debug-only note so a genuine catastrophic failure is still visible. */
+                IF @Debug = 1
+                BEGIN
+                    SET @fb_msg = N'  QS forced-plan baseline: skipped ['
+                        + @fb_db + N'] (' + ERROR_MESSAGE() + N')';
+                    RAISERROR(@fb_msg, 10, 1) WITH NOWAIT;
+                END;
+            END CATCH;
+
+            FETCH NEXT FROM fb_db_cursor INTO @fb_db;
+        END;
+
+        CLOSE fb_db_cursor;
+        DEALLOCATE fb_db_cursor;
+
+        /* Emit the summary line at non-debug severity when any plans were captured;
+           debug-only tally when zero plans found (leadership-friendly signal-to-noise). */
+        IF @fb_total_rows > 0
+        BEGIN
+            SET @fb_msg = N'QS forced-plan baseline: captured '
+                + CONVERT(nvarchar(10), @fb_total_rows)
+                + N' forced plan(s) across '
+                + CONVERT(nvarchar(10), @fb_db_count)
+                + N' database(s) (post-run delta check enabled).';
+            RAISERROR(@fb_msg, 10, 1) WITH NOWAIT;
+            RAISERROR(N'', 10, 1) WITH NOWAIT;
+        END
+        ELSE IF @Debug = 1
+        BEGIN
+            SET @fb_msg = N'  QS forced-plan baseline: 0 forced plans found across '
+                + CONVERT(nvarchar(10), @fb_dbs_scanned)
+                + N' database(s) (delta check will be a no-op).';
+            RAISERROR(@fb_msg, 10, 1) WITH NOWAIT;
+        END;
+    END;
+
     /*#endregion 07A-ADAPTIVE */
     /*#region 07B-MODE-DETECT: Mode detection, DIRECT_STRING db loop, @parameters_string, parallel skip */
     /*
@@ -4298,16 +4624,23 @@ OPTION (RECOMPILE);';
                 fresh stats are rare, so a blanket join to sys.partitions is
                 unwarranted.  index_id IN (0, 1) covers heap and clustered
                 (the base storage), matching the Phase 5 page_count pattern.
+
+                lfbv: restructured from OUTER APPLY (per-stat) to derived-table
+                JOIN (per-object).  Multiple fresh stats on one table previously
+                repeated the SUM(rows) aggregate; one lookup per object_id is
+                sufficient because physical_row_count is table-level, not stat-level.
                 */
                 UPDATE sc
                 SET sc.physical_row_count = pr.physical_rows
                 FROM #stat_candidates AS sc
-                OUTER APPLY (
-                    SELECT physical_rows = SUM(p.rows)
+                JOIN (
+                    SELECT
+                        p.object_id,
+                        physical_rows = SUM(p.rows)
                     FROM sys.partitions AS p
-                    WHERE p.object_id = sc.object_id
-                    AND   p.index_id IN (0, 1)
-                ) AS pr
+                    WHERE p.index_id IN (0, 1)
+                    GROUP BY p.object_id
+                ) AS pr ON pr.object_id = sc.object_id
                 WHERE sc.last_updated IS NULL;
 
                 /*
@@ -4836,6 +5169,10 @@ OPTION (RECOMPILE);';
                             WHEN N''PHYSICAL_READS'' THEN {{PHYSICAL_READS_ORDER}}
                             WHEN N''AVG_MEMORY'' THEN SUM(CONVERT(float, qsrs.avg_query_max_used_memory * qsrs.count_executions)) / NULLIF(SUM(CONVERT(float, qsrs.count_executions)), 0)
                             WHEN N''WAITS'' THEN {{WAITS_ORDER}}
+                            /* 6aa2 / gh-534: WAIT_CPU reuses the same WaitsByPlan CTE plumbing;
+                               the wait_category filter (see @qs_wait_categories) narrows to
+                               wait_category = 1 (SOS_SCHEDULER_YIELD). */
+                            WHEN N''WAIT_CPU'' THEN {{WAITS_ORDER}}
                             ELSE SUM(qsrs.avg_cpu_time * qsrs.count_executions)
                         END DESC
                     ),
@@ -4910,6 +5247,8 @@ OPTION (RECOMPILE);';
                                          WHEN N''PHYSICAL_READS'' THEN ISNULL(qs.total_physical_reads, 0)
                                          WHEN N''AVG_MEMORY'' THEN ISNULL(qs.total_memory_grant_kb, 0) / NULLIF(qs.total_executions, 0)
                                          WHEN N''WAITS'' THEN 0 /* populated by separate wait stats UPDATE below */
+                                         /* 6aa2 / gh-534: WAIT_CPU also populated by the wait stats UPDATE below */
+                                         WHEN N''WAIT_CPU'' THEN 0
                                          ELSE ISNULL(qs.total_cpu_ms, 0)
                                      END
                                 ELSE 0
@@ -4965,12 +5304,15 @@ OPTION (RECOMPILE);';
                     END;
 
                     /* #366: Stats-relevant wait stats enrichment (SQL 2017+).
-                       Only runs when @i_qs_metric = WAITS to avoid unbounded XML parsing (#371).
-                       Uses same plan XML extraction as QSByTable to correctly map
-                       plan_ids to table object_ids (q.object_id is the MODULE id,
-                       not the table id -- same issue #271 fixed for runtime_stats). */
+                       Only runs when @i_qs_metric IN (WAITS, WAIT_CPU) to avoid unbounded
+                       XML parsing (#371).  Uses same plan XML extraction as QSByTable to
+                       correctly map plan_ids to table object_ids (q.object_id is the MODULE
+                       id, not the table id -- same issue #271 fixed for runtime_stats).
+                       6aa2 / gh-534: WAIT_CPU shares this enrichment path -- the
+                       {{WAITS_CATEGORIES}} token is switched to N''1'' (SOS_SCHEDULER_YIELD)
+                       upstream when the metric is WAIT_CPU. */
                     IF OBJECT_ID(N''sys.query_store_wait_stats'') IS NOT NULL
-                    AND @i_qs_metric_param = N''WAITS''
+                    AND @i_qs_metric_param IN (N''WAITS'', N''WAIT_CPU'')
                     BEGIN
                         /* #431: compute TopPlanIds for WAITS FIRST, then parse XML only for those plans.
                            gh-544: wait_category filtered via {{WAITS_CATEGORIES}} token
@@ -5027,8 +5369,11 @@ OPTION (RECOMPILE);';
                         INNER JOIN WaitByTable AS wbt ON wbt.object_id = sc.object_id;
                     END;
 
-                    /* #366: Update priority boost for WAITS metric (must run after wait stats UPDATE) */
-                    IF @i_qs_metric_param = N''WAITS''
+                    /* #366: Update priority boost for WAITS metric (must run after wait stats UPDATE).
+                       6aa2 / gh-534: WAIT_CPU uses the same boost formula -- the total_wait_ms is
+                       simply the sum of wait_category = 1 (SOS_SCHEDULER_YIELD) instead of the
+                       Buffer/Memory/IO set. */
+                    IF @i_qs_metric_param IN (N''WAITS'', N''WAIT_CPU'')
                     BEGIN
                         UPDATE sc
                         SET sc.qs_priority_boost = CASE
@@ -5200,14 +5545,17 @@ OPTION (RECOMPILE);';
 
                 /* gh-544: Inject stats-relevant wait categories (centralized in @qs_wait_categories).
                    Replaces {{WAITS_CATEGORIES}} in the per-database staged_sql body (sites 1 and 2:
-                   WaitTopPlanIds and WaitByTable CTEs).  Numeric constant -- not user input. */
+                   WaitTopPlanIds and WaitByTable CTEs).  Numeric constant -- not user input.
+                   6aa2 / gh-534: @qs_wait_categories was already switched to N'1' upstream when
+                   the effective metric is WAIT_CPU (SOS_SCHEDULER_YIELD only). */
                 SET @staged_sql = REPLACE(@staged_sql, N'{{WAITS_CATEGORIES}}', @qs_wait_categories);
 
-                /* Version-gate WAITS: sys.query_store_wait_stats added in SQL 2017 (14.x).
+                /* Version-gate WAITS / WAIT_CPU: sys.query_store_wait_stats added in SQL 2017 (14.x).
                    bd -iqw: pre-aggregate wait stats in a CTE + LEFT JOIN instead of
                    a correlated subquery in the ORDER BY (O(N+M) vs O(N*M) on large QS).
                    gh-544: wait_category list sourced from @qs_wait_categories
-                   (Buffer Latch=5, Buffer IO=6, Memory=17, Other Disk IO=21). */
+                   (WAITS => Buffer Latch=5, Buffer IO=6, Memory=17, Other Disk IO=21).
+                   6aa2 / gh-534: WAIT_CPU => wait_category = 1 (SOS_SCHEDULER_YIELD). */
                 SET @staged_sql = REPLACE(@staged_sql, N'{{WAITS_CTE}}',
                     CASE WHEN @sql_major_version >= 14
                     THEN N'WaitsByPlan AS (
@@ -7660,10 +8008,13 @@ OPTION (RECOMPILE);';
         END;
 
         /*
-        P2c fix (v2.4): @StopByTime window overshoot prevention.
+        P2c fix (v2.4): budget-guard overshoot prevention (sss6).
         When @i_max_seconds_per_stat and @i_time_limit are both set, check CommandLog history
         for estimated duration of this stat. If estimated > remaining_seconds, skip.
         Conservative: if no history in CommandLog, always run it.
+        @i_time_limit is always set when @StopByTime is the only time budget
+        (see @StopByTime -> @i_time_limit conversion in 03E-VALIDATION), so the
+        @i_time_limit IS NOT NULL guard already covers @StopByTime-only runs.
         */
         IF  @i_max_seconds_per_stat IS NOT NULL
         AND @i_time_limit IS NOT NULL
@@ -7678,9 +8029,11 @@ OPTION (RECOMPILE);';
 
             SELECT @p2c_remaining_seconds = @i_time_limit - DATEDIFF(SECOND, @start_time, SYSDATETIME());
 
-            /* Estimate from CommandLog: avg of last 10 successful runs for this stat */
+            /* Estimate from CommandLog: MAX of last 10 successful runs for this stat.
+               MAX (not AVG) because a single 4-hour outlier blows the maintenance
+               window even if nine prior runs completed in minutes; the average hides it. */
             SELECT TOP (1)
-                @p2c_estimated_seconds = CONVERT(int, AVG(DATEDIFF(SECOND, cl.StartTime, cl.EndTime)))
+                @p2c_estimated_seconds = CONVERT(int, MAX(DATEDIFF(SECOND, cl.StartTime, cl.EndTime)))
             FROM dbo.CommandLog AS cl
             WHERE cl.CommandType = N'UPDATE_STATISTICS'
             AND   cl.DatabaseName = @current_database
@@ -8813,12 +9166,17 @@ OPTION (RECOMPILE);';
                                     AND  @current_days_stale = 9999
                                     AND  @current_row_count > 0
                                     THEN N'NEVER_UPDATED'
-                                    WHEN @current_qs_priority_boost > 0
-                                    THEN N'QUERY_STORE_PRIORITY'
+                                    /* gh-554 (u6n7): FILTERED_DRIFT ordered ABOVE QUERY_STORE_PRIORITY.
+                                       A stat that exceeds the selectivity-drift ratio is a stronger,
+                                       more specific signal than a generic QS workload boost -- the
+                                       drift describes a structural histogram problem on this exact stat.
+                                       Mirrors the NEVER_UPDATED rationale: the more specific signal wins. */
                                     WHEN @current_has_filter = 1
                                     AND  @i_filtered_stats_mode = N'PRIORITY'
                                     AND  @current_filtered_drift_ratio >= @i_filtered_stats_stale_factor
                                     THEN N'FILTERED_DRIFT'
+                                    WHEN @current_qs_priority_boost > 0
+                                    THEN N'QUERY_STORE_PRIORITY'
                                     WHEN @current_no_recompute = 1
                                     AND  @TargetNorecompute IN (N'Y', N'BOTH')
                                     THEN N'NORECOMPUTE_TARGET'
@@ -9142,12 +9500,15 @@ OPTION (RECOMPILE);';
                                         AND  @current_days_stale = 9999
                                         AND  @current_row_count > 0
                                         THEN N'NEVER_UPDATED'
-                                        WHEN @current_qs_priority_boost > 0
-                                        THEN N'QUERY_STORE_PRIORITY'
+                                        /* gh-554 (u6n7): FILTERED_DRIFT ordered ABOVE QUERY_STORE_PRIORITY.
+                                           Mirrors success-path CASE: drift is the stronger, more specific
+                                           signal; the generic QS boost must not mask it. */
                                         WHEN @current_has_filter = 1
                                         AND  @i_filtered_stats_mode = N'PRIORITY'
                                         AND  @current_filtered_drift_ratio >= @i_filtered_stats_stale_factor
                                         THEN N'FILTERED_DRIFT'
+                                        WHEN @current_qs_priority_boost > 0
+                                        THEN N'QUERY_STORE_PRIORITY'
                                         WHEN @current_no_recompute = 1
                                         AND  @TargetNorecompute IN (N'Y', N'BOTH')
                                         THEN N'NORECOMPUTE_TARGET'
@@ -9220,11 +9581,15 @@ OPTION (RECOMPILE);';
                 BEGIN
                     RAISERROR(N'', 10, 1) WITH NOWAIT;
                     RAISERROR(N'  Run DBCC CHECKDB on database [%s] to assess corruption extent.', 10, 1, @current_database) WITH NOWAIT;
-                    /* Deduplicate IO_CORRUPTION warning code -- append at most once per run */
-                    IF ISNULL(@WarningsCodesOut, N'') NOT LIKE N'%IO_CORRUPTION%'
+                    /* Deduplicate IO_CORRUPTION warning code -- append at most once per run.
+                       lfbv: replaced LIKE N'%IO_CORRUPTION%' (fragile if a future code like
+                       IO_CORRUPTION_EXTENDED ever appears) with a dedicated bit flag, mirroring
+                       the @mop_up_done idiom. */
+                    IF @io_corruption_warned = 0
                     BEGIN
                         SET @warnings = @warnings + N'IO_CORRUPTION: Error ' + CONVERT(nvarchar(10), @current_error_number) + N' on [' + @current_database + N']; ';
                         SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'IO_CORRUPTION';
+                        SET @io_corruption_warned = 1;
                     END;
                     IF @AbortOnIntegrityError = 1
                     BEGIN
@@ -10231,6 +10596,14 @@ OPTION (RECOMPILE);';
     QUERY STORE FORCED PLAN CHECK (#32)
     After stats updates, warn if forced plans exist on updated tables.
     Statistics changes may invalidate forced plan choices.
+
+    zks1 / gh-533: Also LEFT JOIN #qs_forced_baseline (captured pre-loop) and
+    compute force_failure_count DELTA per plan.  A rising failure_count during
+    the run means the just-updated statistics are the prime suspect for a
+    post-maintenance plan-forcing regression.  Delta drives a distinct advisory
+    (severity 10, per-plan details in @qs_forced_details) and a ForcedPlanFailureDelta
+    element on the END Summary XML.  The existing QS_FORCED_PLANS warning code
+    is retained -- delta detail lives in @warnings text only.
     ============================================================================
     */
     /* gh-498: In parallel mode only the lead worker (the one that ran discovery
@@ -10247,12 +10620,28 @@ OPTION (RECOMPILE);';
             @qs_forced_count int = 0,
             @qs_forced_total int = 0,
             @qs_forced_details nvarchar(max) = N'',
-            @qs_db_idx int = 0;
+            @qs_db_idx int = 0,
+            /* zks1 / gh-533: per-DB delta and details.
+               @qs_forced_failure_delta_total is declared at batch scope (~line 1223)
+               so the Summary XML builder can reference it unconditionally. */
+            @qs_forced_failure_delta_db bigint = 0,
+            @qs_delta_details nvarchar(max) = N'';
 
         DECLARE @qs_databases TABLE
         (
             idx int IDENTITY(1,1) PRIMARY KEY,
             database_name sysname NOT NULL
+        );
+
+        /* zks1 / gh-533: per-plan post-state buffer for delta computation.
+           Populated per-database inside the loop, then joined against
+           #qs_forced_baseline to compute failure_delta.  Truncated between
+           databases so we never mix per-plan_ids across DBs. */
+        CREATE TABLE #qs_forced_post
+        (
+            plan_id bigint NOT NULL PRIMARY KEY,
+            query_id bigint NOT NULL,
+            force_failure_count bigint NOT NULL DEFAULT 0
         );
 
         INSERT INTO @qs_databases (database_name)
@@ -10281,13 +10670,21 @@ OPTION (RECOMPILE);';
                 /*
                 v2.26: Early-out when database has zero forced plans.
                 Avoids the expensive CHARINDEX scan entirely.
+                zks1 / gh-533: MANUAL filter when @has_plan_forcing_type = 1 --
+                excludes APC-driven forced plans that we cannot attribute to
+                stat maintenance.  Pre-2022 behavior unchanged.
                 */
                 DECLARE @qs_has_forced int = 0;
-                SET @qs_check_sql = N'
+                SET @qs_check_sql = CONVERT(nvarchar(max), N'')
+                    + N'
                     SET LOCK_TIMEOUT 10000;
                     SELECT @cnt = COUNT(*)
                     FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan
-                    WHERE is_forced_plan = 1;';
+                    WHERE is_forced_plan = 1'
+                    + CASE WHEN @has_plan_forcing_type = 1
+                           THEN N' AND plan_forcing_type = N''MANUAL'';'
+                           ELSE N';'
+                      END;
 
                 EXEC sp_executesql @qs_check_sql,
                     N'@cnt int OUTPUT',
@@ -10301,14 +10698,22 @@ OPTION (RECOMPILE);';
                 query_sql_text for compiled objects (SPs/functions/triggers).  Only
                 ad-hoc queries (qsq.object_id IS NULL) fall through to CHARINDEX.
                 Uses 30-second LOCK_TIMEOUT to prevent indefinite blocking on QS DMVs.
+                zks1 / gh-533: MANUAL filter when column exists.
                 */
-                SET @qs_check_sql = N'
+                SET @qs_check_sql = CONVERT(nvarchar(max), N'')
+                    + N'
                     SET LOCK_TIMEOUT 30000;
                     SELECT @cnt = COUNT(DISTINCT qsp.plan_id)
                     FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan AS qsp
                     INNER JOIN ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_query AS qsq
                         ON qsq.query_id = qsp.query_id
-                    WHERE qsp.is_forced_plan = 1
+                    WHERE qsp.is_forced_plan = 1'
+                    + CASE WHEN @has_plan_forcing_type = 1
+                           THEN N'
+                    AND qsp.plan_forcing_type = N''MANUAL'''
+                           ELSE N''
+                      END
+                    + N'
                     AND (
                         /* Compiled objects: integer join via sql_expression_dependencies */
                         EXISTS (
@@ -10364,6 +10769,84 @@ OPTION (RECOMPILE);';
                         + @qs_check_db + N'(' + CONVERT(nvarchar(10), @qs_forced_count)
                         + CASE WHEN @apc_enabled = 1 THEN N',APC' ELSE N'' END
                         + N') ';
+
+                    /*
+                    zks1 / gh-533: DELTA COMPUTATION
+                    Pull post-state (query_id, plan_id, force_failure_count) for every
+                    forced plan in this database, then LEFT JOIN against
+                    #qs_forced_baseline on (database_name, plan_id) to compute
+                    failure_delta = post - ISNULL(pre, 0).
+                    New forced plans (not in baseline) count from 0 -- if they have
+                    non-zero failures now, the delta reflects that (stats caused
+                    problems for a newly-forced plan).
+
+                    Gated on @i_qs_enabled = 1: the baseline was only populated in
+                    that case (see region 07A ~line 3598), so LEFT JOIN would treat
+                    every current failure as a delta and report false positives.
+
+                    Also gated on #qs_forced_baseline_dbs membership: if this
+                    database's baseline capture failed transiently pre-run, its
+                    pre-existing force_failure_count values would all read as
+                    deltas.  Skip the delta (debug note) rather than lie.
+                    */
+                    IF  @i_qs_enabled = 1
+                    AND EXISTS
+                        (
+                            SELECT 1
+                            FROM #qs_forced_baseline_dbs AS fbd
+                            WHERE fbd.database_name = @qs_check_db
+                        )
+                    BEGIN
+                        TRUNCATE TABLE #qs_forced_post;
+
+                        SET @qs_check_sql = CONVERT(nvarchar(max), N'')
+                            + N'
+                            SET LOCK_TIMEOUT 10000;
+                            INSERT INTO #qs_forced_post (plan_id, query_id, force_failure_count)
+                            SELECT qsp.plan_id, qsp.query_id, qsp.force_failure_count
+                            FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan AS qsp
+                            WHERE qsp.is_forced_plan = 1'
+                            + CASE WHEN @has_plan_forcing_type = 1
+                                   THEN N' AND qsp.plan_forcing_type = N''MANUAL'';'
+                                   ELSE N';'
+                              END;
+
+                        BEGIN TRY
+                            EXEC sp_executesql @qs_check_sql;
+
+                            /* Compute per-database delta: sum of positive deltas across all plans */
+                            SET @qs_forced_failure_delta_db = 0;
+                            SELECT @qs_forced_failure_delta_db =
+                                SUM(post.force_failure_count - ISNULL(pre.force_failure_count, 0))
+                            FROM #qs_forced_post AS post
+                            LEFT JOIN #qs_forced_baseline AS pre
+                                ON pre.database_name = @qs_check_db
+                                AND pre.plan_id = post.plan_id
+                            WHERE post.force_failure_count - ISNULL(pre.force_failure_count, 0) > 0;
+
+                            IF ISNULL(@qs_forced_failure_delta_db, 0) > 0
+                            BEGIN
+                                SET @qs_forced_failure_delta_total += @qs_forced_failure_delta_db;
+                                SET @qs_delta_details = @qs_delta_details
+                                    + @qs_check_db + N'(+' + CONVERT(nvarchar(20), @qs_forced_failure_delta_db)
+                                    + N') ';
+                            END;
+                        END TRY
+                        BEGIN CATCH
+                            /* Post-state pull failed on this DB (permissions, blocked, etc.) -- skip delta */
+                            IF @Debug = 1
+                            BEGIN
+                                DECLARE @qs_delta_err nvarchar(500) = LEFT(ERROR_MESSAGE(), 500);
+                                RAISERROR(N'  QS forced-plan delta: skipped post-state capture on [%s] (%s)', 10, 1, @qs_check_db, @qs_delta_err) WITH NOWAIT;
+                            END;
+                        END CATCH;
+                    END
+                    ELSE
+                    IF  @i_qs_enabled = 1
+                    AND @Debug = 1
+                    BEGIN
+                        RAISERROR(N'  QS forced-plan delta: skipped [%s] -- pre-run baseline capture failed; delta would misread pre-existing failures.', 10, 1, @qs_check_db) WITH NOWAIT;
+                    END;
                 END;
                 END; /* END IF @qs_has_forced > 0 */
             END TRY
@@ -10386,10 +10869,35 @@ OPTION (RECOMPILE);';
             RAISERROR(N'         Stats changes may affect forced plan quality. Review with sys.query_store_plan.', 10, 1) WITH NOWAIT;
         END;
 
+        /*
+        zks1 / gh-533: Distinct advisory when force_failure_count rose during the run.
+        Prime suspect: the just-updated statistics.  Per-plan deltas go into
+        @warnings text (not a new warning code -- delta detail lives in
+        QS_FORCED_PLANS' text) and the total lands on the END Summary XML
+        (ForcedPlanFailureDelta element, NULLIF to omit when zero).
+        */
+        IF @qs_forced_failure_delta_total > 0
+        BEGIN
+            DECLARE @qs_delta_msg nvarchar(2000) =
+                N'WARNING: Query Store forced-plan force_failure_count rose by '
+                + CONVERT(nvarchar(20), @qs_forced_failure_delta_total)
+                + N' during this run.  Forced plans started FAILING -- the just-updated statistics are the prime suspect for post-maintenance regressions.  Per-database delta: '
+                + RTRIM(@qs_delta_details);
+            SET @warnings = @warnings
+                + N'QS_FORCED_PLAN_FAILURE_DELTA: +'
+                + CONVERT(nvarchar(20), @qs_forced_failure_delta_total)
+                + N' failures (' + RTRIM(@qs_delta_details) + N'); ';
+            RAISERROR(N'', 10, 1) WITH NOWAIT;
+            RAISERROR(@qs_delta_msg, 10, 1) WITH NOWAIT;
+            RAISERROR(N'         Investigate sys.query_store_plan.force_failure_count and force_failure_reason for the affected plans.', 10, 1) WITH NOWAIT;
+        END;
+
         /* gh-452: the forced-plan check issued SET LOCK_TIMEOUT 10000/30000 via
            sp_executesql, which persists at session level after the EXECUTE
            returns -- overwriting the restore done at region-top.  Re-restore now. */
         EXECUTE (@lock_restore_sql);
+
+        DROP TABLE #qs_forced_post;
     END;
 
     /*
@@ -10478,6 +10986,14 @@ OPTION (RECOMPILE);';
                         THEN 1 ELSE 0
                     END AS QSEnrichmentSkipped,
                     NULLIF(@WarningsCodesOut, N'') AS WarningsCodes,
+                    /* zks1 / gh-533: total force_failure_count delta across all target
+                       databases (post - pre).  NULLIF(...,0) omits the element when the
+                       delta is zero -- absent element == no forced-plan regression signal.
+                       Only the normal finalize END writer gets this element; the four
+                       early-return writers (fingerprint conflict, max workers, queue init
+                       error, applock/re-entry) cannot have run any stats so a delta is
+                       structurally impossible on those paths. */
+                    NULLIF(@qs_forced_failure_delta_total, 0) AS ForcedPlanFailureDelta,
                     @json_summary_str AS JsonSummary
                 FOR
                     XML RAW(N'Summary'),
