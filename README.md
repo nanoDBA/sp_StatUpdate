@@ -194,7 +194,7 @@ Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operatio
 
 ### v3 API Summary
 
-v3 has **33 input parameters** (was 58 in v2) plus **10 OUTPUT parameters**.  25 parameters from v2 were absorbed into preset-controlled internal variables.  Explicit parameters always override preset defaults.
+v3 has **42 input parameters** (was 58 in v2) plus **11 OUTPUT parameters**.  23 parameters from v2 were absorbed into preset-controlled internal variables.  Explicit parameters always override preset defaults.
 
 ### Database & Table Selection
 
@@ -214,6 +214,8 @@ v3 has **33 input parameters** (was 58 in v2) plus **10 OUTPUT parameters**.  25
 | `@TargetNorecompute` | `'BOTH'` | `'Y'`=NORECOMPUTE only, `'N'`=regular only, `'BOTH'`=all |
 | `@ModificationThreshold` | Preset-dependent | Minimum modifications to qualify (DEFAULT=5000) |
 | `@StaleHours` | `NULL` | Minimum hours since last update |
+| `@FilteredStatsMode` | `'INCLUDE'` | Filtered statistics handling: `INCLUDE`, `EXCLUDE`, `ONLY`, `PRIORITY` (drift-boosted) |
+| `@FilteredStatsStaleFactor` | `2.0` | Filtered stat counts as drifted when `unfiltered_rows/rows` exceeds this factor |
 
 ### Execution Control
 
@@ -244,7 +246,7 @@ v3 has **33 input parameters** (was 58 in v2) plus **10 OUTPUT parameters**.  25
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `@QueryStore` | Preset-dependent | `'OFF'` or metric name: `CPU`, `DURATION`, `READS`, `EXECUTIONS`, `AVG_CPU`, `MEMORY_GRANT`, `TEMPDB_SPILLS`, `PHYSICAL_READS`, `AVG_MEMORY`, `WAITS` |
+| `@QueryStore` | Preset-dependent | `'OFF'` or metric name: `CPU`, `DURATION`, `READS`, `EXECUTIONS`, `AVG_CPU`, `MEMORY_GRANT`, `TEMPDB_SPILLS`, `PHYSICAL_READS`, `AVG_MEMORY`, `WAITS`, `WAIT_CPU` |
 | `@QueryStoreTopPlans` | `500` | Max plans to XML-parse. `NULL` = unlimited. Lower = faster Phase 6 |
 | `@QueryStoreMinExecutions` | `100` | Minimum plan executions to boost |
 | `@QueryStoreRecentHours` | `168` | Only consider plans from last N hours (7 days) |
@@ -784,7 +786,7 @@ Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and lo
 
 ## Migrating from v2
 
-v3 simplifies the API from 58 to 33 input parameters.  Most v2 scripts work with minor changes.
+v3 simplifies the API from 58 (v2) to 42 input parameters.  Most v2 scripts work with minor changes.
 
 ### Quick Migration Guide
 
@@ -812,7 +814,7 @@ v3 simplifies the API from 58 to 33 input parameters.  Most v2 scripts work with
 | `@ReturnDetailedResults` | Removed |
 | `@ProgressLogInterval` | Removed |
 | `@StatisticsFromTable` | Removed |
-| `@FilteredStatsMode` | Preset-controlled |
+| `@FilteredStatsMode` | Public again since v3.7.0 (was preset-controlled in v3.0-v3.6) |
 
 ### Example: v2 Agent Job to v3
 
@@ -836,6 +838,8 @@ EXEC dbo.sp_StatUpdate
 
 ## Version History
 
+- **3.7.0.2026.07.03** - QS attribution + guardrail batch.  (1) **Forced-plan failure attribution** (gh-533): before touching any stat, the proc snapshots `force_failure_count` for every forced Query Store plan per database (`MANUAL`-only on SQL 2022+ so Automatic Plan Correction noise is excluded); after the run it computes the delta.  Rising counts emit a `QS_FORCED_PLAN_FAILURE_DELTA` warning naming per-database deltas, and the END Summary XML gains a `ForcedPlanFailureDelta` element (omitted when zero) — the DBA can finally attribute "forced plan started failing overnight" to the stats job or rule it out.  Databases whose baseline capture failed transiently are excluded from the delta so pre-existing failures are never misattributed.  (2) **`@QueryStore = WAIT_CPU`** (gh-534): prioritizes by CPU-category waits only (`sys.query_store_wait_stats` `wait_category = 1`), complementing `WAITS` (all stat-influenceable categories).  (3) **Budget-overshoot guard** (gh-539): before each stat, estimated duration (MAX of the last 10 successful CommandLog updates — one 4-hour outlier must count, so not AVG) is checked against the remaining `@TimeLimit`/`@StopByTime` budget; stats that cannot fit are deferred instead of blowing through the window.  (4) **Denial artifact** (gh-551): a run refused with `ALREADY_RUNNING` now writes a durable `SP_STATUPDATE_DENIED` CommandLog row identifying the denied session and the lock holder (session, login time, lock acquire time); suppressed with `@LogToTable = N'N'`.  (5) **Filtered-drift proof surface** (gh-554): `FILTERED_DRIFT` now outranks `QUERY_STORE_PRIORITY` in `QualifyReason`, and `@FilteredStatsMode` / `@FilteredStatsStaleFactor` are public parameters again — the v3.0 API collapse had absorbed them with no preset exposing EXCLUDE/ONLY/PRIORITY, leaving those modes and the FILTERED_DRIFT sort order unreachable.  (6) **Preset contract docs** (gh-553): `@Help` preset topic rewritten as a bounded override contract listing the supported override set.  (7) IO-corruption warning deduped via flag; fresh-stat physical row counts aggregated once per object.
+- **Diag 2026.07.03.1** - **I8/RS13 DataStatus** (gh-532): the QS Performance Correlation surfaces no longer go silently empty on sparse Query Store history.  Sparse I8 findings carry a machine-readable `[DataStatus: AVAILABLE|INSUFFICIENT_HISTORY|UNAVAILABLE; QSCpuRuns: N; TrackedStats: N]` suffix, and RS 13 returns a single `[NO DATA]` sentinel row (full column list, reason text explaining what to enable) instead of zero rows whenever status is not AVAILABLE — including the empty-CommandLog first-run path and `@SingleResultSet` mode.
 - **Diag 2026.07.02.2** - Phase-C diagnostic batch.  **@CriticalTables coverage**: per-stat `IsCritical`/`CriticalSampleOverride` and the three `Critical*` parameters are now ingested; new **W16 CRITICAL_TABLES_NO_MATCH** (configured pattern matched zero stats -- silent misconfiguration) and **I17 CRITICAL_TABLES_COVERAGE** (leadership summary with avg processing position proving `@CriticalTablesFirst` works).  **Version-aware parameter gating** (gh-520): runs from sp_StatUpdate < 2.15 (pre full-parameter-logging) are excluded from W1/I4 parameter reasoning -- on newer runs an absent element genuinely means NULL, so those checks stay sharp without false findings on old rows.  **Executive Dashboard TIME_LIMIT annotation** (gh-521): when time-limit exhaustion crosses the C3 threshold, COMPLETION gains a `[!] budget-capped, not workload-complete` banner + CompletionReason detail (annotation only -- scores/grades unchanged).  **History watermark** (gh-524): `StatUpdateDiagHistory` gains `MaxStartTime` (purge/archive-safe) alongside the legacy ID watermark; RunLabel dedup guard unchanged.  **Hardening**: all three `#stat_updates` ingestion builds start with a `CONVERT(nvarchar(max), ...)` operand -- sub-4000-char literal pieces previously made intermediate concats `nvarchar(4000)` and silently truncated the assembled batch (the direct path lost its WHERE tail and ingested zero rows); cache CREATE brought into lockstep with its upgrade ALTERs.
 - **3.6.0.2026.07.02** - Telemetry contract batch.  (1) **`WarningsCodes` in END Summary XML**: the run's pipe-delimited warning codes (same tokens as `@WarningsCodesOut`) now land in the `SP_STATUPDATE_END` row's `Summary/WarningsCodes` element on all five live END writers (four early-return paths + normal finalize), so CommandLog consumers are no longer blind to runtime warnings.  (2) **StopReason fix**: `COMPLETED_WITH_SKIPPED_DBS` is applied before the END row is written — CommandLog previously always recorded plain `COMPLETED`.  (3) **`CONSECUTIVE_FAILURES_ELEVATED`**: new peak tracker emits this code when consecutive failures reached >= 3 mid-run without hitting the bailout; `@Help` WARNINGS topic now documents the full format contract (every code token enumerated; codes may be added, never renamed/removed without a major version bump).  (4) **`AZURE_SQL_EDGE`**: EngineEdition 9 gets its own platform message + warning code.  (5) **Operator polish**: per-stat progress line gains a wall-clock + ETA suffix (once 5 stats have completed); startup advisory when a 0-1s `@LockTimeout` is combined with `@MaxConsecutiveFailures = 1` (one lock wait would abort the run).
 - **Diag 2026.07.02.1** - Phase-B diagnostic batch.  Skip markers (`SKIPPED:` / `TOCTOU_SKIP`) are excluded from `#stat_updates` ingestion, so they no longer pollute durations, appearance counts, or top-tables (NULL-safe predicate).  `Summary/StatsToctou` and `Summary/QSEnrichmentSkipped` are now consumed directly (W5/I9b use the definitive signal with inference as fallback for old rows).  I4 UNUSED_FEATURES catalog refreshed (`@FirstTimeFullScanCapRows`, `@CriticalTables`, `@AbortOnIntegrityError` — the latter surfaces when IO_CORRUPTION appears in StopReason *or* WarningsCodes).  Dead v2 `GroupByJoinPattern` ingestion removed.  Two new checks: **W14 RECURRING_SAFETY_STOP** (same safety StopReason — TEMPDB_PRESSURE, AG_REDO_QUEUE, LOG_SPACE_HIGH, IO_CORRUPTION, FAIL_FAST, CONSECUTIVE_FAILURES, BATCH_LIMIT — in >= 2 runs) and **W15/I16 RECURRING_RUNTIME_WARNING** (warning codes recurring across runs, severity-tiered environmental vs informational; consumes the new `Summary/WarningsCodes` element; older runs without the element produce no false findings).
