@@ -36,9 +36,26 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.23.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.23.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.07.23.1 - C4 adjacent-window fix (ehwn / gh-558):
+History:    2026.07.23.2 - Empty-CommandLog single-result envelope (0pgq / gh-557):
+                           With @SingleResultSet = 1 and no usable CommandLog
+                           data, the early-return branch previously emitted only
+                           ResultSetIDs 1-2, silently violating the advertised
+                           stable-ID contract (IDs 1-13).  IDs 3-13 now each
+                           carry one marker row whose RowData JSON contains
+                           DataStatus = UNAVAILABLE, Reason = NO_COMMANDLOG_DATA,
+                           and the ResultSetName, so automation can distinguish
+                           unavailable source data from zero findings without
+                           message parsing.  IDs 1-2 content unchanged; the
+                           multi-result-set empty path (gh-304) unchanged.
+                           Also fixed: the empty-path ID 2 RowData subquery was
+                           uncorrelated, concatenating all recommendation rows
+                           into one invalid JSON string per row -- now correlated
+                           on FindingID with sequential RowNum, matching the
+                           normal-path RS2 shape.
+
+            2026.07.23.1 - C4 adjacent-window fix (ehwn / gh-558):
                            C4 DEGRADING_THROUGHPUT now compares the recent
                            @ThroughputWindowDays against the immediately
                            preceding window of equal length.  PRIOR previously
@@ -471,7 +488,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.23.1',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.23.2',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260723';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -693,13 +710,13 @@ BEGIN
                 (N'Overlapping Runs (W4)',
                  N'Detects concurrent sp_StatUpdate executions by checking for overlapping StartTime/EndTime ranges. Excludes killed runs to prevent false positives from orphan-cleanup END records.'),
                 (N'SingleResultSet Mode',
-                 N'@SingleResultSet=1 wraps all 8 result sets into one table with columns: ResultSetID (int), ResultSetName (nvarchar), RowNum (int), RowData (nvarchar(max) as JSON). Use OPENJSON(RowData) to parse. Enables INSERT...EXEC patterns that fail with multiple result sets.'),
+                 N'@SingleResultSet=1 wraps all 8 result sets into one table with columns: ResultSetID (int), ResultSetName (nvarchar), RowNum (int), RowData (nvarchar(max) as JSON). Use OPENJSON(RowData) to parse. Enables INSERT...EXEC patterns that fail with multiple result sets.  When CommandLog has no usable data, IDs 3-13 are each represented by one marker row whose RowData JSON contains DataStatus = UNAVAILABLE, Reason = NO_COMMANDLOG_DATA, and the ResultSetName -- distinguish unavailable surfaces from zero-finding surfaces by the DataStatus property, never by message text.'),
                 (N'CommandLog Requirements',
                  N'Requires Ola Hallengren''s dbo.CommandLog table with sp_StatUpdate entries (CommandType IN SP_STATUPDATE_START, SP_STATUPDATE_END, UPDATE_STATISTICS). No data = no diagnostics (graceful empty result sets). @CommandLogDatabase lets you point to a central logging database.'),
                 (N'PowerShell Wrapper',
                  N'Invoke-StatUpdateDiag.ps1 runs sp_StatUpdate_Diag across multiple servers in parallel, detects version skew and parameter inconsistencies, and generates Markdown/HTML/JSON reports. Use -Obfuscate for safe sharing.'),
                 (N'Automation / Stable Result Sets',
-                 N'The number of result sets varies by @ExpertMode (2 vs 12-13) and @Obfuscate (shifts RS9). For automation, use @SingleResultSet=1 -- it wraps all output into one table with a stable ResultSetID column (values 1-13). This makes INSERT...EXEC reliable regardless of parameter combinations.')
+                 N'The number of result sets varies by @ExpertMode (2 vs 12-13) and @Obfuscate (shifts RS9). For automation, use @SingleResultSet=1 -- it wraps all output into one table with a stable ResultSetID column (values 1-13). This makes INSERT...EXEC reliable regardless of parameter combinations.  Unavailable surfaces (e.g., empty CommandLog) still appear in the envelope as marker rows with RowData JSON DataStatus = UNAVAILABLE plus a Reason code (currently NO_COMMANDLOG_DATA), so missing source data is never silently indistinguishable from zero findings.')
         ) AS notes (topic, detail);
 
         /* Result set 6: Grading Scale */
@@ -2010,7 +2027,13 @@ BEGIN
         END
         ELSE
         BEGIN
-            /* Single result set mode: return Executive Dashboard + NO_DATA recommendation row */
+            /* Single result set mode: return Executive Dashboard + NO_DATA recommendation row.
+               gh-557: the stable-ID contract promises ResultSetIDs 1-13 in single-result mode,
+               so IDs 3-13 each get one machine-readable UNAVAILABLE marker row.  Consumers key
+               on RowData JSON DataStatus = UNAVAILABLE / Reason = NO_COMMANDLOG_DATA -- structurally
+               distinct from domain rows and from an available result set with zero findings.
+               ID 9 (Obfuscation Map) marker carries no names, so the rule excluding map CONTENT
+               from unified output is preserved. */
             SELECT
                 ResultSetID   = 1,
                 ResultSetName = N'Executive Dashboard',
@@ -2020,19 +2043,44 @@ BEGIN
             SELECT
                 ResultSetID   = 2,
                 ResultSetName = N'Recommendations',
-                RowNum        = 1,
+                RowNum        = ROW_NUMBER() OVER (ORDER BY r.SortPriority, r.FindingID),
                 RowData       = (
                     SELECT
-                        Severity       = r.Severity,
-                        Category       = r.Category,
-                        Finding        = r.Finding,
-                        Evidence       = r.Evidence,
-                        Recommendation = r.Recommendation,
-                        ExampleCall    = r.ExampleCall
-                    FROM #recommendations AS r
+                        Severity       = r2.Severity,
+                        Category       = r2.Category,
+                        Finding        = r2.Finding,
+                        Evidence       = r2.Evidence,
+                        Recommendation = r2.Recommendation,
+                        ExampleCall    = r2.ExampleCall
+                    FROM #recommendations AS r2
+                    WHERE r2.FindingID = r.FindingID
                     FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
                 )
-            FROM #recommendations;
+            FROM #recommendations AS r
+            UNION ALL
+            SELECT
+                ResultSetID   = v.rs_id,
+                ResultSetName = v.rs_name,
+                RowNum        = 1,
+                RowData       = (SELECT DataStatus = N'UNAVAILABLE', Reason = N'NO_COMMANDLOG_DATA', ResultSetName = v.rs_name FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)
+            FROM
+            (
+                VALUES
+                    (3,  N'Run Health Summary'),
+                    (4,  N'Run Detail'),
+                    (5,  N'Top Tables'),
+                    (6,  N'Failing Statistics'),
+                    (7,  N'Long-Running Statistics'),
+                    (8,  N'Parameter Change History'),
+                    (9,  N'Obfuscation Map'),
+                    (10, N'Efficacy Trend'),
+                    (11, N'Efficacy Detail'),
+                    (12, N'High-CPU Stat Positions'),
+                    (13, N'QS Performance Correlation')
+            ) AS v (rs_id, rs_name)
+            ORDER BY
+                ResultSetID,
+                RowNum;
         END;
 
         RETURN;
