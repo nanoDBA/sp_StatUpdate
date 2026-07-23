@@ -36,9 +36,20 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.03.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.23.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
 
-History:    2026.07.03.1 - I8/RS13 DataStatus surface (w5p2 / gh-532):
+History:    2026.07.23.1 - C4 adjacent-window fix (ehwn / gh-558):
+                           C4 DEGRADING_THROUGHPUT now compares the recent
+                           @ThroughputWindowDays against the immediately
+                           preceding window of equal length.  PRIOR previously
+                           had no lower bound, so all loaded history outside
+                           the recent window (up to @DaysBack) entered the
+                           baseline and @DaysBack silently changed C4 results.
+                           Runs older than 2 x @ThroughputWindowDays are now
+                           excluded, and @ThroughputWindowDays is validated to
+                           be at most @DaysBack / 2 (was: at most @DaysBack).
+
+            2026.07.03.1 - I8/RS13 DataStatus surface (w5p2 / gh-532):
                            I8 and RS13 no longer go silently empty when Query Store
                            CPU history is sparse or absent.  New @i8_data_status
                            (AVAILABLE / INSUFFICIENT_HISTORY / UNAVAILABLE) computed
@@ -460,8 +471,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.03.1',  /* orchestrator bumps this */
-        @procedure_version_date datetime = '20260703';     /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.23.1',  /* orchestrator bumps this */
+        @procedure_version_date datetime = '20260723';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -504,8 +515,8 @@ BEGIN
                     N'1-N', N'3'),
                 (N'@TimeLimitExhaustionPct',    N'integer',  N'If more than this percentage of runs hit TIME_LIMIT stop reason, triggers C3 CRITICAL finding',
                     N'1-100', N'80'),
-                (N'@ThroughputWindowDays',      N'integer',  N'Compare recent N days throughput against prior window for C4 degrading throughput detection',
-                    N'1-@DaysBack', N'7'),
+                (N'@ThroughputWindowDays',      N'integer',  N'Compare recent N days throughput against the immediately preceding N days for C4 degrading throughput detection; runs older than 2 x N days are ignored',
+                    N'1 to @DaysBack / 2', N'7'),
                 (N'@TopN',                     N'integer',  N'Maximum rows returned in detail result sets (Top Tables, Failing Stats, Long-Running Stats)',
                     N'1-1000', N'20'),
                 (N'@EfficacyDaysBack',         N'integer',  N'Broad window for QS efficacy trending (weekly aggregates). NULL inherits from @DaysBack.',
@@ -678,7 +689,7 @@ BEGIN
                 (N'Killed Run Detection',
                  N'Two detection methods: (1) SP_STATUPDATE_START without matching SP_STATUPDATE_END = orphaned run, (2) SP_STATUPDATE_END with StopReason=KILLED = cleaned up by @CleanupOrphanedRuns. Both trigger C1 CRITICAL.'),
                 (N'Throughput Trend (C4)',
-                 N'Compares average seconds-per-stat in the recent @ThroughputWindowDays against the prior window of equal length. If recent average is >50% worse, triggers C4 CRITICAL. Data-dependent -- requires sufficient runs in both windows.'),
+                 N'Compares average seconds-per-stat in the recent @ThroughputWindowDays against the immediately preceding window of equal length. Runs older than 2 x @ThroughputWindowDays are excluded, so @DaysBack does not affect the comparison. Requires @DaysBack >= 2 x @ThroughputWindowDays (validation error otherwise). If recent average is >50% worse, triggers C4 CRITICAL. Data-dependent -- requires sufficient runs in both windows.'),
                 (N'Overlapping Runs (W4)',
                  N'Detects concurrent sp_StatUpdate executions by checking for overlapping StartTime/EndTime ranges. Excludes killed runs to prevent false positives from orphan-cleanup END records.'),
                 (N'SingleResultSet Mode',
@@ -843,8 +854,10 @@ BEGIN
     IF @TimeLimitExhaustionPct < 1 OR @TimeLimitExhaustionPct > 100
         SET @errors = @errors + N'@TimeLimitExhaustionPct must be between 1 and 100. ';
 
-    IF @ThroughputWindowDays < 1 OR @ThroughputWindowDays > @DaysBack
-        SET @errors = @errors + N'@ThroughputWindowDays must be between 1 and @DaysBack. ';
+    /* gh-558: C4 needs two complete adjacent windows, so 2 x @ThroughputWindowDays
+       must fit inside the loaded @DaysBack history */
+    IF @ThroughputWindowDays IS NULL OR @ThroughputWindowDays < 1 OR (2 * @ThroughputWindowDays) > @DaysBack
+        SET @errors = @errors + N'@ThroughputWindowDays must be >= 1 and no more than half of @DaysBack (C4 compares two adjacent windows of @ThroughputWindowDays each). ';
 
     IF @TopN < 1 OR @TopN > 1000
         SET @errors = @errors + N'@TopN must be between 1 and 1000. ';
@@ -2569,11 +2582,24 @@ BEGIN
        ====================================================================== */
     /* #306: Compare only runs with same StatsInParallel mode to avoid false CRITICAL
        when switching between serial and parallel modes changes throughput characteristics */
+    /* gh-558: RECENT and PRIOR are adjacent windows of equal length
+       (@ThroughputWindowDays each).  PRIOR has an explicit lower bound so runs
+       older than 2 x @ThroughputWindowDays never enter the comparison --
+       previously every loaded run outside RECENT was classified PRIOR, so
+       raising @DaysBack silently changed the C4 baseline.  A single anchor
+       keeps the two windows exactly adjacent. */
+    DECLARE @c4_anchor datetime2(3) = SYSDATETIME();
+
+    DECLARE @c4_recent_start datetime2(3) = DATEADD(DAY, -@ThroughputWindowDays, @c4_anchor);
+
+    /* Derived from @c4_recent_start so adjacency is structural, not arithmetic */
+    DECLARE @c4_prior_start datetime2(3) = DATEADD(DAY, -@ThroughputWindowDays, @c4_recent_start);
+
     ;WITH throughput_windows AS
     (
         SELECT
             window_label = CASE
-                WHEN r.StartTime >= DATEADD(DAY, -@ThroughputWindowDays, GETDATE()) THEN N'RECENT'
+                WHEN r.StartTime >= @c4_recent_start THEN N'RECENT'
                 ELSE N'PRIOR'
             END,
             parallel_mode = ISNULL(r.StatsInParallel, N'N'),
@@ -2590,6 +2616,7 @@ BEGIN
         FROM #runs AS r
         WHERE r.IsKilled = 0
         AND   r.StatsProcessed > 0
+        AND   r.StartTime >= @c4_prior_start  /* gh-558: exclude runs older than two windows */
     ),
     window_avgs AS
     (
