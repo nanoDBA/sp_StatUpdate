@@ -36,11 +36,23 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.7.1.2026.07.23 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.7.2.2026.07.23 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.7.1.2026.07.23 - QS score cache value + identity fix (sp_StatUpdate-rcng
+History:    3.7.2.2026.07.23 - Phase 3B delta-enrichment cache key omits SchemaName
+                            (sp_StatUpdate-mtt4):  the gh-502 cl_lookup CTE
+                            joined CommandLog on DatabaseName + ObjectName +
+                            StatisticsName -- the same incomplete key fixed for
+                            Phase 5B in v3.7.1.  Same-named table+stat pairs in
+                            different schemas could read the other schema's last
+                            ModificationCounter, producing wrong
+                            effective_counter deltas (a stat could be skipped
+                            as already-current based on the wrong counter)
+                            and wrong modification_velocity.  SchemaName is now
+                            part of the join key.
+
+            3.7.1.2026.07.23 - QS score cache value + identity fix (sp_StatUpdate-rcng
                             / gh-556):  Phase 5B cache hits were zeroed by the
                             unconditional Phase 6 qs_priority_boost
                             initialization while the live enrichment still
@@ -636,7 +648,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.7.1.2026.07.23',
+        @procedure_version varchar(20) = '3.7.2.2026.07.23',
         @procedure_version_date datetime = '20260723',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -4756,6 +4768,7 @@ OPTION (RECOMPILE);';
                         INNER JOIN ' + @commandlog_3part + N' AS cl
                             ON  cl.CommandType    = N''UPDATE_STATISTICS''
                             AND cl.DatabaseName   = DB_NAME() COLLATE DATABASE_DEFAULT
+                            AND cl.SchemaName     = sc2.schema_name COLLATE DATABASE_DEFAULT /* mtt4: same-named table+stat in different schemas must not share counters */
                             AND cl.ObjectName     = sc2.table_name COLLATE DATABASE_DEFAULT
                             AND cl.StatisticsName = sc2.stat_name COLLATE DATABASE_DEFAULT
                             AND cl.EndTime IS NOT NULL
