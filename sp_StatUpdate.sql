@@ -36,11 +36,25 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.7.0.2026.07.03 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.7.1.2026.07.23 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.7.0.2026.07.03 - QS attribution + guardrail batch (sp_StatUpdate-zks1,
+History:    3.7.1.2026.07.23 - QS score cache value + identity fix (sp_StatUpdate-rcng
+                            / gh-556):  Phase 5B cache hits were zeroed by the
+                            unconditional Phase 6 qs_priority_boost
+                            initialization while the live enrichment still
+                            skipped them, so every hit ranked as 0.  Zero-init
+                            now applies to cache misses only; the WAITS/WAIT_CPU
+                            wait-stats UPDATEs gain the same qs_cache_hit
+                            exclusion.  The cache key now also matches
+                            SchemaName (same-named table+stat in different
+                            schemas no longer share scores) and requires the
+                            cached QSMetric to equal the current run metric
+                            (the gh-503 invalidation contract); legacy rows
+                            without QSMetric are cache misses.
+
+            3.7.0.2026.07.03 - QS attribution + guardrail batch (sp_StatUpdate-zks1,
                             -6aa2, -sss6, -o7gf, -u6n7, -l4ui, -lfbv):
                             (1) gh-533 (zks1): pre-run QS forced-plan baseline --
                             #qs_forced_baseline snapshots force_failure_count per
@@ -622,8 +636,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.7.0.2026.07.03',
-        @procedure_version_date datetime = '20260703',
+        @procedure_version varchar(20) = '3.7.1.2026.07.23',
+        @procedure_version_date datetime = '20260723',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -5025,6 +5039,9 @@ OPTION (RECOMPILE);';
                 the most recent CommandLog entry per stat.  If QSLastExecution is
                 within @i_qs_recent_hours, copy cached scores and mark
                 qs_cache_hit=1 so Phase 6 skips the expensive QS DMV joins.
+                rcng / gh-556: a hit additionally requires the CommandLog row to
+                match on SchemaName and to carry a QSMetric equal to the current
+                run metric; rows without QSMetric are misses.
                 ================================================================
                 */
                 IF @commandlog_exists_param = 1 AND @i_qs_enabled_param = 1
@@ -5048,10 +5065,17 @@ OPTION (RECOMPILE);';
                         INNER JOIN ' + @commandlog_3part + N' AS cl
                             ON  cl.CommandType    = N''UPDATE_STATISTICS''
                             AND cl.DatabaseName   = DB_NAME() COLLATE DATABASE_DEFAULT
+                            AND cl.SchemaName     = sc2.schema_name COLLATE DATABASE_DEFAULT /* rcng / gh-556: same-named table+stat in different schemas must not share scores */
                             AND cl.ObjectName     = sc2.table_name COLLATE DATABASE_DEFAULT
                             AND cl.StatisticsName = sc2.stat_name COLLATE DATABASE_DEFAULT
                             AND cl.EndTime IS NOT NULL
                             AND cl.ErrorNumber    = 0
+                        /* rcng / gh-556: a cached score is only valid for the metric it was
+                           computed under (the gh-503 invalidation contract).  Legacy rows
+                           without a QSMetric element return NULL here and are cache misses.
+                           Filtering inside the CTE keeps rn ranking only metric-matching rows,
+                           so an older same-metric row still hits after a metric flip-flop. */
+                        WHERE cl.ExtendedInfo.value(N''(/ExtendedInfo/QSMetric)[1]'', N''nvarchar(20)'') = @i_qs_metric_param COLLATE DATABASE_DEFAULT
                     )
                     UPDATE sc
                     SET sc.qs_priority_boost    = ISNULL(qs_cache.cached_boost, 0),
@@ -5121,8 +5145,11 @@ OPTION (RECOMPILE);';
                     Now we parse plan XML to find which tables each QS plan references.
                     */
 
-                    /* Initialize qs_priority_boost to 0 for all rows first */
-                    UPDATE #stat_candidates SET qs_priority_boost = 0;
+                    /* Initialize qs_priority_boost to 0 for cache misses only.
+                       rcng / gh-556: cache hits carry their Phase 5B cached score --
+                       zeroing them here discarded the score while the live enrichment
+                       below still skipped them, so every hit ranked as 0. */
+                    UPDATE #stat_candidates SET qs_priority_boost = 0 WHERE qs_cache_hit = 0;
 
                     /*#region PHASE-6-EARLY-BAILOUT */
                     /* Early bail-out: skip XML parsing if QS has no recent runtime data */
@@ -5366,7 +5393,8 @@ OPTION (RECOMPILE);';
                         UPDATE sc
                         SET sc.qs_total_wait_time_ms = wbt.total_wait_ms
                         FROM #stat_candidates AS sc
-                        INNER JOIN WaitByTable AS wbt ON wbt.object_id = sc.object_id;
+                        INNER JOIN WaitByTable AS wbt ON wbt.object_id = sc.object_id
+                        WHERE sc.qs_cache_hit = 0; /* rcng / gh-556: hits keep their cached WAITS boost */
                     END;
 
                     /* #366: Update priority boost for WAITS metric (must run after wait stats UPDATE).
@@ -5382,7 +5410,8 @@ OPTION (RECOMPILE);';
                             ELSE 0
                         END
                         FROM #stat_candidates AS sc
-                        WHERE sc.qs_total_wait_time_ms IS NOT NULL;
+                        WHERE sc.qs_total_wait_time_ms IS NOT NULL
+                        AND   sc.qs_cache_hit = 0; /* rcng / gh-556 */
                     END;
 
                     END; /* ELSE from early bail-out */
