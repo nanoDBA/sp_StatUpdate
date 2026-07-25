@@ -12,77 +12,19 @@
 
 **A NIGHTLY run, live** -- worst stats first (Query Store CPU), per-stat progress, an AG-safety pause, and a *graceful* stop at the time limit with everything it didn't reach logged, not lost:
 
-```text
- ═══════════════════════════════════════════════════════════════════════
- sp_StatUpdate  v3.7.4       @Preset = NIGHTLY       @Databases = Production
- ═══════════════════════════════════════════════════════════════════════
- Discovering qualifying statistics via DMV...
-   Phase 1 (candidates):       3,481 stats    (412 ms)
-   Phase 4 (after thresholds): 1,284 qualify  (238 ms)
-   Sort order: QUERY_STORE (CPU)  - worst offenders first, not alphabetical
- Found 1,284 qualifying statistics  · time limit 3600s
-
- [   1/1284] ✓ dbo.Orders.IX_Orders_CustomerId      mods: 842,015   QS-CPU #1   0.4s
- [   2/1284] ✓ dbo.LineItems.IX_LineItems_Sku       mods: 511,880   QS-CPU #2   1.1s
- [   3/1284] ✓ dbo.Invoices.IX_Invoices_DueDate     mods: 318,204   QS-CPU #3   0.7s
- [   4/1284] ✓ dbo.Shipments.IX_Shipments_Status    mods: 204,551   QS-CPU #4   0.5s
-   ⚠ AG secondary redo queue 640 MB > 500 MB - pausing (drained in 38s)
- [   5/1284] ✓ dbo.Payments.IX_Payments_PostedUtc   mods: 198,332   QS-CPU #5   0.9s
-         ...
- [ 947/1284] ✓ dbo.AuditLog.IX_AuditLog_EventTime   mods:   5,004   QS-CPU #947 0.2s
-
- ═══════════════════════════════════════════════════════════════════════
- ⏱  TIME_LIMIT reached at 3600s - stopping gracefully
-    Succeeded: 947     Failed: 0     Remaining: 337 (logged to CommandLog, not lost)
-    The 947 highest-workload stats were updated first. Nothing left to chance.
- ═══════════════════════════════════════════════════════════════════════
-  WARNING  Incomplete: 337 stat(s) remaining (TIME_LIMIT)
-```
+![sp_StatUpdate NIGHTLY run: worst stats first by Query Store CPU, an AG-safety pause, and a graceful stop at the time limit with everything it did not reach logged, not lost](assets/demo-run.png)
 
 **The diagnostic dashboard** -- letter grades your boss understands and your monitoring can alert on. RELIABILITY is a C because two runs got killed; the tool noticed, even if nobody else did:
 
-```text
- sp_StatUpdate_Diag - Executive Dashboard                        @ExpertMode = 0
- ────────────────────────────────────────────────────────────────────────────
- CATEGORY          GRADE   SCORE   HEALTH                   HEADLINE
- OVERALL             B       84   █████████████████░░░   Healthy, minor opportunities
- COMPLETION          A      100   ████████████████████   Nearly all qualifying stats updated
- RELIABILITY         C       55   ███████████░░░░░░░░░   2 run(s) were killed - check Agent
- SPEED               A       92   ██████████████████░░   Very fast (0.4 sec/stat)
- WORKLOAD FOCUS      B       78   ████████████████░░░░   Query Store prioritization working
- ────────────────────────────────────────────────────────────────────────────
- Health score 84 / 100   ·   3 runs / 30 days   ·   grades your monitoring can alert on
-```
+![sp_StatUpdate_Diag Executive Dashboard: letter grades your boss understands and your monitoring can alert on](assets/demo-dashboard.png)
 
 **It reads the room** -- @Debug = 1 reports everything that changes how statistics behave (CE version, trace flags, AG role, tempdb) and flags what will bite you:
 
-```text
- sp_StatUpdate - Environment Intelligence            @Debug = 1
- ──────────────────────────────────────────────────────────────
- SQL Server    2022 (16.0.4265)  Enterprise Developer Edition
- Compat / CE   170 / New CE (150)
- Trace flags   2371 ON -> auto-stats threshold lowered for big tables
- Hardware      16 cores · 4 NUMA · 256 GB · uptime 41h
- tempdb free   18,432 MB
- AG role       PRIMARY redo queue 12 MB (healthy)
- Resource Gov  pool [maintenance]  MAXDOP 4
-  ⚠ BACKUP_RUNNING - full backup in progress, proceeding carefully
-  ⚠ PEAK_HOURS     - business hours; expect plan recompiles
-```
+![sp_StatUpdate Environment Intelligence at @Debug = 1: CE version, trace flags, AG role, tempdb, and the conditions that will bite you](assets/demo-environment.png)
 
 **It doesn't just diagnose -- it prescribes.** Copy-paste the EXEC it built for *your* server:
 
-```text
- sp_StatUpdate_Diag - Recommendations
- ──────────────────────────────────────────────────────────────────────
-  ⛔ CRITICAL  C1  2 runs killed before completing - check the 5 AM Agent stop
-  ⚠ WARNING   W3  61% of stats never processed - raise @TimeLimit or add @MopUpPass
-  ⚠ WARNING   W1  No @TimeLimit set - a runaway job can burn hours
-  ℹ INFO      I10 Recommended for THIS server:
-                  EXEC sp_StatUpdate @Preset='NIGHTLY',
-                                     @Databases='USER_DATABASES',
-                                     @MopUpPass='Y', @TimeLimit=7200;
-```
+![sp_StatUpdate_Diag Recommendations: prioritized findings plus a copy-paste EXEC tuned for this server](assets/demo-recommendations.png)
 
 ## Why This Exists
 
