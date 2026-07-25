@@ -36,11 +36,21 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.7.3.2026.07.23 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.7.4.2026.07.25 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.7.3.2026.07.23 - Publish early-rejection outcomes before severity-16
+History:    3.7.4.2026.07.25 - SPILL PROOF: preselection-vs-proof @Help topic
+                            (sp_StatUpdate-ggnq / gh-552).  Query Store metrics
+                            (TEMPDB_SPILLS/WAITS/WAIT_CPU) preselect candidates
+                            before a run; they do NOT prove a sort spill in the
+                            UPDATE STATISTICS statement itself.  @Help now says
+                            so and points to sp_StatUpdate_XE_Session.sql, whose
+                            new sort_warning (primary) + hash_warning (secondary)
+                            events are the truthful proof surface.  No behavioral
+                            change to QS enrichment, ranking, or sort logic.
+
+            3.7.3.2026.07.23 - Publish early-rejection outcomes before severity-16
                             signaling (sp_StatUpdate-2zla / gh-555):  the
                             open-transaction guard and the ALREADY_RUNNING
                             branch raised their severity-16 error BEFORE
@@ -669,8 +679,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.7.3.2026.07.23',
-        @procedure_version_date datetime = '20260723',
+        @procedure_version varchar(20) = '3.7.4.2026.07.25',
+        @procedure_version_date datetime = '20260725',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -779,7 +789,8 @@ BEGIN
             (N'COLUMNSTORE',   N'@SkipTablesWithNCCI=Y (default) skips tables with nonclustered columnstore (plan stability).  @SkipTablesWithCCI=N (default) updates CCI tables.'),
             (N'WARNINGS',      N'@WarningsCodesOut returns pipe-delimited codes for programmatic parsing.  @WarningsOut is human-readable.  Same codes appear in END row Summary/WarningsCodes element.  Policy: codes may be added in any release, never renamed/removed without a major version bump.  Current tokens: AG_SECONDARY_SERVER|ELASTIC_POOL|RCSI_VERSION_STORE|DEAD_WORKER_TIMEOUT_NULL_COERCED|EMPTY_STRING_PARAM|AZURE_SQL_DB|AZURE_SQL_MI|AZURE_SQL_EDGE|CASE_SENSITIVE_COLLATION|LOW_UPTIME|BACKUP_RUNNING|PEAK_HOURS|CONTAINER_MEMORY|DB_SKIPPED|RLS_DETECTED|RLS_CHECK_FAILED|WIDESTAT_CHECK_FAILED|FILTER_MISMATCH|FILTER_CHECK_FAILED|COLUMNSTORE_TABLES|COLUMNSTORE_CHECK_FAILED|COMPRESSED_CHECK_FAILED|COMPUTEDCOL_CHECK_FAILED|CDC_TABLES|REPLICATION_MAJORITY|PARALLEL_ORPHAN_BACKLOG|STALE_QUEUE_SWEEP|BACKUP_STARTED_MID_RUN|LOG_SPACE_HIGH|PERSIST_SAMPLE_INADEQUATE|IO_CORRUPTION|STOPBYTIME_OVERSHOOT|QS_FORCED_PLANS|TOCTOU_SKIPS|CONSECUTIVE_FAILURES_ELEVATED'),
             (N'PARALLEL',      N'@StatsInParallel=Y. Requires dbo.Queue + dbo.QueueStatistic (auto-created). Run same EXEC from multiple Agent steps. AG-secondary guard and orphan-row sweep run at startup.'),
-            (N'QUERY STORE',   N'@QueryStore=CPU/DURATION/READS/etc. to prioritize stats on high-workload tables.  WAITS filters to Buffer Latch, Buffer IO, Memory, Other Disk IO -- wait classes statistics quality can influence.  WAIT_CPU: CPU-scheduler waits (SOS_SCHEDULER_YIELD) -- wait-bound queries the runtime metrics miss.  OFF to disable.'),
+            (N'QUERY STORE',   N'@QueryStore=CPU/DURATION/READS/etc. to prioritize stats on high-workload tables.  WAITS filters to Buffer Latch, Buffer IO, Memory, Other Disk IO -- wait classes statistics quality can influence.  WAIT_CPU: CPU-scheduler waits (SOS_SCHEDULER_YIELD) -- wait-bound queries the runtime metrics miss.  OFF to disable.  NOTE: these metrics PRESELECT which stats to update BEFORE the run; they are not proof of a spill in the UPDATE STATISTICS statement itself -- see SPILL PROOF.'),
+            (N'SPILL PROOF',   N'Query Store TEMPDB_SPILLS/WAITS/WAIT_CPU rank candidates BEFORE the run; they are NOT evidence about the generated UPDATE STATISTICS statements.  For truthful proof of a sort spill in the stats-update command, run sp_StatUpdate_XE_Session.sql: its sort_warning event is the proof surface (hash_warning is secondary context), correlatable to the CommandLog UPDATE_STATISTICS row by time + statement (gh-552).'),
             (N'MOP-UP',        N'@MopUpPass=Y: after priority pass, sweep any stat with modification_counter>0.  Needs @TimeLimit + @LogToTable=Y.'),
             (N'DIRECT MODE',   N'@Statistics=''Schema.Table.Stat'' for ad-hoc updates. Skips discovery.  Comma-separate for multiple.'),
             (N'STALE HOURS',   N'@StaleHours=48 means skip stats updated within 48 hours.  Replaces v2 @DaysStaleThreshold/@HoursStaleThreshold.'),
