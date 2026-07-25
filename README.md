@@ -26,6 +26,10 @@
 
 ![sp_StatUpdate_Diag Recommendations: prioritized findings plus a copy-paste EXEC tuned for this server](assets/demo-recommendations.png)
 
+> **About the color:** the console output is really colorized -- pass `@Ansi = 'Y'` (opt-in; default is plain text). The escape codes are **console-only** and never touch CommandLog, OUTPUT parameters, or result sets.
+>
+> Color renders in **Windows Terminal, VS Code's integrated terminal, iTerm2/Terminal.app, Linux terminals, `sqlcmd | less -R`, and CI log viewers**. It shows **raw escape codes** (so leave `@Ansi` off) in **SSMS, Azure Data Studio, DataGrip/DBeaver, PowerShell ISE, legacy `cmd.exe`, SQL Agent job logs, and files** -- i.e. don't enable it for SSMS or Agent jobs. Only basic 16-color SGR codes are used, so wherever ANSI works at all, these do.
+
 ## Why This Exists
 
 | Problem | Fix |

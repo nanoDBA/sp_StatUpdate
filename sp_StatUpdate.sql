@@ -36,11 +36,24 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.7.4.2026.07.25 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.8.0.2026.07.25 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.7.4.2026.07.25 - SPILL PROOF: preselection-vs-proof @Help topic
+History:    3.8.0.2026.07.25 - COLOR: opt-in @Ansi param (sp_StatUpdate-w0xp).
+                            @Ansi = N'Y' colorizes console (RAISERROR) output
+                            with ANSI SGR escape codes -- banners, discovery
+                            line, "Found N qualifying", the per-stat progress
+                            line, and the summary Succeeded/Failed/Remaining
+                            counts.  Default N'N' is byte-identical to prior
+                            output (all color variables are empty strings), so
+                            existing behavior, tests, CommandLog, OUTPUT params,
+                            and result sets are unchanged -- codes are injected
+                            into console RAISERROR text ONLY.  SSMS ignores the
+                            codes; use a color-aware terminal (Windows Terminal,
+                            sqlcmd piped to a color-aware pager) to see them.
+
+            3.7.4.2026.07.25 - SPILL PROOF: preselection-vs-proof @Help topic
                             (sp_StatUpdate-ggnq / gh-552).  Query Store metrics
                             (TEMPDB_SPILLS/WAITS/WAIT_CPU) preselect candidates
                             before a run; they do NOT prove a sort spill in the
@@ -648,6 +661,7 @@ ALTER PROCEDURE
     @FailFast bit = 0,                              /* 1 = abort on first error */
     @AbortOnIntegrityError bit = 1,                 /* 1 = abort run on 823/824/825 (default); 0 = emit advisory + IO_CORRUPTION warning code, count as failure, and continue */
     @Debug bit = 0,                                 /* 1 = verbose output */
+    @Ansi nvarchar(1) = N'N',                       /* Y = colorize console (RAISERROR) output with ANSI escape codes; N (default) = plain text.  Console-only; never touches CommandLog, OUTPUT params, or result sets.  SSMS ignores the codes; use a color-aware terminal (Windows Terminal, sqlcmd piped to a pager) to see them. */
 
     /* PARALLEL EXECUTION */
     @StatsInParallel nvarchar(1) = N'N',            /* Y = queue-based parallel processing */
@@ -679,7 +693,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.7.4.2026.07.25',
+        @procedure_version varchar(20) = '3.8.0.2026.07.25',
         @procedure_version_date datetime = '20260725',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -774,6 +788,7 @@ BEGIN
             (N'@FilteredStatsMode', N'nvarchar(10)',       N'NULL', N'Filtered-statistics scope: INCLUDE (default), EXCLUDE (skip filtered stats), ONLY (only filtered stats), PRIORITY (boost filtered stats whose selectivity drifted -- see @FilteredStatsStaleFactor).  NULL = INCLUDE.'),
             (N'@FilteredStatsStaleFactor', N'float',       N'NULL', N'A filtered stat counts as drifted when unfiltered_rows / rows exceeds this factor (default 2.0).  Drift-qualified stats under PRIORITY mode report QualifyReason = FILTERED_DRIFT.'),
             (N'@Debug',                 N'bit',            N'0',   N'Verbose output'),
+            (N'@Ansi',                  N'nvarchar(1)',    N'N',   N'Y = colorize console (RAISERROR) output with ANSI escape codes; N (default) = plain text.  Console-only -- never touches CommandLog, OUTPUT params, or result sets.  SSMS ignores the codes; use a color-aware terminal.'),
             (N'@StatsInParallel',       N'nvarchar(1)',    N'N',   N'Queue-based parallel processing'),
             (N'@Help',                  N'nvarchar(50)',   N'0',   N'1 = show this help')
         ) AS r(parameter, data_type, default_value, description);
@@ -800,6 +815,7 @@ BEGIN
             (N'DIAGNOSTICS',     N'Run sp_StatUpdate_Diag after for automated analysis.  @ExpertMode=1 for full detail, 0 for dashboard only.'),
             (N'CRITICAL TABLES', N'Use @CriticalTables + @CriticalSamplePercent to force higher sample rates on specific tables without affecting the rest.  Use @CriticalTablesFirst = Y to ensure critical tables are always processed first, even with QS ordering.  PERSIST_SAMPLE_PERCENT is auto-enabled for critical tables so auto-update between runs respects the sample rate.  Supports % wildcards (same syntax as @ExcludeTables).'),
             (N'INTEGRITY ABORT',  N'@AbortOnIntegrityError=1 (default): I/O corruption errors (823/824/825) abort the run and set StopReason=IO_CORRUPTION.  Set to 0 to emit the CHECKDB advisory and IO_CORRUPTION warning code, count the stat as failed, and continue processing remaining stats.  The IO_CORRUPTION warning code is appended at most once per run regardless of how many integrity errors occur.  Note: @FailFast = 1 aborts on ANY failure, including integrity errors, regardless of @AbortOnIntegrityError = 0.'),
+            (N'ANSI COLOR',      N'@Ansi=Y colorizes the console (RAISERROR) output with ANSI escape codes -- banners, discovery, "Found N", the per-stat progress line, and the Succeeded/Failed/Remaining summary.  Default N is plain text and byte-identical to prior versions.  Codes are console-only: CommandLog, OUTPUT params, and result sets are never touched.  RENDERS IN COLOR: Windows Terminal, VS Code integrated terminal, iTerm2/Terminal.app, Linux terminals, sqlcmd piped to "less -R", CI log viewers.  SHOWS RAW CODES (do NOT use @Ansi=Y here): SSMS Messages tab, Azure Data Studio, DataGrip/DBeaver, PowerShell ISE, legacy conhost/cmd.exe, SQL Agent job step output/history, and output redirected to a file.  Rule of thumb: only enable it when running from a real VT-capable terminal; leave it off for SSMS and Agent jobs.  Only basic SGR codes are used (16-color + bright), so where ANSI works at all these codes work.'),
             (N'VERSION',         N'v3.0 -- simplified API (33 input + 10 OUTPUT vs 58 input + 10 OUTPUT in v2).  Full behavioral parity with v2.37.  Preset-first design.')
         ) AS t(topic, detail);
 
@@ -1344,7 +1360,7 @@ BEGIN
     DECLARE
         @norecompute_display nvarchar(20) = N'',
         @duration_ms integer = 0,
-        @progress_msg nvarchar(500) = N'',
+        @progress_msg nvarchar(1000) = N'',
         @persisted_pct_msg integer = 0,
         @iteration_time datetime2(7) = NULL, /*Captured once per loop iteration for consistent timing*/
         @log_error_msg nvarchar(4000) = NULL; /*For TRY/CATCH - truncate at assignment to leave room for prefix*/
@@ -2138,6 +2154,9 @@ BEGIN
     IF @CriticalTables IS NOT NULL AND LEN(LTRIM(RTRIM(@CriticalTables))) = 0
         SET @CriticalTables = NULL;
 
+    /* @Ansi: normalize to upper-case single char so 'y'/'n' are accepted */
+    SET @Ansi = UPPER(LTRIM(RTRIM(ISNULL(@Ansi, N'N'))));
+
     /* Y/N parameter validation */
     DECLARE @yn_checks TABLE (param_name nvarchar(50), param_value nvarchar(10));
     INSERT INTO @yn_checks VALUES
@@ -2146,7 +2165,8 @@ BEGIN
         (N'@StatsInParallel', @StatsInParallel),
         (N'@MopUpPass (internal)', @i_mop_up_pass),
         (N'@SkipTablesWithNCCI', @SkipTablesWithNCCI),
-        (N'@SkipTablesWithCCI', @SkipTablesWithCCI);
+        (N'@SkipTablesWithCCI', @SkipTablesWithCCI),
+        (N'@Ansi', @Ansi);
 
     INSERT INTO @errors (error_message, error_severity)
     SELECT N'The value for ' + c.param_name + N' is not supported.  Use Y or N.', 16
@@ -2792,10 +2812,45 @@ BEGIN
         @MaxConsecutiveFailures_display nvarchar(20) = ISNULL(CONVERT(nvarchar(20), @i_max_consecutive_failures), N'None'),
         @start_time_display nvarchar(30) = CONVERT(nvarchar(30), @start_time, 121);
 
+    /*#region ANSI-COLOR: opt-in via @Ansi.  All vars are empty strings when off,
+       so message text is byte-identical to the pre-@Ansi behavior.  Escape byte is
+       NCHAR(27).  Applied ONLY to RAISERROR console output below -- never to
+       CommandLog, OUTPUT params, or result sets. */
+    DECLARE
+        @esc nchar(1) = NCHAR(27),
+        @a_reset nvarchar(12) = N'',   /* reset all attributes           */
+        @a_hdr nvarchar(12) = N'',     /* bright cyan bold  - banners     */
+        @a_cyan nvarchar(12) = N'',    /* cyan              - QS/accents   */
+        @a_dim nvarchar(12) = N'',     /* bright black/gray - secondary    */
+        @a_white nvarchar(12) = N'',   /* bright white bold - key numbers  */
+        @a_green nvarchar(12) = N'',   /* bright green      - success      */
+        @a_yellow nvarchar(12) = N'',  /* bright yellow     - warnings     */
+        @a_red nvarchar(12) = N'';     /* bright red        - critical     */
+
+    IF @Ansi = N'Y'
+    BEGIN
+        SET @a_reset  = @esc + N'[0m';
+        SET @a_hdr    = @esc + N'[1;36m';
+        SET @a_cyan   = @esc + N'[36m';
+        SET @a_dim    = @esc + N'[90m';
+        SET @a_white  = @esc + N'[1;97m';
+        SET @a_green  = @esc + N'[92m';
+        SET @a_yellow = @esc + N'[1;33m';
+        SET @a_red    = @esc + N'[1;91m';
+    END;
+
+    /* Pre-built colored separator bar (79 '=').  Plain '===...===' when @Ansi = N'N'. */
+    DECLARE @bar_line nvarchar(120) = @a_hdr + REPLICATE(N'=', 79) + @a_reset;
+    /* Reusable scratch for colored messages.  RAISERROR's message argument must be a
+       literal/variable/msg_id (not an expression), so colored lines are built here first. */
+    DECLARE @ansi_line nvarchar(4000) = N'';
+    /*#endregion*/
+
     RAISERROR(N'', 10, 1) WITH NOWAIT;
-    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
-    RAISERROR(N' sp_StatUpdate - Priority-Based Statistics Maintenance', 10, 1) WITH NOWAIT;
-    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+    RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
+    SET @ansi_line = @a_hdr + N' sp_StatUpdate - Priority-Based Statistics Maintenance' + @a_reset;
+    RAISERROR(@ansi_line, 10, 1) WITH NOWAIT;
+    RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
     RAISERROR(N'Server:      %s', 10, 1, @server_name) WITH NOWAIT;
     RAISERROR(N'Version:     %s', 10, 1, @product_version) WITH NOWAIT;
@@ -3029,6 +3084,7 @@ BEGIN
     RAISERROR(N'  @LogToTable              = %s', 10, 1, @LogToTable) WITH NOWAIT;
     RAISERROR(N'  CleanupOrphanedRuns       = %s', 10, 1, @i_cleanup_orphaned_runs) WITH NOWAIT;
     RAISERROR(N'  @Debug                   = %d', 10, 1, @Debug_int) WITH NOWAIT;
+    RAISERROR(N'  @Ansi                    = %s', 10, 1, @Ansi) WITH NOWAIT;
     IF @StatsInParallel = N'Y' AND @i_dead_worker_timeout_min IS NOT NULL
         RAISERROR(N'  @DeadWorkerTimeout       = %d minutes', 10, 1, @i_dead_worker_timeout_min) WITH NOWAIT;
 
@@ -4248,7 +4304,8 @@ OPTION (RECOMPILE);';
     */
     IF @mode = N'DISCOVERY' AND @skip_discovery = 0
     BEGIN
-        RAISERROR(N'Discovering qualifying statistics via DMV...', 10, 1) WITH NOWAIT;
+        SET @ansi_line = @a_dim + N'Discovering qualifying statistics via DMV...' + @a_reset;
+        RAISERROR(@ansi_line, 10, 1) WITH NOWAIT;
 
         DECLARE
             @discovery_sql nvarchar(max) = N'',
@@ -6256,7 +6313,8 @@ OPTION (RECOMPILE);';
     IF @skip_discovery = 0
     BEGIN
         RAISERROR(N'', 10, 1) WITH NOWAIT;
-        RAISERROR(N'Found %d qualifying statistics:', 10, 1, @total_stats) WITH NOWAIT;
+        SET @ansi_line = N'Found ' + @a_white + N'%d' + @a_reset + N' qualifying statistics:';
+        RAISERROR(@ansi_line, 10, 1, @total_stats) WITH NOWAIT;
         RAISERROR(N'  - NORECOMPUTE:      %d', 10, 1, @norecompute_stats) WITH NOWAIT;
         RAISERROR(N'  - Incremental:      %d', 10, 1, @incremental_stats) WITH NOWAIT;
         RAISERROR(N'  - On heaps:         %d', 10, 1, @heap_stats) WITH NOWAIT;
@@ -7230,9 +7288,9 @@ OPTION (RECOMPILE);';
     PROCESS STATISTICS
     ============================================================================
     */
-    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+    RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
     RAISERROR(N' Processing Statistics', 10, 1) WITH NOWAIT;
-    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+    RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
     /*
@@ -8849,9 +8907,9 @@ OPTION (RECOMPILE);';
                     ELSE N'no'
                 END,
             @progress_msg =
-                N'[' + CONVERT(nvarchar(10), @stats_processed) + N'/' + CONVERT(nvarchar(10), @total_stats) + N'] ' +
+                @a_dim + N'[' + CONVERT(nvarchar(10), @stats_processed) + N'/' + CONVERT(nvarchar(10), @total_stats) + N']' + @a_reset + N' ' +
                 @current_schema_name + N'.' + @current_table_name + N'.' + @current_stat_name +
-                N' (mods: ' + CONVERT(nvarchar(20), @current_modification_counter) +
+                N' (mods: ' + @a_white + CONVERT(nvarchar(20), @current_modification_counter) + @a_reset +
                 CASE
                     WHEN @current_page_count >= 1280 /* >= ~10 MB = 0.01 GB */
                     THEN N', ' + CONVERT(nvarchar(20), CONVERT(decimal(10, 2), @current_page_count * 8.0 / 1024.0 / 1024.0)) + N' GB'
@@ -10052,9 +10110,9 @@ OPTION (RECOMPILE);';
             BEGIN
                 /* WE ARE THE MOP-UP LEADER -- run full discovery */
                 RAISERROR(N'', 10, 1) WITH NOWAIT;
-                RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
                 RAISERROR(N' Mop-Up Pass (parallel leader): %d seconds remaining', 10, 1, @mop_up_remaining_seconds) WITH NOWAIT;
-                RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
                 RAISERROR(N'', 10, 1) WITH NOWAIT;
 
                 DECLARE @mop_up_db_list TABLE (idx int IDENTITY(1,1) PRIMARY KEY, database_name sysname NOT NULL);
@@ -10302,9 +10360,9 @@ OPTION (RECOMPILE);';
 
                         RAISERROR(N'Mop-up: found %d stats across %d tables -- queued for parallel processing', 10, 1, @mop_up_found, @mop_tables_queued) WITH NOWAIT;
                         RAISERROR(N'', 10, 1) WITH NOWAIT;
-                        RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                        RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
                         RAISERROR(N' Processing Mop-Up Statistics (parallel)', 10, 1) WITH NOWAIT;
-                        RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                        RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
                         RAISERROR(N'', 10, 1) WITH NOWAIT;
 
                         SET @total_stats = @total_stats + @mop_up_found;
@@ -10354,9 +10412,9 @@ OPTION (RECOMPILE);';
                 BEGIN
                     RAISERROR(N'Mop-up: joining mop-up pass (%d tables unclaimed)', 10, 1, @mop_up_queued) WITH NOWAIT;
                     RAISERROR(N'', 10, 1) WITH NOWAIT;
-                    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                    RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
                     RAISERROR(N' Processing Mop-Up Statistics (parallel follower)', 10, 1) WITH NOWAIT;
-                    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                    RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
                     RAISERROR(N'', 10, 1) WITH NOWAIT;
 
                     SET @stop_reason = NULL;
@@ -10390,9 +10448,9 @@ OPTION (RECOMPILE);';
             ====================================================================
             */
             RAISERROR(N'', 10, 1) WITH NOWAIT;
-            RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+            RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
             RAISERROR(N' Mop-Up Pass: %d seconds remaining -- broad sweep of modified stats', 10, 1, @mop_up_remaining_seconds) WITH NOWAIT;
-            RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+            RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
             RAISERROR(N'', 10, 1) WITH NOWAIT;
 
             DECLARE @mop_up_db_list_s TABLE (idx int IDENTITY(1,1) PRIMARY KEY, database_name sysname NOT NULL);
@@ -10569,9 +10627,9 @@ OPTION (RECOMPILE);';
 
                 RAISERROR(N'Mop-up: found %d additional stats with modifications (ordered by modification_counter DESC)', 10, 1, @mop_up_found) WITH NOWAIT;
                 RAISERROR(N'', 10, 1) WITH NOWAIT;
-                RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
                 RAISERROR(N' Processing Mop-Up Statistics', 10, 1) WITH NOWAIT;
-                RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+                RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
                 RAISERROR(N'', 10, 1) WITH NOWAIT;
 
                 GOTO ProcessLoop;
@@ -10616,9 +10674,9 @@ OPTION (RECOMPILE);';
             @stop_reason = N'NATURAL_END';
     END;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
-    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+    RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
     RAISERROR(N' Summary', 10, 1) WITH NOWAIT;
-    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+    RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
     RAISERROR(N'End time:        %s', 10, 1, @end_time_display) WITH NOWAIT;
     /* Sub-second duration display: show decimal seconds (e.g., 0.9s not 0s) */
@@ -10628,12 +10686,15 @@ OPTION (RECOMPILE);';
     RAISERROR(N'Duration:        %s', 10, 1, @duration_display) WITH NOWAIT;
     RAISERROR(N'', 10, 1) WITH NOWAIT;
     RAISERROR(N'Stats processed: %d / %d', 10, 1, @stats_processed, @total_stats) WITH NOWAIT;
-    RAISERROR(N'  Succeeded:     %d', 10, 1, @stats_succeeded) WITH NOWAIT;
-    RAISERROR(N'  Failed:        %d', 10, 1, @stats_failed) WITH NOWAIT;
+    SET @ansi_line = N'  Succeeded:     ' + @a_green + N'%d' + @a_reset;
+    RAISERROR(@ansi_line, 10, 1, @stats_succeeded) WITH NOWAIT;
+    SET @ansi_line = N'  Failed:        ' + CASE WHEN @stats_failed > 0 THEN @a_red ELSE @a_green END + N'%d' + @a_reset;
+    RAISERROR(@ansi_line, 10, 1, @stats_failed) WITH NOWAIT;
     IF @stats_toctou > 0
         RAISERROR(N'  TOCTOU skips:  %d (dropped objects)', 10, 1, @stats_toctou) WITH NOWAIT;
     RAISERROR(N'  Skipped:       %d (dry run)', 10, 1, @stats_skipped) WITH NOWAIT;
-    RAISERROR(N'  Remaining:     %d', 10, 1, @remaining_stats) WITH NOWAIT;
+    SET @ansi_line = N'  Remaining:     ' + CASE WHEN @remaining_stats > 0 THEN @a_yellow ELSE @a_green END + N'%d' + @a_reset;
+    RAISERROR(@ansi_line, 10, 1, @remaining_stats) WITH NOWAIT;
     IF @total_pages_processed > 0
     BEGIN
         DECLARE @volume_gb nvarchar(20) = CONVERT(nvarchar(20), CONVERT(decimal(10, 2), @total_pages_processed * 8.0 / 1024.0 / 1024.0));
@@ -10683,7 +10744,7 @@ OPTION (RECOMPILE);';
         END;
     END;
 
-    RAISERROR(N'===============================================================================', 10, 1) WITH NOWAIT;
+    RAISERROR(@bar_line, 10, 1) WITH NOWAIT;
 
     /*
     ============================================================================
