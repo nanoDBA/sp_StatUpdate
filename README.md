@@ -20,9 +20,9 @@
 
 ![sp_StatUpdate_Diag Executive Dashboard with @Ansi='Y': A-F letter grades, health scores, and colored health bars per category](assets/demo-dashboard.png)
 
-**It reads the room** -- `@Debug = 1` reports what changes how statistics behave (trace flags, CPU/NUMA/memory, tempdb headroom) and flags what will bite you:
+**It reads the room** -- `@Debug = 1` reports what changes how statistics behave: active stats-relevant trace flags (with guidance), CPU/NUMA, Resource Governor, and tempdb headroom -- and flags what will bite you:
 
-![sp_StatUpdate Environment Intelligence at @Debug=1, @Ansi='Y': trace flags, CPU/NUMA/memory, and tempdb headroom](assets/demo-environment.png)
+![sp_StatUpdate Environment Intelligence at @Debug=1, @Ansi='Y': active trace flags with guidance, CPU/NUMA, Resource Governor, and tempdb headroom](assets/demo-environment.png)
 
 **It doesn't just diagnose -- it prescribes.** Copy-paste the EXEC it built for *your* server:
 
