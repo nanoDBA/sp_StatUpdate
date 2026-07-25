@@ -36,7 +36,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.23.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.25.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.25.1 - @Ansi opt-in: also render Executive Dashboard + Recommendations
+                           as colorized text on the Messages stream (RAISERROR), in
+                           addition to the normal result sets.  Reads the populated
+                           #executive_dashboard / #recommendations temp tables (no
+                           recomputation), block glyphs via NCHAR (deployment-safe),
+                           dynamic lines %-escaped.  Console-only; result sets, history,
+                           and OUTPUT params unchanged.  Default N = result sets only.
 
 History:    2026.07.23.2 - Empty-CommandLog single-result envelope (0pgq / gh-557):
                            With @SingleResultSet = 1 and no usable CommandLog
@@ -472,6 +479,7 @@ ALTER PROCEDURE
     @GradeWeights nvarchar(500) = NULL,            /* custom category weights (auto-normalized): 'COMPLETION=40, WORKLOAD=40' */
     @Help bit = 0,
     @Debug bit = 0,
+    @Ansi nvarchar(1) = N'N',       /* Y = also render the Dashboard + Recommendations as colorized text on the Messages (console) stream via RAISERROR, IN ADDITION to the normal result sets.  N (default) = result sets only.  Console-only: never alters the result sets, history table, or OUTPUT params.  SSMS/ADS ignore the codes -- use a color-aware terminal. */
     @SingleResultSet bit = 0,       /* 0 = default multi-result-set, 1 = single result set with ResultSetID/RowData */
     @Version varchar(20) = NULL OUTPUT,
     @VersionDate datetime = NULL OUTPUT
@@ -488,7 +496,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.23.2',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.25.1',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260723';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -6358,6 +6366,108 @@ BEGIN
             )
         FROM #recommendations AS r;
     END;
+
+    /*#region ANSI-CONSOLE: opt-in via @Ansi.  Renders the Executive Dashboard and
+       Recommendations as colorized text on the Messages (console) stream via RAISERROR,
+       IN ADDITION to the result sets above.  Reads the already-populated
+       #executive_dashboard and #recommendations temp tables, so grades / scores /
+       headlines / severities are identical to the result sets -- no recomputation.
+       Escape codes go to the console ONLY; result sets, history, and OUTPUT params are
+       untouched.  Block glyphs are built with NCHAR() so the source stays ASCII-clean
+       (deployment-safe), and every dynamic line is %-escaped before RAISERROR because
+       findings/headlines contain literal '%' (e.g. "61% of stats"). */
+    IF UPPER(LTRIM(RTRIM(ISNULL(@Ansi, N'N')))) = N'Y'
+    BEGIN
+        DECLARE
+            @esc nchar(1) = NCHAR(27),
+            @full nchar(1) = NCHAR(9608),   /* full block */
+            @shade nchar(1) = NCHAR(9617),  /* light shade */
+            @a_reset nvarchar(12), @a_hdr nvarchar(12), @a_cyan nvarchar(12),
+            @a_dim nvarchar(12), @a_white nvarchar(12), @a_green nvarchar(12),
+            @a_agreen nvarchar(12), @a_yellow nvarchar(12), @a_red nvarchar(12);
+        SET @a_reset  = @esc + N'[0m';
+        SET @a_hdr    = @esc + N'[1;36m';
+        SET @a_cyan   = @esc + N'[36m';
+        SET @a_dim    = @esc + N'[90m';
+        SET @a_white  = @esc + N'[1;97m';
+        SET @a_green  = @esc + N'[32m';
+        SET @a_agreen = @esc + N'[92m';
+        SET @a_yellow = @esc + N'[1;33m';
+        SET @a_red    = @esc + N'[1;91m';
+
+        DECLARE @cbar nvarchar(120) = @a_hdr + REPLICATE(N'=', 79) + @a_reset;
+        DECLARE @cline nvarchar(2000);
+
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+        RAISERROR(@cbar, 10, 1) WITH NOWAIT;
+        SET @cline = @a_hdr + N' sp_StatUpdate_Diag - Executive Dashboard' + @a_reset;
+        RAISERROR(@cline, 10, 1) WITH NOWAIT;
+        RAISERROR(@cbar, 10, 1) WITH NOWAIT;
+        SET @cline = @a_dim + N' CATEGORY          GRADE  SCORE  HEALTH                 HEADLINE' + @a_reset;
+        RAISERROR(@cline, 10, 1) WITH NOWAIT;
+
+        DECLARE @d_cat nvarchar(30), @d_grade varchar(2), @d_score integer, @d_head nvarchar(4000);
+        DECLARE @gcolor nvarchar(12), @filled integer;
+        DECLARE dash_cur CURSOR LOCAL FAST_FORWARD FOR
+            SELECT Category, Grade, Score, Headline
+            FROM #executive_dashboard ORDER BY SortOrder;
+        OPEN dash_cur;
+        FETCH NEXT FROM dash_cur INTO @d_cat, @d_grade, @d_score, @d_head;
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            SET @gcolor = CASE LEFT(@d_grade, 1)
+                              WHEN 'A' THEN @a_agreen WHEN 'B' THEN @a_green
+                              WHEN 'C' THEN @a_yellow ELSE @a_red END;
+            SET @filled = CASE WHEN @d_score IS NULL THEN 0
+                               WHEN @d_score > 100 THEN 20
+                               WHEN @d_score < 0 THEN 0
+                               ELSE @d_score / 5 END;
+            SET @cline = N' ' + CONVERT(nchar(17), @d_cat)
+                       + @gcolor + N'  ' + CONVERT(nchar(2), @d_grade) + @a_reset + N'   '
+                       + @a_white + RIGHT(REPLICATE(N' ', 3) + ISNULL(CONVERT(nvarchar(3), @d_score), N'-'), 3) + @a_reset + N'  '
+                       + @gcolor + REPLICATE(@full, @filled) + @a_dim + REPLICATE(@shade, 20 - @filled) + @a_reset + N'  '
+                       + LEFT(@d_head, 60);
+            SET @cline = REPLACE(@cline, N'%', N'%%');
+            RAISERROR(@cline, 10, 1) WITH NOWAIT;
+            FETCH NEXT FROM dash_cur INTO @d_cat, @d_grade, @d_score, @d_head;
+        END;
+        CLOSE dash_cur; DEALLOCATE dash_cur;
+        RAISERROR(@cbar, 10, 1) WITH NOWAIT;
+
+        IF EXISTS (SELECT 1 FROM #recommendations)
+        BEGIN
+            RAISERROR(N'', 10, 1) WITH NOWAIT;
+            SET @cline = @a_hdr + N' sp_StatUpdate_Diag - Recommendations' + @a_reset;
+            RAISERROR(@cline, 10, 1) WITH NOWAIT;
+            RAISERROR(@cbar, 10, 1) WITH NOWAIT;
+            DECLARE @r_sev nvarchar(20), @r_find nvarchar(4000), @r_ex nvarchar(4000);
+            DECLARE @scolor nvarchar(12);
+            DECLARE rec_cur CURSOR LOCAL FAST_FORWARD FOR
+                SELECT Severity, Finding, ExampleCall
+                FROM #recommendations
+                ORDER BY CASE Severity WHEN N'CRITICAL' THEN 1 WHEN N'WARNING' THEN 2 WHEN N'INFO' THEN 3 ELSE 4 END, SortPriority, FindingID;
+            OPEN rec_cur;
+            FETCH NEXT FROM rec_cur INTO @r_sev, @r_find, @r_ex;
+            WHILE @@FETCH_STATUS = 0
+            BEGIN
+                SET @scolor = CASE @r_sev WHEN N'CRITICAL' THEN @a_red WHEN N'WARNING' THEN @a_yellow WHEN N'INFO' THEN @a_cyan ELSE @a_dim END;
+                SET @cline = N' ' + @scolor + CONVERT(nchar(9), @r_sev) + @a_reset + N' ' + LEFT(@r_find, 100);
+                SET @cline = REPLACE(@cline, N'%', N'%%');
+                RAISERROR(@cline, 10, 1) WITH NOWAIT;
+                IF @r_ex IS NOT NULL
+                BEGIN
+                    SET @cline = N'          ' + @a_green + LEFT(@r_ex, 120) + @a_reset;
+                    SET @cline = REPLACE(@cline, N'%', N'%%');
+                    RAISERROR(@cline, 10, 1) WITH NOWAIT;
+                END;
+                FETCH NEXT FROM rec_cur INTO @r_sev, @r_find, @r_ex;
+            END;
+            CLOSE rec_cur; DEALLOCATE rec_cur;
+            RAISERROR(@cbar, 10, 1) WITH NOWAIT;
+        END;
+        RAISERROR(N'', 10, 1) WITH NOWAIT;
+    END;
+    /*#endregion ANSI-CONSOLE */
 
     /*
     ============================================================================
