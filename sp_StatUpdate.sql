@@ -36,11 +36,32 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.8.0.2026.07.25 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.8.1.2026.07.25 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.8.0.2026.07.25 - COLOR: opt-in @Ansi param (sp_StatUpdate-w0xp).
+History:    3.8.1.2026.07.25 - MONITORING: per-stat CONTEXT_INFO refresh
+                            (sp_StatUpdate-03i3 / gh-538).  The gh-423
+                            CONTEXT_INFO set at proc entry was static for the
+                            whole run (DB/Job/Preset only) -- a DBA using
+                            sp_WhoIsActive mid-run saw no run label, no stat
+                            index/total, no current stat name; only the inner
+                            dynamic UPDATE STATISTICS SQL was visible.
+                            CONTEXT_INFO is now refreshed every loop iteration
+                            with a compact 'SU|<n>/<total>|<schema.table.stat>
+                            |Run:<label>' payload (varchar, not nvarchar, to
+                            use the full 128-BYTE budget instead of 64 chars).
+                            Restored to the caller's original value on every
+                            exit path (unchanged).  The v2-era
+                            ##sp_StatUpdate_Progress global temp table this
+                            issue also proposed extending no longer exists --
+                            removed in the v3 API simplification -- so that
+                            part of the original ask is moot; CONTEXT_INFO
+                            plus the existing RAISERROR job-log progress
+                            already cover both the DMV/sp_WhoIsActive and
+                            job-log monitoring surfaces.
+
+            3.8.0.2026.07.25 - COLOR: opt-in @Ansi param (sp_StatUpdate-w0xp).
                             @Ansi = N'Y' colorizes console (RAISERROR) output
                             with ANSI SGR escape codes -- banners, discovery
                             line, "Found N qualifying", the per-stat progress
@@ -693,7 +714,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.8.0.2026.07.25',
+        @procedure_version varchar(20) = '3.8.1.2026.07.25',
         @procedure_version_date datetime = '20260725',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -8910,6 +8931,28 @@ OPTION (RECOMPILE);';
         OUTPUT / EXECUTE
         ========================================================================
         */
+
+        /*
+        sp_StatUpdate-03i3: per-stat CONTEXT_INFO refresh.
+        The gh-423 CONTEXT_INFO set at proc entry is static for the whole run
+        (DB/Job/Preset only) -- a DBA using sp_WhoIsActive mid-run sees no run
+        label, no stat index/total, no current stat name.  Refresh it every
+        iteration so that information is visible without cross-referencing
+        CommandLog or the job log.  Built as varchar (not nvarchar) to fit the
+        full 128-BYTE CONTEXT_INFO budget (nvarchar would halve it to 64 chars).
+        Restored to the caller's original value at every exit path (unchanged).
+        */
+        DECLARE
+            @loop_context_str varchar(128) =
+                'SU|' + CONVERT(varchar(10), @stats_processed) + '/' + CONVERT(varchar(10), @total_stats)
+                + '|' + LEFT(
+                      CONVERT(varchar(100), @current_schema_name) + '.'
+                    + CONVERT(varchar(100), @current_table_name) + '.'
+                    + CONVERT(varchar(100), @current_stat_name), 90)
+                + '|Run:' + LEFT(ISNULL(CONVERT(varchar(30), @run_label), '?'), 24),
+            @loop_context_bin varbinary(128) = NULL;
+        SET @loop_context_bin = CONVERT(varbinary(128), @loop_context_str);
+        SET CONTEXT_INFO @loop_context_bin;
 
         /*
         Progress message
