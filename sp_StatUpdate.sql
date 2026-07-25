@@ -36,11 +36,32 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.7.2.2026.07.23 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.7.3.2026.07.23 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.7.2.2026.07.23 - Phase 3B delta-enrichment cache key omits SchemaName
+History:    3.7.3.2026.07.23 - Publish early-rejection outcomes before severity-16
+                            signaling (sp_StatUpdate-2zla / gh-555):  the
+                            open-transaction guard and the ALREADY_RUNNING
+                            branch raised their severity-16 error BEFORE
+                            setting OUTPUT params, emitting the structured
+                            summary row, and (ALREADY_RUNNING) writing the
+                            gh-551 SP_STATUPDATE_DENIED artifact.  A caller
+                            wrapping EXEC in TRY/CATCH transfers control at
+                            the RAISERROR, so it received the exception
+                            WITHOUT the summary row or denial telemetry.
+                            Both paths now publish first and signal last
+                            (message/severity/state and return codes are
+                            unchanged; the lock transaction still commits
+                            before any signal).  Known T-SQL limit: OUTPUT
+                            parameters are not copied back when the caller
+                            catches the error, so TRY/CATCH callers should
+                            key off the streamed summary row, the denial
+                            CommandLog row, or ERROR_MESSAGE().  Callers
+                            without TRY/CATCH see identical behavior except
+                            the error message now follows the result set.
+
+            3.7.2.2026.07.23 - Phase 3B delta-enrichment cache key omits SchemaName
                             (sp_StatUpdate-mtt4):  the gh-502 cl_lookup CTE
                             joined CommandLog on DatabaseName + ObjectName +
                             StatisticsName -- the same incomplete key fixed for
@@ -648,7 +669,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.7.2.2026.07.23',
+        @procedure_version varchar(20) = '3.7.3.2026.07.23',
         @procedure_version_date datetime = '20260723',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -783,7 +804,12 @@ BEGIN
     */
     IF @@TRANCOUNT <> 0
     BEGIN
-        RAISERROR(N'The transaction count is not 0.  sp_StatUpdate must not be called within an open transaction.', 16, 1) WITH NOWAIT;
+        /* 2zla / gh-555: publish outcomes BEFORE the severity-16 signal.  A caller
+           wrapping EXEC in TRY/CATCH transfers control at the RAISERROR, so anything
+           after it never runs for that caller.  The summary result set streams to
+           the client before the error; OUTPUT parameters still only reach callers
+           WITHOUT an outer TRY/CATCH (T-SQL copy-out does not happen when the proc
+           is terminated by a caught error -- a language limit, not an ordering one). */
         SET @StopReasonOut = N'PARAMETER_ERROR';
         SET @StatsFoundOut = 0;
         SET @StatsProcessedOut = 0;
@@ -798,6 +824,7 @@ BEGIN
             DatabasesProcessed = 0, DurationSeconds = 0,
             StopReason = N'PARAMETER_ERROR', RunLabel = CONVERT(nvarchar(100), NULL),
             Version = @procedure_version;
+        RAISERROR(N'The transaction count is not 0.  sp_StatUpdate must not be called within an open transaction.', 16, 1) WITH NOWAIT;
         RETURN 1;
     END;
 
@@ -924,8 +951,13 @@ BEGIN
 
             IF @holder_is_alive = 1
             BEGIN
+                /* 2zla / gh-555: COMMIT first (never leave the lock transaction open
+                   across a signal), then publish ALL outcomes -- OUTPUT params, the
+                   structured summary, and the gh-551 denial artifact -- BEFORE the
+                   severity-16 RAISERROR.  A caller with an outer TRY/CATCH transfers
+                   control at the signal; previously that suppressed the summary row
+                   and the denial telemetry this path exists to provide. */
                 COMMIT TRANSACTION;
-                RAISERROR(N'Another instance of sp_StatUpdate is already running (non-parallel mode). Use @StatsInParallel=''Y'' for concurrent execution.', 16, 1);
                 SET @StopReasonOut = N'ALREADY_RUNNING';
                 SET @StatsFoundOut = 0;
                 SET @StatsProcessedOut = 0;
@@ -992,6 +1024,7 @@ BEGIN
                     END CATCH;
                 END;
 
+                RAISERROR(N'Another instance of sp_StatUpdate is already running (non-parallel mode). Use @StatsInParallel=''Y'' for concurrent execution.', 16, 1) WITH NOWAIT;
                 RETURN;
             END;
 
@@ -4744,11 +4777,14 @@ OPTION (RECOMPILE);';
 
                 /*
                 ================================================================
-                PHASE 3B: CommandLog delta enrichment (gh-502, gh-507)
-                Fetch last known modification_counter from CommandLog for each
-                stat.  Compute effective_counter (delta) and velocity.
-                Stats with delta=0 are already current -- skip them in Phase 4.
-                Stats with no CommandLog history fall back to raw counter.
+                PHASE 3B: CommandLog enrichment (gh-502, gh-507; icjq)
+                Fetch the last SUCCESSFUL update time from CommandLog for each
+                stat to drive modification_velocity (mods/hour).  effective_counter
+                = the raw live modification_counter: a matched successful update
+                already reset the live counter to 0, so it is mods-since-last-update
+                and must NOT be reduced by the logged pre-update counter (icjq --
+                that subtraction double-counted and skipped stale stats).
+                Stats with no CommandLog history also use the raw counter.
                 ================================================================
                 */
                 SET @phase_timer = SYSDATETIME();
@@ -4777,19 +4813,23 @@ OPTION (RECOMPILE);';
                     UPDATE sc
                     SET sc.cl_last_counter = cl_lookup.last_counter,
                         sc.cl_last_update  = cl_lookup.last_update,
-                        sc.effective_counter =
-                            CASE
-                                WHEN cl_lookup.last_counter IS NOT NULL
-                                     AND sc.modification_counter >= cl_lookup.last_counter
-                                THEN sc.modification_counter - cl_lookup.last_counter
-                                ELSE sc.modification_counter
-                            END,
+                        /* icjq: a matched SUCCESSFUL UPDATE_STATISTICS row (cl_lookup
+                           filters EndTime IS NOT NULL AND ErrorNumber = 0) proves the
+                           live modification_counter was reset to 0 at that update, so
+                           the live counter ALREADY is mods-since-last-update.  The old
+                           formula subtracted the logged pre-update counter
+                           (effective = live - logged), which double-counts: when the
+                           post-update mod volume equals the logged counter the delta
+                           was 0 and a stale stat was wrongly skipped as already-current
+                           (root cause of the E03 reused-container flake).  effective
+                           is therefore simply the raw live counter; cl_last_update is
+                           retained only as the velocity time basis. */
+                        sc.effective_counter = sc.modification_counter,
                         sc.modification_velocity =
                             CASE
-                                WHEN cl_lookup.last_counter IS NOT NULL
-                                     AND sc.modification_counter >= cl_lookup.last_counter
+                                WHEN cl_lookup.last_update IS NOT NULL
                                      AND DATEDIFF(MINUTE, cl_lookup.last_update, SYSDATETIME()) > 0
-                                THEN CONVERT(float, sc.modification_counter - cl_lookup.last_counter)
+                                THEN CONVERT(float, sc.modification_counter)
                                      / (CONVERT(float, DATEDIFF(MINUTE, cl_lookup.last_update, SYSDATETIME())) / 60.0)
                                 ELSE NULL
                             END
@@ -4808,7 +4848,7 @@ OPTION (RECOMPILE);';
                     DECLARE @phase3b_zero int = (SELECT COUNT(*) FROM #stat_candidates WHERE effective_counter = 0);
                     SET @phase_ms = DATEDIFF(MILLISECOND, @phase_timer, SYSDATETIME());
                     IF @Debug_param = 1
-                        RAISERROR(N''    Phase 3B (CommandLog delta): %d stats enriched, %d with delta=0 (%d ms)'', 10, 1, @phase3b_enriched, @phase3b_zero, @phase_ms) WITH NOWAIT;
+                        RAISERROR(N''    Phase 3B (CommandLog velocity): %d stats have update history, %d with 0 modifications (%d ms)'', 10, 1, @phase3b_enriched, @phase3b_zero, @phase_ms) WITH NOWAIT;
                 END
                 ELSE
                 BEGIN
@@ -4822,9 +4862,10 @@ OPTION (RECOMPILE);';
                 /*
                 ================================================================
                 PHASE 4: Apply threshold filters (early elimination)
-                gh-502: Uses effective_counter (delta) instead of raw
-                modification_counter when CommandLog history is available.
-                Stats with delta=0 are already current and skip qualification.
+                gh-502/icjq: Qualifies on effective_counter, which equals the raw
+                live modification_counter (mods since the last successful update).
+                Stats with effective_counter = 0 have no modifications and skip
+                qualification.
                 ================================================================
                 */
                 /* Apply threshold logic (v3: OR is the only supported mode).
