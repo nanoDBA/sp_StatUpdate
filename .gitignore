@@ -21,6 +21,10 @@
 !LICENSE
 !.gitignore
 
+# README demo screenshots (colorized terminal output, rendered to PNG)
+!assets/
+!assets/*.png
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db
