@@ -3239,18 +3239,24 @@ BEGIN
         RAISERROR(N'', 10, 1) WITH NOWAIT;
         IF LEN(@tf_warnings) > 0
         BEGIN
-            RAISERROR(N'Statistics-Relevant Trace Flags: Active', 10, 1) WITH NOWAIT;
-            RAISERROR(N'  %s', 10, 1, @tf_warnings) WITH NOWAIT;
+            SET @ansi_line = @a_hdr + N'Statistics-Relevant Trace Flags: ' + @a_reset + @a_green + N'Active' + @a_reset;
+            RAISERROR(@ansi_line, 10, 1) WITH NOWAIT;
+            SET @ansi_line = @a_green + N'  %s' + @a_reset;
+            RAISERROR(@ansi_line, 10, 1, @tf_warnings) WITH NOWAIT;
         END
         ELSE
         BEGIN
-            RAISERROR(N'Statistics-Relevant Trace Flags: None active', 10, 1) WITH NOWAIT;
+            SET @ansi_line = @a_hdr + N'Statistics-Relevant Trace Flags: ' + @a_reset + @a_dim + N'None active' + @a_reset;
+            RAISERROR(@ansi_line, 10, 1) WITH NOWAIT;
         END;
 
         RAISERROR(N'', 10, 1) WITH NOWAIT;
-        RAISERROR(N'Environment (hardware context):', 10, 1) WITH NOWAIT;
+        SET @ansi_line = @a_hdr + N'Environment (hardware context):' + @a_reset;
+        RAISERROR(@ansi_line, 10, 1) WITH NOWAIT;
         DECLARE @hw_memory_gb bigint = @hw_memory_mb / 1024;
-        RAISERROR(N'  CPU cores: %d (visible schedulers: %d), NUMA nodes: %d, Uptime: %d hours (SQL Server)', 10, 1,
+        SET @ansi_line = N'  CPU cores: ' + @a_white + N'%d' + @a_reset + N' (visible schedulers: ' + @a_white + N'%d' + @a_reset
+            + N'), NUMA nodes: ' + @a_white + N'%d' + @a_reset + N', Uptime: ' + @a_white + N'%d' + @a_reset + N' hours (SQL Server)';
+        RAISERROR(@ansi_line, 10, 1,
             @hw_cpu_count, @visible_schedulers, @hw_numa_nodes, @hw_uptime_hours) WITH NOWAIT;
         DECLARE
             @proc_memory_mb bigint = @process_memory_kb / 1024,
@@ -3338,12 +3344,21 @@ BEGIN
         IF @ag_is_primary = 1
         BEGIN
             IF @ag_redo_initial_mb IS NOT NULL
-                RAISERROR(N'  AG redo queue:   %I64d MB (max across secondaries at startup)', 10, 1, @ag_redo_initial_mb) WITH NOWAIT;
+            BEGIN
+                SET @ansi_line = N'  AG redo queue:   ' + @a_green + N'%I64d MB' + @a_reset + N' (max across secondaries at startup)';
+                RAISERROR(@ansi_line, 10, 1, @ag_redo_initial_mb) WITH NOWAIT;
+            END
             ELSE
-                RAISERROR(N'  AG primary:      Yes (secondaries offline or no redo data)', 10, 1) WITH NOWAIT;
+            BEGIN
+                SET @ansi_line = N'  AG primary:      ' + @a_green + N'Yes' + @a_reset + N' (secondaries offline or no redo data)';
+                RAISERROR(@ansi_line, 10, 1) WITH NOWAIT;
+            END;
         END;
         IF @tempdb_free_mb IS NOT NULL
-            RAISERROR(N'  Tempdb free:     %I64d MB', 10, 1, @tempdb_free_mb) WITH NOWAIT;
+        BEGIN
+            SET @ansi_line = N'  Tempdb free:     ' + @a_green + N'%I64d MB' + @a_reset;
+            RAISERROR(@ansi_line, 10, 1, @tempdb_free_mb) WITH NOWAIT;
+        END;
     END;
 
     /*

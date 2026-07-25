@@ -10,23 +10,25 @@
 
 ## See It Run
 
-**A NIGHTLY run, live** -- worst stats first (Query Store CPU), per-stat progress, an AG-safety pause, and a *graceful* stop at the time limit with everything it didn't reach logged, not lost:
+*The screenshots below are **real `@Ansi = 'Y'` console captures** -- not mockups. Numbers vary with your workload.*
 
-![sp_StatUpdate NIGHTLY run: worst stats first by Query Store CPU, an AG-safety pause, and a graceful stop at the time limit with everything it did not reach logged, not lost](assets/demo-run.png)
+**A run, live** -- worst stats first, per-stat progress with a live ETA, and a clean summary where every stat is accounted for:
 
-**The diagnostic dashboard** -- letter grades your boss understands and your monitoring can alert on. RELIABILITY is a C because two runs got killed; the tool noticed, even if nobody else did:
+![sp_StatUpdate run with @Ansi='Y': worst stats first by modification count, per-stat progress with live ETA, and a summary counting every stat](assets/demo-run.png)
 
-![sp_StatUpdate_Diag Executive Dashboard: letter grades your boss understands and your monitoring can alert on](assets/demo-dashboard.png)
+**The diagnostic dashboard** -- letter grades your boss understands and your monitoring can alert on. RELIABILITY is a D because two runs got killed; the tool noticed, even if nobody else did:
 
-**It reads the room** -- @Debug = 1 reports everything that changes how statistics behave (CE version, trace flags, AG role, tempdb) and flags what will bite you:
+![sp_StatUpdate_Diag Executive Dashboard with @Ansi='Y': A-F letter grades, health scores, and colored health bars per category](assets/demo-dashboard.png)
 
-![sp_StatUpdate Environment Intelligence at @Debug = 1: CE version, trace flags, AG role, tempdb, and the conditions that will bite you](assets/demo-environment.png)
+**It reads the room** -- `@Debug = 1` reports what changes how statistics behave (trace flags, CPU/NUMA/memory, tempdb headroom) and flags what will bite you:
+
+![sp_StatUpdate Environment Intelligence at @Debug=1, @Ansi='Y': trace flags, CPU/NUMA/memory, and tempdb headroom](assets/demo-environment.png)
 
 **It doesn't just diagnose -- it prescribes.** Copy-paste the EXEC it built for *your* server:
 
-![sp_StatUpdate_Diag Recommendations: prioritized findings plus a copy-paste EXEC tuned for this server](assets/demo-recommendations.png)
+![sp_StatUpdate_Diag Recommendations with @Ansi='Y': severity-colored findings plus copy-paste EXEC calls tuned for this server](assets/demo-recommendations.png)
 
-> **About the color:** the console output is really colorized -- pass `@Ansi = 'Y'` (opt-in; default is plain text). The escape codes are **console-only** and never touch CommandLog, OUTPUT parameters, or result sets.
+> **About the color:** every screenshot above is the tool's own output with `@Ansi = 'Y'` (opt-in; default is plain text). For `sp_StatUpdate` the run/environment console is colorized; for `sp_StatUpdate_Diag`, `@Ansi = 'Y'` *also* renders the Dashboard and Recommendations as colored text on the Messages stream, in addition to the normal result sets. The escape codes are **console-only** and never touch CommandLog, OUTPUT parameters, or result sets.
 >
 > Color renders in **Windows Terminal, VS Code's integrated terminal, iTerm2/Terminal.app, Linux terminals, `sqlcmd | less -R`, and CI log viewers**. It shows **raw escape codes** (so leave `@Ansi` off) in **SSMS, Azure Data Studio, DataGrip/DBeaver, PowerShell ISE, legacy `cmd.exe`, SQL Agent job logs, and files** -- i.e. don't enable it for SSMS or Agent jobs. Only basic 16-color SGR codes are used, so wherever ANSI works at all, these do.
 
