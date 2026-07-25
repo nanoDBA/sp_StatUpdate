@@ -8,6 +8,82 @@
 [![SQL Server 2016+](https://img.shields.io/badge/SQL%20Server-2016%2B-blue.svg)](https://www.microsoft.com/sql-server)
 [![Azure SQL](https://img.shields.io/badge/Azure%20SQL-Supported-0078D4.svg)](https://azure.microsoft.com/products/azure-sql)
 
+## See It Run
+
+**A NIGHTLY run, live** -- worst stats first (Query Store CPU), per-stat progress, an AG-safety pause, and a *graceful* stop at the time limit with everything it didn't reach logged, not lost:
+
+```ansi
+[1;36m ═══════════════════════════════════════════════════════════════════════[0m
+[1;36m sp_StatUpdate  v3.7.3       @Preset = NIGHTLY       @Databases = Production[0m
+[1;36m ═══════════════════════════════════════════════════════════════════════[0m
+[90m Discovering qualifying statistics via DMV...[0m
+[90m   Phase 1 (candidates):       3,481 stats    (412 ms)[0m
+[90m   Phase 4 (after thresholds): 1,284 qualify  (238 ms)[0m
+   Sort order: [36mQUERY_STORE (CPU)[0m  [90m- worst offenders first, not alphabetical[0m
+ Found [1;97m1,284[0m qualifying statistics  [90m· time limit 3600s[0m
+
+ [   1/1284] [92m✓[0m dbo.Orders.IX_Orders_CustomerId      mods: [1;97m842,015[0m   [36mQS-CPU #1[0m   0.4s
+ [   2/1284] [92m✓[0m dbo.LineItems.IX_LineItems_Sku       mods: [1;97m511,880[0m   [36mQS-CPU #2[0m   1.1s
+ [   3/1284] [92m✓[0m dbo.Invoices.IX_Invoices_DueDate     mods: [1;97m318,204[0m   [36mQS-CPU #3[0m   0.7s
+ [   4/1284] [92m✓[0m dbo.Shipments.IX_Shipments_Status    mods: [1;97m204,551[0m   [36mQS-CPU #4[0m   0.5s
+   [1;33m⚠ AG secondary redo queue 640 MB > 500 MB - pausing[0m [90m(drained in 38s)[0m
+ [   5/1284] [92m✓[0m dbo.Payments.IX_Payments_PostedUtc   mods: [1;97m198,332[0m   [36mQS-CPU #5[0m   0.9s
+ [90m        ...[0m
+ [ 947/1284] [92m✓[0m dbo.AuditLog.IX_AuditLog_EventTime   mods: [1;97m  5,004[0m   [36mQS-CPU #947[0m 0.2s
+
+[1;36m ═══════════════════════════════════════════════════════════════════════[0m
+ [1;33m⏱  TIME_LIMIT reached at 3600s - stopping gracefully[0m
+    Succeeded: [92m947[0m     Failed: [92m0[0m     Remaining: [1;33m337[0m [90m(logged to CommandLog, not lost)[0m
+    [90mThe 947 highest-workload stats were updated first. Nothing left to chance.[0m
+[1;36m ═══════════════════════════════════════════════════════════════════════[0m
+ [1;33m WARNING [0m Incomplete: 337 stat(s) remaining (TIME_LIMIT)
+```
+
+**The diagnostic dashboard** -- letter grades your boss understands and your monitoring can alert on. RELIABILITY is a C because two runs got killed; the tool noticed, even if nobody else did:
+
+```ansi
+ [1;36msp_StatUpdate_Diag - Executive Dashboard[0m                        [90m@ExpertMode = 0[0m
+ [90m────────────────────────────────────────────────────────────────────────────[0m
+ [90mCATEGORY          GRADE   SCORE   HEALTH                   HEADLINE[0m
+ OVERALL           [1;32m  B  [0m    [1;97m 84[0m   3[32m█████████████████3[90m░░░3[0m   Healthy, minor opportunities
+ COMPLETION        [1;92m  A  [0m    [1;97m100[0m   0[92m████████████████████0[90m0[0m   Nearly all qualifying stats updated
+ RELIABILITY       [1;33m  C  [0m    [1;97m 55[0m   9[33m███████████9[90m░░░░░░░░░9[0m   [1;33m2 run(s) were killed[0m - check Agent
+ SPEED             [1;92m  A  [0m    [1;97m 92[0m   2[92m██████████████████2[90m░░2[0m   Very fast (0.4 sec/stat)
+ WORKLOAD FOCUS    [1;32m  B  [0m    [1;97m 78[0m   4[32m████████████████4[90m░░░░4[0m   Query Store prioritization working
+ [90m────────────────────────────────────────────────────────────────────────────[0m
+ Health score [1;97m84 / 100[0m   [90m·[0m   3 runs / 30 days   [90m·[0m   grades your monitoring can alert on
+```
+
+**It reads the room** -- @Debug = 1 reports everything that changes how statistics behave (CE version, trace flags, AG role, tempdb) and flags what will bite you:
+
+```ansi
+ [1;36msp_StatUpdate - Environment Intelligence[0m            [90m@Debug = 1[0m
+ [90m──────────────────────────────────────────────────────────────[0m
+ [90mSQL Server   [0m 2022 (16.0.4265)  Enterprise Developer Edition
+ [90mCompat / CE  [0m 170 / [92mNew CE (150)[0m
+ [90mTrace flags  [0m [92m2371 ON[0m [90m-> auto-stats threshold lowered for big tables[0m
+ [90mHardware     [0m 16 cores [90m·[0m 4 NUMA [90m·[0m 256 GB [90m·[0m uptime 41h
+ [90mtempdb free  [0m 18,432 MB
+ [90mAG role      [0m [92mPRIMARY[0m redo queue 12 MB [90m(healthy)[0m
+ [90mResource Gov [0m pool [maintenance]  MAXDOP 4
+ [1;33m ⚠ BACKUP_RUNNING[0m [90m- full backup in progress, proceeding carefully[0m
+ [1;33m ⚠ PEAK_HOURS[0m     [90m- business hours; expect plan recompiles[0m
+```
+
+**It doesn't just diagnose -- it prescribes.** Copy-paste the EXEC it built for *your* server:
+
+```ansi
+ [1;36msp_StatUpdate_Diag - Recommendations[0m
+ [90m──────────────────────────────────────────────────────────────────────[0m
+ [1;91m ⛔ CRITICAL  C1[0m  2 runs killed before completing - check the 5 AM Agent stop
+ [1;33m ⚠ WARNING   W3[0m  61% of stats never processed - raise @TimeLimit or add @MopUpPass
+ [1;33m ⚠ WARNING   W1[0m  No @TimeLimit set - a runaway job can burn hours
+ [36m ℹ INFO      I10[0m Recommended for [1;97mTHIS[0m server:
+                  [92mEXEC sp_StatUpdate @Preset='NIGHTLY',[0m
+                  [92m                   @Databases='USER_DATABASES',[0m
+                  [92m                   @MopUpPass='Y', @TimeLimit=7200;[0m
+```
+
 ## Why This Exists
 
 | Problem | Fix |
@@ -19,6 +95,7 @@
 | Large stats that never finish | `@LongRunningThresholdMinutes` -- auto-reduce sample rate |
 | Query Store knows what's hot | `@QueryStore = 'CPU'` -- prioritize by workload metric |
 | QS enrichment too slow | `@QueryStoreTopPlans = 200` -- parse only top N plans |
+| "Query Store proves the spill" | It doesn't -- XE `sort_warning` proves the `UPDATE STATISTICS` spill; QS only ranks candidates |
 | Cascading failures | `@FailFast = 1` -- stop on first error |
 | AG secondary falls behind | `@MaxAGRedoQueueMB` -- pauses when redo queue is deep |
 | tempdb pressure during FULLSCAN | `@MinTempdbFreeMB` -- checks before each stat update |
@@ -775,14 +852,18 @@ Cross-server analysis detects version skew and parameter inconsistencies.
 
 ## Extended Events
 
-An XE session is included for runtime troubleshooting:
+`sp_StatUpdate_XE_Session.sql` builds a ready-to-run session (`sp_StatUpdate_Monitor`) for when you'd rather watch a run than autopsy it afterward:
 
 ```sql
--- Create and start (see sp_StatUpdate_XE_Session.sql)
+-- 1. Run sp_StatUpdate_XE_Session.sql to create the session
+-- 2. Start it before the maintenance job
 ALTER EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER STATE = START;
+-- 3. Analysis queries (incl. spill-to-CommandLog correlation) live at the bottom of the script
 ```
 
-Captures UPDATE STATISTICS commands, errors, lock waits, lock escalation, and long-running statements.
+Captures the START and COMPLETION of every `UPDATE STATISTICS` statement, errors, lock waits and escalation, attentions (cancels/timeouts), deadlocks -- and, as of session v2.2, **`sort_warning`** (plus `hash_warning` as supporting context): the truthful proof surface for a sort spill in the stats-update statement itself.
+
+**Preselection is not proof.** Query Store's `TEMPDB_SPILLS` / `WAITS` / `WAIT_CPU` metrics are excellent for choosing *which* stats to update before a run -- but a DDL statement barely registers in Query Store wait data, so those metrics can't prove the `UPDATE STATISTICS` command actually spilled. `sort_warning` fires from the spilling statement, filtered to the generated command text, with `context_info` carrying the run tag; analysis query 7 ties each spill back to its `CommandLog` row by time. Rank with Query Store; prove with XE.
 
 ## Migrating from v2
 
@@ -838,6 +919,7 @@ EXEC dbo.sp_StatUpdate
 
 ## Version History
 
+- **3.7.4.2026.07.25** - **Spill proof: preselection vs. proof** (gh-552): sp_StatUpdate's Query Store metrics (`TEMPDB_SPILLS`, `WAITS`, `WAIT_CPU`) rank which stats to update *before* a run -- but a DDL statement barely registers in Query Store wait data, so they can't prove the `UPDATE STATISTICS` command itself spilled.  `@Help` now documents that distinction (new **SPILL PROOF** topic) and points to `sp_StatUpdate_XE_Session.sql`, which gains `sort_warning` (primary proof surface) plus `hash_warning` (secondary context) events -- filtered to the generated command text, `context_info`-tagged, and correlated to the `CommandLog` row by time via a new analysis query.  Fixed a latent bug the new events exposed: the session DDL was built by concatenating string literals, which capped at 4000 nchars and silently truncated the `CREATE EVENT SESSION` mid-token once the session grew past that -- now forced to `NVARCHAR(MAX)`.  No behavioral change to the main proc's QS enrichment, ranking, or sort logic.
 - **3.7.3.2026.07.23** - **Publish early-rejection outcomes before severity-16 signaling** (gh-555): the open-transaction guard and the ALREADY_RUNNING branch raised their severity-16 error BEFORE setting OUTPUT parameters, emitting the structured summary row, and (ALREADY_RUNNING) writing the gh-551 `SP_STATUPDATE_DENIED` artifact.  A caller wrapping EXEC in TRY/CATCH transfers control at the RAISERROR, so it received the exception without the summary row or the denial telemetry the artifact exists to provide.  Both paths now publish first and signal last -- message/severity/state and return codes unchanged, and the StatUpdateLock transaction still commits before any signal.  Known T-SQL limit (locked in by regression test): OUTPUT parameters are never copied back when the caller's CATCH intercepts the error, so TRY/CATCH callers should key off the streamed summary row, the denial CommandLog row, or `ERROR_MESSAGE()`.  Callers without TRY/CATCH see identical behavior except the error message now follows the result set in the stream.
 - **3.7.2.2026.07.23** - **Phase 3B delta-enrichment cache key omits SchemaName**: the gh-502 `cl_lookup` CTE joined CommandLog on DatabaseName + ObjectName + StatisticsName -- the same incomplete key fixed for the Phase 5B QS score cache in v3.7.1.  Same-named table+stat pairs in different schemas could read each other's last `ModificationCounter`, producing wrong `effective_counter` deltas (a stat could be treated as already-current based on another schema's counter) and wrong `modification_velocity`.  `SchemaName` is now part of the join key.
 - **3.7.1.2026.07.23** - **QS score cache value + identity fix** (gh-556): the gh-503 CommandLog-backed Query Store score cache had three defects.  (1) Phase 6 zero-initialized `qs_priority_boost` for ALL candidates while live enrichment skipped cache hits -- every hit silently ranked as 0 (debug output still reported a fresh hit).  Zero-init now applies to cache misses only, and the WAITS/WAIT_CPU wait-stats UPDATEs gain the same cache-hit exclusion.  (2) The cache lookup never compared the cached `QSMetric` -- a boost computed under CPU could be reused for a DURATION/WAITS run, violating the gh-503 invalidation contract.  The lookup now requires cached metric = current metric (filtered inside the CTE, so an older same-metric row still hits after a metric flip-flop); legacy rows without a `QSMetric` element are cache misses.  (3) The cache key was DatabaseName + ObjectName + StatisticsName -- same-named table+stat pairs in different schemas shared scores.  `SchemaName` is now part of the join key.

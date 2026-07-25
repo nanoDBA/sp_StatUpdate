@@ -3,7 +3,17 @@ sp_StatUpdate Extended Events Troubleshooting Session
 
 Purpose:    Monitor sp_StatUpdate execution for troubleshooting.
             Captures both statement START and COMPLETION events for before/after
-            correlation, plus wait stats, errors, and blocking.
+            correlation, plus wait stats, errors, blocking, and -- as the
+            truthful proof surface for sort-spill diagnostics -- sort_warning.
+
+            PRESELECTION vs PROOF (gh-552):  sp_StatUpdate's Query Store metrics
+            (TEMPDB_SPILLS, WAITS, WAIT_CPU) rank which stats to update BEFORE a
+            run.  They are NOT evidence about the UPDATE STATISTICS statements
+            themselves -- a DDL statement is not represented in Query Store wait
+            data in a way that supports direct spill attribution.  This XE
+            session is the proof surface: sort_warning fires from the actual
+            spilling UPDATE STATISTICS statement, filtered to the generated
+            command text and correlatable to its CommandLog row by time.
 
 Usage:
     1. Run this script to create the XE session
@@ -15,9 +25,15 @@ To stop:    ALTER EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER STATE = STOP;
 To drop:    DROP EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER;
 To view:    See queries at bottom of this script
 
-Version:    2.1.2026.03.19 (Major.Minor.YYYY.MM.DD)
+Version:    2.2.2026.07.25 (Major.Minor.YYYY.MM.DD)
 
-History:    2.1.2026.03.19 - Dynamic map_key resolution for wait_type predicates (#290)
+History:    2.2.2026.07.25 - sort_warning (primary) + hash_warning (secondary) spill
+                             proof events for UPDATE STATISTICS, filtered to the
+                             generated command text with context_info correlation;
+                             analysis queries 6 (spill events) and 7 (join spills to
+                             CommandLog, UTC->local aligned); preselection-vs-proof
+                             documented (gh-552)
+            2.1.2026.03.19 - Dynamic map_key resolution for wait_type predicates (#290)
             2.0.2026.02.12 - Added starting events for during-execution visibility
             1.0.2026.01.28 - Initial creation for sp_StatUpdate troubleshooting (#8)
 */
@@ -98,8 +114,14 @@ BEGIN
     SET @wait_predicate = N'wait_type = -1 /* no wait types resolved */';
 END;
 
-/* Build and execute the full CREATE EVENT SESSION DDL */
-DECLARE @sql NVARCHAR(MAX) = N'
+/* Build and execute the full CREATE EVENT SESSION DDL.
+   CONVERT(NVARCHAR(MAX), ...) on the first operand forces the whole
+   concatenation to MAX -- otherwise literal + @wait_predicate + literal caps at
+   4000 nchars and silently truncates the DDL mid-token (gh-552: adding the
+   sort_warning/hash_warning events pushed the session past 4000 and exposed it,
+   producing "Incorrect syntax near '.'" as the DDL ended at a dangling
+   "sqlserver."). Part B is appended via a separate SET so it stays MAX too. */
+DECLARE @sql NVARCHAR(MAX) = CONVERT(NVARCHAR(MAX), N'
 CREATE EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER
 
 /* Capture UPDATE STATISTICS command START (for during-execution visibility) */
@@ -142,7 +164,8 @@ ADD EVENT sqlos.wait_completed
     WHERE (
         duration > 1000000  /* > 1 second (in microseconds) */
         AND (
-               ' + @wait_predicate + N'
+               ') + @wait_predicate;
+SET @sql = @sql + N'
         )
     )
 ),
@@ -162,6 +185,34 @@ ADD EVENT sqlserver.sql_statement_completed
     ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text, sqlserver.plan_handle)
     WHERE duration > 10000000  /* > 10 seconds (in microseconds) */
     AND sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N''%UPDATE STATISTICS%'')
+),
+
+/* SPILL PROOF (gh-552, PRIMARY): sort_warning is the truthful evidence surface
+   for a sort spill in the generated UPDATE STATISTICS statement.  Query Store
+   TEMPDB_SPILLS/WAITS metrics only PRESELECT candidates before the run; they do
+   not prove the stats-update statement itself spilled -- this event does.
+   Filtered to the UPDATE STATISTICS command text; context_info carries the
+   sp_StatUpdate run tag (gh-423) for session attribution, plan_handle links to
+   the plan.  Correlate to CommandLog by time via analysis query 7. */
+ADD EVENT sqlserver.sort_warning
+(
+    ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text,
+            sqlserver.plan_handle, sqlserver.context_info)
+    WHERE (
+        sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N''%UPDATE STATISTICS%'')
+    )
+),
+
+/* SPILL PROOF (gh-552, SECONDARY/supporting context): hash_warning flags a hash
+   spill during the same statement.  Labeled secondary -- sort_warning is the
+   primary proof for stats-maintenance sort spills. */
+ADD EVENT sqlserver.hash_warning
+(
+    ACTION (sqlserver.session_id, sqlserver.database_name, sqlserver.sql_text,
+            sqlserver.plan_handle, sqlserver.context_info)
+    WHERE (
+        sqlserver.like_i_sql_unicode_string(sqlserver.sql_text, N''%UPDATE STATISTICS%'')
+    )
 ),
 
 /* Capture lock escalation (common during large stat scans) */
@@ -311,7 +362,82 @@ LEFT JOIN events AS c ON c.session_id = s.session_id
 WHERE s.event_name = 'sp_statement_starting'
 ORDER BY s.event_time DESC;
 
--- 6. Export to file (optional - creates file in SQL Server default backup dir)
+-- 6. SPILL PROOF -- sort_warning (PRIMARY) and hash_warning (SECONDARY) events.
+--    This is the truthful proof surface for an UPDATE STATISTICS sort spill;
+--    Query Store TEMPDB_SPILLS/WAITS only PRESELECT candidates before the run.
+;WITH ring_buffer AS
+(
+    SELECT
+        CAST(target_data AS xml) AS event_data
+    FROM sys.dm_xe_session_targets AS xst
+    JOIN sys.dm_xe_sessions AS xs ON xs.address = xst.event_session_address
+    WHERE xs.name = N'sp_StatUpdate_Monitor'
+    AND   xst.target_name = N'ring_buffer'
+)
+SELECT
+    event_data.value('(event/@name)[1]', 'varchar(50)') AS spill_event,   -- sort_warning | hash_warning
+    CASE event_data.value('(event/@name)[1]', 'varchar(50)')
+         WHEN 'sort_warning' THEN 'PRIMARY (proof)' ELSE 'SECONDARY (context)' END AS evidence_class,
+    event_data.value('(event/@timestamp)[1]', 'datetime2(3)') AS event_time_utc,
+    event_data.value('(event/action[@name="session_id"]/value)[1]', 'int') AS session_id,
+    event_data.value('(event/action[@name="database_name"]/value)[1]', 'sysname') AS database_name,
+    /* sort_warning_type: single-pass vs multiple-pass (field absent on some builds -> NULL, harmless) */
+    event_data.value('(event/data[@name="sort_warning_type"]/text)[1]', 'varchar(30)') AS sort_warning_type,
+    event_data.value('(event/action[@name="context_info"]/value)[1]', 'varchar(256)') AS context_info,  -- sp_StatUpdate run tag (gh-423)
+    LEFT(event_data.value('(event/action[@name="sql_text"]/value)[1]', 'nvarchar(max)'), 300) AS sql_text
+FROM ring_buffer
+CROSS APPLY event_data.nodes('RingBufferTarget/event') AS n(event_data)
+WHERE event_data.value('(event/@name)[1]', 'varchar(50)') IN ('sort_warning', 'hash_warning')
+ORDER BY event_time_utc DESC;
+
+-- 7. Tie each spill event back to the CommandLog UPDATE_STATISTICS row that
+--    produced it (truthful attribution).  Run in the maintenance DB where
+--    CommandLog lives.  XE @timestamp is UTC while CommandLog StartTime/EndTime
+--    use SYSDATETIME() (server-local), so the spill time is shifted UTC->local
+--    by the server's current offset before the window join.
+;WITH ring_buffer AS
+(
+    SELECT
+        CAST(target_data AS xml) AS event_data
+    FROM sys.dm_xe_session_targets AS xst
+    JOIN sys.dm_xe_sessions AS xs ON xs.address = xst.event_session_address
+    WHERE xs.name = N'sp_StatUpdate_Monitor'
+    AND   xst.target_name = N'ring_buffer'
+),
+spills AS
+(
+    SELECT
+        event_data.value('(event/@name)[1]', 'varchar(50)') AS spill_event,
+        /* UTC -> server-local using the live offset (robust to absolute clock skew) */
+        DATEADD(MINUTE, DATEDIFF(MINUTE, SYSUTCDATETIME(), SYSDATETIME()),
+                event_data.value('(event/@timestamp)[1]', 'datetime2(3)')) AS event_time_local,
+        event_data.value('(event/action[@name="session_id"]/value)[1]', 'int') AS session_id,
+        event_data.value('(event/action[@name="database_name"]/value)[1]', 'sysname') AS database_name
+    FROM ring_buffer
+    CROSS APPLY event_data.nodes('RingBufferTarget/event') AS n(event_data)
+    WHERE event_data.value('(event/@name)[1]', 'varchar(50)') IN ('sort_warning', 'hash_warning')
+)
+SELECT
+    sp.spill_event,
+    sp.event_time_local,
+    sp.session_id,
+    cl.ID AS commandlog_id,
+    cl.DatabaseName,
+    cl.SchemaName,
+    cl.ObjectName,
+    cl.StatisticsName,
+    cl.StartTime,
+    cl.EndTime,
+    LEFT(cl.Command, 300) AS command
+FROM spills AS sp
+INNER JOIN dbo.CommandLog AS cl
+    ON  cl.CommandType = N'UPDATE_STATISTICS'
+    AND cl.DatabaseName = sp.database_name COLLATE DATABASE_DEFAULT
+    AND sp.event_time_local >= cl.StartTime
+    AND sp.event_time_local <= COALESCE(cl.EndTime, SYSDATETIME())
+ORDER BY sp.event_time_local DESC;
+
+-- 8. Export to file (optional - creates file in SQL Server default backup dir)
 -- ALTER EVENT SESSION [sp_StatUpdate_Monitor] ON SERVER
 -- ADD TARGET package0.event_file (SET filename = N'sp_StatUpdate_Monitor.xel', max_file_size = 50);
 
