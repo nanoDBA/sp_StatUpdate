@@ -36,7 +36,70 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.25.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.28.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.28.1 - Fleet analysis batch (sp_StatUpdate-o2md).  Findings from the
+                           40-server production diagnostic sweep of 2026-07-28, all of
+                           them cases where a check asserted more than its evidence
+                           supported.
+
+                           o2md.10 - W16 CRITICAL_TABLES_NO_MATCH was a 100% false
+                           positive: sp_StatUpdate serializes parameters with
+                           FOR XML ... ELEMENTS XSINIL, so an unset @CriticalTables
+                           arrives as '' rather than NULL and the duplicated
+                           IS NOT NULL guard was always true.  Now a real emptiness
+                           test.  Same XSINIL blast radius fixed in the C4 parallel_mode
+                           bucketing, where '' formed a third mode distinct from 'N'.
+
+                           o2md.11 - C6 SILENT_NOOP_RUN asserted one root cause (the
+                           3.5.7 parallel queue-leadership fix) even for COMPLETED /
+                           NATURAL_END runs, a different code path that fix does not
+                           touch.  The recommendation now branches on the observed
+                           StopReason mix and on the parsed run version, and refuses to
+                           advise an upgrade when the runs already report 3.5.7+.
+                           Flagged runs are materialized once (#c6_noop_runs) instead of
+                           duplicating the predicate between count and evidence.
+
+                           o2md.13 - C4 DEGRADING_THROUGHPUT graded parallel windows on
+                           sec/stat, which in parallel mode measures this worker's slice
+                           against the whole worker lifetime (~10x disagreement with
+                           GB/min observed on the fleet).  A parallel window is now only
+                           CRITICAL when the slice-independent GB/min metric agrees;
+                           otherwise WARNING, with the disagreement stated.
+
+                           o2md.16 - W5 QS_NOT_EFFECTIVE blamed customer Query Store
+                           configuration for a proc-side gap: the mop-up pass carries no
+                           QS fields, so a mop-up-only run is indistinguishable from a
+                           run with QS disabled.  Mop-up-only runs are excluded from both
+                           the numerator and the denominator, and an all-mop-up window
+                           now reports QS_NOT_EVALUABLE (INFO) instead.
+
+                           o2md.17 - W12 PRIORITY_PASS_EMPTY recommended lowering
+                           @ModificationThreshold even when the priority pass qualified
+                           EXACTLY zero stats while mop-up found real work -- a state no
+                           threshold value produces.  That case is now CRITICAL and
+                           version-gated against the 3.7.0 effective_counter fix.
+
+                           o2md.18 - W13 PERPETUALLY_SKIPPED printed "0 of 0 discovered"
+                           when the position aggregates were unmeasurable (ISNULL(...,0)
+                           on missing ProcessingPosition data), and asserted the time
+                           limit as the cause even when no run in the window was
+                           time-limited.  Both aggregates are now nullable, the finding
+                           is suppressed when degenerate, and the cause/recommendation
+                           branch on whether any run actually ran out of time.  The
+                           over-counting sub-issue is documented in place as NOT FIXED --
+                           it is not derivable from CommandLog.
+
+                           o2md.22 - I8 QS_PERFORMANCE_TREND emitted impossible
+                           percentages ("avg 9014150.4% change", "1681.8% reduction")
+                           because it averaged unbounded ratios with no denominator
+                           floor -- one 1 KB -> 20 MB stat dominated the result, and a
+                           slightly larger outlier would have overflowed decimal(10,1)
+                           and killed the whole run.  Now a MEDIAN of per-stat deltas
+                           with a baseline floor and a clamp, sample size disclosed, and
+                           the reduction/increase label taken from the SIGN of the median
+                           rather than from the improving/degrading counts (which is what
+                           let a degrading trend be reported as a "reduction").
+
             2026.07.25.1 - @Ansi opt-in: also render Executive Dashboard + Recommendations
                            as colorized text on the Messages stream (RAISERROR), in
                            addition to the normal result sets.  Reads the populated
@@ -496,8 +559,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.25.1',  /* orchestrator bumps this */
-        @procedure_version_date datetime = '20260723';     /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.28.1',  /* orchestrator bumps this */
+        @procedure_version_date datetime = '20260728';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -1714,6 +1777,61 @@ BEGIN
                      AND name = N'UX_runs_RunLabel')
         CREATE UNIQUE NONCLUSTERED INDEX UX_runs_RunLabel ON #runs (RunLabel);
 
+    /* ----------------------------------------------------------------------
+       o2md.11 / o2md.17: sortable numeric key for each run's sp_StatUpdate
+       version, so checks can gate version-specific advice on evidence instead
+       of asserting a fix that may not apply.
+
+       Key = major * 1000000 + minor * 1000 + patch, e.g. 3.5.7 -> 3005007 and
+       3.7.0 -> 3007000.  NULL when the version string is absent or unparseable
+       -- callers must treat NULL as "unknown", never as "old".
+       ---------------------------------------------------------------------- */
+    CREATE TABLE #run_version_keys
+    (
+        RunLabel nvarchar(100) NOT NULL,
+        VersionKey integer NULL,
+        CONSTRAINT PK_run_version_keys PRIMARY KEY CLUSTERED (RunLabel)
+    );
+
+    INSERT INTO #run_version_keys
+        (RunLabel, VersionKey)
+    SELECT
+        r.RunLabel,
+        vk.VersionKey
+    FROM #runs AS r
+    CROSS APPLY
+    (
+        /* padded so CHARINDEX always finds separators, whatever the version shape */
+        SELECT s = ISNULL(r.[Version], N'') + N'.0.0.0'
+    ) AS v0
+    CROSS APPLY
+    (
+        SELECT
+            p1    = LEFT(v0.s, CHARINDEX(N'.', v0.s) - 1),
+            rest1 = SUBSTRING(v0.s, CHARINDEX(N'.', v0.s) + 1, 60)
+    ) AS v1
+    CROSS APPLY
+    (
+        SELECT
+            p2    = LEFT(v1.rest1, CHARINDEX(N'.', v1.rest1) - 1),
+            rest2 = SUBSTRING(v1.rest1, CHARINDEX(N'.', v1.rest1) + 1, 60)
+    ) AS v2
+    CROSS APPLY
+    (
+        SELECT p3 = LEFT(v2.rest2, CHARINDEX(N'.', v2.rest2) - 1)
+    ) AS v3
+    CROSS APPLY
+    (
+        SELECT VersionKey =
+            CASE
+                WHEN TRY_CONVERT(integer, v1.p1) IS NULL
+                    THEN NULL
+                ELSE TRY_CONVERT(integer, v1.p1) * 1000000
+                     + ISNULL(TRY_CONVERT(integer, v2.p2), 0) * 1000
+                     + ISNULL(TRY_CONVERT(integer, v3.p3), 0)
+            END
+    ) AS vk;
+
     DECLARE @run_count integer = (SELECT COUNT_BIG(*) FROM #runs);
     DECLARE @killed_count integer = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 1);
 
@@ -2658,7 +2776,9 @@ BEGIN
                 WHEN r.StartTime >= @c4_recent_start THEN N'RECENT'
                 ELSE N'PRIOR'
             END,
-            parallel_mode = ISNULL(r.StatsInParallel, N'N'),
+            /* o2md.10 blast radius: XSINIL makes an unset @StatsInParallel arrive as '',
+               which would otherwise form a third mode bucket distinct from 'N'. */
+            parallel_mode = ISNULL(NULLIF(r.StatsInParallel, N''), N'N'),
             avg_sec_per_stat = CASE
                 WHEN r.StatsProcessed > 0
                 THEN r.DurationSeconds * 1.0 / r.StatsProcessed
@@ -2687,8 +2807,14 @@ BEGIN
     )
     INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
     SELECT
-        /* If modes differ between recent/prior windows, downgrade to INFO */
-        CASE WHEN recent_w.parallel_mode = prior_w.parallel_mode THEN N'CRITICAL' ELSE N'INFO' END,
+        /* o2md.13: sec/stat alone must not raise CRITICAL for parallel windows -- see the
+           CROSS APPLY below.  (The mode-mismatch ELSE is unreachable: parity is enforced
+           in the WHERE clause by gh-479.) */
+        CASE
+            WHEN recent_w.parallel_mode <> N'Y' THEN N'CRITICAL'
+            WHEN agree.gb_degraded = 1 THEN N'CRITICAL'
+            ELSE N'WARNING'
+        END,
         N'DEGRADING_THROUGHPUT',
         CASE WHEN recent_w.parallel_mode = prior_w.parallel_mode
             THEN N'Throughput degraded: recent avg ' + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), recent_w.avg_sec))
@@ -2703,13 +2829,23 @@ BEGIN
         END,
         N'Recent window: ' + CONVERT(nvarchar(10), recent_w.run_count) + N' runs averaging '
             + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), recent_w.avg_sec)) + N' sec/stat'
-            + CASE WHEN recent_w.avg_gb_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), recent_w.avg_gb_min) + N' GB/min)' ELSE N'' END
+            /* o2md.13: round GB/min at format time, matching how avg_sec is handled -- AVG() of a
+               decimal(10,2) widens the scale and was printing values like 53.920769 GB/min. */
+            + CASE WHEN recent_w.avg_gb_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), recent_w.avg_gb_min)) + N' GB/min)' ELSE N'' END
             + N' (StatsInParallel=' + recent_w.parallel_mode + N'). '
             + N'Prior window: ' + CONVERT(nvarchar(10), prior_w.run_count) + N' runs averaging '
             + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), prior_w.avg_sec)) + N' sec/stat'
-            + CASE WHEN prior_w.avg_gb_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), prior_w.avg_gb_min) + N' GB/min)' ELSE N'' END
+            + CASE WHEN prior_w.avg_gb_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), prior_w.avg_gb_min)) + N' GB/min)' ELSE N'' END
             + N' (StatsInParallel=' + prior_w.parallel_mode + N'). '
-            + N'Comparison window: ' + CONVERT(nvarchar(10), @ThroughputWindowDays) + N' days.',
+            + N'Comparison window: ' + CONVERT(nvarchar(10), @ThroughputWindowDays) + N' days.'
+            + CASE
+                  WHEN recent_w.parallel_mode <> N'Y' THEN N''
+                  WHEN agree.gb_degraded = 1
+                      THEN N' Both sec/stat and GB/min degraded past the 1.5x threshold, so the slowdown is corroborated by a slice-independent metric.'
+                  WHEN agree.gb_degraded = 0
+                      THEN N' NOTE: parallel runs -- GB/min did NOT degrade past the 1.5x threshold, so the sec/stat delta is most likely worker slice-composition noise rather than a real slowdown (in parallel mode StatsProcessed is only this worker''s slice while DurationSeconds covers the whole worker lifetime). Reported as WARNING, not CRITICAL.'
+                  ELSE N' NOTE: parallel runs -- GB/min was unavailable to corroborate the sec/stat delta, which in parallel mode is dominated by worker slice composition. Reported as WARNING, not CRITICAL.'
+              END,
         N'Possible causes: (1) Table growth increasing update cost, '
             + N'(2) I/O subsystem degradation, '
             + N'(3) Concurrent workload pressure, '
@@ -2721,6 +2857,23 @@ BEGIN
         20
     FROM window_avgs AS recent_w
     CROSS JOIN window_avgs AS prior_w
+    CROSS APPLY
+    (
+        /* o2md.13: in parallel mode StatsProcessed is only THIS worker's slice while
+           DurationSeconds covers the whole worker lifetime, so sec/stat is dominated by
+           slice composition (observed ~10x disagreement with GB/min on the prod fleet).
+           GB/min is derived from TotalGB over the same duration and is slice-independent,
+           so it must AGREE before a parallel window is graded CRITICAL.
+           1 = GB/min also degraded past 1.5x, 0 = it did not, NULL = not measurable. */
+        SELECT gb_degraded =
+            CASE
+                WHEN recent_w.avg_gb_min IS NULL
+                  OR prior_w.avg_gb_min IS NULL
+                  OR prior_w.avg_gb_min <= 0 THEN NULL
+                WHEN recent_w.avg_gb_min < prior_w.avg_gb_min / 1.5 THEN 1
+                ELSE 0
+            END
+    ) AS agree
     WHERE recent_w.window_label = N'RECENT'
     AND   prior_w.window_label = N'PRIOR'
     AND   prior_w.avg_sec > 0
@@ -2733,7 +2886,7 @@ BEGIN
     AND   recent_w.parallel_mode = prior_w.parallel_mode;
 
     IF @@ROWCOUNT > 0
-        RAISERROR(N'  [CRITICAL] C4: Degrading throughput detected', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  [C4] Degrading throughput detected (CRITICAL when corroborated; WARNING for parallel windows where GB/min disagrees)', 10, 1) WITH NOWAIT;
 
     /* ======================================================================
        C6: SILENT NO-OP RUN (sp_StatUpdate-kzx0)
@@ -2759,8 +2912,32 @@ BEGIN
     DECLARE @c6_silent_noop bit = 0;
     DECLARE @c6_count integer = 0;
 
-    SELECT @c6_count = COUNT_BIG(*)
+    /* o2md.11: materialize the flagged runs ONCE.  The detection predicate used to be
+       written twice (count + evidence) and the recommendation asserted a single root
+       cause (parallel queue zombies, fixed in 3.5.7) even for COMPLETED/NATURAL_END
+       runs -- an entirely different code path that 3.5.7 does not touch.  Keeping the
+       flagged rows lets the recommendation branch on the observed StopReason mix and
+       on the parsed run Version. */
+    CREATE TABLE #c6_noop_runs
+    (
+        RunLabel nvarchar(100) NOT NULL,
+        StartTime datetime2(3) NOT NULL,
+        StopReason nvarchar(50) NULL,
+        StatsFound integer NULL,
+        VersionKey integer NULL   /* major * 1000000 + minor * 1000 + patch; NULL when unparseable */
+    );
+
+    INSERT INTO #c6_noop_runs
+        (RunLabel, StartTime, StopReason, StatsFound, VersionKey)
+    SELECT
+        r.RunLabel,
+        r.StartTime,
+        r.StopReason,
+        r.StatsFound,
+        vk.VersionKey
     FROM #runs AS r
+    LEFT JOIN #run_version_keys AS vk
+        ON vk.RunLabel = r.RunLabel
     WHERE r.IsKilled = 0
     AND   r.StopReason IN (N'PARALLEL_COMPLETE', N'COMPLETED', N'NATURAL_END')
     AND   r.StatsFound > 0
@@ -2784,9 +2961,56 @@ BEGIN
               AND   ISNULL(su.EndTime, DATEADD(MINUTE, 60, su.StartTime)) >= DATEADD(MINUTE, -5, r.StartTime)
           );
 
+    SET @c6_count = (SELECT COUNT_BIG(*) FROM #c6_noop_runs);
+
     IF @c6_count > 0
     BEGIN
         SET @c6_silent_noop = 1;
+
+        DECLARE
+            @c6_parallel_count integer,
+            @c6_completed_count integer,
+            @c6_parallel_min_verkey integer,
+            @c6_recommendation nvarchar(max);
+
+        /* 3.5.7 -> version key 3005007 (the parallel queue-leadership fix) */
+        DECLARE @c6_queue_fix_verkey integer = 3005007;
+
+        SELECT
+            @c6_parallel_count      = COUNT_BIG(CASE WHEN n.StopReason = N'PARALLEL_COMPLETE' THEN 1 END),
+            @c6_completed_count     = COUNT_BIG(CASE WHEN n.StopReason IN (N'COMPLETED', N'NATURAL_END') THEN 1 END),
+            @c6_parallel_min_verkey = MIN(CASE WHEN n.StopReason = N'PARALLEL_COMPLETE' THEN n.VersionKey END)
+        FROM #c6_noop_runs AS n;
+
+        SET @c6_recommendation =
+            N'Statistics maintenance is silently NOT happening -- these runs found work, '
+            + N'processed none of it, and no other worker in the same window did either. ';
+
+        IF @c6_parallel_count > 0
+            SET @c6_recommendation = @c6_recommendation
+                + N'[' + CONVERT(nvarchar(10), @c6_parallel_count) + N' run(s) exited PARALLEL_COMPLETE] '
+                + N'Consistent with zombied parallel queue leadership: a drained queue whose leader '
+                + N'SessionID was recycled refuses re-claim, so every new worker joins, claims nothing, and exits. '
+                + CASE
+                      WHEN @c6_parallel_min_verkey IS NULL
+                          THEN N'The sp_StatUpdate version of those run(s) could not be parsed -- if it is below 3.5.7, upgrade (fixed there). '
+                      WHEN @c6_parallel_min_verkey < @c6_queue_fix_verkey
+                          THEN N'Those run(s) predate sp_StatUpdate 3.5.7, where this was fixed -- upgrade to 3.5.7 or later. '
+                      ELSE N'NOTE: those run(s) already report 3.5.7 or later, so the 3.5.7 queue-leadership fix is NOT the explanation -- '
+                               + N'do not upgrade on that basis; investigate the live queue state instead. '
+                  END
+                + N'Inspect dbo.Queue / dbo.QueueStatistic for rows referencing dead sessions; if stale, clear the queue '
+                + N'state so the next run claims leadership fresh. ';
+
+        IF @c6_completed_count > 0
+            SET @c6_recommendation = @c6_recommendation
+                + N'[' + CONVERT(nvarchar(10), @c6_completed_count) + N' run(s) exited COMPLETED/NATURAL_END] '
+                + N'This is a DIFFERENT code path from the parallel-queue defect and the 3.5.7 fix does not apply to it. '
+                + N'A run that discovers work and then processes none of it on a normal-completion path points at the '
+                + N'lazy mop-up fall-through defect (the mop-up re-entry path exits the process loop instead of continuing), '
+                + N'not at queue leadership. Compare StatsFound against per-stat UPDATE_STATISTICS rows in CommandLog for '
+                + N'these RunLabels, and check whether StatsFound decays run over run (a decaying StatsFound with zero '
+                + N'processed is the signature). ';
 
         INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
         SELECT
@@ -2802,46 +3026,17 @@ BEGIN
                       + N', found ' + CONVERT(nvarchar(10), x.StatsFound) + N', processed 0)',
                       N'; ')
                       WITHIN GROUP (ORDER BY x.StartTime DESC),
-            N'Statistics maintenance is silently NOT happening -- these runs found work, '
-                + N'processed none of it, and no other worker in the same window did either. '
-                + N'Known cause: zombied parallel queue leadership (fixed in sp_StatUpdate 3.5.7) -- '
-                + N'a drained queue whose leader SessionID was recycled refused re-claim, so every '
-                + N'new worker joined, claimed nothing, and exited PARALLEL_COMPLETE. '
-                + N'(1) Upgrade sp_StatUpdate to 3.5.7+. '
-                + N'(2) Inspect dbo.Queue / dbo.QueueStatistic for rows referencing dead sessions. '
-                + N'(3) If stale, clear the queue state so the next run claims leadership fresh.',
+            @c6_recommendation,
             N'SELECT q.QueueID, q.SessionID, q.QueueStartTime, qs.DatabaseName, qs.ObjectName, qs.SessionID, qs.TableStartTime, qs.TableEndTime FROM dbo.Queue AS q LEFT JOIN dbo.QueueStatistic AS qs ON qs.QueueID = q.QueueID WHERE q.ObjectName = N''sp_StatUpdate'';',
             5
         FROM
         (
             SELECT TOP (10)
-                r.StartTime,
-                r.StopReason,
-                r.StatsFound
-            FROM #runs AS r
-            WHERE r.IsKilled = 0
-            AND   r.StopReason IN (N'PARALLEL_COMPLETE', N'COMPLETED', N'NATURAL_END')
-            AND   r.StatsFound > 0
-            AND   ISNULL(r.StatsProcessed, 0) = 0
-            AND   NOT EXISTS
-                  (
-                      SELECT 1
-                      FROM #runs AS r2
-                      WHERE r2.RunLabel <> r.RunLabel
-                      AND   r2.IsKilled = 0
-                      AND   ISNULL(r2.StatsProcessed, 0) > 0
-                      AND   r2.StartTime <= DATEADD(MINUTE, 5, ISNULL(r.EndTime, r.StartTime))
-                      AND   ISNULL(r2.EndTime, DATEADD(SECOND, ISNULL(r2.TimeLimit, 18000), r2.StartTime)) >= DATEADD(MINUTE, -5, r.StartTime)
-                  )
-            AND   NOT EXISTS
-                  (
-                      SELECT 1
-                      FROM #stat_updates AS su
-                      WHERE su.RunLabel IS NOT NULL
-                      AND   su.StartTime <= DATEADD(MINUTE, 5, ISNULL(r.EndTime, r.StartTime))
-                      AND   ISNULL(su.EndTime, DATEADD(MINUTE, 60, su.StartTime)) >= DATEADD(MINUTE, -5, r.StartTime)
-                  )
-            ORDER BY r.StartTime DESC
+                n.StartTime,
+                n.StopReason,
+                n.StatsFound
+            FROM #c6_noop_runs AS n
+            ORDER BY n.StartTime DESC
         ) AS x;
 
         RAISERROR(N'  [CRITICAL] C6: Silent no-op run(s) detected (%i)', 10, 1, @c6_count) WITH NOWAIT;
@@ -3132,11 +3327,55 @@ BEGIN
        ====================================================================== */
     IF EXISTS (SELECT 1 FROM #runs WHERE QueryStorePriority = N'Y')
     BEGIN
-        DECLARE @w5_qs_runs integer = (SELECT COUNT_BIG(*) FROM #runs WHERE QueryStorePriority = N'Y');
+        /* ------------------------------------------------------------------
+           o2md.16: mop-up rows must not count as evidence that QS enrichment
+           failed.  The mop-up pass hard-codes the qs_* per-stat fields to NULL,
+           so a run whose only stat rows came from mop-up looks identical to a
+           run where Query Store was disabled -- and W5 then blames the customer's
+           QS configuration for a proc-side enrichment gap.  Runs with no
+           evaluable (non-mop-up, non-skip) stat rows are excluded from BOTH the
+           numerator and the denominator.
+
+           TODO (o2md.5): mop-up rows are identified here by the existing
+           QualifyReason = 'MOP_UP' tag emitted by sp_StatUpdate (see the
+           @in_mop_up CASE in the per-stat ExtendedInfo).  If o2md.5 lands a
+           dedicated mop-up flag column on the per-stat ExtendedInfo, ingest it
+           into #stat_updates and prefer it here -- QualifyReason is a single
+           value, so a mop-up stat that also has another qualify reason is
+           reported as MOP_UP and this guard stays correct, but a dedicated flag
+           is less fragile.
+           ------------------------------------------------------------------ */
+        DECLARE @w5_qs_runs integer = (
+            SELECT COUNT_BIG(*)
+            FROM #runs AS r
+            WHERE r.QueryStorePriority = N'Y'
+            AND   EXISTS
+                  (
+                      SELECT 1
+                      FROM #stat_updates AS su
+                      WHERE su.RunLabel = r.RunLabel
+                      AND   ISNULL(su.IsSkip, 0) = 0
+                      AND   ISNULL(su.QualifyReason, N'') <> N'MOP_UP'
+                  )
+        );
+        DECLARE @w5_mopup_only_runs integer = (
+            SELECT COUNT_BIG(*)
+            FROM #runs AS r
+            WHERE r.QueryStorePriority = N'Y'
+            AND   NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM #stat_updates AS su
+                      WHERE su.RunLabel = r.RunLabel
+                      AND   ISNULL(su.IsSkip, 0) = 0
+                      AND   ISNULL(su.QualifyReason, N'') <> N'MOP_UP'
+                  )
+        );
         DECLARE @w5_qs_data_runs integer = (
             SELECT COUNT(DISTINCT su.RunLabel)
             FROM #stat_updates AS su
             WHERE su.QSPlanCount IS NOT NULL /* 0 = enrichment ran (no match), >0 = matched; NULL = skipped */
+            AND   ISNULL(su.QualifyReason, N'') <> N'MOP_UP'   /* o2md.16 */
         );
 
         /* 1h2l: QSEnrichmentSkipped direct signal from END Summary XML (v3+ only).
@@ -3182,7 +3421,29 @@ BEGIN
             AND @w5_enrichment_skipped_runs = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 0 AND QueryStorePriority = N'Y')
             SET @w5_definitive_skipped = 1;
 
-        IF @w5_definitive_skipped = 1 OR @w5_qs_data_runs = 0
+        IF @w5_qs_runs = 0
+        BEGIN
+            /* o2md.16: every QS-priority run in the window consists solely of mop-up
+               (or skipped) stat rows, so there is no evidence either way about QS
+               enrichment.  Say so instead of blaming the customer's QS configuration. */
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES
+            (
+                N'INFO', N'QS_NOT_EVALUABLE',
+                N'Query Store prioritization cannot be evaluated -- all runs did mop-up work only',
+                N'QS prioritization is configured, but all ' + CONVERT(nvarchar(10), @w5_mopup_only_runs)
+                    + N' QS-priority run(s) in the window produced only mop-up stat rows. '
+                    + N'The mop-up pass does not carry Query Store enrichment fields, so the absence of QS data '
+                    + N'in those rows says nothing about Query Store health -- it says the priority pass qualified nothing. '
+                    + N'See the PRIORITY_PASS_EMPTY finding (if present) for that.',
+                N'Do not change Query Store settings on this evidence. Investigate why the priority pass qualified '
+                    + N'no statistics first; QS effectiveness can only be judged once the priority pass processes work.',
+                NULL,
+                40
+            );
+            RAISERROR(N'  [INFO] W5: QS effectiveness not evaluable (mop-up-only runs)', 10, 1) WITH NOWAIT;
+        END
+        ELSE IF @w5_definitive_skipped = 1 OR @w5_qs_data_runs = 0
         BEGIN
             /* sp_StatUpdate-6x80: when all QS-priority runs are parallel AND QS
                CPU data was observed in stat updates, the zero-QSPlanCount signal
@@ -3242,7 +3503,15 @@ BEGIN
                     + N' of ' + CONVERT(nvarchar(10), @w5_qs_runs) + N' QS-priority runs',
                 N'QS prioritization was configured across ' + CONVERT(nvarchar(10), @w5_qs_runs)
                     + N' runs, but QS enrichment only executed in ' + CONVERT(nvarchar(10), @w5_qs_data_runs)
-                    + N'.  Query Store may have transitioned to READ_ONLY or had no recent runtime stats in some runs.',
+                    + N'.  Query Store may have transitioned to READ_ONLY or had no recent runtime stats in some runs.'
+                    /* o2md.16: mop-up-only runs are already excluded from both counts; say so
+                       so the reader does not chase a QS misconfiguration that is not there. */
+                    + CASE WHEN @w5_mopup_only_runs > 0
+                           THEN N'  (' + CONVERT(nvarchar(10), @w5_mopup_only_runs)
+                                + N' further run(s) produced only mop-up stat rows and were excluded from both counts -- '
+                                + N'the mop-up pass carries no Query Store fields, so those runs are not evidence of a QS problem.)'
+                           ELSE N''
+                      END,
                 N'Check QS status: SELECT actual_state_desc, query_capture_mode_desc, current_storage_size_mb, max_storage_size_mb FROM sys.database_query_store_options. '
                     + N'If space pressure caused READ_ONLY transition, increase max_storage_size_mb or enable SIZE_BASED_CLEANUP_MODE.',
                 N'ALTER DATABASE [YourDB] SET QUERY_STORE (MAX_STORAGE_SIZE_MB = 2048);',
@@ -3961,7 +4230,17 @@ BEGIN
             @w12_avg_priority decimal(10, 1),
             @w12_avg_mopup   decimal(10, 1),
             @w12_mopup_pct   decimal(5, 1),
-            @w12_mod_thresh  bigint;
+            @w12_mod_thresh  bigint,
+            /* o2md.17: newest sp_StatUpdate version seen across the mop-up runs.
+               3.7.0 -> 3007000.  Below that, the priority pass could qualify nothing
+               regardless of @ModificationThreshold (effective_counter defect), so the
+               "lower the threshold" advice is unactionable and must not be emitted. */
+            @w12_max_verkey  integer,
+            @w12_severity    nvarchar(10),
+            @w12_recommendation nvarchar(2000),
+            @w12_example nvarchar(2000);
+
+        DECLARE @w12_effective_counter_fix_verkey integer = 3007000;
 
         SELECT
             @w12_run_count    = COUNT(*),
@@ -3969,8 +4248,11 @@ BEGIN
                pass crashed or restarted, producing a negative priority-pass count otherwise. */
             @w12_avg_priority = AVG(CONVERT(decimal(10, 1), CASE WHEN ISNULL(r.StatsProcessed, 0) - ISNULL(r.MopUpProcessed, 0) < 0 THEN 0 ELSE ISNULL(r.StatsProcessed, 0) - ISNULL(r.MopUpProcessed, 0) END)),
             @w12_avg_mopup    = AVG(CONVERT(decimal(10, 1), ISNULL(r.MopUpProcessed, 0))),
-            @w12_mod_thresh   = MAX(r.ModificationThreshold)
+            @w12_mod_thresh   = MAX(r.ModificationThreshold),
+            @w12_max_verkey   = MAX(vk.VersionKey)
         FROM #runs AS r
+        LEFT JOIN #run_version_keys AS vk
+            ON vk.RunLabel = r.RunLabel
         WHERE r.MopUpTriggered = 1
         AND   r.IsKilled = 0;
 
@@ -3984,30 +4266,85 @@ BEGIN
                 ELSE 100.0
             END;
 
+            /* o2md.17: distinguish "few stats qualified" (a tuning problem) from
+               "EXACTLY zero qualified while mop-up found real work" (a defect).
+               The latter is not fixable by any @ModificationThreshold value. */
+            SET @w12_severity =
+                CASE WHEN ISNULL(@w12_avg_priority, 99) = 0 AND ISNULL(@w12_avg_mopup, 0) > 0
+                     THEN N'CRITICAL'
+                     ELSE N'WARNING'
+                END;
+
+            IF @w12_severity = N'CRITICAL'
+            BEGIN
+                SET @w12_recommendation =
+                    N'The priority pass qualified EXACTLY ZERO statistics while mop-up found real work. '
+                    + N'That is not a threshold-tuning symptom -- no @ModificationThreshold value can produce zero '
+                    + N'qualifying stats while a broad sweep over the same tables finds many. '
+                    + CASE
+                          WHEN @w12_max_verkey IS NULL
+                              THEN N'The sp_StatUpdate version of these runs could not be parsed; if it is below 3.7.x, '
+                                   + N'this is the known effective_counter defect (the priority pass evaluates a counter that is '
+                                   + N'always 0, so nothing ever qualifies) -- upgrade and re-measure before touching thresholds. '
+                          WHEN @w12_max_verkey < @w12_effective_counter_fix_verkey
+                              THEN N'These runs are below 3.7.x, which matches the known effective_counter defect: the priority pass '
+                                   + N'evaluates a counter that is always 0, so nothing ever qualifies regardless of threshold. '
+                                   + N'Upgrade sp_StatUpdate to 3.7.x or later and re-measure BEFORE changing @ModificationThreshold. '
+                          ELSE N'These runs already report 3.7.x or later, so the known effective_counter defect does not explain it. '
+                               + N'Investigate discovery directly: run with @Execute = N''N'', @Debug = 1 and compare the per-phase '
+                               + N'candidate counts against what mop-up subsequently finds. '
+                      END;
+
+                SET @w12_example =
+                    CASE
+                        WHEN @w12_max_verkey IS NULL OR @w12_max_verkey < @w12_effective_counter_fix_verkey
+                            THEN N'/* Verify the installed version first: EXECUTE dbo.sp_StatUpdate @Version = @v OUTPUT; -- do not retune thresholds until it is 3.7.x or later */'
+                            ELSE N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @Execute = N''N'', @Debug = 1;'
+                    END;
+            END
+            ELSE
+            BEGIN
+                SET @w12_recommendation =
+                    N'Lower @ModificationThreshold so more stats qualify for the priority pass (with its workload-aware ordering), '
+                    + N'rather than falling through to the unordered mop-up sweep.  '
+                    + N'This ensures high-impact stats are prioritised when the time limit is hit.';
+
+                SET @w12_example =
+                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @MopUpPass = N''Y'', @ModificationThreshold = '
+                    + ISNULL(CONVERT(nvarchar(20), @w12_mod_thresh / 2), N'1000') + N';';
+            END;
+
             INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
             VALUES (
-                N'WARNING',
+                @w12_severity,
                 N'PRIORITY_PASS_EMPTY',
-                N'Priority pass finds almost no qualifying stats -- mop-up does '
-                    + CONVERT(nvarchar(10), CONVERT(int, ISNULL(@w12_mopup_pct, 0))) + N'% of the work',
+                CASE WHEN @w12_severity = N'CRITICAL'
+                     THEN N'Priority pass qualified ZERO stats -- mop-up does '
+                          + CONVERT(nvarchar(10), CONVERT(int, ISNULL(@w12_mopup_pct, 0))) + N'% of the work'
+                     ELSE N'Priority pass finds almost no qualifying stats -- mop-up does '
+                          + CONVERT(nvarchar(10), CONVERT(int, ISNULL(@w12_mopup_pct, 0))) + N'% of the work'
+                END,
                 N'Across ' + CONVERT(nvarchar(10), @w12_run_count) + N' mop-up runs, the priority pass averaged only '
                     + CONVERT(nvarchar(10), CONVERT(int, ISNULL(@w12_avg_priority, 0))) + N' stat(s) while mop-up averaged '
                     + CONVERT(nvarchar(10), CONVERT(int, ISNULL(@w12_avg_mopup, 0))) + N' stat(s).  '
-                    + N'The modification threshold or tiered threshold settings are filtering out nearly all candidates '
-                    + N'from the priority pass, leaving them for the broad mop-up sweep.  '
+                    + CASE WHEN @w12_severity = N'CRITICAL'
+                           THEN N'The priority-pass average is EXACTLY zero, which no threshold setting produces on its own.  '
+                           ELSE N'The modification threshold or tiered threshold settings are filtering out nearly all candidates '
+                                + N'from the priority pass, leaving them for the broad mop-up sweep.  '
+                      END
                     + CASE WHEN @w12_mod_thresh IS NOT NULL
                         THEN N'Current @ModificationThreshold: ' + CONVERT(nvarchar(20), @w12_mod_thresh) + N'.'
                         ELSE N'' END,
-                N'Lower @ModificationThreshold so more stats qualify for the priority pass (with its workload-aware ordering), '
-                    + N'rather than falling through to the unordered mop-up sweep.  '
-                    + N'This ensures high-impact stats are prioritised when the time limit is hit.',
-                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @MopUpPass = N''Y'', @ModificationThreshold = '
-                    + ISNULL(CONVERT(nvarchar(20), @w12_mod_thresh / 2), N'1000') + N';',
-                42
+                @w12_recommendation,
+                @w12_example,
+                CASE WHEN @w12_severity = N'CRITICAL' THEN 8 ELSE 42 END
             );
 
             DECLARE @w12_mopup_pct_int integer = CONVERT(integer, ISNULL(@w12_mopup_pct, 0));
-            RAISERROR(N'  [WARNING] W12: Priority pass empty -- mop-up does %i%% of work', 10, 1, @w12_mopup_pct_int) WITH NOWAIT;
+            IF @w12_severity = N'CRITICAL'
+                RAISERROR(N'  [CRITICAL] W12: Priority pass qualified ZERO stats -- mop-up does %i%% of work', 10, 1, @w12_mopup_pct_int) WITH NOWAIT;
+            ELSE
+                RAISERROR(N'  [WARNING] W12: Priority pass empty -- mop-up does %i%% of work', 10, 1, @w12_mopup_pct_int) WITH NOWAIT;
         END;
     END;
 
@@ -4065,14 +4402,28 @@ BEGIN
         DECLARE @w13_min_consecutive int = 3;
         DECLARE @w13_skipped_count int = 0;
         DECLARE @w13_run_count int = 0;
-        DECLARE @w13_avg_last_position int = 0;
-        DECLARE @w13_avg_total int = 0;
+        /* o2md.18(a): these two must stay NULLABLE.  They were ISNULL(...,0), which turned
+           "no ProcessingPosition data" (parallel / mop-up rows) and "StatsFound = 0" into a
+           literal "Average last position processed: 0 of 0 discovered" evidence line under a
+           headline claiming thousands of stale stats.  NULL now means "not measurable" and
+           the finding is suppressed rather than printed with degenerate evidence. */
+        DECLARE @w13_avg_last_position int = NULL;
+        DECLARE @w13_avg_total int = NULL;
+        /* o2md.18(b): the stated cause ("the time limit expires before they are reached")
+           must not be asserted when no run in the window was actually time-limited. */
+        DECLARE @w13_time_limited_runs int = 0;
 
         /* Count non-killed, time-limited runs */
         SELECT @w13_run_count = COUNT(*)
         FROM #runs
         WHERE IsKilled = 0
         AND   StopReason IN (N'TIME_LIMIT', N'NATURAL_END', N'COMPLETED');
+
+        SELECT @w13_time_limited_runs = COUNT(*)
+        FROM #runs
+        WHERE IsKilled = 0
+        AND   (StopReason = N'TIME_LIMIT'
+            OR (StopReason IN (N'NATURAL_END', N'COMPLETED') AND ISNULL(StatsRemaining, 0) > 0));
 
         IF @w13_run_count >= @w13_min_consecutive
         BEGIN
@@ -4125,24 +4476,55 @@ BEGIN
                         AND   us.StatisticsName = su_all.StatisticsName
                     )
                 ),
-                @w13_avg_last_position = ISNULL((SELECT AVG(max_position) FROM run_positions), 0),
-                @w13_avg_total = ISNULL((SELECT AVG(StatsFound) FROM recent_runs), 0);
+                /* o2md.18(a): no ISNULL -- NULL means "not measurable", see the DECLARE above */
+                @w13_avg_last_position = (SELECT AVG(max_position) FROM run_positions),
+                @w13_avg_total = (SELECT AVG(NULLIF(StatsFound, 0)) FROM recent_runs);
+
+            /* o2md.18(c) NOT FIXED -- deliberately.  @w13_skipped_count counts every distinct
+               stat seen anywhere in the @DaysBack window that is absent from the last N runs,
+               with no requirement that the stat still qualifies for an update.  Requiring
+               "currently qualifies" is not derivable from CommandLog: it only records stats
+               that WERE updated, so the qualifying-but-not-updated population is unobservable
+               here (the proc logs it only under @LogSkippedToCommandLog = Y).  Fixing this
+               properly needs a proc-side discovery-candidate log, not a Diag change.  See the
+               bd issue comment on sp_StatUpdate-o2md.18. */
 
             IF @w13_skipped_count > 0
+            /* o2md.18(a): suppress entirely when the position aggregate is degenerate --
+               "0 of 0 discovered" is worse than saying nothing. */
+            AND @w13_avg_last_position IS NOT NULL
+            AND @w13_avg_total IS NOT NULL
+            AND @w13_avg_total > 0
             BEGIN
                 INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
                 VALUES (
                     N'WARNING',
                     N'PERPETUALLY_SKIPPED',
-                    CONVERT(nvarchar(10), @w13_skipped_count) + N' stats never updated across '
+                    CONVERT(nvarchar(10), @w13_skipped_count) + N' stats not updated in the last '
                         + CONVERT(nvarchar(10), @w13_min_consecutive) + N' consecutive runs',
-                    N'Discovery finds these stats but the time limit expires before they are reached.  '
+                    /* o2md.18(b): only claim the time limit is the cause when runs actually ran out of time. */
+                    CASE WHEN @w13_time_limited_runs > 0
+                         THEN N'Discovery finds these stats but the time limit expires before they are reached.  '
+                         ELSE N'These stats were updated earlier in the analysis window but not in the last '
+                              + CONVERT(nvarchar(10), @w13_min_consecutive) + N' runs.  No run in the window hit its '
+                              + N'time limit or ended with stats remaining, so the time limit is NOT the cause here -- '
+                              + N'the more likely explanations are that the stats no longer qualify (low modification '
+                              + N'counters) or that discovery is not reaching them.  '
+                    END
                         + N'Average last position processed: ' + CONVERT(nvarchar(10), @w13_avg_last_position)
                         + N' of ' + CONVERT(nvarchar(10), @w13_avg_total) + N' discovered.  '
                         + N'Stats beyond position ' + CONVERT(nvarchar(10), @w13_avg_last_position) + N' are perpetually stale.',
-                    N'Increase @TimeLimit to allow more stats to be processed, use @SortOrder=MODIFICATION_VELOCITY '
-                        + N'to prioritize high-velocity stats, or lower @ModificationThreshold so fewer stats qualify.',
-                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @SortOrder = N''MODIFICATION_VELOCITY'', @TimeLimit = 7200;',
+                    CASE WHEN @w13_time_limited_runs > 0
+                         THEN N'Increase @TimeLimit to allow more stats to be processed, use @SortOrder=MODIFICATION_VELOCITY '
+                              + N'to prioritize high-velocity stats, or lower @ModificationThreshold so fewer stats qualify.'
+                         ELSE N'Do not raise @TimeLimit on this evidence -- no run in the window was time-limited.  '
+                              + N'Confirm first whether these stats still qualify (check modification_counter via '
+                              + N'sys.dm_db_stats_properties) before changing any parameter.'
+                    END,
+                    CASE WHEN @w13_time_limited_runs > 0
+                         THEN N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @SortOrder = N''MODIFICATION_VELOCITY'', @TimeLimit = 7200;'
+                         ELSE N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @Execute = N''N'', @Debug = 1; /* confirm discovery reaches these stats */'
+                    END,
                     40
                 );
 
@@ -4813,11 +5195,49 @@ BEGIN
             @i8_stable_count integer = 0,
             @i8_regressed_count integer = 0,
             @i8_total_tracked integer = 0,
-            @i8_avg_delta_pct decimal(10, 1) = 0,
+            /* o2md.22: this is now a MEDIAN of per-stat deltas, not a mean of ratios, and it
+               is NULLABLE -- NULL means "no stat had a baseline above the reporting floor".
+               Every consumer must ISNULL it before concatenating. */
+            @i8_avg_delta_pct decimal(10, 1) = NULL,
+            @i8_cpu_delta_sample integer = 0,
             @i8_mem_improving integer = 0,
             @i8_mem_degrading integer = 0,
             @i8_mem_tracked integer = 0,
-            @i8_mem_avg_delta_pct decimal(10, 1) = 0;
+            @i8_mem_avg_delta_pct decimal(10, 1) = NULL,
+            @i8_mem_delta_sample integer = 0;
+
+        /* ------------------------------------------------------------------
+           o2md.22: per-stat deltas are materialized so the headline can use a
+           MEDIAN (robust to outliers) instead of AVG of ratios.
+
+           The old AVG((last - first) * 100.0 / first) had no denominator floor,
+           so one stat going 1 KB -> 20 MB dominated the whole result and produced
+           leadership-facing text like "avg 9014150.4% change".  decimal(10, 1)
+           tops out at 999,999,999.9, so a slightly larger outlier would have
+           thrown an arithmetic overflow and killed the entire diag run.
+
+           Two guards: a denominator floor (baselines below it yield NULL and are
+           excluded from the median) and a clamp on each per-stat delta.
+           ------------------------------------------------------------------ */
+        DECLARE @i8_cpu_floor_ms_per_exec decimal(18, 4) = 0.1;    /* sub-0.1 ms/exec baselines make the ratio meaningless */
+        DECLARE @i8_mem_floor_kb bigint = 1024;                    /* sub-1 MB memory grants likewise */
+        DECLARE @i8_delta_clamp_pct decimal(10, 1) = 1000.0;       /* +1000% ceiling; -100% is the natural floor */
+
+        CREATE TABLE #i8_cpu_deltas
+        (
+            first_cpu_per_exec decimal(18, 4) NULL,
+            last_cpu_per_exec decimal(18, 4) NULL,
+            min_cpu_per_exec decimal(18, 4) NULL,
+            appearances bigint NULL,
+            delta_pct decimal(10, 1) NULL   /* NULL = baseline below the floor, excluded from the median */
+        );
+
+        CREATE TABLE #i8_mem_deltas
+        (
+            first_mem bigint NULL,
+            last_mem bigint NULL,
+            delta_pct decimal(10, 1) NULL
+        );
 
         /* Compare first vs last per-execution CPU for each stat across runs */
         ;WITH stat_appearances AS
@@ -4861,15 +5281,45 @@ BEGIN
             WHERE appearance_cnt >= 2
             GROUP BY DatabaseName, SchemaName, ObjectName, StatisticsName
         )
+        INSERT INTO #i8_cpu_deltas
+            (first_cpu_per_exec, last_cpu_per_exec, min_cpu_per_exec, appearances, delta_pct)
+        SELECT
+            fl.first_cpu_per_exec,
+            fl.last_cpu_per_exec,
+            fl.min_cpu_per_exec,
+            fl.appearances,
+            /* o2md.22: denominator floor + clamp */
+            delta_pct =
+                CASE
+                    WHEN fl.first_cpu_per_exec IS NULL
+                      OR fl.last_cpu_per_exec IS NULL
+                      OR fl.first_cpu_per_exec < @i8_cpu_floor_ms_per_exec THEN NULL
+                    WHEN (fl.last_cpu_per_exec - fl.first_cpu_per_exec) * 100.0 / fl.first_cpu_per_exec > @i8_delta_clamp_pct
+                        THEN @i8_delta_clamp_pct
+                    WHEN (fl.last_cpu_per_exec - fl.first_cpu_per_exec) * 100.0 / fl.first_cpu_per_exec < -100.0
+                        THEN CONVERT(decimal(10, 1), -100.0)
+                    ELSE CONVERT(decimal(10, 1), (fl.last_cpu_per_exec - fl.first_cpu_per_exec) * 100.0 / fl.first_cpu_per_exec)
+                END
+        FROM first_last AS fl;
+
         SELECT
             @i8_total_tracked   = COUNT_BIG(*),
-            @i8_improving_count = SUM(CASE WHEN last_cpu_per_exec < first_cpu_per_exec * 0.95 THEN 1 ELSE 0 END),
-            @i8_degrading_count = SUM(CASE WHEN last_cpu_per_exec > first_cpu_per_exec * 1.05 THEN 1 ELSE 0 END),
-            @i8_stable_count    = SUM(CASE WHEN last_cpu_per_exec BETWEEN first_cpu_per_exec * 0.95 AND first_cpu_per_exec * 1.05 THEN 1 ELSE 0 END),
+            @i8_improving_count = SUM(CASE WHEN d.last_cpu_per_exec < d.first_cpu_per_exec * 0.95 THEN 1 ELSE 0 END),
+            @i8_degrading_count = SUM(CASE WHEN d.last_cpu_per_exec > d.first_cpu_per_exec * 1.05 THEN 1 ELSE 0 END),
+            @i8_stable_count    = SUM(CASE WHEN d.last_cpu_per_exec BETWEEN d.first_cpu_per_exec * 0.95 AND d.first_cpu_per_exec * 1.05 THEN 1 ELSE 0 END),
             /* #276: Detect improve-then-regress: min < first AND last > min (improved at some point, then got worse) */
-            @i8_regressed_count = SUM(CASE WHEN appearances >= 3 AND min_cpu_per_exec < first_cpu_per_exec * 0.95 AND last_cpu_per_exec > min_cpu_per_exec * 1.05 THEN 1 ELSE 0 END),
-            @i8_avg_delta_pct   = AVG(CASE WHEN first_cpu_per_exec > 0 THEN CONVERT(decimal(10, 1), (last_cpu_per_exec - first_cpu_per_exec) * 100.0 / first_cpu_per_exec) ELSE 0 END)
-        FROM first_last;
+            @i8_regressed_count = SUM(CASE WHEN d.appearances >= 3 AND d.min_cpu_per_exec < d.first_cpu_per_exec * 0.95 AND d.last_cpu_per_exec > d.min_cpu_per_exec * 1.05 THEN 1 ELSE 0 END),
+            @i8_cpu_delta_sample = SUM(CASE WHEN d.delta_pct IS NOT NULL THEN 1 ELSE 0 END)
+        FROM #i8_cpu_deltas AS d;
+
+        /* o2md.22: median of the clamped, floored per-stat deltas */
+        SELECT @i8_avg_delta_pct = CONVERT(decimal(10, 1), MAX(m.med))
+        FROM
+        (
+            SELECT med = PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.delta_pct) OVER ()
+            FROM #i8_cpu_deltas AS d
+            WHERE d.delta_pct IS NOT NULL
+        ) AS m;
 
         /* #368: Memory grant trending (separate query -- only stats with memory data) */
         ;WITH mem_appearances AS
@@ -4899,12 +5349,40 @@ BEGIN
             WHERE mem_cnt >= 2
             GROUP BY DatabaseName, SchemaName, ObjectName, StatisticsName
         )
+        INSERT INTO #i8_mem_deltas
+            (first_mem, last_mem, delta_pct)
         SELECT
-            @i8_mem_tracked       = COUNT_BIG(*),
-            @i8_mem_improving     = SUM(CASE WHEN last_mem < first_mem * 0.95 THEN 1 ELSE 0 END),
-            @i8_mem_degrading     = SUM(CASE WHEN last_mem > first_mem * 1.05 THEN 1 ELSE 0 END),
-            @i8_mem_avg_delta_pct = AVG(CASE WHEN first_mem > 0 THEN CONVERT(decimal(10, 1), (last_mem - first_mem) * 100.0 / first_mem) ELSE 0 END)
-        FROM mem_first_last;
+            ml.first_mem,
+            ml.last_mem,
+            /* o2md.22: denominator floor + clamp -- this is the "1 KB -> 20 MB" case that
+               produced "avg 1681.8% reduction" (a mathematically impossible label). */
+            delta_pct =
+                CASE
+                    WHEN ml.first_mem IS NULL
+                      OR ml.last_mem IS NULL
+                      OR ml.first_mem < @i8_mem_floor_kb THEN NULL
+                    WHEN (ml.last_mem - ml.first_mem) * 100.0 / ml.first_mem > @i8_delta_clamp_pct
+                        THEN @i8_delta_clamp_pct
+                    WHEN (ml.last_mem - ml.first_mem) * 100.0 / ml.first_mem < -100.0
+                        THEN CONVERT(decimal(10, 1), -100.0)
+                    ELSE CONVERT(decimal(10, 1), (ml.last_mem - ml.first_mem) * 100.0 / ml.first_mem)
+                END
+        FROM mem_first_last AS ml;
+
+        SELECT
+            @i8_mem_tracked      = COUNT_BIG(*),
+            @i8_mem_improving    = SUM(CASE WHEN d.last_mem < d.first_mem * 0.95 THEN 1 ELSE 0 END),
+            @i8_mem_degrading    = SUM(CASE WHEN d.last_mem > d.first_mem * 1.05 THEN 1 ELSE 0 END),
+            @i8_mem_delta_sample = SUM(CASE WHEN d.delta_pct IS NOT NULL THEN 1 ELSE 0 END)
+        FROM #i8_mem_deltas AS d;
+
+        SELECT @i8_mem_avg_delta_pct = CONVERT(decimal(10, 1), MAX(m.med))
+        FROM
+        (
+            SELECT med = PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d.delta_pct) OVER ()
+            FROM #i8_mem_deltas AS d
+            WHERE d.delta_pct IS NOT NULL
+        ) AS m;
 
         IF @i8_total_tracked < 2
         BEGIN
@@ -4957,16 +5435,27 @@ BEGIN
                     WHEN @i8_improving_count > @i8_degrading_count AND @i8_avg_delta_pct < -5
                     THEN N'Per-execution query CPU improving after stat updates: '
                         + CONVERT(nvarchar(10), @i8_improving_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
-                        + N' tracked statistics show lower per-execution CPU (avg '
+                        + N' tracked statistics show lower per-execution CPU (median '
                         + CONVERT(nvarchar(20), ABS(@i8_avg_delta_pct)) + N'% reduction).'
-                        + CASE WHEN @i8_mem_tracked >= 2 AND @i8_mem_improving > @i8_mem_degrading
+                        /* o2md.22: the reduction/increase label comes from the SIGN of the median delta,
+                           never from the improving/degrading counts.  The old code chose the branch on
+                           counts and then printed ABS(mean) labelled "reduction", so a net-positive
+                           (degrading) mean was reported as a reduction. */
+                        + CASE
+                            WHEN @i8_mem_tracked >= 2 AND @i8_mem_avg_delta_pct < 0
                             THEN N' Memory grants also improved for '
                                 + CONVERT(nvarchar(10), @i8_mem_improving) + N' of ' + CONVERT(nvarchar(10), @i8_mem_tracked)
-                                + N' tracked statistics (avg ' + CONVERT(nvarchar(20), ABS(@i8_mem_avg_delta_pct)) + N'% reduction).'
-                            WHEN @i8_mem_tracked >= 2 AND @i8_mem_degrading > @i8_mem_improving
-                            THEN N' However, memory grants degraded for '
+                                + N' tracked statistics (median ' + CONVERT(nvarchar(20), ABS(@i8_mem_avg_delta_pct)) + N'% reduction).'
+                            WHEN @i8_mem_tracked >= 2 AND @i8_mem_avg_delta_pct > 0
+                            THEN N' However, memory grants increased for '
                                 + CONVERT(nvarchar(10), @i8_mem_degrading) + N' of ' + CONVERT(nvarchar(10), @i8_mem_tracked)
-                                + N' tracked statistics despite CPU improvement.'
+                                + N' tracked statistics despite CPU improvement (median '
+                                + CONVERT(nvarchar(20), @i8_mem_avg_delta_pct) + N'% increase).'
+                            WHEN @i8_mem_tracked >= 2 AND @i8_mem_avg_delta_pct = 0
+                            THEN N' Memory grants were unchanged (median 0%).'
+                            WHEN @i8_mem_tracked >= 2
+                            THEN N' Memory grant change was not quantifiable: no tracked statistic had a baseline grant above '
+                                + CONVERT(nvarchar(20), @i8_mem_floor_kb) + N' KB.'
                             ELSE N''
                         END
                     /* #276: Improve-then-regress pattern -- CPU improved at some point but regressed back */
@@ -4981,8 +5470,8 @@ BEGIN
                     WHEN @i8_degrading_count > @i8_improving_count
                     THEN N'Per-execution query CPU not improving: '
                         + CONVERT(nvarchar(10), @i8_degrading_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
-                        + N' tracked statistics show higher per-execution CPU (avg '
-                        + CONVERT(nvarchar(20), @i8_avg_delta_pct) + N'% change).'
+                        + N' tracked statistics show higher per-execution CPU (median '
+                        + ISNULL(CONVERT(nvarchar(20), @i8_avg_delta_pct), N'n/a') + N'% change).'
                         + CASE WHEN @i8_forced_at_risk > 0
                             THEN N' WARNING: ' + CONVERT(nvarchar(10), @i8_forced_at_risk) + N' forced plan(s) exist on affected tables -- stat updates may have triggered forced plan abandonment.'
                             ELSE N''
@@ -5001,7 +5490,12 @@ BEGIN
                         THEN N'. Improved-then-regressed: ' + CONVERT(nvarchar(10), @i8_regressed_count)
                         ELSE N''
                     END
-                    + N'. Avg per-exec CPU change: ' + CONVERT(nvarchar(20), @i8_avg_delta_pct) + N'%.'
+                    /* o2md.22: median, clamped to +/- the reporting bounds, over stats whose
+                       baseline exceeded the denominator floor.  Sample size disclosed. */
+                    + N'. Median per-exec CPU change: ' + ISNULL(CONVERT(nvarchar(20), @i8_avg_delta_pct), N'n/a')
+                    + N'% (over ' + CONVERT(nvarchar(10), @i8_cpu_delta_sample) + N' of '
+                    + CONVERT(nvarchar(10), @i8_total_tracked) + N' stats with a baseline above '
+                    + CONVERT(nvarchar(20), @i8_cpu_floor_ms_per_exec) + N' ms/exec).'
                     + CASE WHEN @i8_forced_at_risk > 0
                         THEN N' Forced plans at risk: ' + CONVERT(nvarchar(10), @i8_forced_at_risk) + N'.'
                         ELSE N''
@@ -5010,7 +5504,9 @@ BEGIN
                         THEN N' Memory grant tracking: ' + CONVERT(nvarchar(10), @i8_mem_tracked)
                             + N' stats, improving: ' + CONVERT(nvarchar(10), @i8_mem_improving)
                             + N', degrading: ' + CONVERT(nvarchar(10), @i8_mem_degrading)
-                            + N', avg change: ' + CONVERT(nvarchar(20), @i8_mem_avg_delta_pct) + N'%.'
+                            + N', median change: ' + ISNULL(CONVERT(nvarchar(20), @i8_mem_avg_delta_pct), N'n/a')
+                            + N'% (over ' + CONVERT(nvarchar(10), @i8_mem_delta_sample) + N' stats with a baseline above '
+                            + CONVERT(nvarchar(20), @i8_mem_floor_kb) + N' KB).'
                         ELSE N''
                     END,
                 CASE
@@ -5574,7 +6070,9 @@ BEGIN
         FROM #runs AS r
         WHERE r.IsKilled = 0
         AND   r.CriticalTables IS NOT NULL
-        AND   r.CriticalTables IS NOT NULL   /* element presence implied by non-NULL value */
+        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* o2md.10: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
+                                                           so an unset parameter arrives as '' rather than NULL.  A real emptiness
+                                                           test is required -- the former duplicate IS NOT NULL was always true. */
         AND   NOT EXISTS (
             SELECT 1
             FROM #stat_updates AS su
@@ -5594,7 +6092,9 @@ BEGIN
         FROM #runs AS r
         WHERE r.IsKilled = 0
         AND   r.CriticalTables IS NOT NULL
-        AND   r.CriticalTables IS NOT NULL   /* element presence implied by non-NULL value */
+        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* o2md.10: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
+                                                           so an unset parameter arrives as '' rather than NULL.  A real emptiness
+                                                           test is required -- the former duplicate IS NOT NULL was always true. */
         AND   NOT EXISTS (
             SELECT 1
             FROM #stat_updates AS su
@@ -5642,7 +6142,9 @@ BEGIN
         FROM #runs AS r
         WHERE r.IsKilled = 0
         AND   r.CriticalTables IS NOT NULL
-        AND   r.CriticalTables IS NOT NULL   /* element presence implied by non-NULL value */
+        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* o2md.10: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
+                                                           so an unset parameter arrives as '' rather than NULL.  A real emptiness
+                                                           test is required -- the former duplicate IS NOT NULL was always true. */
         AND   EXISTS (
             SELECT 1
             FROM #stat_updates AS su
@@ -5669,7 +6171,7 @@ BEGIN
             ON r.RunLabel = su.RunLabel
             AND r.IsKilled = 0
             AND r.CriticalTables IS NOT NULL
-            AND r.CriticalTables IS NOT NULL;
+            AND LEN(LTRIM(RTRIM(r.CriticalTables))) > 0;   /* o2md.10: XSINIL -- unset params read as '' not NULL */
 
         /* Pull pattern and CriticalTablesFirst from most recent qualifying run */
         SELECT TOP (1)
@@ -5678,7 +6180,9 @@ BEGIN
         FROM #runs AS r
         WHERE r.IsKilled = 0
         AND   r.CriticalTables IS NOT NULL
-        AND   r.CriticalTables IS NOT NULL   /* element presence implied by non-NULL value */
+        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* o2md.10: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
+                                                           so an unset parameter arrives as '' rather than NULL.  A real emptiness
+                                                           test is required -- the former duplicate IS NOT NULL was always true. */
         ORDER BY r.StartTime DESC;
 
         INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
