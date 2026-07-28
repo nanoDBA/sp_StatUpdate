@@ -36,11 +36,48 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.8.1.2026.07.25 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.8.2.2026.07.28 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.8.1.2026.07.25 - MONITORING: per-stat CONTEXT_INFO refresh
+History:    3.8.2.2026.07.28 - SILENT NO-OP: fleet analysis batch (o2md).
+                            Found by the 40-server production diagnostic sweep
+                            of 2026-07-28, where ~50 nightly maintenance windows
+                            reported SUCCESS while processing zero statistics.
+
+                            o2md.1 (P0) -- the lazy mop-up branches that discover
+                            0 stats for a claimed table, and their CATCH, released
+                            the claim and NULLed @claimed_table_* but had no
+                            CONTINUE.  Control fell through to the work-claim
+                            block, whose parallel predicate compares against those
+                            now-NULL variables, matched 0 rows, and exited the run
+                            with @stop_reason = COMPLETED -- abandoning every
+                            remaining queued table.  Signature in the wild:
+                            StatsFound decaying by roughly one table per night
+                            (1779 -> 1746 -> 1710 -> 1704) with StatsProcessed = 0.
+                            Distinct from sp_StatUpdate-v31y, which covers the
+                            PARALLEL_COMPLETE variant.
+
+                            o2md.2 (P1) -- @remaining_stats counted
+                            #stats_to_process, which is structurally empty when
+                            @skip_discovery = 1 (worker joined an existing queue),
+                            so StatsRemaining reported 0 no matter how much work
+                            was outstanding.  Now derived from dbo.QueueStatistic
+                            in parallel mode, split under its own IF so the
+                            optional table is not name-resolved on non-parallel
+                            runs (cf. sp_StatUpdate-isa2).
+
+                            o2md.3 (P1) -- StatsFound > 0 with StatsProcessed = 0
+                            now grades Status = ERROR, emits the SILENT_NOOP
+                            warning code, and returns 2 so SQL Agent fails the
+                            job.  Detection previously existed only in
+                            sp_StatUpdate_Diag, so no-ops went unnoticed for weeks.
+
+                            o2md.9 (P3) -- the lazy mop-up zero-stats debug message
+                            interpolated @claimed_table_* after they were NULLed
+                            and always rendered NULL.NULL.
+
+            3.8.1.2026.07.25 - MONITORING: per-stat CONTEXT_INFO refresh
                             (sp_StatUpdate-03i3 / gh-538).  The gh-423
                             CONTEXT_INFO set at proc entry was static for the
                             whole run (DB/Job/Preset only) -- a DBA using
@@ -714,7 +751,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.8.1.2026.07.25',
+        @procedure_version varchar(20) = '3.8.2.2026.07.28',
         @procedure_version_date datetime = '20260725',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -823,7 +860,7 @@ BEGIN
             (N'PRESETS',       N'Packaged configs: DEFAULT=balanced, NIGHTLY=1h+QS+mop-up, WEEKLY_FULL=4h+FULLSCAN, OLTP_LIGHT=30m+high-thresh, WAREHOUSE=unlimited+FULLSCAN.  Bounded overrides when using a preset: @TimeLimit, @ModificationThreshold, @SortOrder, @StatisticsSample, @MopUpPass, @QueryStore, @LockTimeout -- these are wired to override preset internals.  All other params (e.g. @Databases, @Tables, @LogToTable) are independent of presets.'),
             (N'CONTEXT_INFO',  N'@JobName=NMyJobName sets CONTEXT_INFO on entry, restored on exit.  Visible in XE sessions, dm_exec_requests, and any session-level monitoring.'),
             (N'COLUMNSTORE',   N'@SkipTablesWithNCCI=Y (default) skips tables with nonclustered columnstore (plan stability).  @SkipTablesWithCCI=N (default) updates CCI tables.'),
-            (N'WARNINGS',      N'@WarningsCodesOut returns pipe-delimited codes for programmatic parsing.  @WarningsOut is human-readable.  Same codes appear in END row Summary/WarningsCodes element.  Policy: codes may be added in any release, never renamed/removed without a major version bump.  Current tokens: AG_SECONDARY_SERVER|ELASTIC_POOL|RCSI_VERSION_STORE|DEAD_WORKER_TIMEOUT_NULL_COERCED|EMPTY_STRING_PARAM|AZURE_SQL_DB|AZURE_SQL_MI|AZURE_SQL_EDGE|CASE_SENSITIVE_COLLATION|LOW_UPTIME|BACKUP_RUNNING|PEAK_HOURS|CONTAINER_MEMORY|DB_SKIPPED|RLS_DETECTED|RLS_CHECK_FAILED|WIDESTAT_CHECK_FAILED|FILTER_MISMATCH|FILTER_CHECK_FAILED|COLUMNSTORE_TABLES|COLUMNSTORE_CHECK_FAILED|COMPRESSED_CHECK_FAILED|COMPUTEDCOL_CHECK_FAILED|CDC_TABLES|REPLICATION_MAJORITY|PARALLEL_ORPHAN_BACKLOG|STALE_QUEUE_SWEEP|BACKUP_STARTED_MID_RUN|LOG_SPACE_HIGH|PERSIST_SAMPLE_INADEQUATE|IO_CORRUPTION|STOPBYTIME_OVERSHOOT|QS_FORCED_PLANS|TOCTOU_SKIPS|CONSECUTIVE_FAILURES_ELEVATED'),
+            (N'WARNINGS',      N'@WarningsCodesOut returns pipe-delimited codes for programmatic parsing.  @WarningsOut is human-readable.  Same codes appear in END row Summary/WarningsCodes element.  Policy: codes may be added in any release, never renamed/removed without a major version bump.  Current tokens: AG_SECONDARY_SERVER|ELASTIC_POOL|RCSI_VERSION_STORE|DEAD_WORKER_TIMEOUT_NULL_COERCED|EMPTY_STRING_PARAM|AZURE_SQL_DB|AZURE_SQL_MI|AZURE_SQL_EDGE|CASE_SENSITIVE_COLLATION|LOW_UPTIME|BACKUP_RUNNING|PEAK_HOURS|CONTAINER_MEMORY|DB_SKIPPED|RLS_DETECTED|RLS_CHECK_FAILED|WIDESTAT_CHECK_FAILED|FILTER_MISMATCH|FILTER_CHECK_FAILED|COLUMNSTORE_TABLES|COLUMNSTORE_CHECK_FAILED|COMPRESSED_CHECK_FAILED|COMPUTEDCOL_CHECK_FAILED|CDC_TABLES|REPLICATION_MAJORITY|PARALLEL_ORPHAN_BACKLOG|STALE_QUEUE_SWEEP|BACKUP_STARTED_MID_RUN|LOG_SPACE_HIGH|PERSIST_SAMPLE_INADEQUATE|IO_CORRUPTION|STOPBYTIME_OVERSHOOT|QS_FORCED_PLANS|TOCTOU_SKIPS|CONSECUTIVE_FAILURES_ELEVATED|SILENT_NOOP'),
             (N'PARALLEL',      N'@StatsInParallel=Y. Requires dbo.Queue + dbo.QueueStatistic (auto-created). Run same EXEC from multiple Agent steps. AG-secondary guard and orphan-row sweep run at startup.'),
             (N'QUERY STORE',   N'@QueryStore=CPU/DURATION/READS/etc. to prioritize stats on high-workload tables.  WAITS filters to Buffer Latch, Buffer IO, Memory, Other Disk IO -- wait classes statistics quality can influence.  WAIT_CPU: CPU-scheduler waits (SOS_SCHEDULER_YIELD) -- wait-bound queries the runtime metrics miss.  OFF to disable.  NOTE: these metrics PRESELECT which stats to update BEFORE the run; they are not proof of a spill in the UPDATE STATISTICS statement itself -- see SPILL PROOF.'),
             (N'SPILL PROOF',   N'Query Store TEMPDB_SPILLS/WAITS/WAIT_CPU rank candidates BEFORE the run; they are NOT evidence about the generated UPDATE STATISTICS statements.  For truthful proof of a sort spill in the stats-update command, run sp_StatUpdate_XE_Session.sql: its sort_warning event is the proof surface (hash_warning is secondary context), correlatable to the CommandLog UPDATE_STATISTICS row by time + statement (gh-552).'),
@@ -8032,15 +8069,24 @@ OPTION (RECOMPILE);';
                                 AND   qs.SchemaName = @claimed_table_schema
                                 AND   qs.ObjectName = @claimed_table_name;
 
+                                /* o2md.9: emit BEFORE nulling the claim variables -- the
+                                   previous ordering always rendered NULL.NULL. */
+                                IF @Debug = 1
+                                    RAISERROR(N'  Lazy mop-up: 0 stats for %s.%s -- skipping table', 10, 1,
+                                        @claimed_table_schema, @claimed_table_name) WITH NOWAIT;
+
                                 SELECT
                                     @claimed_table_database = NULL,
                                     @claimed_table_schema = NULL,
                                     @claimed_table_name = NULL,
                                     @claimed_table_object_id = NULL;
 
-                                IF @Debug = 1
-                                    RAISERROR(N'  Lazy mop-up: 0 stats for %s.%s -- skipping table', 10, 1,
-                                        @claimed_table_schema, @claimed_table_name) WITH NOWAIT;
+                                /* o2md.1: MUST re-enter the loop to claim a new table.  Without
+                                   CONTINUE, control falls through to the work-claim block whose
+                                   parallel predicate compares against the now-NULL
+                                   @claimed_table_* variables, matches 0 rows, and exits the run
+                                   with @stop_reason = COMPLETED leaving all queued work undone. */
+                                CONTINUE;
                             END;
                         END TRY
                         BEGIN CATCH
@@ -8068,6 +8114,11 @@ OPTION (RECOMPILE);';
                                 @claimed_table_schema = NULL,
                                 @claimed_table_name = NULL,
                                 @claimed_table_object_id = NULL;
+
+                            /* o2md.1: same fall-through hazard as the zero-rows branch above --
+                               re-enter the loop rather than dropping into the work-claim block
+                               with a NULL claim. */
+                            CONTINUE;
                         END CATCH;
                     END;
                 END;
@@ -10724,6 +10775,53 @@ OPTION (RECOMPILE);';
         @end_time_display nvarchar(30) = CONVERT(nvarchar(30), SYSDATETIME(), 121);
 
     /*
+    o2md.2: under @skip_discovery = 1 this worker joined an existing queue and
+    #stats_to_process was never populated, so the COUNT above is structurally 0
+    no matter how much queued work is still outstanding.  That is what let a no-op
+    run report StatsRemaining = 0 and grade SUCCESS.  Derive remaining from the
+    queue instead.
+
+    Statement is split under its own IF (matching the @total_stats pattern above)
+    so the dbo.QueueStatistic reference is only name-resolved in parallel mode --
+    referencing it unconditionally fails with Msg 208 on non-parallel runs where
+    the optional table does not exist (see sp_StatUpdate-isa2).
+    */
+    IF @skip_discovery = 1
+        SET @remaining_stats =
+        (
+            SELECT ISNULL(SUM(qs.StatsCount), 0)
+            FROM dbo.QueueStatistic AS qs
+            WHERE qs.QueueID = @queue_id
+            AND   qs.TableEndTime IS NULL
+        );
+
+    /*
+    o2md.3: a run that discovered work and processed none of it is a silent no-op,
+    not a success.  At least two distinct mechanisms produce it (zombied parallel
+    queue leadership -- sp_StatUpdate-v31y; and the lazy mop-up fall-through --
+    o2md.1), so classify on the observable outcome rather than on either cause.
+    Guarded on @Execute = 'Y' because a dry run legitimately processes nothing.
+    */
+    DECLARE @silent_noop bit =
+        CASE
+            WHEN @Execute = N'Y'
+             AND @total_stats > 0
+             AND @stats_processed = 0
+            THEN 1
+            ELSE 0
+        END;
+
+    IF @silent_noop = 1
+    BEGIN
+        SET @WarningsOut = ISNULL(@WarningsOut, N'') +
+            N'SILENT_NOOP: discovered ' + CONVERT(nvarchar(20), @total_stats) +
+            N' stat(s) and processed none; ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'SILENT_NOOP';
+
+        RAISERROR(N'SILENT NO-OP: %d statistic(s) were discovered and none were processed. Statistics maintenance did NOT happen this run.', 10, 1, @total_stats) WITH NOWAIT;
+    END;
+
+    /*
     Determine stop reason if not already set
     */
     IF @stop_reason IS NULL
@@ -11164,6 +11262,8 @@ OPTION (RECOMPILE);';
         /* Build JSON summary for monitoring integration (v2.3) */
         DECLARE @json_status nvarchar(10) =
             CASE
+                /* o2md.3: keep the CommandLog footer consistent with the Status column */
+                WHEN @silent_noop = 1 THEN N'ERROR'
                 WHEN @stats_failed > 0 THEN N'ERROR'
                 WHEN @remaining_stats > 0 THEN N'WARNING'
                 ELSE N'OK'
@@ -11282,12 +11382,17 @@ OPTION (RECOMPILE);';
           SUCCESS = All discovered stats updated without issues
         */
         Status = CASE
+            /* o2md.3: discovered work but processed none -- never a success */
+            WHEN @silent_noop = 1 THEN N'ERROR'
             WHEN @stats_failed > 0 THEN N'ERROR'
             WHEN @remaining_stats > 0 THEN N'WARNING'
             WHEN @stats_skipped > 0 AND @Execute = N'Y' THEN N'WARNING'
             ELSE N'SUCCESS'
         END,
         StatusMessage = CASE
+            WHEN @silent_noop = 1
+                THEN N'SILENT NO-OP: ' + CONVERT(nvarchar(10), @total_stats)
+                    + N' stat(s) discovered, 0 processed (' + ISNULL(@stop_reason, N'unknown') + N')'
             WHEN @stats_failed > 0 AND @remaining_stats > 0
                 THEN N'Failed: ' + CONVERT(nvarchar(10), @stats_failed) + N' stat(s), '
                     + CONVERT(nvarchar(10), @remaining_stats) + N' remaining (' + ISNULL(@stop_reason, N'unknown') + N')'
@@ -11324,6 +11429,16 @@ OPTION (RECOMPILE);';
     IF @stats_failed > 0 AND @return_code = 0
     BEGIN
         SELECT @return_code = 1; /*Generic failure code for Agent jobs*/
+    END;
+
+    /*
+    o2md.3: a silent no-op must fail the Agent job too.  Previously these runs
+    returned 0 and reported SUCCESS, so ~50 nightly windows across the fleet
+    passed green while no statistics maintenance happened at all.
+    */
+    IF @silent_noop = 1 AND @return_code = 0
+    BEGIN
+        SELECT @return_code = 2; /*Discovered work, processed none*/
     END;
 
     /*
