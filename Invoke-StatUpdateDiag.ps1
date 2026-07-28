@@ -527,9 +527,22 @@ function ConvertTo-MarkdownTable {
 }
 
 function Build-MarkdownReport {
-    param([hashtable]$AllResults, [System.Collections.Generic.List[PSObject]]$AllRecommendations, [bool]$IsObfuscated)
+    param(
+        [hashtable]$AllResults,
+        [System.Collections.Generic.List[PSObject]]$AllRecommendations,
+        [bool]$IsObfuscated,
+        [PSObject[]]$ConnectionErrors = @()
+    )
 
     $report = [System.Text.StringBuilder]::new()
+
+    # Counts MUST come from the recommendation list actually being rendered.
+    # (Previously these read script-scope $criticalCount/$warningCount/$infoCount,
+    #  which are computed from the non-obfuscated pass, so the SAFE_TO_SHARE
+    #  report's summary disagreed with its own body.)
+    $critCount = @($AllRecommendations | Where-Object { $_.Severity -eq "CRITICAL" }).Count
+    $warnCount = @($AllRecommendations | Where-Object { $_.Severity -eq "WARNING" }).Count
+    $nfoCount  = @($AllRecommendations | Where-Object { $_.Severity -eq "INFO" }).Count
 
     [void]$report.AppendLine("# sp_StatUpdate Diagnostic Report")
     [void]$report.AppendLine("")
@@ -544,35 +557,71 @@ function Build-MarkdownReport {
     [void]$report.AppendLine("")
     [void]$report.AppendLine("| Severity | Count |")
     [void]$report.AppendLine("| --- | --- |")
-    [void]$report.AppendLine("| CRITICAL | $criticalCount |")
-    [void]$report.AppendLine("| WARNING | $warningCount |")
-    [void]$report.AppendLine("| INFO | $infoCount |")
+    [void]$report.AppendLine("| CRITICAL | $critCount |")
+    [void]$report.AppendLine("| WARNING | $warnCount |")
+    [void]$report.AppendLine("| INFO | $nfoCount |")
     [void]$report.AppendLine("")
 
-    # Recommendations by severity
+    # Recommendations by severity.
+    # Findings that are identical apart from the server they came from are
+    # emitted once with a server list instead of repeated verbatim per server.
     foreach ($severity in @("CRITICAL", "WARNING", "INFO")) {
-        $findings = $AllRecommendations | Where-Object { $_.Severity -eq $severity }
+        $findings = @($AllRecommendations | Where-Object { $_.Severity -eq $severity })
         if ($findings.Count -eq 0) { continue }
+
+        $groups = @($findings | Group-Object -Property { "$($_.Category)`u{241F}$($_.Finding)`u{241F}$($_.Recommendation)`u{241F}$($_.ExampleCall)" })
 
         [void]$report.AppendLine("## $severity Findings")
         [void]$report.AppendLine("")
+        if ($groups.Count -lt $findings.Count) {
+            [void]$report.AppendLine("*$($findings.Count) finding(s) across all servers, grouped into $($groups.Count) distinct issue(s).*")
+            [void]$report.AppendLine("")
+        }
 
-        foreach ($finding in $findings) {
-            [void]$report.AppendLine("### [$($finding.Category)] $($finding.Finding)")
+        $ordered = $groups | Sort-Object -Property @{ Expression = { $_.Count }; Descending = $true }, Name
+        foreach ($group in $ordered) {
+            $first = $group.Group[0]
+            $groupServers = @($group.Group | ForEach-Object { $_.Server } | Sort-Object -Unique)
+
+            [void]$report.AppendLine("### [$($first.Category)] $($first.Finding)")
             [void]$report.AppendLine("")
-            [void]$report.AppendLine("**Server:** $($finding.Server)")
+
+            if ($groupServers.Count -eq 1) {
+                [void]$report.AppendLine("**Server:** $($groupServers[0])")
+            }
+            else {
+                [void]$report.AppendLine("**Servers ($($groupServers.Count)):** $($groupServers -join ', ')")
+            }
             [void]$report.AppendLine("")
-            if ($finding.Evidence) {
-                [void]$report.AppendLine("**Evidence:** $($finding.Evidence)")
+
+            $evidence = @($group.Group | Where-Object { $_.Evidence } | Select-Object -Property Server, Evidence)
+            $distinctEvidence = @($evidence | ForEach-Object { $_.Evidence } | Sort-Object -Unique)
+            if ($distinctEvidence.Count -eq 1) {
+                [void]$report.AppendLine("**Evidence:** $($distinctEvidence[0])")
                 [void]$report.AppendLine("")
             }
-            if ($finding.Recommendation) {
-                [void]$report.AppendLine("**Recommendation:** $($finding.Recommendation)")
+            elseif ($distinctEvidence.Count -gt 1) {
+                [void]$report.AppendLine("**Evidence (per server):**")
+                [void]$report.AppendLine("")
+                $shown = 0
+                foreach ($e in ($evidence | Sort-Object Server)) {
+                    if ($shown -ge 20) {
+                        [void]$report.AppendLine("- *... $($evidence.Count - 20) more server(s)*")
+                        break
+                    }
+                    [void]$report.AppendLine("- **$($e.Server)**: $($e.Evidence)")
+                    $shown++
+                }
                 [void]$report.AppendLine("")
             }
-            if ($finding.ExampleCall) {
+
+            if ($first.Recommendation) {
+                [void]$report.AppendLine("**Recommendation:** $($first.Recommendation)")
+                [void]$report.AppendLine("")
+            }
+            if ($first.ExampleCall) {
                 [void]$report.AppendLine('```sql')
-                [void]$report.AppendLine($finding.ExampleCall)
+                [void]$report.AppendLine($first.ExampleCall)
                 [void]$report.AppendLine('```')
                 [void]$report.AppendLine("")
             }
@@ -589,6 +638,13 @@ function Build-MarkdownReport {
         [void]$report.AppendLine("### Server: $(Get-DisplayName $server)")
         [void]$report.AppendLine("")
 
+        # Executive Dashboard (RS 1) - letter grades and health score
+        if ($data.Dashboard -and $data.Dashboard.Rows.Count -gt 0) {
+            [void]$report.AppendLine("#### Executive Dashboard")
+            [void]$report.AppendLine("")
+            [void]$report.AppendLine((ConvertTo-MarkdownTable -Table $data.Dashboard -MaxRows 20))
+        }
+
         # Run Health
         if ($data.RunHealth -and $data.RunHealth.Rows.Count -gt 0) {
             [void]$report.AppendLine("#### Run Health Summary")
@@ -598,39 +654,40 @@ function Build-MarkdownReport {
             [void]$report.AppendLine("| --- | --- |")
             foreach ($col in $data.RunHealth.Columns) {
                 $val = $rh[$col.ColumnName]
-                $displayVal = if ($val -eq [DBNull]::Value) { "N/A" } else { $val.ToString() }
+                $displayVal = if ($val -eq [DBNull]::Value) { "N/A" } else { $val.ToString().Replace("|", "\|").Replace("`n", " ") }
                 [void]$report.AppendLine("| $($col.ColumnName) | $displayVal |")
             }
             [void]$report.AppendLine("")
         }
 
-        # Top Tables
-        if ($data.TopTables -and $data.TopTables.Rows.Count -gt 0) {
-            [void]$report.AppendLine("#### Top Tables by Maintenance Cost")
-            [void]$report.AppendLine("")
-            [void]$report.AppendLine((ConvertTo-MarkdownTable -Table $data.TopTables -MaxRows 10))
-        }
+        # Remaining collected result sets. Row caps keep a 40-server report readable.
+        $sections = @(
+            @{ Key = "RunDetail";        Title = "Recent Runs";                     MaxRows = 5 },
+            @{ Key = "TopTables";        Title = "Top Tables by Maintenance Cost";  MaxRows = 5 },
+            @{ Key = "FailingStats";     Title = "Failing Statistics";              MaxRows = 5 },
+            @{ Key = "LongRunning";      Title = "Long-Running Statistics";         MaxRows = 5 },
+            @{ Key = "ParamHistory";     Title = "Parameter Change History";        MaxRows = 5 },
+            @{ Key = "EfficacyTrend";    Title = "Query Store Efficacy Trend";      MaxRows = 8 },
+            @{ Key = "EfficacyDetail";   Title = "Query Store Efficacy Detail";     MaxRows = 5 },
+            @{ Key = "HighCpuPositions"; Title = "High-CPU Statistic Positions";    MaxRows = 5 },
+            @{ Key = "QSCorrelation";    Title = "Query Store Performance Correlation"; MaxRows = 5 }
+        )
 
-        # Failing Stats
-        if ($data.FailingStats -and $data.FailingStats.Rows.Count -gt 0) {
-            [void]$report.AppendLine("#### Failing Statistics")
-            [void]$report.AppendLine("")
-            [void]$report.AppendLine((ConvertTo-MarkdownTable -Table $data.FailingStats -MaxRows 10))
-        }
-
-        # Long-Running Stats
-        if ($data.LongRunning -and $data.LongRunning.Rows.Count -gt 0) {
-            [void]$report.AppendLine("#### Long-Running Statistics")
-            [void]$report.AppendLine("")
-            [void]$report.AppendLine((ConvertTo-MarkdownTable -Table $data.LongRunning -MaxRows 10))
+        foreach ($section in $sections) {
+            $table = $data[$section.Key]
+            if ($table -and $table.Rows.Count -gt 0) {
+                [void]$report.AppendLine("#### $($section.Title)")
+                [void]$report.AppendLine("")
+                [void]$report.AppendLine((ConvertTo-MarkdownTable -Table $table -MaxRows $section.MaxRows))
+            }
         }
     }
 
     # Connection failures
-    if ($allErrors.Count -gt 0) {
+    if ($ConnectionErrors -and $ConnectionErrors.Count -gt 0) {
         [void]$report.AppendLine("## Connection Failures")
         [void]$report.AppendLine("")
-        foreach ($err in $allErrors) {
+        foreach ($err in $ConnectionErrors) {
             $errServer = Get-DisplayName $err.Server
             [void]$report.AppendLine("- **$errServer**: $($err.Error)")
         }
@@ -679,9 +736,11 @@ function Build-JsonOutput {
         DaysBack            = $DaysBack
         Obfuscated          = $StripObfuscationMap
         Summary             = @{
-            Critical = $criticalCount
-            Warning  = $warningCount
-            Info     = $infoCount
+            # Counted from the list being serialized, not from script scope --
+            # the obfuscated pass carries a different recommendation list.
+            Critical = @($AllRecommendations | Where-Object { $_.Severity -eq "CRITICAL" }).Count
+            Warning  = @($AllRecommendations | Where-Object { $_.Severity -eq "WARNING" }).Count
+            Info     = @($AllRecommendations | Where-Object { $_.Severity -eq "INFO" }).Count
         }
         Recommendations     = @($AllRecommendations | ForEach-Object {
             @{
@@ -781,10 +840,162 @@ function New-DecodeSqlScript {
 }
 
 # =============================================================================
+# Markdown -> HTML rendering
+# =============================================================================
+
+function Format-HtmlInline {
+    param([string]$Text)
+
+    $t = $Text -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;'
+    $t = $t -replace '`([^`]+)`', '<code>$1</code>'
+    $t = $t -replace '\*\*([^*]+)\*\*', '<strong>$1</strong>'
+    $t = $t -replace '(?<!\*)\*([^*]+)\*(?!\*)', '<em>$1</em>'
+    return $t
+}
+
+function ConvertTo-HtmlTable {
+    param([string[]]$Lines)
+
+    $rows = [System.Collections.Generic.List[string[]]]::new()
+    foreach ($line in $Lines) {
+        $trim = $line.Trim()
+        if ($trim.StartsWith("|")) { $trim = $trim.Substring(1) }
+        if ($trim.EndsWith("|")) { $trim = $trim.Substring(0, [Math]::Max(0, $trim.Length - 1)) }
+        # Split on pipes that were not escaped by ConvertTo-MarkdownTable
+        $cells = @([regex]::Split($trim, '(?<!\\)\|') | ForEach-Object { $_.Trim().Replace('\|', '|') })
+        $rows.Add($cells)
+    }
+    if ($rows.Count -eq 0) { return "" }
+
+    $sb = [System.Text.StringBuilder]::new()
+    [void]$sb.AppendLine("<table>")
+    [void]$sb.Append("<thead><tr>")
+    foreach ($cell in $rows[0]) { [void]$sb.Append("<th>$(Format-HtmlInline $cell)</th>") }
+    [void]$sb.AppendLine("</tr></thead>")
+
+    # Row 1 is the markdown separator (---) when present
+    $start = 1
+    if ($rows.Count -gt 1 -and @($rows[1] | Where-Object { $_ -notmatch '^:?-{2,}:?$' }).Count -eq 0) { $start = 2 }
+
+    if ($rows.Count -gt $start) {
+        [void]$sb.AppendLine("<tbody>")
+        for ($r = $start; $r -lt $rows.Count; $r++) {
+            [void]$sb.Append("<tr>")
+            foreach ($cell in $rows[$r]) { [void]$sb.Append("<td>$(Format-HtmlInline $cell)</td>") }
+            [void]$sb.AppendLine("</tr>")
+        }
+        [void]$sb.AppendLine("</tbody>")
+    }
+    [void]$sb.AppendLine("</table>")
+    return $sb.ToString()
+}
+
+function ConvertTo-HtmlBody {
+    param([string]$Markdown)
+
+    $out = [System.Text.StringBuilder]::new()
+    $lines = @($Markdown -split "`r?`n")
+    $i = 0
+
+    while ($i -lt $lines.Count) {
+        $line = $lines[$i]
+
+        # Fenced code block
+        if ($line -match '^\s*```') {
+            $i++
+            $code = [System.Collections.Generic.List[string]]::new()
+            while ($i -lt $lines.Count -and $lines[$i] -notmatch '^\s*```') {
+                $code.Add($lines[$i])
+                $i++
+            }
+            $i++  # closing fence
+            $escaped = ($code -join "`n") -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;'
+            [void]$out.AppendLine("<pre><code>$escaped</code></pre>")
+            continue
+        }
+
+        # Table (consume the whole contiguous block)
+        if ($line -match '^\s*\|.*\|\s*$') {
+            $tbl = [System.Collections.Generic.List[string]]::new()
+            while ($i -lt $lines.Count -and $lines[$i] -match '^\s*\|.*\|\s*$') {
+                $tbl.Add($lines[$i])
+                $i++
+            }
+            [void]$out.AppendLine((ConvertTo-HtmlTable -Lines $tbl.ToArray()))
+            continue
+        }
+
+        # Headings - most specific first, otherwise '### x' matches the h1 pattern
+        if ($line -match '^######\s+(.*)$') { [void]$out.AppendLine("<h6>$(Format-HtmlInline $Matches[1])</h6>"); $i++; continue }
+        if ($line -match '^#####\s+(.*)$')  { [void]$out.AppendLine("<h5>$(Format-HtmlInline $Matches[1])</h5>"); $i++; continue }
+        if ($line -match '^####\s+(.*)$')   { [void]$out.AppendLine("<h4>$(Format-HtmlInline $Matches[1])</h4>"); $i++; continue }
+        if ($line -match '^###\s+(.*)$')    { [void]$out.AppendLine("<h3>$(Format-HtmlInline $Matches[1])</h3>"); $i++; continue }
+        if ($line -match '^##\s+(.*)$')     { [void]$out.AppendLine("<h2>$(Format-HtmlInline $Matches[1])</h2>"); $i++; continue }
+        if ($line -match '^#\s+(.*)$')      { [void]$out.AppendLine("<h1>$(Format-HtmlInline $Matches[1])</h1>"); $i++; continue }
+
+        # Horizontal rule
+        if ($line -match '^\s*-{3,}\s*$') { [void]$out.AppendLine("<hr />"); $i++; continue }
+
+        # Unordered list
+        if ($line -match '^\s*-\s+(.*)$') {
+            [void]$out.AppendLine("<ul>")
+            while ($i -lt $lines.Count -and $lines[$i] -match '^\s*-\s+(.*)$') {
+                [void]$out.AppendLine("<li>$(Format-HtmlInline $Matches[1])</li>")
+                $i++
+            }
+            [void]$out.AppendLine("</ul>")
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($line)) { $i++; continue }
+
+        [void]$out.AppendLine("<p>$(Format-HtmlInline $line)</p>")
+        $i++
+    }
+
+    return $out.ToString()
+}
+
+function New-HtmlDocument {
+    param([string]$Markdown, [string]$Title)
+
+    $body = ConvertTo-HtmlBody -Markdown $Markdown
+
+    return @"
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>$Title</title>
+<style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+    h1 { color: #1a1a2e; border-bottom: 3px solid #16213e; padding-bottom: 10px; }
+    h2 { color: #16213e; margin-top: 30px; }
+    h3 { color: #0f3460; }
+    h4 { color: #0f3460; }
+    table { border-collapse: collapse; width: 100%; margin: 10px 0; background: white; display: block; overflow-x: auto; }
+    th { background: #16213e; color: white; padding: 8px 12px; text-align: left; }
+    td { padding: 6px 12px; border-bottom: 1px solid #eee; }
+    tr:hover td { background: #f0f0f0; }
+    code, pre { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; font-family: 'Cascadia Code', Consolas, monospace; }
+    pre { padding: 12px; overflow-x: auto; }
+    .critical { color: #d32f2f; font-weight: bold; }
+    .warning { color: #f57c00; font-weight: bold; }
+    .info { color: #1976d2; }
+</style>
+</head>
+<body>
+$body
+</body>
+</html>
+"@
+}
+
+# =============================================================================
 # Build report content (Markdown used for Markdown and HTML formats)
 # =============================================================================
 
-$reportContent = Build-MarkdownReport -AllResults $allResults -AllRecommendations $allRecommendations -IsObfuscated $false
+$reportContent = Build-MarkdownReport -AllResults $allResults -AllRecommendations $allRecommendations -IsObfuscated $false -ConnectionErrors @($allErrors)
 
 # =============================================================================
 # Output
@@ -846,73 +1057,21 @@ if ($Obfuscate) {
 
             # SAFE_TO_SHARE (obfuscated)
             $safePath = Join-Path $OutputPath "${baseFileName}_SAFE_TO_SHARE.md"
-            $safeReport = Build-MarkdownReport -AllResults $safeResults -AllRecommendations $obfRecommendations -IsObfuscated $true
+            $safeReport = Build-MarkdownReport -AllResults $safeResults -AllRecommendations $obfRecommendations -IsObfuscated $true -ConnectionErrors @($allErrors)
             $safeReport | Out-File -FilePath $safePath -Encoding UTF8
             Write-Host "  SAFE_TO_SHARE: $safePath" -ForegroundColor Green
         }
         "HTML" {
             # CONFIDENTIAL
             $confPath = Join-Path $OutputPath "${baseFileName}_CONFIDENTIAL.html"
-            $html = @"
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>sp_StatUpdate Diagnostic Report (CONFIDENTIAL)</title>
-<style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
-    h1 { color: #1a1a2e; border-bottom: 3px solid #16213e; padding-bottom: 10px; }
-    h2 { color: #16213e; margin-top: 30px; }
-    h3 { color: #0f3460; }
-    table { border-collapse: collapse; width: 100%; margin: 10px 0; background: white; }
-    th { background: #16213e; color: white; padding: 8px 12px; text-align: left; }
-    td { padding: 6px 12px; border-bottom: 1px solid #eee; }
-    tr:hover td { background: #f0f0f0; }
-    code, pre { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; font-family: 'Cascadia Code', Consolas, monospace; }
-    pre { padding: 12px; overflow-x: auto; }
-    .critical { color: #d32f2f; font-weight: bold; }
-    .warning { color: #f57c00; font-weight: bold; }
-    .info { color: #1976d2; }
-</style>
-</head>
-<body>
-$($reportContent -replace '```sql\r?\n(.*?)\r?\n```', '<pre><code>$1</code></pre>' -replace '\*\*([^*]+)\*\*', '<strong>$1</strong>' -replace '# (.+)', '<h1>$1</h1>' -replace '## (.+)', '<h2>$1</h2>' -replace '### (.+)', '<h3>$1</h3>')
-</body>
-</html>
-"@
+            $html = New-HtmlDocument -Markdown $reportContent -Title "sp_StatUpdate Diagnostic Report (CONFIDENTIAL)"
             $html | Out-File -FilePath $confPath -Encoding UTF8
             Write-Host "  CONFIDENTIAL: $confPath" -ForegroundColor Yellow
 
             # SAFE_TO_SHARE
             $safePath = Join-Path $OutputPath "${baseFileName}_SAFE_TO_SHARE.html"
-            $safeReport = Build-MarkdownReport -AllResults $safeResults -AllRecommendations $obfRecommendations -IsObfuscated $true
-            $safeHtml = @"
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>sp_StatUpdate Diagnostic Report (Safe to Share)</title>
-<style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
-    h1 { color: #1a1a2e; border-bottom: 3px solid #16213e; padding-bottom: 10px; }
-    h2 { color: #16213e; margin-top: 30px; }
-    h3 { color: #0f3460; }
-    table { border-collapse: collapse; width: 100%; margin: 10px 0; background: white; }
-    th { background: #16213e; color: white; padding: 8px 12px; text-align: left; }
-    td { padding: 6px 12px; border-bottom: 1px solid #eee; }
-    tr:hover td { background: #f0f0f0; }
-    code, pre { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; font-family: 'Cascadia Code', Consolas, monospace; }
-    pre { padding: 12px; overflow-x: auto; }
-    .critical { color: #d32f2f; font-weight: bold; }
-    .warning { color: #f57c00; font-weight: bold; }
-    .info { color: #1976d2; }
-</style>
-</head>
-<body>
-$($safeReport -replace '```sql\r?\n(.*?)\r?\n```', '<pre><code>$1</code></pre>' -replace '\*\*([^*]+)\*\*', '<strong>$1</strong>' -replace '# (.+)', '<h1>$1</h1>' -replace '## (.+)', '<h2>$1</h2>' -replace '### (.+)', '<h3>$1</h3>')
-</body>
-</html>
-"@
+            $safeReport = Build-MarkdownReport -AllResults $safeResults -AllRecommendations $obfRecommendations -IsObfuscated $true -ConnectionErrors @($allErrors)
+            $safeHtml = New-HtmlDocument -Markdown $safeReport -Title "sp_StatUpdate Diagnostic Report (Safe to Share)"
             $safeHtml | Out-File -FilePath $safePath -Encoding UTF8
             Write-Host "  SAFE_TO_SHARE: $safePath" -ForegroundColor Green
         }
@@ -961,33 +1120,7 @@ else {
         "HTML" {
             $filePath = Join-Path $OutputPath "sp_StatUpdate_Diag_${timestamp}.html"
 
-            $html = @"
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>sp_StatUpdate Diagnostic Report</title>
-<style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
-    h1 { color: #1a1a2e; border-bottom: 3px solid #16213e; padding-bottom: 10px; }
-    h2 { color: #16213e; margin-top: 30px; }
-    h3 { color: #0f3460; }
-    table { border-collapse: collapse; width: 100%; margin: 10px 0; background: white; }
-    th { background: #16213e; color: white; padding: 8px 12px; text-align: left; }
-    td { padding: 6px 12px; border-bottom: 1px solid #eee; }
-    tr:hover td { background: #f0f0f0; }
-    code, pre { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; font-family: 'Cascadia Code', Consolas, monospace; }
-    pre { padding: 12px; overflow-x: auto; }
-    .critical { color: #d32f2f; font-weight: bold; }
-    .warning { color: #f57c00; font-weight: bold; }
-    .info { color: #1976d2; }
-</style>
-</head>
-<body>
-$($reportContent -replace '```sql\r?\n(.*?)\r?\n```', '<pre><code>$1</code></pre>' -replace '\*\*([^*]+)\*\*', '<strong>$1</strong>' -replace '# (.+)', '<h1>$1</h1>' -replace '## (.+)', '<h2>$1</h2>' -replace '### (.+)', '<h3>$1</h3>')
-</body>
-</html>
-"@
+            $html = New-HtmlDocument -Markdown $reportContent -Title "sp_StatUpdate Diagnostic Report"
             $html | Out-File -FilePath $filePath -Encoding UTF8
             Write-Host "  Report: $filePath" -ForegroundColor Green
         }
