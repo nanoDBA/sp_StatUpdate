@@ -1,0 +1,73 @@
+# Line-ending policy: this repository always stores LF.
+#
+# Why this file exists: the working tree lives on a synced folder (Google Drive /
+# Syncthing), which rewrites text files to CRLF behind git's back. Without `text`
+# attributes git compares raw bytes, so every synced file shows as wholly modified
+# and real changes get buried in thousand-line whitespace diffs.
+#
+# With `text=auto` git normalizes to LF when staging and when diffing, so a CRLF
+# working tree compares clean against an LF repository. `git add --renormalize .`
+# was run once when this file was introduced, so committed blobs are LF regardless
+# of what the working tree currently holds.
+#
+# Practical effect: `git status` stays quiet until you actually change something,
+# and `git diff` shows only real edits. Nothing needs to be done per-checkout.
+
+* text=auto eol=lf
+
+# Windows shells are the real exception -- cmd.exe can mis-parse LF-only batch
+# files (notably around labels and goto), so these keep CRLF in the working tree.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# `text=auto` detects binaries by looking for NUL bytes, which misses some
+# formats. Mark the common ones explicitly so they are never line-ending munged.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.bmp   binary
+*.ico   binary
+*.webp  binary
+*.svgz  binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.tgz   binary
+*.bz2   binary
+*.xz    binary
+*.7z    binary
+*.rar   binary
+*.mp3   binary
+*.mp4   binary
+*.mov   binary
+*.avi   binary
+*.mkv   binary
+*.wav   binary
+*.flac  binary
+*.ttf   binary
+*.otf   binary
+*.woff  binary
+*.woff2 binary
+*.eot   binary
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.dylib binary
+*.pyc   binary
+*.pyd   binary
+*.class binary
+*.jar   binary
+*.db    binary
+*.sqlite binary
+*.sqlite3 binary
+*.mdf   binary
+*.ldf   binary
+*.bak   binary
+*.trn   binary
+*.xlsx  binary
+*.xls   binary
+*.docx  binary
+*.doc   binary
+*.pptx  binary
+*.ppt   binary
