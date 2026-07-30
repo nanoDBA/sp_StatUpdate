@@ -36,7 +36,53 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.3 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.4 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.30.4 - Diag correctness batch (o2md.15, o2md.23, o2md.25,
+                           o2md.27).
+
+                           o2md.15 - C4 DEGRADING_THROUGHPUT recommendation
+                           and ExampleCall were constants that always
+                           suggested enabling @StatsInParallel, even when the
+                           evidence line already prints StatsInParallel=Y
+                           (5/5 findings in the fleet sweep). Now conditional
+                           on recent_w.parallel_mode.
+
+                           o2md.23 - I8 headline required BOTH an
+                           improving-count majority AND a median magnitude
+                           below -5% to report "improving" -- when they
+                           disagreed (336 improving / 301 degrading, median
+                           only -3%), it fell through to "stable" regardless
+                           of the clear count majority. New intermediate
+                           "trending down (modest)" branch reports the
+                           count-majority honestly, placed after the more
+                           specific regressed/degrading branches so it
+                           doesn't preempt them.
+
+                           o2md.25 - I10 TimeLimit jitter normalization only
+                           rounded when MAX-MIN spread across the whole
+                           @DaysBack window was under 300s; a single outlier
+                           (rollout run, stray non-killed-but-atypical run)
+                           blew the spread and the raw jittery value (21598,
+                           31499, etc.) was emitted verbatim in 40/40 fleet
+                           recommendations. Replaced with MODE (most common
+                           rounded-to-minute value), applied unconditionally
+                           -- robust to a handful of outliers by construction.
+
+                           o2md.27 - W6 EXCESSIVE_OVERHEAD's guard
+                           (DurationSeconds > 10 AND StatsProcessed >= 5) was
+                           too weak: a 34-stat run still showed 93.4%
+                           overhead because fixed startup cost dominates when
+                           measured stat-update time is tiny, regardless of
+                           stat count. Tightened to DurationSeconds > 60 AND
+                           measured stat-time >= 10s (both CTEs kept in
+                           sync). Recommendation text now states the
+                           overhead figure is wall-clock minus measured
+                           stat-update time -- inferred, not measured -- and
+                           lists @DelayBetweenStats, AG-redo waits, lock
+                           waits, and parallel-worker queue-idle as untested
+                           alternative causes before attributing to
+                           discovery/environment cost.
+
             2026.07.30.3 - o2md.12: C6 SILENT_NOOP_RUN evidence + NULL-vs-0
                            split.  Evidence previously carried only
                            StartTime/StopReason/StatsFound -- the
@@ -612,7 +658,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.30.3',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.30.4',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -2905,14 +2951,24 @@ BEGIN
                       THEN N' NOTE: parallel runs -- GB/min did NOT degrade past the 1.5x threshold, so the sec/stat delta is most likely worker slice-composition noise rather than a real slowdown (in parallel mode StatsProcessed is only this worker''s slice while DurationSeconds covers the whole worker lifetime). Reported as WARNING, not CRITICAL.'
                   ELSE N' NOTE: parallel runs -- GB/min was unavailable to corroborate the sec/stat delta, which in parallel mode is dominated by worker slice composition. Reported as WARNING, not CRITICAL.'
               END,
+        /* o2md.15: recent_w.parallel_mode is already computed and printed in Evidence above
+           (StatsInParallel=Y/N) but the recommendation and ExampleCall were constants that
+           always suggested enabling @StatsInParallel -- even for runs whose own evidence
+           says it's already Y (5/5 DEGRADING_THROUGHPUT findings in the fleet sweep). */
         N'Possible causes: (1) Table growth increasing update cost, '
             + N'(2) I/O subsystem degradation, '
             + N'(3) Concurrent workload pressure, '
             + N'(4) Sample rate too high for growing tables. '
-            + N'Consider: @StatsInParallel for throughput, '
+            + CASE WHEN recent_w.parallel_mode = N'Y'
+                  THEN N'@StatsInParallel is already Y on the recent window -- it is not the fix here. '
+                  ELSE N'Consider: @StatsInParallel for throughput. '
+              END
             + N'@LongRunningThresholdMinutes to cap outliers, '
             + N'or investigate storage performance.',
-        N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @StatsInParallel = N''Y'', @LongRunningThresholdMinutes = 15;',
+        CASE WHEN recent_w.parallel_mode = N'Y'
+            THEN N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @LongRunningThresholdMinutes = 15;'
+            ELSE N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @StatsInParallel = N''Y'', @LongRunningThresholdMinutes = 15;'
+        END,
         20
     FROM window_avgs AS recent_w
     CROSS JOIN window_avgs AS prior_w
@@ -3731,8 +3787,15 @@ BEGIN
                 GROUP BY su.RunLabel
             ) AS su_agg ON su_agg.RunLabel = r.RunLabel
             WHERE r.IsKilled = 0
-            AND   r.DurationSeconds > 10  /* skip trivial runs */
-            AND   r.StatsProcessed >= 5   /* need enough stats for meaningful ratio */
+            /* o2md.27: DurationSeconds > 10 AND StatsProcessed >= 5 was too weak -- a run
+               with 34 processed stats still showed 93.4% overhead in the fleet sweep
+               because fixed startup cost dominates when the actual measured stat-update
+               time is tiny, regardless of how many individual stats were touched. Require
+               at least 60s of wall clock AND at least 10s of measured stat-update time so
+               the percentage reflects a real ratio, not fixed-cost noise on a small run. */
+            AND   r.DurationSeconds > 60
+            AND   r.StatsProcessed >= 5
+            AND   ISNULL(su_agg.TotalStatMs, 0) >= 10000
         )
         SELECT
             @w6_overhead_runs = COUNT(*),
@@ -3763,7 +3826,9 @@ BEGIN
                     SELECT su.RunLabel, TotalStatMs = SUM(ISNULL(su.DurationMs, 0))
                     FROM #stat_updates AS su WHERE su.EndTime IS NOT NULL GROUP BY su.RunLabel
                 ) AS su_agg ON su_agg.RunLabel = r.RunLabel
-                WHERE r.IsKilled = 0 AND r.DurationSeconds > 10 AND r.StatsProcessed >= 5
+                /* o2md.27: must match the primary run_overhead CTE's guard above */
+                WHERE r.IsKilled = 0 AND r.DurationSeconds > 60 AND r.StatsProcessed >= 5
+                AND   ISNULL(su_agg.TotalStatMs, 0) >= 10000
             )
             SELECT TOP (1) @w6_worst_label = ro2.RunLabel
             FROM run_overhead2 AS ro2
@@ -3781,9 +3846,17 @@ BEGIN
             VALUES
             (
                 N'WARNING', N'EXCESSIVE_OVERHEAD',
-                N'Discovery and environment checks consuming disproportionate time vs actual stat updates',
+                N'Wall clock minus measured stat-update time is disproportionately large',
                 @w6_detail,
-                N'Review recent parameter changes -- features like @QueryStore (CPU/DURATION/READS) and extended discovery options add overhead. '
+                /* o2md.27: this figure is wall-clock minus measured per-stat UPDATE STATISTICS
+                   time -- it is NOT a measurement of what the remaining time was spent on.
+                   @DelayBetweenStats, AG-redo wait loops, lock waits, and parallel-worker
+                   queue-idle time all land in this same "overhead" bucket unmeasured (proc-side
+                   wait/idle-time logging tracked separately). Discovery/environment cost is one
+                   plausible explanation among several, not a confirmed cause. */
+                N'This is the difference between wall-clock and measured stat-update time -- discovery/environment cost is one possible cause, not a measured one. '
+                    + N'Before assuming it is discovery overhead, rule out: @DelayBetweenStats (if set), AG secondary redo-queue waits, lock waits/blocking during the run, '
+                    + N'and (in parallel mode) workers idling on the queue. If those are ruled out, review recent parameter changes -- features like @QueryStore (CPU/DURATION/READS) and extended discovery options do add real overhead. '
                     + N'Reduce @CommandLogRetentionDays, or check whether CommandLog table needs a StartTime index. '
                     + N'If SQL Server is under memory pressure (check sys.dm_os_memory_brokers, sys.dm_os_process_memory), high overhead may indicate page cache eviction during stat scans.',
                 N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @Debug = 1; /* Review per-phase timing in debug output */',
@@ -5647,6 +5720,20 @@ BEGIN
                             THEN N' WARNING: ' + CONVERT(nvarchar(10), @i8_forced_at_risk) + N' forced plan(s) exist on affected tables -- stat updates may have triggered forced plan abandonment.'
                             ELSE N''
                         END
+                    /* o2md.23: the strong-improving branch above requires BOTH a count-majority
+                       AND the median magnitude to clear -5% -- when they disagree (a real
+                       improving-count majority whose median delta is modest), control used to
+                       fall straight through to the true-stable ELSE below regardless of the
+                       counts, e.g. "336 improving, 301 degrading" reported as stable because
+                       the median only moved -3%. This branch reports the same count-majority
+                       honestly instead of mislabeling it stable, while still yielding to the
+                       more specific regressed/degrading-majority branches above it. */
+                    WHEN @i8_improving_count > @i8_degrading_count
+                    THEN N'Per-execution query CPU trending down (modest): '
+                        + CONVERT(nvarchar(10), @i8_improving_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
+                        + N' tracked statistics show lower per-execution CPU vs. '
+                        + CONVERT(nvarchar(10), @i8_degrading_count) + N' higher, but the median change ('
+                        + ISNULL(CONVERT(nvarchar(20), @i8_avg_delta_pct), N'n/a') + N'%) is below the 5% reporting threshold for a confident "improving" call.'
                     ELSE N'Per-execution query CPU stable across updates: '
                         + CONVERT(nvarchar(10), @i8_stable_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
                         + N' tracked statistics show consistent per-execution CPU. '
@@ -5775,23 +5862,30 @@ BEGIN
             FROM #runs
             WHERE RunLabel = @rc_baseline;
 
-            /* sp_StatUpdate-6x80: TimeLimit jitter normalization.
+            /* sp_StatUpdate-6x80 / o2md.25: TimeLimit jitter normalization.
                When @StopByTime is used, each run derives its TimeLimit from
                DATEDIFF(SECOND, start_time, stop_by_time), so a job that starts
                at 23:00:01 vs 23:00:02 yields 21599 vs 21598 instead of 21600.
-               If the spread across recent non-killed runs with non-NULL TimeLimit
-               is < 300 s (5 min), round to the nearest minute to produce a clean
-               value (e.g. 21600 instead of 21599). */
-            DECLARE @rc_tl_spread integer = (
-                SELECT MAX(TimeLimit) - MIN(TimeLimit)
+
+               o2md.25: the original guard only rounded when MAX-MIN spread across
+               ALL non-killed runs in the whole @DaysBack window was < 300s -- a
+               single outlier (a version rollout, a one-off manual run, a killed
+               run that slipped past IsKilled) blows the raw spread past 300s and
+               the guard backs off entirely, emitting whatever the single baseline
+               run happened to report verbatim (21598, 31499, etc., seen 40/40
+               times in the fleet sweep). Replaced with the MODE (most common
+               rounded-to-minute value) across the window, which is robust to a
+               handful of outliers by construction and applies unconditionally --
+               no spread check needed. */
+            DECLARE @rc_tl_mode integer = (
+                SELECT TOP (1) CONVERT(integer, ROUND(TimeLimit / 60.0, 0) * 60)
                 FROM #runs
                 WHERE IsKilled = 0 AND TimeLimit IS NOT NULL
+                GROUP BY CONVERT(integer, ROUND(TimeLimit / 60.0, 0) * 60)
+                ORDER BY COUNT(*) DESC, CONVERT(integer, ROUND(TimeLimit / 60.0, 0) * 60) DESC
             );
-            IF @rc_tl_spread IS NOT NULL AND @rc_tl_spread < 300
-                SET @rc_timelimit = CONVERT(integer, ROUND(
-                    (SELECT AVG(CONVERT(decimal(12, 2), TimeLimit))
-                     FROM #runs WHERE IsKilled = 0 AND TimeLimit IS NOT NULL)
-                    / 60.0, 0) * 60);
+            IF @rc_tl_mode IS NOT NULL
+                SET @rc_timelimit = @rc_tl_mode;
 
             /* ---- Adjust based on fired checks ---- */
 

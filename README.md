@@ -924,11 +924,12 @@ EXEC dbo.sp_StatUpdate
 
 ## Version History 📜
 
-**Current version:** `3.8.4.2026.07.30` (proc) &nbsp;·&nbsp; `2026.07.30.3` (diag)
+**Current version:** `3.8.4.2026.07.30` (proc) &nbsp;·&nbsp; `2026.07.30.4` (diag)
 
 <details>
 <summary><strong>📜 Show full changelog (60+ releases)</strong></summary>
 
+- **Diag 2026.07.30.4** - Diag correctness batch (o2md.15, o2md.23, o2md.25, o2md.27): C4 `DEGRADING_THROUGHPUT` recommendation no longer suggests `@StatsInParallel` when the evidence already shows it enabled; I8 headline no longer mislabels a real improving-count-majority as "stable" just because the median magnitude is under the 5% threshold; I10 TimeLimit jitter normalization now uses MODE instead of a spread check any single outlier could defeat (40/40 fleet recommendations were carrying raw jittery values); W6 `EXCESSIVE_OVERHEAD`'s guard tightened (was firing at 93.4% "overhead" on a 34-stat run dominated by fixed cost) and its recommendation now says the figure is inferred, not measured, before pointing at discovery cost.
 - **Diag 2026.07.30.3** - o2md.12: C6 `SILENT_NOOP_RUN` evidence now includes Version/StatsInParallel/DurationSeconds/StatsRemaining (previously only StartTime/StopReason/StatsFound -- the recommendation said "upgrade to 3.5.7+" without ever showing the installed version). Also fixed `ISNULL(StatsProcessed, 0) = 0` conflating a genuinely-NULL StatsProcessed (older proc build, truncated END write) with a confirmed 0 -- CRITICAL C6 now requires `StatsProcessed = 0` explicitly, and the NULL case gets its own new INFO-severity check (I18 `NOOP_UNCONFIRMED`) instead of being silently mis-classified.
 - **3.8.4.2026.07.30** - o2md.8: the existing #163 deadlock-retry loop (up to 3 attempts, exponential backoff) retried error 1205 only -- extended to also retry 1222 (lock timeout), just as transient, previously burned as a hard failure on the first hit (100% of failures on one production server). Existing `DEADLOCK_RETRY_OK/FAIL` text unchanged for 1205; new `LOCK_TIMEOUT_RETRY_OK/FAIL` for 1222.
 - **Diag 2026.07.30.2** - ExampleCall audit sweep, round 1 (o2md.20, o2md.21): I15 `HEAP_TIME_BUDGET` no longer references `@CollectHeapForwarding` (removed in v3, made the emitted example fail outright on 7/40 fleet servers) -- points at `sys.dm_db_index_physical_stats(...).forwarded_record_count` directly instead. W2 `LONG_RUNNING_STATS` ExampleCall now includes `@Databases` (was silently targeting only the current database) and notes the ~10M-row sample cap when it applies.
