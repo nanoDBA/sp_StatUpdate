@@ -36,7 +36,61 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.4 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.5 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.30.5 - Redundant/tautological findings + obfuscation
+                           hardening (o2md.43, o2md.44, o2md.28, o2md.36).
+
+                           o2md.43 - W7 HIGH_IMPACT_STATS_DEPRIORITIZED
+                           compared each top-10 CPU stat's average processing
+                           position against the overall median -- true, by
+                           construction, for roughly half of any top-10 list
+                           regardless of whether prioritization is working,
+                           and it unconditionally recommended enabling
+                           @QueryStore=CPU even on servers already running
+                           it. Gated on the most recent run actually using
+                           QUERY_STORE sort order: that is the only case
+                           where "still processed late" is a real signal
+                           (QS enrichment/scoring not working), and the
+                           recommendation now points there instead of at a
+                           sort order that is already active.
+
+                           o2md.44 - I9 WORKLOAD_CONCENTRATION fired when the
+                           top stats reached 80% of workload CPU -- the
+                           Pareto principle, true of nearly every workload
+                           distribution, not a defect signal. Reframed as
+                           neutral descriptive text; no longer suggests
+                           enabling @QueryStore=CPU when the most recent run
+                           already has it on (reuses the o2md.43 sort-order
+                           check).
+
+                           o2md.28 - W5 QS_NOT_EFFECTIVE (WARNING), I6
+                           QS_EFFICACY, and I8 QS_PERFORMANCE_TREND all
+                           independently reported "no QS data" for the same
+                           15 servers -- three findings, one fact (~45
+                           redundant findings out of 446 in the fleet sweep).
+                           I6 and I8's no-data branches now check for an
+                           existing W5 QS_NOT_EFFECTIVE row first and skip
+                           the duplicate. Implemented as nested IF/ELSE
+                           (matching each block's original outer condition)
+                           rather than an ELSE IF chain, which would have let
+                           the suppressed case fall through into the
+                           has-real-data branch when @Debug = 0.
+
+                           o2md.36 - obfuscation tokens were 6-hex (Schema
+                           tokens were actually 4-hex, the confirmed cause of
+                           a fleet-wide SCH_ collision), a trivial dictionary-
+                           attack target with no seed. All 20 HASHBYTES call
+                           sites now produce 8-hex tokens uniformly (matching
+                           the width already used for RunLabel tokens).
+                           @ObfuscationSeed NULL now auto-generates and
+                           RAISERROR's a random per-run seed instead of
+                           hashing unsalted -- defense-in-depth for direct
+                           EXEC callers (the wrapper already requires a seed
+                           for -Obfuscate). Not returned as an OUTPUT
+                           parameter, to avoid a breaking signature change
+                           for existing callers passing @ObfuscationSeed by
+                           literal value.
+
             2026.07.30.4 - Diag correctness batch (o2md.15, o2md.23, o2md.25,
                            o2md.27).
 
@@ -626,7 +680,7 @@ ALTER PROCEDURE
     @DaysBack integer = 30,                     /* history window in days */
     @CommandLogDatabase sysname = NULL,          /* NULL = current DB */
     @Obfuscate bit = 0,                         /* 0 = real names, 1 = hashed names */
-    @ObfuscationSeed nvarchar(128) = NULL,       /* salt for HASHBYTES -- makes tokens unpredictable without seed */
+    @ObfuscationSeed nvarchar(128) = NULL,       /* salt for HASHBYTES. NULL = auto-generated random seed (o2md.36), RAISERROR'd so it can be captured -- avoids unsalted hashing */
     @ObfuscationMapTable sysname = NULL,          /* persist obfuscation map to this table (auto-creates if missing) */
     @LongRunningMinutes integer = 10,            /* threshold for "long-running stat" detection */
     @FailureThreshold integer = 3,               /* same stat failing N+ times = CRITICAL */
@@ -658,7 +712,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.30.4',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.30.5',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -692,7 +746,7 @@ BEGIN
                     N'NULL, database name (e.g., DBATools, master)', N'NULL (current database)'),
                 (N'@Obfuscate',                N'bit',      N'Hash database/schema/table/stat names for safe external sharing. Uses HASHBYTES MD5. Obfuscation map returned as result set 8 (multi-result-set mode only).',
                     N'0, 1', N'0'),
-                (N'@ObfuscationSeed',          N'nvarchar(128)', N'Salt prepended to names before hashing. Makes tokens unpredictable without the seed but deterministic across runs/servers with the same seed. NULL = unsalted (backward compatible).',
+                (N'@ObfuscationSeed',          N'nvarchar(128)', N'Salt prepended to names before hashing. Makes tokens unpredictable without the seed but deterministic across runs/servers with the same seed. NULL = a random seed is auto-generated and RAISERROR''d for this run (o2md.36) -- capture it if you need to reproduce or decode tokens later; it is never unsalted.',
                     N'NULL, any string up to 128 chars', N'NULL'),
                 (N'@ObfuscationMapTable',      N'sysname',  N'Persist obfuscation map to this table (auto-creates if missing, merges new entries on subsequent runs). Enables saving the map on prod while exporting only obfuscated results. Requires @Obfuscate=1.',
                     N'NULL, table name (e.g., dbo.DiagMap, tempdb.dbo.diag_map)', N'NULL'),
@@ -2325,6 +2379,21 @@ BEGIN
     BEGIN
         RAISERROR(N'Applying obfuscation...', 10, 1) WITH NOWAIT;
 
+        /* o2md.36: an unseeded run hashed raw names with no salt (@seed_prefix = '' below),
+           making tokens a trivial dictionary-attack target -- a SAFE_TO_SHARE label
+           overstated the protection. The wrapper (Invoke-StatUpdateDiag.ps1) already
+           refuses to run -Obfuscate without -ObfuscationSeed, so this is defense-in-depth
+           for direct EXEC callers: auto-generate a random per-run seed instead of hashing
+           unsalted. RAISERROR'd (not returned as an OUTPUT param, to avoid a breaking
+           signature change for existing callers that pass @ObfuscationSeed by literal
+           value) so the caller can capture and reuse it -- otherwise this run's tokens
+           can never be reproduced or decoded later. */
+        IF @ObfuscationSeed IS NULL
+        BEGIN
+            SET @ObfuscationSeed = CONVERT(nvarchar(36), NEWID());
+            RAISERROR(N'NOTE: @ObfuscationSeed was not supplied -- auto-generated %s for this run. Save this value if you need to reproduce or decode these tokens later; it is not persisted anywhere.', 10, 1, @ObfuscationSeed) WITH NOWAIT;
+        END;
+
         /* Seed prefix: when @ObfuscationSeed is provided, prepend to all names before hashing */
         DECLARE @seed_prefix nvarchar(128) = ISNULL(@ObfuscationSeed, N'');
 
@@ -2333,14 +2402,14 @@ BEGIN
         SELECT DISTINCT
             object_type = N'Database',
             original_name = su.DatabaseName,
-            obfuscated_name = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.DatabaseName), 2), 6)
+            obfuscated_name = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.DatabaseName), 2), 8)
         FROM #stat_updates AS su
         WHERE su.DatabaseName IS NOT NULL
         UNION
         SELECT DISTINCT
             N'Schema',
             su.SchemaName,
-            N'SCH_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.SchemaName), 2), 4)
+            N'SCH_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.SchemaName), 2), 8)
         FROM #stat_updates AS su
         WHERE su.SchemaName IS NOT NULL
         UNION
@@ -2349,7 +2418,7 @@ BEGIN
         SELECT DISTINCT
             N'Table',
             su.DatabaseName + N'.' + su.SchemaName + N'.' + su.ObjectName,
-            N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.DatabaseName + N'.' + su.SchemaName + N'.' + su.ObjectName), 2), 6)
+            N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.DatabaseName + N'.' + su.SchemaName + N'.' + su.ObjectName), 2), 8)
         FROM #stat_updates AS su
         WHERE su.ObjectName IS NOT NULL
         UNION
@@ -2357,11 +2426,11 @@ BEGIN
             N'Statistic',
             su.StatisticsName,
             CASE
-                WHEN su.StatisticsName LIKE N'_WA_Sys_%' THEN N'_WA_Sys_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'PK_%'       THEN N'PK_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'IX_%'       THEN N'IX_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'UQ_%'       THEN N'UQ_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
-                ELSE N'STAT_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
+                WHEN su.StatisticsName LIKE N'_WA_Sys_%' THEN N'_WA_Sys_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 8)
+                WHEN su.StatisticsName LIKE N'PK_%'       THEN N'PK_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 8)
+                WHEN su.StatisticsName LIKE N'IX_%'       THEN N'IX_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 8)
+                WHEN su.StatisticsName LIKE N'UQ_%'       THEN N'UQ_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 8)
+                ELSE N'STAT_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 8)
             END
         FROM #stat_updates AS su
         WHERE su.StatisticsName IS NOT NULL;
@@ -2376,7 +2445,7 @@ BEGIN
         SELECT DISTINCT
             N'RunDatabase',
             r.[Databases],
-            N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + r.[Databases]), 2), 6)
+            N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + r.[Databases]), 2), 8)
         FROM #runs AS r
         WHERE r.[Databases] IS NOT NULL
         AND   r.[Databases] NOT IN (N'USER_DATABASES', N'SYSTEM_DATABASES', N'ALL_DATABASES', N'AVAILABILITY_GROUP_DATABASES')  /* BUG-09: leave keywords unobfuscated */
@@ -2385,23 +2454,23 @@ BEGIN
         /* Apply obfuscation to #stat_updates */
         UPDATE su
         SET
-            su.DatabaseName = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.DatabaseName), 2), 6),
-            su.SchemaName = N'SCH_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.SchemaName), 2), 4),
+            su.DatabaseName = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.DatabaseName), 2), 8),
+            su.SchemaName = N'SCH_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.SchemaName), 2), 8),
             /* BUG-08 fix: hash uses pre-update DatabaseName+SchemaName+ObjectName composite key;
                SQL Server evaluates all RHS before applying SET, so original values are used here. */
-            su.ObjectName = N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.DatabaseName + N'.' + su.SchemaName + N'.' + su.ObjectName), 2), 6),
+            su.ObjectName = N'TBL_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.DatabaseName + N'.' + su.SchemaName + N'.' + su.ObjectName), 2), 8),
             su.StatisticsName = CASE
-                WHEN su.StatisticsName LIKE N'_WA_Sys_%' THEN N'_WA_Sys_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'PK_%'       THEN N'PK_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'IX_%'       THEN N'IX_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
-                WHEN su.StatisticsName LIKE N'UQ_%'       THEN N'UQ_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
-                ELSE N'STAT_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 6)
+                WHEN su.StatisticsName LIKE N'_WA_Sys_%' THEN N'_WA_Sys_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 8)
+                WHEN su.StatisticsName LIKE N'PK_%'       THEN N'PK_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 8)
+                WHEN su.StatisticsName LIKE N'IX_%'       THEN N'IX_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 8)
+                WHEN su.StatisticsName LIKE N'UQ_%'       THEN N'UQ_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 8)
+                ELSE N'STAT_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + su.StatisticsName), 2), 8)
             END
         FROM #stat_updates AS su;
 
         /* Obfuscate #runs.Databases -- skip known keywords (BUG-09: they contain no sensitive names) */
         UPDATE r
-        SET r.[Databases] = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + r.[Databases]), 2), 6)
+        SET r.[Databases] = N'DB_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + r.[Databases]), 2), 8)
         FROM #runs AS r
         WHERE r.[Databases] IS NOT NULL
         AND   r.[Databases] NOT IN (N'USER_DATABASES', N'SYSTEM_DATABASES', N'ALL_DATABASES', N'AVAILABILITY_GROUP_DATABASES');
@@ -3875,7 +3944,22 @@ BEGIN
        W7: HIGH_IMPACT_STATS_DEPRIORITIZED (#263)
        Top CPU stats processed late (high ProcessingPosition).
        ====================================================================== */
-    IF @workload_impact_count > 0
+    /* o2md.43: "avg_position > median_position" is true, by construction, for roughly
+       half of any top-10 CPU list regardless of whether prioritization is working --
+       under MODIFICATION_COUNTER (or any non-QS) sort order this fires on essentially
+       every server, and the recommendation ("enable Query Store-based prioritization")
+       was emitted unconditionally, including on servers where QUERY_STORE sort was
+       already active. Gated below on the most recent run actually using QUERY_STORE
+       sort: that's the only case where "high-impact stats still processed late" is a
+       real signal (QS scoring/enrichment not working as intended) rather than the
+       expected shape of a non-QS-sorted run. */
+    DECLARE @w7_qs_sort_active bit = 0;
+    SELECT TOP (1) @w7_qs_sort_active = CASE WHEN SortOrder = N'QUERY_STORE' THEN 1 ELSE 0 END
+    FROM #runs
+    WHERE IsKilled = 0
+    ORDER BY StartTime DESC;
+
+    IF @workload_impact_count > 0 AND @w7_qs_sort_active = 1
     BEGIN
         DECLARE @w7_deprioritized_count integer;
         DECLARE @w7_evidence nvarchar(2000);
@@ -3941,10 +4025,15 @@ BEGIN
                 VALUES (
                     N'WARNING',
                     N'HIGH_IMPACT_STATS_DEPRIORITIZED',
-                    N'High-workload statistics processed late in maintenance window',
+                    N'High-workload statistics processed late despite QUERY_STORE sort order already being active',
                     N'Top CPU stats with high processing positions: ' + @w7_evidence,
-                    N'Enable Query Store-based prioritization to process high-impact stats first.',
-                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStore = N''CPU'', @SortOrder = N''QUERY_STORE'';',
+                    /* o2md.43: this fires only when QUERY_STORE sort is already active (see gate above),
+                       so "enable QS-based prioritization" is never the right advice here. */
+                    N'@SortOrder=QUERY_STORE is already active, so this points at QS scoring/enrichment, not a missing feature. '
+                        + N'Check whether Phase 6 QS enrichment is actually finding data for these tables (Query Store enabled/READ_WRITE '
+                        + N'on the target database, query_capture_mode not NONE, recent runtime stats within @QueryStoreRecentHours) rather '
+                        + N'than re-enabling a sort order that is already on.',
+                    N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @Debug = 1; /* Review Phase 6 QS enrichment counts in debug output */',
                     36
                 );
 
@@ -3973,6 +4062,11 @@ BEGIN
         WHERE ranked.CumulativePct >= 80.0
         ORDER BY ranked.rn;
 
+        /* o2md.44: "top N stats reach 80% of CPU" is the Pareto principle -- true of
+           nearly every workload distribution, not a defect signal. Reframed as neutral
+           descriptive context rather than a recommendation to act, and (reusing
+           @w7_qs_sort_active from the W7 check above) no longer suggests enabling
+           @QueryStore=CPU when the most recent run is already using it. */
         IF @i9_top_n IS NOT NULL
         BEGIN
             INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
@@ -3984,9 +4078,16 @@ BEGIN
                 N'Out of ' + CONVERT(nvarchar(10), @workload_impact_count) + N' objects with Query Store data, '
                     + CONVERT(nvarchar(10), @i9_top_n) + N' account for '
                     + CONVERT(nvarchar(10), @i9_pct) + N'% of total CPU. '
-                    + N'Concentrating statistics maintenance on these tables maximizes performance impact.',
-                N'Use @QueryStore = N''CPU'' (v3) to automatically prioritize these high-impact tables.',
-                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStore = N''CPU'';',
+                    + N'This concentration (a small share of tables driving most CPU) is typical of most workloads -- '
+                    + N'it is descriptive context, not on its own a sign of a problem.',
+                CASE WHEN @w7_qs_sort_active = 1
+                    THEN N'@SortOrder=QUERY_STORE is already active, so statistics maintenance is already concentrating on these tables automatically.'
+                    ELSE N'@QueryStore = N''CPU'' (v3) would let statistics maintenance concentrate on these tables automatically, if that fits your priorities.'
+                END,
+                CASE WHEN @w7_qs_sort_active = 1
+                    THEN NULL
+                    ELSE N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStore = N''CPU'';'
+                END,
                 74
             );
 
@@ -5206,27 +5307,37 @@ BEGIN
         WHERE e.IsQSRun = 1
         AND   e.HighCpuInFirstQuartilePct IS NOT NULL;
 
+        /* o2md.28: when W5 QS_NOT_EFFECTIVE already fired (a WARNING, inserted earlier in
+           this batch), that is the same root fact -- "no QS data captured" -- stated more
+           prominently. Skip this INFO duplicate rather than reporting the identical
+           condition three times (also see I8 below). Nested IF (not ELSE IF/ELSE) so the
+           run_count=0-but-suppressed case cannot fall through into the run_count>0 branch. */
         IF @i6_run_count = 0
         BEGIN
-            /* QS-flagged runs exist but none had usable CPU metrics (all HighCpuInFirstQuartilePct IS NULL).
-               This happens when Query Store was recently enabled, has no runtime stats, or databases have minimal activity. */
-            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
-            VALUES
-            (
-                N'INFO',
-                N'QS_EFFICACY',
-                N'Query Store prioritization is configured but no CPU workload data was found in '
-                    + CONVERT(nvarchar(10), @qs_run_count) + N' recent QS run(s). '
-                    + N'This may indicate Query Store was recently enabled, has no runtime stats yet, '
-                    + N'or the monitored databases have minimal query activity.',
-                N'QS-flagged runs found: ' + CONVERT(nvarchar(10), @qs_run_count)
-                    + N'. None contained usable CPU metrics in sys.query_store_runtime_stats.',
-                N'Verify Query Store is in READ_WRITE mode and has accumulated runtime statistics. '
-                    + N'Check: SELECT actual_state_desc FROM sys.database_query_store_options;',
-                N'EXECUTE dbo.sp_StatUpdate_Diag @EfficacyDaysBack = 100, @Debug = 1;',
-                70
-            );
-            RAISERROR(N'  [INFO] I6: QS runs found but no CPU data available', 10, 1) WITH NOWAIT;
+            IF NOT EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'QS_NOT_EFFECTIVE')
+            BEGIN
+                /* QS-flagged runs exist but none had usable CPU metrics (all HighCpuInFirstQuartilePct IS NULL).
+                   This happens when Query Store was recently enabled, has no runtime stats, or databases have minimal activity. */
+                INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+                VALUES
+                (
+                    N'INFO',
+                    N'QS_EFFICACY',
+                    N'Query Store prioritization is configured but no CPU workload data was found in '
+                        + CONVERT(nvarchar(10), @qs_run_count) + N' recent QS run(s). '
+                        + N'This may indicate Query Store was recently enabled, has no runtime stats yet, '
+                        + N'or the monitored databases have minimal query activity.',
+                    N'QS-flagged runs found: ' + CONVERT(nvarchar(10), @qs_run_count)
+                        + N'. None contained usable CPU metrics in sys.query_store_runtime_stats.',
+                    N'Verify Query Store is in READ_WRITE mode and has accumulated runtime statistics. '
+                        + N'Check: SELECT actual_state_desc FROM sys.database_query_store_options;',
+                    N'EXECUTE dbo.sp_StatUpdate_Diag @EfficacyDaysBack = 100, @Debug = 1;',
+                    70
+                );
+                RAISERROR(N'  [INFO] I6: QS runs found but no CPU data available', 10, 1) WITH NOWAIT;
+            END
+            ELSE IF @Debug = 1
+                RAISERROR(N'  [INFO] I6: no CPU data, same root cause as W5 QS_NOT_EFFECTIVE -- not duplicating', 10, 1) WITH NOWAIT;
         END
         ELSE
         BEGIN
@@ -5790,23 +5901,32 @@ BEGIN
     END
     ELSE
     BEGIN
-        /* #239: No QS CPU data at all -- explain why I8/RS13 are empty instead of silent skip. */
-        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
-        VALUES (
-            N'INFO', N'QS_PERFORMANCE_TREND',
-            /* w5p2 / gh-532: preserve existing text; append machine-readable DataStatus suffix */
-            N'No Query Store CPU data found in any run. RS 13 (QS Performance Correlation) will be empty.'
-                + N' [DataStatus: ' + @i8_data_status
-                + N'; QSCpuRuns: ' + CONVERT(nvarchar(10), @i8_qs_cpu_runs)
-                + N'; TrackedStats: ' + CONVERT(nvarchar(10), @i8_tracked_stats)
-                + N']',
-            N'0 of ' + CONVERT(nvarchar(10), (SELECT COUNT(*) FROM #runs))
-                + N' runs contained Query Store CPU metrics. Ensure QS prioritization is configured (@QueryStore = N''CPU'' in v3) and Query Store is enabled/READ_WRITE.',
-            N'Enable QS prioritization: EXEC sp_StatUpdate @QueryStore = N''CPU''.',
-            N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStore = N''CPU'';',
-            73
-        );
-        RAISERROR(N'  [INFO] I8: no Query Store CPU data available', 10, 1) WITH NOWAIT;
+        /* o2md.28: same root fact as W5 QS_NOT_EFFECTIVE (WARNING, inserted earlier) and I6
+           QS_EFFICACY's no-data branch above -- skip this third duplicate when W5 already
+           fired. This ELSE is the terminal branch (nothing follows it), so a plain nested
+           IF/ELSE here carries no fall-through risk. */
+        IF NOT EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'QS_NOT_EFFECTIVE')
+        BEGIN
+            /* #239: No QS CPU data at all -- explain why I8/RS13 are empty instead of silent skip. */
+            INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+            VALUES (
+                N'INFO', N'QS_PERFORMANCE_TREND',
+                /* w5p2 / gh-532: preserve existing text; append machine-readable DataStatus suffix */
+                N'No Query Store CPU data found in any run. RS 13 (QS Performance Correlation) will be empty.'
+                    + N' [DataStatus: ' + @i8_data_status
+                    + N'; QSCpuRuns: ' + CONVERT(nvarchar(10), @i8_qs_cpu_runs)
+                    + N'; TrackedStats: ' + CONVERT(nvarchar(10), @i8_tracked_stats)
+                    + N']',
+                N'0 of ' + CONVERT(nvarchar(10), (SELECT COUNT(*) FROM #runs))
+                    + N' runs contained Query Store CPU metrics. Ensure QS prioritization is configured (@QueryStore = N''CPU'' in v3) and Query Store is enabled/READ_WRITE.',
+                N'Enable QS prioritization: EXEC sp_StatUpdate @QueryStore = N''CPU''.',
+                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @QueryStore = N''CPU'';',
+                73
+            );
+            RAISERROR(N'  [INFO] I8: no Query Store CPU data available', 10, 1) WITH NOWAIT;
+        END
+        ELSE IF @Debug = 1
+            RAISERROR(N'  [INFO] I8: no CPU data, same root cause as W5 QS_NOT_EFFECTIVE -- not duplicating', 10, 1) WITH NOWAIT;
     END;
 
     /* ======================================================================
