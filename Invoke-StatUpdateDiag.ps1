@@ -341,6 +341,19 @@ Write-Host "Parallelism:     $MaxParallel"
 Write-Host "Timeouts:        connect ${ConnectTimeout}s / query ${QueryTimeout}s"
 Write-Host "Output:          $OutputPath"
 Write-Host "Format:          $OutputFormat$(if (-not $NoCsv -and $OutputFormat -ne 'CSV') { ' + per-result-set CSV' })"
+
+# o2md.40: prefer Microsoft.Data.SqlClient when resolvable, fall back to the
+# legacy (but runtime-bundled) System.Data.SqlClient otherwise.  The modern
+# provider is a separate NuGet package, NOT part of the default PowerShell
+# runtime -- a hard switch would break every machine without it installed.
+# Assemblies are process-wide, so a type loaded here resolves inside the
+# ForEach-Object -Parallel runspaces too.
+$script:ModernSqlClient = $false
+try { $null = [Microsoft.Data.SqlClient.SqlConnection]; $script:ModernSqlClient = $true }
+catch {
+    try { Add-Type -AssemblyName 'Microsoft.Data.SqlClient' -ErrorAction Stop; $null = [Microsoft.Data.SqlClient.SqlConnection]; $script:ModernSqlClient = $true } catch { }
+}
+Write-Host "SQL client:      $(if ($script:ModernSqlClient) { 'Microsoft.Data.SqlClient' } else { 'System.Data.SqlClient (legacy fallback -- install Microsoft.Data.SqlClient to modernize)' })"
 Write-Host "Server detail:   $(if ($NoServerDetail) { 'omitted (-NoServerDetail)' } else { 'included' })"
 Write-Host "Diag history:    $(if ($SkipHistory) { 'skipped (@SkipHistory = 1)' } else { 'written to dbo.StatUpdateDiagHistory on each instance' })"
 Write-Host ""
@@ -406,6 +419,7 @@ $Servers | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
     $connTimeout = $using:ConnectTimeout
     $queryTimeout = $using:QueryTimeout
     $retries = $using:RetryCount
+    $modernSql = $using:ModernSqlClient
 
     $progressLocal[$server] = "Running"
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -451,7 +465,10 @@ $Servers | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
         # Connection string via the builder, not string concatenation: instance
         # and database names are escaped correctly, and a password containing
         # ; " or = can neither break the string nor inject a keyword.
-        $csb = [System.Data.SqlClient.SqlConnectionStringBuilder]::new()
+        # o2md.40: type literals resolve at runtime, so the modern branch is
+        # only evaluated when the assembly is confirmed loadable.
+        $csb = if ($modernSql) { [Microsoft.Data.SqlClient.SqlConnectionStringBuilder]::new() }
+               else            { [System.Data.SqlClient.SqlConnectionStringBuilder]::new() }
         $csb['Data Source'] = $server
         $csb['Initial Catalog'] = $dbLocal
         $csb['TrustServerCertificate'] = $trustCert
@@ -465,7 +482,8 @@ $Servers | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
             # instead of materializing it in the connection string.
             $securePw = $credLocal.Password.Copy()
             $securePw.MakeReadOnly()
-            $sqlCredential = [System.Data.SqlClient.SqlCredential]::new($credLocal.UserName, $securePw)
+            $sqlCredential = if ($modernSql) { [Microsoft.Data.SqlClient.SqlCredential]::new($credLocal.UserName, $securePw) }
+                             else            { [System.Data.SqlClient.SqlCredential]::new($credLocal.UserName, $securePw) }
         }
         else {
             $csb['Integrated Security'] = $true
@@ -535,12 +553,15 @@ $Servers | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
 
             $lastError = $null
             for ($attempt = 0; $attempt -le $Attempts; $attempt++) {
-                $c = New-Object System.Data.SqlClient.SqlConnection($ConnStr)
+                # o2md.40: $modernSql resolves from the enclosing scriptblock scope
+                $c = if ($modernSql) { New-Object Microsoft.Data.SqlClient.SqlConnection($ConnStr) }
+                     else            { New-Object System.Data.SqlClient.SqlConnection($ConnStr) }
                 if ($SqlCredential) { $c.Credential = $SqlCredential }
                 $cm = $c.CreateCommand()
                 $cm.CommandTimeout = $Timeout
                 $cm.CommandText = $Sql
-                $a = New-Object System.Data.SqlClient.SqlDataAdapter($cm)
+                $a = if ($modernSql) { New-Object Microsoft.Data.SqlClient.SqlDataAdapter($cm) }
+                     else            { New-Object System.Data.SqlClient.SqlDataAdapter($cm) }
                 $d = New-Object System.Data.DataSet
                 try {
                     $c.Open()
@@ -849,6 +870,29 @@ function ConvertTo-MarkdownTable {
     return ($rows -join "`n") + "`n"
 }
 
+# o2md.51: severity + grade visual markers (theme-agnostic -- render in both
+# GitHub light/dark modes; a .md cannot force its own theme, the viewer decides).
+function Get-SeverityEmoji {
+    param([string]$Severity)
+    switch ($Severity) {
+        "CRITICAL" { "`u{1F534}" }   # red circle
+        "WARNING"  { "`u{1F7E0}" }   # orange circle
+        "INFO"     { "`u{1F535}" }   # blue circle
+        default    { "`u{26AA}" }    # white circle
+    }
+}
+
+function Get-GradeBadge {
+    param([string]$Grade)
+    switch -Regex ($Grade) {
+        "^[AB]" { "`u{1F7E2} $Grade" }   # green
+        "^C"    { "`u{1F7E1} $Grade" }   # yellow
+        "^D"    { "`u{1F7E0} $Grade" }   # orange
+        "^F"    { "`u{1F534} $Grade" }   # red
+        default { if ($Grade) { $Grade } else { "?" } }
+    }
+}
+
 function Build-MarkdownReport {
     param(
         [hashtable]$AllResults,
@@ -880,10 +924,31 @@ function Build-MarkdownReport {
     [void]$report.AppendLine("")
     [void]$report.AppendLine("| Severity | Count |")
     [void]$report.AppendLine("| --- | --- |")
-    [void]$report.AppendLine("| CRITICAL | $critCount |")
-    [void]$report.AppendLine("| WARNING | $warnCount |")
-    [void]$report.AppendLine("| INFO | $nfoCount |")
+    [void]$report.AppendLine("| $(Get-SeverityEmoji 'CRITICAL') CRITICAL | $critCount |")
+    [void]$report.AppendLine("| $(Get-SeverityEmoji 'WARNING') WARNING | $warnCount |")
+    [void]$report.AppendLine("| $(Get-SeverityEmoji 'INFO') INFO | $nfoCount |")
     [void]$report.AppendLine("")
+
+    # o2md.51: top-issues callout -- GitHub-flavored alert block ([!CAUTION] /
+    # [!WARNING]); renders as a plain blockquote on renderers without alerts.
+    $calloutSeverity = if ($critCount -gt 0) { "CRITICAL" } elseif ($warnCount -gt 0) { "WARNING" } else { $null }
+    if ($calloutSeverity) {
+        $alertKind = if ($calloutSeverity -eq "CRITICAL") { "CAUTION" } else { "WARNING" }
+        $topGroups = @($AllRecommendations |
+            Where-Object { $_.Severity -eq $calloutSeverity } |
+            Group-Object -Property { "$($_.Category)`u{241F}$($_.Finding)" } |
+            Sort-Object -Property @{ Expression = { $_.Count }; Descending = $true } |
+            Select-Object -First 3)
+        [void]$report.AppendLine("> [!$alertKind]")
+        [void]$report.AppendLine("> **Top $calloutSeverity issue(s) this sweep:**")
+        foreach ($g in $topGroups) {
+            $f = $g.Group[0]
+            $srvCount = @($g.Group | ForEach-Object { $_.Server } | Sort-Object -Unique).Count
+            $findingLine = ($f.Finding -replace "`r?`n", " ")
+            [void]$report.AppendLine("> - $(Get-SeverityEmoji $calloutSeverity) **[$($f.Category)]** $findingLine *($srvCount server(s))*")
+        }
+        [void]$report.AppendLine("")
+    }
 
     # Fleet scoreboard.
     # Per-server detail sections are unreadable past a handful of instances --
@@ -928,7 +993,7 @@ function Build-MarkdownReport {
         foreach ($row in $ranked) {
             $headline = $row.Headline -replace '\|', '\|' -replace "`n", " "
             $scoreText = if ($null -ne $row.Score) { $row.Score } else { "N/A" }
-            $gradeText = if ($row.Grade) { $row.Grade } else { "?" }
+            $gradeText = Get-GradeBadge $row.Grade
             [void]$report.AppendLine("| $($row.Server) | $gradeText | $scoreText | $($row.Critical) | $($row.Warning) | $headline |")
         }
         [void]$report.AppendLine("")
@@ -943,7 +1008,7 @@ function Build-MarkdownReport {
 
         $groups = @($findings | Group-Object -Property { "$($_.Category)`u{241F}$($_.Finding)`u{241F}$($_.Recommendation)`u{241F}$($_.ExampleCall)" })
 
-        [void]$report.AppendLine("## $severity Findings")
+        [void]$report.AppendLine("## $(Get-SeverityEmoji $severity) $severity Findings")
         [void]$report.AppendLine("")
         if ($groups.Count -lt $findings.Count) {
             [void]$report.AppendLine("*$($findings.Count) finding(s) across all servers, grouped into $($groups.Count) distinct issue(s).*")
@@ -955,7 +1020,7 @@ function Build-MarkdownReport {
             $first = $group.Group[0]
             $groupServers = @($group.Group | ForEach-Object { $_.Server } | Sort-Object -Unique)
 
-            [void]$report.AppendLine("### [$($first.Category)] $($first.Finding)")
+            [void]$report.AppendLine("### $(Get-SeverityEmoji $severity) [$($first.Category)] $($first.Finding)")
             [void]$report.AppendLine("")
 
             if ($groupServers.Count -eq 1) {
@@ -1013,10 +1078,19 @@ function Build-MarkdownReport {
         $detailServers = @($AllResults.Keys | Sort-Object)
     }
 
+    # o2md.51: grade lookup for the collapsible section headers
+    $gradeByServer = @{}
+    foreach ($row in $scoreboard) { $gradeByServer[$row.Server] = $row.Grade }
+
     foreach ($server in $detailServers) {
         $data = $AllResults[$server]
+        $displayName = Get-DisplayName $server
+        $svrGrade = Get-GradeBadge $gradeByServer[$displayName]
 
-        [void]$report.AppendLine("### Server: $(Get-DisplayName $server)")
+        # o2md.51: collapsible so a fleet report opens scannable; the blank line
+        # after </summary> is required for Markdown to render inside <details>.
+        [void]$report.AppendLine("<details>")
+        [void]$report.AppendLine("<summary><strong>Server: $displayName</strong> &mdash; $svrGrade</summary>")
         [void]$report.AppendLine("")
 
         # Executive Dashboard (RS 1) - letter grades and health score
@@ -1062,6 +1136,11 @@ function Build-MarkdownReport {
                 [void]$report.AppendLine((ConvertTo-MarkdownTable -Table $table -MaxRows $section.MaxRows))
             }
         }
+
+        [void]$report.AppendLine("</details>")
+        [void]$report.AppendLine("")
+        [void]$report.AppendLine("---")
+        [void]$report.AppendLine("")
     }
 
     # Connection failures
@@ -1412,6 +1491,36 @@ function ConvertTo-HtmlBody {
         if ($line -match '^##\s+(.*)$')     { [void]$out.AppendLine("<h2>$(Format-HtmlInline $Matches[1])</h2>"); $i++; continue }
         if ($line -match '^#\s+(.*)$')      { [void]$out.AppendLine("<h1>$(Format-HtmlInline $Matches[1])</h1>"); $i++; continue }
 
+        # o2md.51: raw <details>/<summary> lines from the collapsible server
+        # sections pass through unescaped (open attribute added so the dark
+        # HTML report renders fully expanded for printing/search).
+        if ($line -match '^\s*<details>\s*$')    { [void]$out.AppendLine("<details open>"); $i++; continue }
+        if ($line -match '^\s*</details>\s*$')   { [void]$out.AppendLine("</details>"); $i++; continue }
+        if ($line -match '^\s*<summary>.*</summary>\s*$') { [void]$out.AppendLine($line.Trim()); $i++; continue }
+
+        # o2md.51: blockquote block -- GitHub alert syntax ([!CAUTION] etc.)
+        # becomes a styled callout div; plain blockquotes become <blockquote>.
+        if ($line -match '^\s*>') {
+            $bq = [System.Collections.Generic.List[string]]::new()
+            while ($i -lt $lines.Count -and $lines[$i] -match '^\s*>') {
+                $bq.Add(($lines[$i] -replace '^\s*>\s?', ''))
+                $i++
+            }
+            $alertClass = $null
+            if ($bq.Count -gt 0 -and $bq[0] -match '^\[!(CAUTION|WARNING|NOTE|TIP|IMPORTANT)\]') {
+                $alertClass = $Matches[1].ToLowerInvariant()
+                $bq.RemoveAt(0)
+            }
+            $inner = [System.Text.StringBuilder]::new()
+            foreach ($bl in $bq) {
+                if ($bl -match '^\s*-\s+(.*)$') { [void]$inner.AppendLine("<div class='alert-item'>$(Format-HtmlInline $Matches[1])</div>") }
+                elseif (-not [string]::IsNullOrWhiteSpace($bl)) { [void]$inner.AppendLine("<p>$(Format-HtmlInline $bl)</p>") }
+            }
+            if ($alertClass) { [void]$out.AppendLine("<div class='alert alert-$alertClass'>$($inner.ToString())</div>") }
+            else             { [void]$out.AppendLine("<blockquote>$($inner.ToString())</blockquote>") }
+            continue
+        }
+
         # Horizontal rule
         if ($line -match '^\s*-{3,}\s*$') { [void]$out.AppendLine("<hr />"); $i++; continue }
 
@@ -1447,20 +1556,47 @@ function New-HtmlDocument {
 <meta charset="UTF-8">
 <title>$Title</title>
 <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
-    h1 { color: #1a1a2e; border-bottom: 3px solid #16213e; padding-bottom: 10px; }
-    h2 { color: #16213e; margin-top: 30px; }
-    h3 { color: #0f3460; }
-    h4 { color: #0f3460; }
-    table { border-collapse: collapse; width: 100%; margin: 10px 0; background: white; display: block; overflow-x: auto; }
-    th { background: #16213e; color: white; padding: 8px 12px; text-align: left; }
-    td { padding: 6px 12px; border-bottom: 1px solid #eee; }
-    tr:hover td { background: #f0f0f0; }
-    code, pre { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; font-family: 'Cascadia Code', Consolas, monospace; }
-    pre { padding: 12px; overflow-x: auto; }
-    .critical { color: #d32f2f; font-weight: bold; }
-    .warning { color: #f57c00; font-weight: bold; }
-    .info { color: #1976d2; }
+    /* o2md.51: self-contained dark theme -- zero external assets, so the file
+       works offline and nothing leaks from SAFE_TO_SHARE reports. */
+    :root {
+        --bg: #0d1117; --bg-panel: #161b22; --bg-hover: #1f2733;
+        --fg: #e6edf3; --fg-muted: #9da7b3; --border: #30363d;
+        --accent: #58a6ff; --crit: #f85149; --warn: #d29922; --note: #58a6ff; --good: #3fb950;
+    }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 1200px;
+           margin: 0 auto; padding: 24px; background: var(--bg); color: var(--fg); line-height: 1.55; }
+    h1 { color: var(--fg); border-bottom: 2px solid var(--accent); padding-bottom: 10px; }
+    h2 { color: var(--accent); margin-top: 34px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+    h3 { color: var(--fg); margin-top: 26px; }
+    h4 { color: var(--fg-muted); text-transform: uppercase; font-size: 0.85em; letter-spacing: 0.05em; margin-top: 22px; }
+    a { color: var(--accent); }
+    hr { border: 0; border-top: 1px solid var(--border); margin: 28px 0; }
+    table { border-collapse: collapse; width: 100%; margin: 12px 0; background: var(--bg-panel);
+            display: block; overflow-x: auto; border: 1px solid var(--border); border-radius: 6px; }
+    th { background: #21262d; color: var(--fg); padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
+    td { padding: 6px 12px; border-bottom: 1px solid var(--border); color: var(--fg); }
+    tr:last-child td { border-bottom: 0; }
+    tr:hover td { background: var(--bg-hover); }
+    code { background: #21262d; color: #79c0ff; padding: 2px 6px; border-radius: 4px;
+           font-family: 'Cascadia Code', Consolas, monospace; font-size: 0.9em; }
+    pre { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px;
+          padding: 14px; overflow-x: auto; }
+    pre code { background: transparent; padding: 0; color: #a5d6ff; }
+    blockquote { border-left: 4px solid var(--border); margin: 12px 0; padding: 4px 16px; color: var(--fg-muted); }
+    details { background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px;
+              padding: 10px 16px; margin: 14px 0; }
+    details > summary { cursor: pointer; font-size: 1.05em; padding: 4px 0; color: var(--fg); }
+    details > summary:hover { color: var(--accent); }
+    .alert { border-left: 4px solid var(--note); border-radius: 6px; background: var(--bg-panel);
+             padding: 12px 16px; margin: 14px 0; }
+    .alert p { margin: 4px 0; }
+    .alert-item { margin: 4px 0 4px 12px; }
+    .alert-caution   { border-left-color: var(--crit); }
+    .alert-warning   { border-left-color: var(--warn); }
+    .alert-note, .alert-tip, .alert-important { border-left-color: var(--note); }
+    .critical { color: var(--crit); font-weight: bold; }
+    .warning { color: var(--warn); font-weight: bold; }
+    .info { color: var(--note); }
 </style>
 </head>
 <body>
@@ -1542,6 +1678,16 @@ if ($Obfuscate) {
             $safeReport = Build-MarkdownReport -AllResults $safeResults -AllRecommendations $obfRecommendations -IsObfuscated $true -ConnectionErrors @($allErrors)
             $safeReport | Out-File -FilePath $safePath -Encoding UTF8
             Write-Host "  SAFE_TO_SHARE: $safePath" -ForegroundColor Green
+
+            # o2md.51: the dark-themed HTML twin always ships alongside the .md --
+            # Markdown cannot control its own theme (the viewer decides), so the
+            # HTML file is the guaranteed-dark, self-contained deliverable.
+            $confHtmlPath = Join-Path $OutputPath "${baseFileName}_CONFIDENTIAL.html"
+            (New-HtmlDocument -Markdown $reportContent -Title "sp_StatUpdate Diagnostic Report (CONFIDENTIAL)") | Out-File -FilePath $confHtmlPath -Encoding UTF8
+            Write-Host "  CONFIDENTIAL (dark HTML): $confHtmlPath" -ForegroundColor Yellow
+            $safeHtmlPath = Join-Path $OutputPath "${baseFileName}_SAFE_TO_SHARE.html"
+            (New-HtmlDocument -Markdown $safeReport -Title "sp_StatUpdate Diagnostic Report (Safe to Share)") | Out-File -FilePath $safeHtmlPath -Encoding UTF8
+            Write-Host "  SAFE_TO_SHARE (dark HTML): $safeHtmlPath" -ForegroundColor Green
         }
         "HTML" {
             # CONFIDENTIAL
