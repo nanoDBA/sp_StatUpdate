@@ -36,11 +36,53 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.8.4.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.8.5.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.8.4.2026.07.30 - o2md.8: bounded retry extended to lock timeouts.
+History:    3.8.5.2026.07.30 - OBSERVABILITY: self-idle-time buckets + mop-up
+                            sort-order/tagging (o2md.46, o2md.49).
+
+                            o2md.46 - the proc's own wait time was invisible:
+                            no field captured time spent in the inter-stat
+                            delay, the AG-redo recheck loop, deadlock/lock-
+                            timeout retry backoff, or parallel claim-cycle
+                            overhead (dead-worker sweep + claim + lazy
+                            discovery), so Diag's W6 EXCESSIVE_OVERHEAD could
+                            only infer "discovery cost" from wall-clock minus
+                            per-stat time.  Four accumulators (SYSDATETIME()
+                            bracketing, DATEDIFF_BIG ms) now emit in the END
+                            Summary XML as DelayWaitMs / AgRedoWaitMs /
+                            RetryBackoffMs / QueueClaimMs -- NULLIF omits each
+                            when zero (matches ForcedPlanFailureDelta; no
+                            XSINIL in that block, so absent == 0).  The
+                            claim-cycle bracket stays open across the
+                            lazy-discovery zero-rows/CATCH CONTINUE loops
+                            (o2md.1) so failed claim cycles are counted, and
+                            is never opened in serial mode.
+
+                            o2md.49 (split from o2md.5) - all three mop-up
+                            discovery sites (lazy per-table, parallel-leader,
+                            serial) hard-coded modification-counter ordering,
+                            silently ignoring @SortOrder.  A shared
+                            @mop_up_order_expr now honors ROWS, PAGE_COUNT,
+                            DAYS_STALE, AUTO_CREATED, and RANDOM (expressions
+                            mirror the main pass's staged-discovery CASE
+                            minus the qs_priority_boost term -- mop-up qs_*
+                            is structurally NULL).  QUERY_STORE and other
+                            enrichment-dependent sorts keep the
+                            modification-counter fallback (pre-fix behavior)
+                            pending the o2md.5 design decision.  Also new:
+                            #stats_to_process.from_mop_up per-row flag,
+                            emitted as FromMopUp in per-stat ExtendedInfo --
+                            unlike QualifyReason's MOP_UP branch (driven by
+                            the session-scoped @in_mop_up flag) it cannot
+                            mislabel priority-pass leftovers processed after
+                            the mop-up flag flips, giving Diag a reliable way
+                            to tell "no QS data" from "QS not applicable to
+                            this pass".
+
+            3.8.4.2026.07.30 - o2md.8: bounded retry extended to lock timeouts.
                             The existing #163 deadlock-retry loop (up to 3
                             attempts, exponential backoff) retried error 1205
                             only.  A lock timeout (1222) is just as transient
@@ -808,7 +850,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.8.4.2026.07.30',
+        @procedure_version varchar(20) = '3.8.5.2026.07.30',
         @procedure_version_date datetime = '20260730',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -1506,6 +1548,8 @@ BEGIN
         @mop_up_stats_processed int = 0, /* v2.24: mop-up stats processed (for summary XML) */
         @mop_lock_result int = NULL, /* v2.24: parallel mop-up app lock result */
         @mop_lock_resource nvarchar(255) = NULL, /* v2.24: parallel mop-up app lock name */
+        @mop_up_order_expr nvarchar(400) = NULL, /* o2md.49: mop-up ORDER BY expression honoring non-QS @SortOrder values (set after sort-order resolution) */
+        @current_from_mop_up bit = 0, /* o2md.49: per-row mop-up-origin flag from #stats_to_process (QualifyReason's @in_mop_up is session-scoped and mislabels priority-pass leftovers) */
         @io_corruption_warned bit = 0; /* lfbv: deduplication flag for IO_CORRUPTION warning code (mirrors @mop_up_done idiom) */
 
     /*
@@ -1525,6 +1569,22 @@ BEGIN
            Populated by the post-run forced-plan check when it runs; hoisted here so the
            Summary XML builder can reference it unconditionally (NULLIF omits when zero). */
         @qs_forced_failure_delta_total bigint = 0;
+
+    /*
+    o2md.46: self-idle-time accumulators.  The proc's own wait time (inter-stat
+    delay, AG-redo recheck loop, deadlock/lock-timeout retry backoff, parallel
+    claim-cycle overhead) was previously invisible -- Diag's W6 EXCESSIVE_OVERHEAD
+    could only infer "discovery cost" from wall-clock minus per-stat time.  Each
+    bucket is accumulated in milliseconds via SYSDATETIME() bracketing and emitted
+    in the END Summary XML (NULLIF omits when zero, matching ForcedPlanFailureDelta).
+    */
+    DECLARE
+        @delay_wait_ms bigint = 0,
+        @ag_redo_wait_ms bigint = 0,
+        @retry_backoff_ms bigint = 0,
+        @queue_claim_ms bigint = 0,
+        @wait_bracket_start datetime2(7) = NULL,
+        @queue_claim_start datetime2(7) = NULL;
 
     /*
     Queue-based parallel processing variables
@@ -1660,6 +1720,7 @@ BEGIN
         qs_last_execution datetime2(3) NULL, /*most recent plan execution*/
         qs_priority_boost bigint NOT NULL DEFAULT 0, /*calculated boost for QS stats*/
         priority integer NOT NULL DEFAULT 0,
+        from_mop_up bit NOT NULL DEFAULT 0, /* o2md.49: row discovered by a mop-up pass (per-row; @in_mop_up is session-scoped and mislabels priority-pass leftovers) */
         processed bit NOT NULL DEFAULT 0
     );
 
@@ -2302,6 +2363,25 @@ BEGIN
                              N'MODIFICATION_VELOCITY')
         INSERT INTO @errors (error_message, error_severity)
         VALUES (N'Invalid @SortOrder. Use: MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED, ROWS, MODIFICATION_VELOCITY.', 16);
+
+    /* o2md.49: mop-up discovery ORDER BY expression.  The three mop-up discovery
+       sites (lazy per-table, parallel-leader, serial) previously hard-coded
+       modification-counter ordering, silently ignoring @SortOrder.  The non-QS sort
+       orders map onto columns those sites already select (aliases s/sp/pgs are
+       identical at all three).  QUERY_STORE, FILTERED_DRIFT, MODIFICATION_VELOCITY
+       and WAIT-based sorts need enrichment mop-up does not run (o2md.5, escalated)
+       -- they keep the modification-counter fallback, which is the pre-fix behavior.
+       Expressions mirror the main pass's staged-discovery CASE (region 05) minus the
+       qs_priority_boost term (mop-up qs_* is structurally NULL). */
+    SET @mop_up_order_expr =
+        CASE @i_sort_order
+            WHEN N'ROWS'         THEN N'ISNULL(sp.rows, 0)'
+            WHEN N'PAGE_COUNT'   THEN N'ISNULL(pgs.total_pages, 0)'
+            WHEN N'DAYS_STALE'   THEN N'ISNULL(DATEDIFF(DAY, sp.last_updated, SYSDATETIME()), 9999)'
+            WHEN N'AUTO_CREATED' THEN N'CASE WHEN ISNULL(s.auto_created, 0) = 0 THEN CONVERT(bigint, 1000000000000) ELSE CONVERT(bigint, 0) END + ISNULL(sp.modification_counter, 0)'
+            WHEN N'RANDOM'       THEN N'CHECKSUM(NEWID())'
+            ELSE N'ISNULL(sp.modification_counter, 0)'
+        END;
 
     /* gh-554 (v3.7.0): validate the re-promoted filtered-stats knobs (effective values) */
     IF @i_filtered_stats_mode NOT IN (N'INCLUDE', N'EXCLUDE', N'ONLY', N'PRIORITY')
@@ -7613,7 +7693,9 @@ OPTION (RECOMPILE);';
                         N' MB) -- waiting 30s...';
                     RAISERROR(@ag_wait_msg, 10, 1) WITH NOWAIT;
 
+                    SET @wait_bracket_start = SYSDATETIME();
                     WAITFOR DELAY '00:00:30';
+                    SET @ag_redo_wait_ms += DATEDIFF_BIG(MILLISECOND, @wait_bracket_start, SYSDATETIME());
 
                     /* #141: Re-check time limit after WAITFOR to prevent overshoot */
                     IF  @i_time_limit IS NOT NULL
@@ -7783,6 +7865,12 @@ OPTION (RECOMPILE);';
             */
             IF @claimed_table_database IS NULL
             BEGIN
+                /* o2md.46: open the claim-cycle bracket only if not already open --
+                   the lazy-discovery zero-rows/CATCH CONTINUE paths (o2md.1) loop back
+                   here with the window still open, and re-opening would undercount. */
+                IF @queue_claim_start IS NULL
+                    SET @queue_claim_start = SYSDATETIME();
+
                 /*
                 First, release any tables claimed by dead workers.
                 A worker is dead if its session is no longer in dm_exec_sessions.
@@ -8029,7 +8117,8 @@ OPTION (RECOMPILE);';
                                                 OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
                                     THEN 1 ELSE 0 END
                                 ELSE 0 END DESC,
-                                ISNULL(sp.modification_counter, 0) DESC, s.stats_id ASC)
+                                ' + @mop_up_order_expr + N' DESC, s.stats_id ASC),
+                            from_mop_up = 1
                         FROM sys.stats AS s
                         JOIN sys.objects AS o ON o.object_id = s.object_id
                         LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
@@ -8140,7 +8229,7 @@ OPTION (RECOMPILE);';
                                 qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
                                 qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_total_wait_time_ms, qs_max_dop, qs_active_feedback_count,
                                 qs_last_execution, qs_priority_boost,
-                                is_published, is_tracked_by_cdc, temporal_type, priority
+                                is_published, is_tracked_by_cdc, temporal_type, priority, from_mop_up
                             )
                             EXECUTE sys.sp_executesql
                                 @lazy_mop_sql,
@@ -8269,6 +8358,16 @@ OPTION (RECOMPILE);';
         END;
 
         /*#endregion 09C-PARALLEL-CLAIM */
+
+        /* o2md.46: close the claim-cycle bracket -- covers the dead-worker sweep,
+           claim UPDATE, and lazy per-table discovery for this cycle.  NULL outside
+           parallel mode (never opened) and on the already-claimed fast path. */
+        IF @queue_claim_start IS NOT NULL
+        BEGIN
+            SET @queue_claim_ms += DATEDIFF_BIG(MILLISECOND, @queue_claim_start, SYSDATETIME());
+            SET @queue_claim_start = NULL;
+        END;
+
         /*#region 09D-WORK-CLAIM: SELECT TOP 1 from #stats_to_process, mark processed, COMPLETED break */
         /*
         Claim next work item
@@ -8319,7 +8418,9 @@ OPTION (RECOMPILE);';
             /* Replication and temporal table awareness */
             @current_is_published = stp.is_published,
             @current_is_tracked_by_cdc = stp.is_tracked_by_cdc,
-            @current_temporal_type = stp.temporal_type
+            @current_temporal_type = stp.temporal_type,
+            /* o2md.49: per-row mop-up-origin flag */
+            @current_from_mop_up = stp.from_mop_up
         FROM #stats_to_process AS stp
         WHERE stp.processed = 0
         /*
@@ -9384,7 +9485,9 @@ OPTION (RECOMPILE);';
                             SET @exec_retry += 1;
                             RAISERROR(N'  ~ %s on stat update (retry %d/2) -- waiting %s before retry (#163/o2md.8)',
                                 10, 1, @exec_err_label, @exec_retry, @exec_retry_delay) WITH NOWAIT;
+                            SET @wait_bracket_start = SYSDATETIME();
                             WAITFOR DELAY @exec_retry_delay;
+                            SET @retry_backoff_ms += DATEDIFF_BIG(MILLISECOND, @wait_bracket_start, SYSDATETIME());
                         END
                         ELSE
                         BEGIN
@@ -9593,6 +9696,12 @@ OPTION (RECOMPILE);';
                                 @mode AS Mode,
                                 @run_label AS RunLabel,
                                 @stats_processed AS ProcessingPosition,
+                                /* o2md.49: per-row mop-up-origin flag.  NULLIF omits when 0
+                                   (no XSINIL here, absent == priority-pass row).  Unlike
+                                   QualifyReason's MOP_UP branch (@in_mop_up, session-scoped)
+                                   this cannot mislabel priority-pass leftovers processed
+                                   after the mop-up flag flips. */
+                                NULLIF(@current_from_mop_up, 0) AS FromMopUp,
                                 @procedure_version AS Version
                             FOR
                                 XML RAW(N'ExtendedInfo'),
@@ -9924,6 +10033,8 @@ OPTION (RECOMPILE);';
                                     @mode AS Mode,
                                     @run_label AS RunLabel,
                                     @stats_processed AS ProcessingPosition,
+                                    /* o2md.49: per-row mop-up-origin flag (see success-path note) */
+                                    NULLIF(@current_from_mop_up, 0) AS FromMopUp,
                                     @procedure_version AS Version
                                 FOR
                                     XML RAW(N'ExtendedInfo'),
@@ -10080,7 +10191,9 @@ OPTION (RECOMPILE);';
             DECLARE
                 @delay_time datetime = DATEADD(MILLISECOND, CONVERT(int, @i_delay_between_stats * 1000), '00:00:00');
 
+            SET @wait_bracket_start = SYSDATETIME();
             WAITFOR DELAY @delay_time;
+            SET @delay_wait_ms += DATEDIFF_BIG(MILLISECOND, @wait_bracket_start, SYSDATETIME());
         END;
 
         /*
@@ -10442,7 +10555,8 @@ OPTION (RECOMPILE);';
                                             OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
                                 THEN 1 ELSE 0 END
                             ELSE 0 END DESC,
-                            ISNULL(sp.modification_counter, 0) DESC, s.object_id ASC, s.stats_id ASC)
+                            ' + @mop_up_order_expr + N' DESC, s.object_id ASC, s.stats_id ASC),
+                        from_mop_up = 1
                     FROM sys.stats AS s
                     JOIN sys.objects AS o ON o.object_id = s.object_id
                     LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
@@ -10496,7 +10610,7 @@ OPTION (RECOMPILE);';
                             qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
                             qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_total_wait_time_ms, qs_max_dop, qs_active_feedback_count,
                             qs_last_execution, qs_priority_boost,
-                            is_published, is_tracked_by_cdc, temporal_type, priority
+                            is_published, is_tracked_by_cdc, temporal_type, priority, from_mop_up
                         )
                         EXECUTE sys.sp_executesql
                             @mop_up_sql,
@@ -10780,7 +10894,8 @@ OPTION (RECOMPILE);';
                                         OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
                             THEN 1 ELSE 0 END
                         ELSE 0 END DESC,
-                        ISNULL(sp.modification_counter, 0) DESC, s.object_id ASC, s.stats_id ASC)
+                        ' + @mop_up_order_expr + N' DESC, s.object_id ASC, s.stats_id ASC),
+                    from_mop_up = 1
                 FROM sys.stats AS s
                 JOIN sys.objects AS o ON o.object_id = s.object_id
                 LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
@@ -10834,7 +10949,7 @@ OPTION (RECOMPILE);';
                         qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
                         qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_total_wait_time_ms, qs_max_dop, qs_active_feedback_count,
                             qs_last_execution, qs_priority_boost,
-                        is_published, is_tracked_by_cdc, temporal_type, priority
+                        is_published, is_tracked_by_cdc, temporal_type, priority, from_mop_up
                     )
                     EXECUTE sys.sp_executesql
                         @mop_up_sql,
@@ -11495,6 +11610,14 @@ OPTION (RECOMPILE);';
                        error, applock/re-entry) cannot have run any stats so a delta is
                        structurally impossible on those paths. */
                     NULLIF(@qs_forced_failure_delta_total, 0) AS ForcedPlanFailureDelta,
+                    /* o2md.46: self-idle-time buckets in ms.  NULLIF omits the element
+                       when zero (this block has no XSINIL, so absent == 0) -- Diag can
+                       subtract measured idle time from wall-clock instead of inferring
+                       "discovery cost" (W6 EXCESSIVE_OVERHEAD attribution). */
+                    NULLIF(@delay_wait_ms, 0) AS DelayWaitMs,
+                    NULLIF(@ag_redo_wait_ms, 0) AS AgRedoWaitMs,
+                    NULLIF(@retry_backoff_ms, 0) AS RetryBackoffMs,
+                    NULLIF(@queue_claim_ms, 0) AS QueueClaimMs,
                     @json_summary_str AS JsonSummary
                 FOR
                     XML RAW(N'Summary'),
