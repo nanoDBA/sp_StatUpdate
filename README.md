@@ -8,7 +8,27 @@
 [![SQL Server 2016+](https://img.shields.io/badge/SQL%20Server-2016%2B-blue.svg)](https://www.microsoft.com/sql-server)
 [![Azure SQL](https://img.shields.io/badge/Azure%20SQL-Supported-0078D4.svg)](https://azure.microsoft.com/products/azure-sql)
 
-## See It Run
+### Contents
+
+📸 [See It Run](#see-it-run-) &nbsp;·&nbsp;
+🎯 [Why This Exists](#why-this-exists-) &nbsp;·&nbsp;
+🚀 [Quick Start](#quick-start-) &nbsp;·&nbsp;
+📋 [Requirements](#requirements-) &nbsp;·&nbsp;
+⚙️ [Presets](#presets-) &nbsp;·&nbsp;
+🛠️ [Common Scenarios](#common-scenarios-) &nbsp;·&nbsp;
+📖 [Parameter Reference](#parameter-reference-) &nbsp;·&nbsp;
+🔍 [Environment Detection](#environment-detection-) &nbsp;·&nbsp;
+📊 [Monitoring](#monitoring-) &nbsp;·&nbsp;
+🩺 [Diagnostic Tool](#diagnostic-tool-) &nbsp;·&nbsp;
+🔬 [Extended Events](#extended-events-) &nbsp;·&nbsp;
+🔄 [Migrating from v2](#migrating-from-v2-) &nbsp;·&nbsp;
+📜 [Version History](#version-history-) &nbsp;·&nbsp;
+⚖️ [When to Use This](#when-to-use-this-vs-indexoptimize-) &nbsp;·&nbsp;
+🙏 [Acknowledgments](#acknowledgments-)
+
+<sub>Anchor links assume GitHub's heading-slug behavior (trailing emoji → trailing `-` in the anchor). If a link doesn't jump correctly on your renderer, the section is still right there in reading order.</sub>
+
+## See It Run 📸
 
 *The screenshots below are **real `@Ansi = 'Y'` console captures** -- not mockups. Numbers vary with your workload.*
 
@@ -28,11 +48,11 @@
 
 ![sp_StatUpdate_Diag Recommendations with @Ansi='Y': severity-colored findings plus copy-paste EXEC calls tuned for this server](assets/demo-recommendations.png)
 
-> **About the color:** every screenshot above is the tool's own output with `@Ansi = 'Y'` (opt-in; default is plain text). For `sp_StatUpdate` the run/environment console is colorized; for `sp_StatUpdate_Diag`, `@Ansi = 'Y'` *also* renders the Dashboard and Recommendations as colored text on the Messages stream, in addition to the normal result sets. The escape codes are **console-only** and never touch CommandLog, OUTPUT parameters, or result sets.
+> 🎨 **About the color:** every screenshot above is the tool's own output with `@Ansi = 'Y'` (opt-in; default is plain text). For `sp_StatUpdate` the run/environment console is colorized; for `sp_StatUpdate_Diag`, `@Ansi = 'Y'` *also* renders the Dashboard and Recommendations as colored text on the Messages stream, in addition to the normal result sets. The escape codes are **console-only** and never touch CommandLog, OUTPUT parameters, or result sets.
 >
 > Color renders in **Windows Terminal, VS Code's integrated terminal, iTerm2/Terminal.app, Linux terminals, `sqlcmd | less -R`, and CI log viewers**. It shows **raw escape codes** (so leave `@Ansi` off) in **SSMS, Azure Data Studio, DataGrip/DBeaver, PowerShell ISE, legacy `cmd.exe`, SQL Agent job logs, and files** -- i.e. don't enable it for SSMS or Agent jobs. Only basic 16-color SGR codes are used, so wherever ANSI works at all, these do.
 
-## Why This Exists
+## Why This Exists 🎯
 
 | Problem | Fix |
 |---------|-----|
@@ -50,7 +70,7 @@
 | Azure DTU/vCore concerns | Auto-detects Azure SQL DB vs MI, platform-specific warnings |
 | Priority pass finishes early | `@MopUpPass = 'Y'` -- broad sweep with remaining time |
 
-## Quick Start
+## Quick Start 🚀
 
 ```sql
 -- 1. Install prerequisites (Ola Hallengren's CommandLog table)
@@ -66,7 +86,7 @@ EXEC dbo.sp_StatUpdate
     -- Defaults: @Preset='DEFAULT', @TargetNorecompute='BOTH', @LogToTable='Y'
 ```
 
-## Requirements
+## Requirements 📋
 
 **DROP-IN COMPATIBLE** with [Ola Hallengren's SQL Server Maintenance Solution](https://ola.hallengren.com).
 
@@ -79,7 +99,7 @@ EXEC dbo.sp_StatUpdate
 
 **Note**: `dbo.QueueStatistic` is auto-created on first parallel run. `dbo.CommandExecute` is NOT required.
 
-## Presets
+## Presets ⚙️
 
 v3 uses a preset-first API.  Choose a preset, then override individual parameters as needed.  Explicit parameters always win over preset defaults.
 
@@ -108,7 +128,7 @@ EXEC dbo.sp_StatUpdate @Preset = 'WAREHOUSE', @Databases = 'MyDW';
 EXEC dbo.sp_StatUpdate @Preset = 'NIGHTLY', @Databases = 'USER_DATABASES', @TimeLimit = 7200;
 ```
 
-## Common Scenarios
+## Common Scenarios 🛠️
 
 ### Time-Limited Nightly Runs
 
@@ -141,7 +161,7 @@ EXEC dbo.sp_StatUpdate
 
 **Available QS metrics:** `CPU`, `DURATION`, `READS`, `EXECUTIONS`, `AVG_CPU`, `MEMORY_GRANT`, `TEMPDB_SPILLS` (SQL 2017+), `PHYSICAL_READS`, `AVG_MEMORY`, `WAITS`
 
-**Performance note:** Phase 6 (QS enrichment) parses plan XML to find table references. On databases with 10,000+ QS plans, this can take minutes. `@QueryStoreTopPlans` limits XML parsing to the most impactful plans. The proc also skips Phase 6 entirely when QS has no recent runtime stats within `@QueryStoreRecentHours`.
+⚡ **Performance note:** Phase 6 (QS enrichment) parses plan XML to find table references. On databases with 10,000+ QS plans, this can take minutes. `@QueryStoreTopPlans` limits XML parsing to the most impactful plans. The proc also skips Phase 6 entirely when QS has no recent runtime stats within `@QueryStoreRecentHours`.
 
 ### NORECOMPUTE Stats Refresh
 
@@ -213,13 +233,14 @@ EXEC dbo.sp_StatUpdate
     @StopByTime = N'04:00';
 ```
 
-## Parameter Reference
+## Parameter Reference 📖
 
 Run `EXEC sp_StatUpdate @Help = 1` for complete documentation including operational notes and preset details.
 
-### v3 API Summary
-
 v3 has **42 input parameters** (was 58 in v2) plus **11 OUTPUT parameters**.  23 parameters from v2 were absorbed into preset-controlled internal variables.  Explicit parameters always override preset defaults.
+
+<details>
+<summary><strong>📖 Show all parameter tables</strong> (database/table selection, thresholds, execution control, sort orders, Query Store, sampling, safety checks, logging, parallel, OUTPUT params, StopReason/Warning values)</summary>
 
 ### Database & Table Selection
 
@@ -295,7 +316,7 @@ v3 has **42 input parameters** (was 58 in v2) plus **11 OUTPUT parameters**.  23
 
 ### Logging & Output
 
-> **Two-phase logging:** Like Ola Hallengren's `CommandExecute`, sp_StatUpdate inserts a CommandLog row with NULL `EndTime` before each stat update, then updates `EndTime` on completion. Query in-progress stats with: `SELECT * FROM dbo.CommandLog WHERE EndTime IS NULL AND CommandType = 'UPDATE_STATISTICS';`
+> 📝 **Two-phase logging:** Like Ola Hallengren's `CommandExecute`, sp_StatUpdate inserts a CommandLog row with NULL `EndTime` before each stat update, then updates `EndTime` on completion. Query in-progress stats with: `SELECT * FROM dbo.CommandLog WHERE EndTime IS NULL AND CommandType = 'UPDATE_STATISTICS';`
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -333,7 +354,9 @@ v3 has **42 input parameters** (was 58 in v2) plus **11 OUTPUT parameters**.  23
 
 `LOW_UPTIME`, `BACKUP_RUNNING`, `AZURE_SQL`, `AZURE_MI`, `RESOURCE_GOVERNOR`, `AG_REDO_ELEVATED`, `TEMPDB_LOW`, `RLS_DETECTED`, `COLUMNSTORE_CONTEXT`, `QS_FORCED_PLANS`, `LOG_SPACE_HIGH`, `WIDE_STATS`, `FILTER_MISMATCH`
 
-## Environment Detection
+</details>
+
+## Environment Detection 🔍
 
 Debug mode (`@Debug = 1`) automatically reports:
 
@@ -360,7 +383,7 @@ When `@Debug = 1`, after discovery the proc checks each database for:
 - **Query Store forced plans** on updated tables (post-update check, automatic)
 - **Transaction log space** >90% full during FULLSCAN operations
 
-## Monitoring
+## Monitoring 📊
 
 ### Summary Result Set
 
@@ -426,7 +449,7 @@ EXEC sp_StatUpdate @Databases = 'USER_DATABASES', @TimeLimit = 3600;
 SELECT * FROM dbo.CommandLog WHERE EndTime IS NULL AND CommandType = 'UPDATE_STATISTICS';
 ```
 
-## Diagnostic Tool
+## Diagnostic Tool 🩺
 
 **sp_StatUpdate_Diag** analyzes CommandLog history and produces actionable recommendations. Two viewing modes: management-friendly dashboard or full DBA deep-dive.
 
@@ -517,6 +540,9 @@ EXEC dbo.sp_StatUpdate_Diag @SkipHistory = 1;
 
 Customize the Executive Dashboard when you know certain issues are expected or irrelevant.
 
+<details>
+<summary><strong>⚙️ Show @GradeOverrides / @GradeWeights details and examples</strong></summary>
+
 #### @GradeOverrides -- Force Grades or Ignore Categories
 
 Force a specific letter grade (A/B/C/D/F) or exclude a category entirely (IGNORE).
@@ -596,9 +622,14 @@ WORKLOAD FOCUS  D         50  Query Store prioritization is not enabled...
 
 **Note:** History table (`StatUpdateDiagHistory`) always uses hardcoded weights (30/25/20/25) -- overrides only affect the current dashboard view, not persisted scores.
 
+</details>
+
 ### Obfuscated Mode
 
 Hash all database, table, and statistics names for safe external sharing. Prefixes (`IX_`, `PK_`, `DB_`, `_WA_Sys_`) are preserved so consultants can still reason about object types.
+
+<details>
+<summary><strong>🔐 Show obfuscation setup, decoding, and PowerShell workflow</strong></summary>
 
 #### Quick Start: Share a Report with a Consultant
 
@@ -740,12 +771,14 @@ FROM [PROD-SQL02].master.dbo.DiagObfMap
 ORDER BY [Server], ObjectType, OriginalName;
 ```
 
-**How obfuscation works:**
+🔐 **How obfuscation works:**
 - **With a seed**: Hashes are **deterministic** -- the same object always produces the same token across servers, runs, and time. This means `TBL_e4c1` in Monday's report is the same table as `TBL_e4c1` in Friday's report.
 - **Without a seed**: Hashes are random per run. Useful for one-off sharing but tokens can't be correlated across runs.
 - The map table **appends** on each run (no data loss from prior runs)
 - The `_CONFIDENTIAL_DECODE.sql` file is standalone -- works in any SSMS session, no server access needed
 - Without the seed, the map, or the decode file, obfuscated tokens **cannot** be reversed (HASHBYTES is one-way)
+
+</details>
 
 ### Custom Analysis
 
@@ -791,6 +824,9 @@ Cross-server analysis detects version skew and parameter inconsistencies.
 
 ### Diag Parameter Reference
 
+<details>
+<summary><strong>📖 Show full Diag parameter table</strong></summary>
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@DaysBack` | `30` | History window in days |
@@ -812,7 +848,9 @@ Cross-server analysis detects version skew and parameter inconsistencies.
 | `@SingleResultSet` | `0` | `1` = JSON-formatted single result set |
 | `@Debug` | `0` | `1` = verbose output |
 
-## Extended Events
+</details>
+
+## Extended Events 🔬
 
 `sp_StatUpdate_XE_Session.sql` builds a ready-to-run session (`sp_StatUpdate_Monitor`) for when you'd rather watch a run than autopsy it afterward:
 
@@ -827,9 +865,12 @@ Captures the START and COMPLETION of every `UPDATE STATISTICS` statement, errors
 
 **Preselection is not proof.** Query Store's `TEMPDB_SPILLS` / `WAITS` / `WAIT_CPU` metrics are excellent for choosing *which* stats to update before a run -- but a DDL statement barely registers in Query Store wait data, so those metrics can't prove the `UPDATE STATISTICS` command actually spilled. `sort_warning` fires from the spilling statement, filtered to the generated command text, with `context_info` carrying the run tag; analysis query 7 ties each spill back to its `CommandLog` row by time. Rank with Query Store; prove with XE.
 
-## Migrating from v2
+## Migrating from v2 🔄
 
 v3 simplifies the API from 58 (v2) to 42 input parameters.  Most v2 scripts work with minor changes.
+
+<details>
+<summary><strong>🔄 Show the full v2 → v3 parameter migration table and example</strong></summary>
 
 ### Quick Migration Guide
 
@@ -879,7 +920,14 @@ EXEC dbo.sp_StatUpdate
     @Databases = N'USER_DATABASES';
 ```
 
-## Version History
+</details>
+
+## Version History 📜
+
+**Current version:** `3.7.4.2026.07.25` (proc) &nbsp;·&nbsp; `2026.07.23.2` (diag)
+
+<details>
+<summary><strong>📜 Show full changelog (60+ releases)</strong></summary>
 
 - **3.7.4.2026.07.25** - **Spill proof: preselection vs. proof** (gh-552): sp_StatUpdate's Query Store metrics (`TEMPDB_SPILLS`, `WAITS`, `WAIT_CPU`) rank which stats to update *before* a run -- but a DDL statement barely registers in Query Store wait data, so they can't prove the `UPDATE STATISTICS` command itself spilled.  `@Help` now documents that distinction (new **SPILL PROOF** topic) and points to `sp_StatUpdate_XE_Session.sql`, which gains `sort_warning` (primary proof surface) plus `hash_warning` (secondary context) events -- filtered to the generated command text, `context_info`-tagged, and correlated to the `CommandLog` row by time via a new analysis query.  Fixed a latent bug the new events exposed: the session DDL was built by concatenating string literals, which capped at 4000 nchars and silently truncated the `CREATE EVENT SESSION` mid-token once the session grew past that -- now forced to `NVARCHAR(MAX)`.  No behavioral change to the main proc's QS enrichment, ranking, or sort logic.
 - **3.7.3.2026.07.23** - **Publish early-rejection outcomes before severity-16 signaling** (gh-555): the open-transaction guard and the ALREADY_RUNNING branch raised their severity-16 error BEFORE setting OUTPUT parameters, emitting the structured summary row, and (ALREADY_RUNNING) writing the gh-551 `SP_STATUPDATE_DENIED` artifact.  A caller wrapping EXEC in TRY/CATCH transfers control at the RAISERROR, so it received the exception without the summary row or the denial telemetry the artifact exists to provide.  Both paths now publish first and signal last -- message/severity/state and return codes unchanged, and the StatUpdateLock transaction still commits before any signal.  Known T-SQL limit (locked in by regression test): OUTPUT parameters are never copied back when the caller's CATCH intercepts the error, so TRY/CATCH callers should key off the streamed summary row, the denial CommandLog row, or `ERROR_MESSAGE()`.  Callers without TRY/CATCH see identical behavior except the error message now follows the result set in the stream.
@@ -938,7 +986,9 @@ EXEC dbo.sp_StatUpdate
 - **1.3.2026.0119** - Multi-database support, OUTPUT parameters, return codes.
 - **1.0.2026.0117** - Initial public release.
 
-## When to Use This (vs IndexOptimize)
+</details>
+
+## When to Use This (vs IndexOptimize) ⚖️
 
 **IndexOptimize** is battle-tested and handles indexes + stats together. Use it for general maintenance.
 
@@ -958,7 +1008,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 Based on patterns from [Ola Hallengren's SQL Server Maintenance Solution](https://ola.hallengren.com) (MIT License).
 
-## Acknowledgments
+## Acknowledgments 🙏
 
 - [Ola Hallengren](https://ola.hallengren.com) - sp_StatUpdate wouldn't exist without his SQL Server Maintenance Solution. We use his CommandLog table, Queue patterns, and database selection syntax. If you're not already using his tools, start there.
 - [Brent Ozar](https://www.brentozar.com) - years of emphasizing stats over index rebuilds, First Responder Kit, and community education.
