@@ -422,14 +422,27 @@ $Servers | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
             elseif ($cols -contains "TotalRuns") { $map["RunHealth"] = $table }
             elseif ($cols -contains "RunLabel" -and $cols -contains "StopReason" -and $cols -contains "IsKilled") { $map["RunDetail"] = $table }
             elseif ($cols -contains "TotalDurationSec") { $map["TopTables"] = $table }
-            elseif ($cols -contains "FailureCount") { $map["FailingStats"] = $table }
-            elseif ($cols -contains "AvgDurationSec" -and -not ($cols -contains "FailureCount")) { $map["LongRunning"] = $table }
+            # o2md.39: this heuristic checked for a column named "FailureCount", but RS6's
+            # actual column (sp_StatUpdate_Diag.sql "RESULT SET 6: FAILING STATISTICS") is
+            # "FailCount" -- the mismatch meant this branch never matched and FailingStats
+            # silently fell through to the else/warning branch on every run. Found live by
+            # that new warning while testing it.
+            elseif ($cols -contains "FailCount") { $map["FailingStats"] = $table }
+            elseif ($cols -contains "AvgDurationSec" -and -not ($cols -contains "FailCount")) { $map["LongRunning"] = $table }
             elseif ($cols -contains "TieredThresholds") { $map["ParamHistory"] = $table }
             elseif ($cols -contains "OriginalName" -and $cols -contains "ObfuscatedName") { $map["ObfuscationMap"] = $table }
             elseif ($cols -contains "WeekLabel" -and $cols -contains "TrendDirection") { $map["EfficacyTrend"] = $table }
             elseif ($cols -contains "DeltaVsPrior") { $map["EfficacyDetail"] = $table }
             elseif ($cols -contains "ProcessingPosition" -and $cols -contains "WorkloadRank") { $map["HighCpuPositions"] = $table }
             elseif ($cols -contains "CpuTrend" -and $cols -contains "CpuChangePct") { $map["QSCorrelation"] = $table }
+            else {
+                # o2md.39: previously silent -- a future Diag column change would
+                # misroute or drop a result set with no signal, indistinguishable
+                # from o2md.30 (collected but never rendered). PS7's -Parallel
+                # streams Warning output back to the caller, so this surfaces even
+                # though Map-ResultSets runs inside a parallel runspace per server.
+                Write-Warning "[$server] Map-ResultSets: table with columns ($($cols -join ', ')) matched no known signature -- this result set will be dropped from the report."
+            }
         }
         return $map
     }
