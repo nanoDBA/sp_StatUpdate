@@ -36,11 +36,41 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.8.5.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.9.0.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.8.5.2026.07.30 - OBSERVABILITY: self-idle-time buckets + mop-up
+History:    3.9.0.2026.07.30 - BEHAVIOR CHANGE (maintainer-authorized, o2md.7):
+                            adaptive sampling on by default in the NIGHTLY and
+                            WEEKLY_FULL presets.  A single large stat with a
+                            100% sample could burn 20+ minutes of NIGHTLY's
+                            60-minute window; historically-slow stats (from
+                            CommandLog history) now fall back to the sampled
+                            rate automatically -- NIGHTLY threshold 10 min,
+                            WEEKLY_FULL 30 min, sample percent stays at the
+                            internal default (10%).  DEFAULT / OLTP_LIGHT /
+                            WAREHOUSE presets unchanged.  Explicit
+                            @LongRunningThresholdMinutes /
+                            @LongRunningSamplePercent still override (applied
+                            after presets).  Also in 3.9.0 (o2md.4, found by
+                            the kill-recovery repro): a parallel run that
+                            joins a carried-over queue, verifies every
+                            carried stat was already updated (CommandLog
+                            freshness check), and drains the queue no longer
+                            classifies as SILENT_NOOP/ERROR -- it reports
+                            the new QUEUE_ALREADY_SATISFIED warning code and
+                            grades normally.  A genuine zombie abandons a
+                            non-empty queue (remaining > 0) and still
+                            classifies.  Minor version bump because
+                            existing NIGHTLY/WEEKLY_FULL callers see changed
+                            sampling behavior on historically-slow stats.
+                            To restore pre-3.9.0 behavior on those presets,
+                            pass a threshold no run can reach (validation
+                            floor is 1; e.g. @LongRunningThresholdMinutes =
+                            100000) -- NULL cannot disable it, NULL means
+                            "preset decides".
+
+            3.8.5.2026.07.30 - OBSERVABILITY: self-idle-time buckets + mop-up
                             sort-order/tagging (o2md.46, o2md.49).
 
                             o2md.46 - the proc's own wait time was invisible:
@@ -850,7 +880,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.8.5.2026.07.30',
+        @procedure_version varchar(20) = '3.9.0.2026.07.30',
         @procedure_version_date datetime = '20260730',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -956,10 +986,10 @@ BEGIN
             detail = t.detail
         FROM (VALUES
             (N'QUICK START',   N'Choose @Preset for a packaged config (DEFAULT if omitted).  For deterministic control skip @Preset and set params explicitly.  @Execute=N for dry run.'),
-            (N'PRESETS',       N'Packaged configs: DEFAULT=balanced, NIGHTLY=1h+QS+mop-up, WEEKLY_FULL=4h+FULLSCAN, OLTP_LIGHT=30m+high-thresh, WAREHOUSE=unlimited+FULLSCAN.  Bounded overrides when using a preset: @TimeLimit, @ModificationThreshold, @SortOrder, @StatisticsSample, @MopUpPass, @QueryStore, @LockTimeout -- these are wired to override preset internals.  All other params (e.g. @Databases, @Tables, @LogToTable) are independent of presets.'),
+            (N'PRESETS',       N'Packaged configs: DEFAULT=balanced, NIGHTLY=1h+QS+mop-up+adaptive-sampling(10min), WEEKLY_FULL=4h+FULLSCAN+adaptive-sampling(30min), OLTP_LIGHT=30m+high-thresh, WAREHOUSE=unlimited+FULLSCAN.  Bounded overrides when using a preset: @TimeLimit, @ModificationThreshold, @SortOrder, @StatisticsSample, @MopUpPass, @QueryStore, @LockTimeout -- these are wired to override preset internals.  All other params (e.g. @Databases, @Tables, @LogToTable) are independent of presets.'),
             (N'CONTEXT_INFO',  N'@JobName=NMyJobName sets CONTEXT_INFO on entry, restored on exit.  Visible in XE sessions, dm_exec_requests, and any session-level monitoring.'),
             (N'COLUMNSTORE',   N'@SkipTablesWithNCCI=Y (default) skips tables with nonclustered columnstore (plan stability).  @SkipTablesWithCCI=N (default) updates CCI tables.'),
-            (N'WARNINGS',      N'@WarningsCodesOut returns pipe-delimited codes for programmatic parsing.  @WarningsOut is human-readable.  Same codes appear in END row Summary/WarningsCodes element.  Policy: codes may be added in any release, never renamed/removed without a major version bump.  Current tokens: AG_SECONDARY_SERVER|ELASTIC_POOL|RCSI_VERSION_STORE|DEAD_WORKER_TIMEOUT_NULL_COERCED|EMPTY_STRING_PARAM|AZURE_SQL_DB|AZURE_SQL_MI|AZURE_SQL_EDGE|CASE_SENSITIVE_COLLATION|LOW_UPTIME|BACKUP_RUNNING|PEAK_HOURS|CONTAINER_MEMORY|DB_SKIPPED|RLS_DETECTED|RLS_CHECK_FAILED|WIDESTAT_CHECK_FAILED|FILTER_MISMATCH|FILTER_CHECK_FAILED|COLUMNSTORE_TABLES|COLUMNSTORE_CHECK_FAILED|COMPRESSED_CHECK_FAILED|COMPUTEDCOL_CHECK_FAILED|CDC_TABLES|REPLICATION_MAJORITY|PARALLEL_ORPHAN_BACKLOG|STALE_QUEUE_SWEEP|BACKUP_STARTED_MID_RUN|LOG_SPACE_HIGH|PERSIST_SAMPLE_INADEQUATE|IO_CORRUPTION|STOPBYTIME_OVERSHOOT|QS_FORCED_PLANS|TOCTOU_SKIPS|CONSECUTIVE_FAILURES_ELEVATED|SILENT_NOOP'),
+            (N'WARNINGS',      N'@WarningsCodesOut returns pipe-delimited codes for programmatic parsing.  @WarningsOut is human-readable.  Same codes appear in END row Summary/WarningsCodes element.  Policy: codes may be added in any release, never renamed/removed without a major version bump.  Current tokens: AG_SECONDARY_SERVER|ELASTIC_POOL|RCSI_VERSION_STORE|DEAD_WORKER_TIMEOUT_NULL_COERCED|EMPTY_STRING_PARAM|AZURE_SQL_DB|AZURE_SQL_MI|AZURE_SQL_EDGE|CASE_SENSITIVE_COLLATION|LOW_UPTIME|BACKUP_RUNNING|PEAK_HOURS|CONTAINER_MEMORY|DB_SKIPPED|RLS_DETECTED|RLS_CHECK_FAILED|WIDESTAT_CHECK_FAILED|FILTER_MISMATCH|FILTER_CHECK_FAILED|COLUMNSTORE_TABLES|COLUMNSTORE_CHECK_FAILED|COMPRESSED_CHECK_FAILED|COMPUTEDCOL_CHECK_FAILED|CDC_TABLES|REPLICATION_MAJORITY|PARALLEL_ORPHAN_BACKLOG|STALE_QUEUE_SWEEP|BACKUP_STARTED_MID_RUN|LOG_SPACE_HIGH|PERSIST_SAMPLE_INADEQUATE|IO_CORRUPTION|STOPBYTIME_OVERSHOOT|QS_FORCED_PLANS|TOCTOU_SKIPS|CONSECUTIVE_FAILURES_ELEVATED|SILENT_NOOP|QUEUE_ALREADY_SATISFIED'),
             (N'PARALLEL',      N'@StatsInParallel=Y. Requires dbo.Queue + dbo.QueueStatistic (auto-created). Run same EXEC from multiple Agent steps. AG-secondary guard and orphan-row sweep run at startup.'),
             (N'QUERY STORE',   N'@QueryStore=CPU/DURATION/READS/etc. to prioritize stats on high-workload tables.  WAITS filters to Buffer Latch, Buffer IO, Memory, Other Disk IO -- wait classes statistics quality can influence.  WAIT_CPU: CPU-scheduler waits (SOS_SCHEDULER_YIELD) -- wait-bound queries the runtime metrics miss.  OFF to disable.  NOTE: these metrics PRESELECT which stats to update BEFORE the run; they are not proof of a spill in the UPDATE STATISTICS statement itself -- see SPILL PROOF.'),
             (N'SPILL PROOF',   N'Query Store TEMPDB_SPILLS/WAITS/WAIT_CPU rank candidates BEFORE the run; they are NOT evidence about the generated UPDATE STATISTICS statements.  For truthful proof of a sort spill in the stats-update command, run sp_StatUpdate_XE_Session.sql: its sort_warning event is the proof surface (hash_warning is secondary context), correlatable to the CommandLog UPDATE_STATISTICS row by time + statement (gh-552).'),
@@ -2182,6 +2212,12 @@ BEGIN
         SET @i_qs_enabled = 1;
         SET @i_mop_up_pass = N'Y';
         SET @i_sort_order = N'QUERY_STORE';
+        /* o2md.7 (maintainer-authorized behavior change, v3.9.0): adaptive
+           sampling on by default -- a single FULLSCAN stat could previously
+           burn 20+ min of this preset's 60-min window.  Threshold sized to
+           the window (~1/6th); explicit @LongRunningThresholdMinutes still
+           overrides (applied after presets). */
+        SET @i_long_running_threshold_min = 10;
     END
     ELSE IF @Preset = N'WEEKLY_FULL'
     BEGIN
@@ -2191,6 +2227,11 @@ BEGIN
         SET @i_mop_up_pass = N'Y';
         SET @i_sort_order = N'QUERY_STORE';
         SET @i_statistics_sample = 100;
+        /* o2md.7 (maintainer-authorized behavior change, v3.9.0): adaptive
+           sampling on by default -- historically-slow stats fall back to the
+           sampled rate instead of repeating a FULLSCAN that will not finish
+           inside the 4-hour window. */
+        SET @i_long_running_threshold_min = 30;
     END
     ELSE IF @Preset = N'OLTP_LIGHT'
     BEGIN
@@ -11074,12 +11115,24 @@ OPTION (RECOMPILE);';
     queue leadership -- sp_StatUpdate-v31y; and the lazy mop-up fall-through --
     o2md.1), so classify on the observable outcome rather than on either cause.
     Guarded on @Execute = 'Y' because a dry run legitimately processes nothing.
+
+    o2md.4 refinement (found by the kill-recovery repro): a parallel run that
+    joined an existing queue (@skip_discovery = 1), lazily discovered zero
+    still-qualifying stats for every carried-over table (the CommandLog
+    freshness check confirmed a prior run already updated them -- e.g. the
+    previous worker was killed AFTER finishing its stats but BEFORE closing
+    its claim), and fully drained the queue (@remaining_stats = 0,
+    queue-derived per o2md.2) is a VERIFIED-COMPLETE recovery, not a no-op.
+    A genuine zombie abandons a non-empty queue and reports remaining > 0,
+    so it still classifies.  Serial runs never set @skip_discovery and are
+    unaffected.
     */
     DECLARE @silent_noop bit =
         CASE
             WHEN @Execute = N'Y'
              AND @total_stats > 0
              AND @stats_processed = 0
+             AND NOT (@skip_discovery = 1 AND @remaining_stats = 0)
             THEN 1
             ELSE 0
         END;
@@ -11092,6 +11145,15 @@ OPTION (RECOMPILE);';
         SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'SILENT_NOOP';
 
         RAISERROR(N'SILENT NO-OP: %d statistic(s) were discovered and none were processed. Statistics maintenance did NOT happen this run.', 10, 1, @total_stats) WITH NOWAIT;
+    END
+    ELSE IF @Execute = N'Y' AND @total_stats > 0 AND @stats_processed = 0
+    BEGIN
+        /* The exempted recovery case -- still observable, just not an error */
+        SET @WarningsOut = ISNULL(@WarningsOut, N'') +
+            N'QUEUE_ALREADY_SATISFIED: joined a carried-over queue of ' + CONVERT(nvarchar(20), @total_stats) +
+            N' stat(s); all were already updated by a prior run (verified via CommandLog) and the queue is now drained; ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'QUEUE_ALREADY_SATISFIED';
+        RAISERROR(N'Queue already satisfied: %d carried-over stat(s) were verified as updated by a prior run; queue drained, nothing to do.', 10, 1, @total_stats) WITH NOWAIT;
     END;
 
     /*
