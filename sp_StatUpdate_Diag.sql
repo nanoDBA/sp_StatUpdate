@@ -36,7 +36,56 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.5 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.6 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.30.6 - Stale v3 parameter references in user-facing
+                           recommendation/@Help text (live user report:
+                           @CleanupOrphanedRuns was appearing in Diag alert
+                           text as something to set, even though v3 runs
+                           orphan cleanup automatically and removed the
+                           parameter).  Auditing the pattern found five more
+                           instances of the same defect class -- v2 params
+                           the v3 migration absorbed into internal variables
+                           or removed outright, still referenced as if they
+                           were live public parameters:
+
+                           - @Help "Killed Run Detection" topic told the
+                             reader orphans are "cleaned up by
+                             @CleanupOrphanedRuns"; now explains cleanup is
+                             automatic on every v3 call and the parameter
+                             was removed in the v2->v3 migration.
+                           - W15's PARALLEL_ORPHAN_BACKLOG and
+                             STALE_QUEUE_SWEEP recurring-code recommendations
+                             both told the reader to "run with
+                             @CleanupOrphanedRuns=Y"; replaced with what
+                             recurring large sweeps actually indicate (job
+                             kills/timeouts) since the sweep itself is no
+                             longer optional.
+                           - W15's AZURE_SQL_MI recommendation told the
+                             reader to "verify @IncludeSystemObjects
+                             behavior on MI"; the parameter was removed in
+                             v3 (system objects are always excluded from
+                             discovery) so there is nothing to verify.
+                           - W6 EXCESSIVE_OVERHEAD recommendation and code
+                             comment suggested "@DelayBetweenStats (if set)"
+                             and "reduce @CommandLogRetentionDays" -- both
+                             v2 params folded into preset-controlled internal
+                             variables (@i_delay_between_stats,
+                             @i_command_log_retention_days) with no public
+                             v3 knob.  Reworded to describe the underlying
+                             concept instead of a settable parameter.
+                           - o2md.18(c)'s code comment referenced
+                             @LogSkippedToCommandLog, the v2 parameter name
+                             for what is now the internal @i_log_skipped
+                             variable (off by default, no public toggle).
+
+                           Two of the six were self-inflicted: the
+                           immediately-prior 2026.07.30.4 batch (o2md.27)
+                           introduced the @DelayBetweenStats and
+                           @CommandLogRetentionDays references while fixing
+                           W6 -- caught only because the user's live report
+                           prompted auditing for the same defect class rather
+                           than trusting the single reported instance.
+
             2026.07.30.5 - Redundant/tautological findings + obfuscation
                            hardening (o2md.43, o2md.44, o2md.28, o2md.36).
 
@@ -712,7 +761,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.30.5',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.30.6',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -929,7 +978,7 @@ BEGIN
                 (N'Obfuscation',
                  N'@Obfuscate=1 replaces names with MD5 hashes (e.g., DB_a1b2c3, TBL_d4e5f6). Prefixes preserved for readability. Map is result set 8 in multi-result-set mode (excluded from @SingleResultSet=1 to prevent leaking real names). Use @ObfuscationMapTable to persist the map on prod. Use @ObfuscationSeed to salt hashes -- makes tokens stable across servers with the same seed but unpredictable without it.'),
                 (N'Killed Run Detection',
-                 N'Two detection methods: (1) SP_STATUPDATE_START without matching SP_STATUPDATE_END = orphaned run, (2) SP_STATUPDATE_END with StopReason=KILLED = cleaned up by @CleanupOrphanedRuns. Both trigger C1 CRITICAL.'),
+                 N'Two detection methods: (1) SP_STATUPDATE_START without matching SP_STATUPDATE_END = orphaned run, (2) SP_STATUPDATE_END with StopReason=KILLED = cleaned up automatically (orphan cleanup runs internally on every v3 call; no parameter needed -- @CleanupOrphanedRuns was a v2-only toggle, removed in v3). Both trigger C1 CRITICAL.'),
                 (N'Throughput Trend (C4)',
                  N'Compares average seconds-per-stat in the recent @ThroughputWindowDays against the immediately preceding window of equal length. Runs older than 2 x @ThroughputWindowDays are excluded, so @DaysBack does not affect the comparison. Requires @DaysBack >= 2 x @ThroughputWindowDays (validation error otherwise). If recent average is >50% worse, triggers C4 CRITICAL. Data-dependent -- requires sufficient runs in both windows.'),
                 (N'Overlapping Runs (W4)',
@@ -3919,14 +3968,19 @@ BEGIN
                 @w6_detail,
                 /* o2md.27: this figure is wall-clock minus measured per-stat UPDATE STATISTICS
                    time -- it is NOT a measurement of what the remaining time was spent on.
-                   @DelayBetweenStats, AG-redo wait loops, lock waits, and parallel-worker
-                   queue-idle time all land in this same "overhead" bucket unmeasured (proc-side
-                   wait/idle-time logging tracked separately). Discovery/environment cost is one
-                   plausible explanation among several, not a confirmed cause. */
+                   The inter-stat delay (preset-controlled internal variable, not a public v3
+                   parameter), AG-redo wait loops, lock waits, and parallel-worker queue-idle
+                   time all land in this same "overhead" bucket unmeasured (proc-side wait/idle-
+                   time logging tracked separately). Discovery/environment cost is one plausible
+                   explanation among several, not a confirmed cause. */
+                /* o2md-followup: neither @DelayBetweenStats nor @CommandLogRetentionDays are
+                   public v3 parameters -- both were absorbed into preset-controlled internal
+                   variables (@i_delay_between_stats, @i_command_log_retention_days) in the v2->v3
+                   migration. Described as concepts below, not as settable flags. */
                 N'This is the difference between wall-clock and measured stat-update time -- discovery/environment cost is one possible cause, not a measured one. '
-                    + N'Before assuming it is discovery overhead, rule out: @DelayBetweenStats (if set), AG secondary redo-queue waits, lock waits/blocking during the run, '
+                    + N'Before assuming it is discovery overhead, rule out: an inter-stat delay (OLTP_LIGHT preset uses 2s; preset-controlled, not a separate parameter in v3), AG secondary redo-queue waits, lock waits/blocking during the run, '
                     + N'and (in parallel mode) workers idling on the queue. If those are ruled out, review recent parameter changes -- features like @QueryStore (CPU/DURATION/READS) and extended discovery options do add real overhead. '
-                    + N'Reduce @CommandLogRetentionDays, or check whether CommandLog table needs a StartTime index. '
+                    + N'Check whether the CommandLog table needs an index on StartTime for faster history lookups. '
                     + N'If SQL Server is under memory pressure (check sys.dm_os_memory_brokers, sys.dm_os_process_memory), high overhead may indicate page cache eviction during stat scans.',
                 N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @Debug = 1; /* Review per-phase timing in debug output */',
                 33
@@ -4829,7 +4883,9 @@ BEGIN
                with no requirement that the stat still qualifies for an update.  Requiring
                "currently qualifies" is not derivable from CommandLog: it only records stats
                that WERE updated, so the qualifying-but-not-updated population is unobservable
-               here (the proc logs it only under @LogSkippedToCommandLog = Y).  Fixing this
+               here (the proc only logs it via the internal @i_log_skipped variable, which
+               defaults off and has no public v3 parameter to enable -- @LogSkippedToCommandLog
+               was the v2 toggle, removed in the migration).  Fixing this
                properly needs a proc-side discovery-candidate log, not a Diag change.  See the
                bd issue comment on sp_StatUpdate-o2md.18. */
 
@@ -6362,8 +6418,12 @@ BEGIN
                     WHEN N'STOPBYTIME_OVERSHOOT'        THEN N'The run consistently exceeds @StopByTime. Set @TimeLimit to a value shorter than the overshoot margin.'
                     WHEN N'CONSECUTIVE_FAILURES_ELEVATED' THEN N'Check RS6 Failing Statistics for error clustering. Reduce @MaxConsecutiveFailures or investigate lock/permission issues.'
                     WHEN N'PERSIST_SAMPLE_INADEQUATE'   THEN N'Increase @StatisticsSample or use FULLSCAN for high-volatility tables flagged in RS5 Top Tables.'
-                    WHEN N'PARALLEL_ORPHAN_BACKLOG'     THEN N'Run sp_StatUpdate with @CleanupOrphanedRuns=Y or manually delete stale QueueStatistic entries.'
-                    WHEN N'STALE_QUEUE_SWEEP'           THEN N'Stale queue entries from prior killed runs accumulate. Ensure @CleanupOrphanedRuns=Y runs between parallel jobs.'
+                    /* o2md-followup: @CleanupOrphanedRuns was a v2-only toggle, removed in v3 --
+                       orphan/stale queue cleanup runs internally on every parallel call now,
+                       there is no parameter to set. The actionable advice is what to check when
+                       the automatic sweep isn't keeping the backlog down, not a nonexistent flag. */
+                    WHEN N'PARALLEL_ORPHAN_BACKLOG'     THEN N'The parallel leader sweeps orphaned QueueStatistic rows automatically on each queue claim -- no parameter needed (v3 always does this). A large backlog usually means parallel runs are killed/timed out often (check SQL Agent job history) or aren''t running frequently enough for the leader to catch up.'
+                    WHEN N'STALE_QUEUE_SWEEP'           THEN N'Stale queue entries from prior killed runs are swept automatically on each parallel run in v3 -- this code just reports how many were found. Recurring large sweeps point at frequent job kills/timeouts rather than a missing setting.'
                     WHEN N'DB_SKIPPED'                  THEN N'Check @Databases filter and verify all target databases are accessible (HAS_DBACCESS).'
                     ELSE N'Investigate root cause of recurring code ' + wc.WarningCode + N'.'
                   END,
@@ -6414,7 +6474,7 @@ BEGIN
                     WHEN N'FILTER_MISMATCH'             THEN N'A filtered statistic uses a different filter than its matching filtered index. Update statistics and index together when possible.'
                     WHEN N'CASE_SENSITIVE_COLLATION'    THEN N'Parameter matching uses COLLATE DATABASE_DEFAULT. Verify database and instance collations align.'
                     WHEN N'AZURE_SQL_DB'                THEN N'On Azure SQL DB, @StatsInParallel=Y is not supported. Use serial mode.'
-                    WHEN N'AZURE_SQL_MI'                THEN N'Azure SQL MI supports most features. Verify @IncludeSystemObjects behavior on MI.'
+                    WHEN N'AZURE_SQL_MI'                THEN N'Azure SQL MI supports most features. System objects are always excluded from discovery in v3 (no @IncludeSystemObjects toggle -- removed in the v2->v3 migration).'
                     WHEN N'AZURE_SQL_EDGE'              THEN N'Azure SQL Edge has reduced DMV coverage. Some discovery features may return empty.'
                     WHEN N'LOW_UPTIME'                  THEN N'Maintenance ran shortly after server restart. Buffer pool may be cold; duration metrics for these runs are inflated.'
                     WHEN N'TOCTOU_SKIPS'                THEN N'TOCTOU skips mean a stat was claimed by another worker between discovery and execution. Normal in parallel mode; investigate if occurring in serial runs.'
