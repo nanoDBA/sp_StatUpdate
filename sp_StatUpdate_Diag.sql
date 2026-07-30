@@ -36,7 +36,19 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.28.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.30.1 - o2md.42: named PRIMARY KEY constraints on 5 temp
+                           tables (#stat_updates, #recommendations,
+                           #run_version_keys, #forced_plans, #qs_efficacy)
+                           unnamed.  Temp table NAMES get a per-session
+                           uniquifier; named CONSTRAINTS on those tables do
+                           not, so two concurrent Diag sessions on the same
+                           instance collided on the constraint name and the
+                           second session's CREATE TABLE failed outright
+                           ("There is already an object named 'PK_stat_
+                           updates'").  Mechanical: constraints still exist,
+                           SQL Server now generates the names.
+
             2026.07.28.1 - Fleet analysis batch (sp_StatUpdate-o2md).  Findings from the
                            40-server production diagnostic sweep of 2026-07-28, all of
                            them cases where a check asserted more than its evidence
@@ -559,8 +571,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.28.1',  /* orchestrator bumps this */
-        @procedure_version_date datetime = '20260728';     /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.30.1',  /* orchestrator bumps this */
+        @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -1481,9 +1493,8 @@ BEGIN
     ============================================================================
     */
 
-    /* Defensive cleanup: if a prior call errored mid-execution, temp tables
-       with named constraints (PK_stat_updates, PK_recommendations) survive
-       in the session and block the next CREATE TABLE. */
+    /* Defensive cleanup: if a prior call errored mid-execution, these temp
+       tables survive in the session and block the next CREATE TABLE. */
     DROP TABLE IF EXISTS #runs;
     DROP TABLE IF EXISTS #stat_updates;
     DROP TABLE IF EXISTS #recommendations;
@@ -1596,7 +1607,10 @@ BEGIN
            Rows with IsSkip=1 are excluded from duration/appearance/success aggregates. */
         IsSkip bit NOT NULL DEFAULT 0,
 
-        CONSTRAINT PK_stat_updates PRIMARY KEY NONCLUSTERED (ID)
+        /* o2md.42: unnamed -- named constraints on temp tables don't get the
+           session uniquifier that temp table names get, so two concurrent
+           sessions collide on the constraint name (2nd session's CREATE fails). */
+        PRIMARY KEY NONCLUSTERED (ID)
     );
 
     /* Recommendations output */
@@ -1613,7 +1627,8 @@ BEGIN
         ExampleCall nvarchar(2000) NULL,
         SortPriority integer NOT NULL DEFAULT 50,
 
-        CONSTRAINT PK_recommendations PRIMARY KEY CLUSTERED (FindingID)
+        /* o2md.42: unnamed, see #stat_updates above */
+        PRIMARY KEY CLUSTERED (FindingID)
     );
 
     /* Obfuscation mapping (populated only when @Obfuscate = 1) */
@@ -1790,7 +1805,8 @@ BEGIN
     (
         RunLabel nvarchar(100) NOT NULL,
         VersionKey integer NULL,
-        CONSTRAINT PK_run_version_keys PRIMARY KEY CLUSTERED (RunLabel)
+        /* o2md.42: unnamed, see #stat_updates above */
+        PRIMARY KEY CLUSTERED (RunLabel)
     );
 
     INSERT INTO #run_version_keys
@@ -2401,7 +2417,8 @@ BEGIN
         DatabaseName sysname NOT NULL,
         ObjectName sysname NOT NULL,
         ForcedPlanCount integer NOT NULL DEFAULT 0,
-        CONSTRAINT PK_forced_plans PRIMARY KEY CLUSTERED (DatabaseName, ObjectName)
+        /* o2md.42: unnamed, see #stat_updates above */
+        PRIMARY KEY CLUSTERED (DatabaseName, ObjectName)
     );
 
     BEGIN TRY
@@ -4756,7 +4773,8 @@ BEGIN
         AvgSecPerStat decimal(10, 1) NULL,
         AvgPositionTop10 decimal(10, 1) NULL,
 
-        CONSTRAINT PK_qs_efficacy PRIMARY KEY NONCLUSTERED (RunLabel)
+        /* o2md.42: unnamed, see #stat_updates above */
+        PRIMARY KEY NONCLUSTERED (RunLabel)
     );
 
     /* Populate #qs_efficacy for all non-killed runs that have stat updates.
