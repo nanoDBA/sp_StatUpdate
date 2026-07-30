@@ -36,7 +36,28 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.9 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.10 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.30.10 - o2md.52: @CriticalTables parameter values leaked
+                           real table names into the obfuscated SAFE_TO_SHARE
+                           report.  The obfuscation pass rewrites
+                           #stat_updates and #runs.Databases in place before
+                           any checks run, but #runs.CriticalTables (sw82
+                           ingestion, added after BUG-09) was never included
+                           -- so W16 CRITICAL_TABLES_NO_MATCH, I17
+                           CRITICAL_TABLES_COVERAGE, and RS8 Parameter Change
+                           History echoed the configured patterns verbatim.
+                           Fixed at the source: per-element PAT_ tokens
+                           (comma-split, seed-prefixed MD5, own namespace --
+                           deliberately not joinable to TBL_ tokens, same
+                           acknowledged limitation as BUG-09 multi-database
+                           lists), map entries under ObjectType
+                           CriticalTablePattern.  The I4d UNUSED_FEATURES
+                           hardcoded example was also changed to obviously-
+                           fake placeholder names so leakage greps on SAFE
+                           reports cannot false-trip on it.  Found by the
+                           standard leakage grep while verifying the o2md.51
+                           report styling; regression test added to the
+                           obfuscation suite.
             2026.07.30.9 - o2md.24: I10 RECOMMENDED_CONFIG severity-precedence
                            rewrite (maintainer option a).  I10 -- the "just run
                            this" output -- previously consumed only 4 finding
@@ -874,7 +895,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.30.9',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.30.10',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -2680,6 +2701,40 @@ BEGIN
         FROM #runs AS r
         WHERE r.[Databases] IS NOT NULL
         AND   r.[Databases] NOT IN (N'USER_DATABASES', N'SYSTEM_DATABASES', N'ALL_DATABASES', N'AVAILABILITY_GROUP_DATABASES');
+
+        /* o2md.52: #runs.CriticalTables carries raw table-name patterns from the
+           START Parameters XML.  It was never included in this rewrite (the sw82
+           ingestion landed after BUG-09), so every downstream echo -- W16
+           CRITICAL_TABLES_NO_MATCH, I17 CRITICAL_TABLES_COVERAGE, RS8 Parameter
+           Change History -- leaked the configured patterns verbatim into the
+           SAFE_TO_SHARE report.  Tokenize per comma-separated element AT THE
+           SOURCE so all echoes inherit tokens.  Elements are LIKE patterns
+           (possibly wildcarded, database-less), so they get their own PAT_
+           namespace -- deliberately NOT joinable to TBL_ tokens (same
+           acknowledged limitation as BUG-09 multi-database lists). */
+        INSERT INTO #obfuscation_map (ObjectType, OriginalName, ObfuscatedName)
+        SELECT DISTINCT
+            N'CriticalTablePattern',
+            LTRIM(RTRIM(ss.value)),
+            N'PAT_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + LTRIM(RTRIM(ss.value))), 2), 8)
+        FROM #runs AS r
+        CROSS APPLY STRING_SPLIT(r.CriticalTables, N',') AS ss
+        WHERE r.CriticalTables IS NOT NULL
+        AND   LTRIM(RTRIM(ss.value)) <> N''
+        AND   NOT EXISTS (
+                  SELECT 1 FROM #obfuscation_map AS m
+                  WHERE m.ObjectType = N'CriticalTablePattern'
+                  AND   m.OriginalName = LTRIM(RTRIM(ss.value))
+              );
+
+        UPDATE r
+        SET r.CriticalTables = STUFF((
+                SELECT N',' + N'PAT_' + RIGHT(CONVERT(varchar(8), HASHBYTES('MD5', @seed_prefix + LTRIM(RTRIM(ss.value))), 2), 8)
+                FROM STRING_SPLIT(r.CriticalTables, N',') AS ss
+                WHERE LTRIM(RTRIM(ss.value)) <> N''
+                FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 1, N'')
+        FROM #runs AS r
+        WHERE r.CriticalTables IS NOT NULL;
 
         /* Obfuscate RunLabels (contain server names) */
         UPDATE r
@@ -5297,7 +5352,9 @@ BEGIN
                     + N'priority boost and optional per-table FULLSCAN override. Particularly useful for tables '
                     + N'identified via W7 HIGH_IMPACT_STATS_DEPRIORITIZED or W9 LOCK_TIMEOUT_INEFFECTIVE.',
                 N'Specify critical tables to ensure they are always updated early in the run, regardless of sort order.',
-                N'EXECUTE dbo.sp_StatUpdate @CriticalTables = N''dbo.Orders,dbo.OrderItems'', @Databases = N''USER_DATABASES'';',
+                /* o2md.52: example uses obviously-placeholder names so a leakage
+                   grep on a SAFE report never false-trips on this literal. */
+                N'EXECUTE dbo.sp_StatUpdate @CriticalTables = N''dbo.YourHotTable,dbo.YourBusyTable'', @Databases = N''USER_DATABASES'';',
                 68
             );
         END;
@@ -6912,7 +6969,8 @@ BEGIN
                 + N'SELECT name FROM sys.objects WHERE OBJECT_ID IN (SELECT object_id FROM sys.stats) '
                 + N'AND (name LIKE N''<your pattern>''). '
                 + N'Requires sp_StatUpdate v3.5.0+ to log IsCritical in per-stat ExtendedInfo.',
-            N'EXECUTE dbo.sp_StatUpdate @CriticalTables = N''dbo.Orders,dbo.OrderItems'', @Databases = N''USER_DATABASES'';',
+            /* o2md.52: placeholder names -- leakage greps on SAFE reports must not false-trip */
+            N'EXECUTE dbo.sp_StatUpdate @CriticalTables = N''dbo.YourHotTable,dbo.YourBusyTable'', @Databases = N''USER_DATABASES'';',
             28
         );
 
@@ -7000,7 +7058,7 @@ BEGIN
                   END,
             N'Critical tables are being processed. Monitor via RS 5 Top Tables and RS 4 Run Detail. '
                 + N'If positions are not early enough, verify @CriticalTablesFirst = N''Y'' and that @SortOrder is compatible.',
-            N'EXECUTE dbo.sp_StatUpdate @CriticalTables = N''' + ISNULL(REPLACE(@i17_pattern, N'''', N''''''), N'dbo.Orders') + N''', @CriticalTablesFirst = N''Y'', @Databases = N''USER_DATABASES'';',
+            N'EXECUTE dbo.sp_StatUpdate @CriticalTables = N''' + ISNULL(REPLACE(@i17_pattern, N'''', N''''''), N'dbo.YourHotTable') + N''', @CriticalTablesFirst = N''Y'', @Databases = N''USER_DATABASES'';',
             72
         );
 
