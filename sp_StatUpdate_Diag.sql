@@ -36,7 +36,26 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.3 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.30.3 - o2md.12: C6 SILENT_NOOP_RUN evidence + NULL-vs-0
+                           split.  Evidence previously carried only
+                           StartTime/StopReason/StatsFound -- the
+                           recommendation text says "upgrade to 3.5.7+"
+                           without ever showing the installed version.  Now
+                           includes Version, StatsInParallel, DurationSeconds,
+                           StatsRemaining (all already tracked on #runs).
+
+                           Also fixed a false-positive vector:
+                           ISNULL(r.StatsProcessed, 0) = 0 treated a
+                           genuinely NULL StatsProcessed (older proc build,
+                           or a truncated/atypical END writer) the same as a
+                           confirmed 0.  CRITICAL C6 now requires
+                           StatsProcessed = 0 explicitly; the NULL case gets
+                           its own new INFO-severity check (I18
+                           NOOP_UNCONFIRMED) instead of being silently
+                           mis-classified as either a confirmed no-op or
+                           dropped entirely.
+
             2026.07.30.2 - ExampleCall audit sweep, round 1 (o2md.20, o2md.21).
 
                            o2md.20 - I15 HEAP_TIME_BUDGET referenced
@@ -593,7 +612,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.30.2',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.30.3',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -692,6 +711,7 @@ BEGIN
                 (N'W10', N'WARNING', N'PARAMETER_CHURN',       N'Parameters changed frequently across recent runs -- unstable configuration'),
                 (N'C5', N'CRITICAL', N'SAMPLE_RATE_DEGRADATION', N'Effective sample rates trending down on large stats -- estimate quality at risk'),
                 (N'C6', N'CRITICAL', N'SILENT_NOOP_RUN',        N'Run self-reported normal completion (PARALLEL_COMPLETE/COMPLETED) with StatsFound > 0 but zero stats processed across the worker window -- zombied parallel queue or claim-nothing failure masquerading as success'),
+                (N'I18', N'INFO',    N'NOOP_UNCONFIRMED',      N'Run has StatsFound > 0 but StatsProcessed is missing from the END record (older proc build or truncated END write) -- cannot confirm a silent no-op from CommandLog alone'),
                 (N'I9', N'INFO',     N'WORKLOAD_CONCENTRATION', N'Few tables drive most measured query CPU -- prioritization opportunity'),
                 (N'I11', N'INFO',    N'FAILURE_CLUSTERING',    N'Failures cluster on one dominant ErrorNumber -- single root cause likely'),
                 (N'I12', N'INFO',    N'QS_COVERAGE_DRIFT',     N'QS workload coverage percentage trending down across runs'),
@@ -2963,24 +2983,39 @@ BEGIN
         StartTime datetime2(3) NOT NULL,
         StopReason nvarchar(50) NULL,
         StatsFound integer NULL,
-        VersionKey integer NULL   /* major * 1000000 + minor * 1000 + patch; NULL when unparseable */
+        VersionKey integer NULL,  /* major * 1000000 + minor * 1000 + patch; NULL when unparseable */
+        /* o2md.12: evidence fields the recommendation text references but never showed */
+        [Version] nvarchar(20) NULL,
+        StatsInParallel nvarchar(1) NULL,
+        DurationSeconds integer NULL,
+        StatsRemaining integer NULL
     );
 
+    /* o2md.12: ISNULL(r.StatsProcessed, 0) = 0 treated a genuinely NULL StatsProcessed
+       (older proc build, or a truncated/atypical END writer) the same as a confirmed 0 --
+       a real no-op and "we don't actually know" were indistinguishable in the evidence.
+       CRITICAL C6 below now requires StatsProcessed = 0 explicitly (NULL fails the
+       comparison and is excluded); the NULL case gets its own lower-severity finding
+       further down instead of being silently dropped or silently counted as CRITICAL. */
     INSERT INTO #c6_noop_runs
-        (RunLabel, StartTime, StopReason, StatsFound, VersionKey)
+        (RunLabel, StartTime, StopReason, StatsFound, VersionKey, [Version], StatsInParallel, DurationSeconds, StatsRemaining)
     SELECT
         r.RunLabel,
         r.StartTime,
         r.StopReason,
         r.StatsFound,
-        vk.VersionKey
+        vk.VersionKey,
+        r.[Version],
+        r.StatsInParallel,
+        r.DurationSeconds,
+        r.StatsRemaining
     FROM #runs AS r
     LEFT JOIN #run_version_keys AS vk
         ON vk.RunLabel = r.RunLabel
     WHERE r.IsKilled = 0
     AND   r.StopReason IN (N'PARALLEL_COMPLETE', N'COMPLETED', N'NATURAL_END')
     AND   r.StatsFound > 0
-    AND   ISNULL(r.StatsProcessed, 0) = 0
+    AND   r.StatsProcessed = 0
     AND   NOT EXISTS
           (
               SELECT 1
@@ -3061,8 +3096,11 @@ BEGIN
                  ELSE N'Runs: '
             END
                 + STRING_AGG(
-                      CONVERT(nvarchar(20), x.StartTime, 120) + N' (' + x.StopReason
-                      + N', found ' + CONVERT(nvarchar(10), x.StatsFound) + N', processed 0)',
+                      CONVERT(nvarchar(20), x.StartTime, 120) + N' (v' + ISNULL(x.[Version], N'?')
+                      + N', ' + x.StopReason + N', parallel=' + ISNULL(x.StatsInParallel, N'?')
+                      + N', found ' + CONVERT(nvarchar(10), x.StatsFound) + N', processed 0'
+                      + N', remaining ' + ISNULL(CONVERT(nvarchar(10), x.StatsRemaining), N'?')
+                      + N', ' + ISNULL(CONVERT(nvarchar(10), x.DurationSeconds), N'?') + N's)',
                       N'; ')
                       WITHIN GROUP (ORDER BY x.StartTime DESC),
             @c6_recommendation,
@@ -3073,12 +3111,96 @@ BEGIN
             SELECT TOP (10)
                 n.StartTime,
                 n.StopReason,
-                n.StatsFound
+                n.StatsFound,
+                n.[Version],
+                n.StatsInParallel,
+                n.DurationSeconds,
+                n.StatsRemaining
             FROM #c6_noop_runs AS n
             ORDER BY n.StartTime DESC
         ) AS x;
 
         RAISERROR(N'  [CRITICAL] C6: Silent no-op run(s) detected (%i)', 10, 1, @c6_count) WITH NOWAIT;
+    END;
+
+    /* ======================================================================
+       I18: NOOP_UNCONFIRMED -- StatsProcessed missing, not confirmed 0
+       o2md.12: same shape as C6 above (StatsFound > 0, normal-completion
+       StopReason, no other worker/CommandLog activity nearby) but StatsProcessed
+       is NULL rather than confirmed 0 -- an older proc build or a truncated END
+       write, not necessarily a no-op.  Reported separately at INFO so it isn't
+       silently dropped (previously conflated with C6 via ISNULL(...,0)=0) or
+       silently inflated into a CRITICAL finding on data that doesn't support it.
+       ====================================================================== */
+    DECLARE @i18_count integer = (
+        SELECT COUNT_BIG(*)
+        FROM #runs AS r
+        WHERE r.IsKilled = 0
+        AND   r.StopReason IN (N'PARALLEL_COMPLETE', N'COMPLETED', N'NATURAL_END')
+        AND   r.StatsFound > 0
+        AND   r.StatsProcessed IS NULL
+        AND   NOT EXISTS
+              (
+                  SELECT 1
+                  FROM #runs AS r2
+                  WHERE r2.RunLabel <> r.RunLabel
+                  AND   r2.IsKilled = 0
+                  AND   ISNULL(r2.StatsProcessed, 0) > 0
+                  AND   r2.StartTime <= DATEADD(MINUTE, 5, ISNULL(r.EndTime, r.StartTime))
+                  AND   ISNULL(r2.EndTime, DATEADD(SECOND, ISNULL(r2.TimeLimit, 18000), r2.StartTime)) >= DATEADD(MINUTE, -5, r.StartTime)
+              )
+        AND   NOT EXISTS
+              (
+                  SELECT 1
+                  FROM #stat_updates AS su
+                  WHERE su.RunLabel IS NOT NULL
+                  AND   su.StartTime <= DATEADD(MINUTE, 5, ISNULL(r.EndTime, r.StartTime))
+                  AND   ISNULL(su.EndTime, DATEADD(MINUTE, 60, su.StartTime)) >= DATEADD(MINUTE, -5, r.StartTime)
+              )
+    );
+
+    IF @i18_count > 0
+    BEGIN
+        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+        SELECT
+            N'INFO',
+            N'NOOP_UNCONFIRMED',
+            CONVERT(nvarchar(10), @i18_count) + N' run(s) have StatsFound > 0 with StatsProcessed missing from the END record',
+            N'Runs: ' + STRING_AGG(CONVERT(nvarchar(20), x.StartTime, 120) + N' (' + x.StopReason
+                + N', found ' + CONVERT(nvarchar(10), x.StatsFound) + N', processed unknown)', N'; ')
+                WITHIN GROUP (ORDER BY x.StartTime DESC),
+            N'StatsProcessed is absent from these runs'' END Summary XML -- likely an older sp_StatUpdate build or a '
+                + N'truncated END write, not necessarily a silent no-op like C6 above. Cross-check CommandLog directly '
+                + N'for UPDATE_STATISTICS rows in each run''s window before concluding either way.',
+            N'SELECT * FROM dbo.CommandLog WHERE CommandType = N''UPDATE_STATISTICS'' AND StartTime BETWEEN ''<RunStartTime>'' AND DATEADD(HOUR, 1, ''<RunStartTime>'');',
+            60
+        FROM
+        (
+            SELECT TOP (10) r.StartTime, r.StopReason, r.StatsFound
+            FROM #runs AS r
+            WHERE r.IsKilled = 0
+            AND   r.StopReason IN (N'PARALLEL_COMPLETE', N'COMPLETED', N'NATURAL_END')
+            AND   r.StatsFound > 0
+            AND   r.StatsProcessed IS NULL
+            AND   NOT EXISTS
+                  (
+                      SELECT 1 FROM #runs AS r2
+                      WHERE r2.RunLabel <> r.RunLabel AND r2.IsKilled = 0
+                      AND   ISNULL(r2.StatsProcessed, 0) > 0
+                      AND   r2.StartTime <= DATEADD(MINUTE, 5, ISNULL(r.EndTime, r.StartTime))
+                      AND   ISNULL(r2.EndTime, DATEADD(SECOND, ISNULL(r2.TimeLimit, 18000), r2.StartTime)) >= DATEADD(MINUTE, -5, r.StartTime)
+                  )
+            AND   NOT EXISTS
+                  (
+                      SELECT 1 FROM #stat_updates AS su
+                      WHERE su.RunLabel IS NOT NULL
+                      AND   su.StartTime <= DATEADD(MINUTE, 5, ISNULL(r.EndTime, r.StartTime))
+                      AND   ISNULL(su.EndTime, DATEADD(MINUTE, 60, su.StartTime)) >= DATEADD(MINUTE, -5, r.StartTime)
+                  )
+            ORDER BY r.StartTime DESC
+        ) AS x;
+
+        RAISERROR(N'  [INFO] I18: %i run(s) with unconfirmed no-op status (StatsProcessed missing)', 10, 1, @i18_count) WITH NOWAIT;
     END;
 
     /* ======================================================================
