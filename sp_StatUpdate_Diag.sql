@@ -36,7 +36,29 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.30.2 - ExampleCall audit sweep, round 1 (o2md.20, o2md.21).
+
+                           o2md.20 - I15 HEAP_TIME_BUDGET referenced
+                           @CollectHeapForwarding, a parameter removed in v3
+                           -- the emitted example failed with "is not a
+                           parameter for procedure sp_StatUpdate" on every
+                           server where it fired (7/40 in the fleet sweep).
+                           Recommendation text and ExampleCall now point at
+                           sys.dm_db_index_physical_stats(...).forwarded_
+                           record_count directly, which is what the removed
+                           parameter used to surface anyway.
+
+                           o2md.21 - W2 LONG_RUNNING_STATS ExampleCall omitted
+                           @Databases, so copy-pasting it silently targeted
+                           only the current database instead of the flagged
+                           server.  Now built from the finding's own
+                           su.DatabaseName.  Also notes the ~10M-row sample
+                           cap (v1.8) when the flagged stat's average row
+                           count exceeds it, since the requested
+                           @LongRunningSamplePercent overstates what will
+                           actually be sampled on very large tables.
+
             2026.07.30.1 - o2md.42: named PRIMARY KEY constraints on 5 temp
                            tables (#stat_updates, #recommendations,
                            #run_version_keys, #forced_plans, #qs_efficacy)
@@ -571,7 +593,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.30.1',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.30.2',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -686,7 +708,7 @@ BEGIN
                 (N'I10', N'INFO',    N'RECOMMENDED_CONFIG',    N'Synthesized parameter set balancing immediate fixes, long-term safeguards, and historical parameter usage.  Based on diagnostic findings and parameter change history.'),
                 (N'W11', N'WARNING', N'MOPUP_LOW_YIELD',       N'Mop-up pass consistently unable to process most of the stats it discovers (avg <50% yield across 3+ runs).'),
                 (N'W12', N'WARNING', N'PRIORITY_PASS_EMPTY',   N'Priority pass averages <5 stats across 3+ mop-up runs -- mop-up is doing all the work.  Lower @ModificationThreshold so the priority pass captures more stats.'),
-                (N'I15', N'INFO',    N'HEAP_TIME_BUDGET',      N'Heap tables account for >50% of total maintenance time.  @CollectHeapForwarding and heap REBUILD may help.'),
+                (N'I15', N'INFO',    N'HEAP_TIME_BUDGET',      N'Heap tables account for >50% of total maintenance time.  Heap REBUILD or a clustered index may help.'),
                 (N'W13', N'WARNING', N'PERPETUALLY_SKIPPED',   N'Stats consistently discovered but never updated across N consecutive runs due to time limits.  Increase @TimeLimit, lower @ModificationThreshold, or use @SortOrder=MODIFICATION_VELOCITY.'),
                 (N'W14', N'WARNING', N'RECURRING_SAFETY_STOP', N'The same safety-stop StopReason (TEMPDB_PRESSURE, AG_REDO_QUEUE, LOG_SPACE_HIGH, IO_CORRUPTION, FAIL_FAST, CONSECUTIVE_FAILURES, BATCH_LIMIT) appears in >= 2 runs within the analysis window.  Each recurring reason produces one finding row with reason-specific remediation. (4g9s)'),
                 (N'W15', N'WARNING', N'RECURRING_RUNTIME_WARNING', N'An environmental/actionable WarningsCodes token from END Summary XML appears in >= 3 runs or >= 50%% of runs.  Codes: BACKUP_RUNNING, BACKUP_STARTED_MID_RUN, LOG_SPACE_HIGH, IO_CORRUPTION, CONTAINER_MEMORY, RCSI_VERSION_STORE, ELASTIC_POOL, PEAK_HOURS, STOPBYTIME_OVERSHOOT, CONSECUTIVE_FAILURES_ELEVATED, PERSIST_SAMPLE_INADEQUATE, PARALLEL_ORPHAN_BACKLOG, STALE_QUEUE_SWEEP, DB_SKIPPED, BACKUP_STARTED_MID_RUN.  Old runs without WarningsCodes produce no findings. (t8lj)'),
@@ -3216,8 +3238,14 @@ BEGIN
                 THEN N'. HIGH IMPACT: workload rank top ' + CONVERT(nvarchar(10), CONVERT(int, (1.0 - ISNULL(MAX(wi.ImpactScore), 0)) * 100)) + N'%'
                 ELSE N''
             END,
-        N'Enable adaptive sampling: stats that historically exceed a threshold get a reduced sample rate automatically.',
-        N'EXECUTE dbo.sp_StatUpdate @LongRunningThresholdMinutes = '
+        N'Enable adaptive sampling: stats that historically exceed a threshold get a reduced sample rate automatically.'
+            + CASE WHEN AVG(su.RowCount_) > 10000000
+                THEN N'  Note: rows sampled is capped at ~10M regardless of the requested percent -- on this '
+                    + CONVERT(nvarchar(20), CONVERT(bigint, AVG(su.RowCount_))) + N'-row table the effective sample '
+                    + N'will be lower than the requested percent implies.'
+                ELSE N''
+            END,
+        N'EXECUTE dbo.sp_StatUpdate @Databases = N''' + su.DatabaseName + N''', @LongRunningThresholdMinutes = '
             + CONVERT(nvarchar(10), @LongRunningMinutes)
             + N', @LongRunningSamplePercent = 10;',
         CASE WHEN MAX(wi.ImpactScore) >= 0.90 THEN 12 ELSE 35 END  /* #266: CRITICAL sorts before WARNING */
@@ -4395,10 +4423,13 @@ BEGIN
                 N'Heap table statistics require full-table scans without a clustered index seek, and forwarding pointers '
                     + N'on heaps accumulate over time causing increasingly expensive updates.  '
                     + CONVERT(nvarchar(10), CONVERT(int, @i15_heap_pct)) + N'% of maintenance duration is spent on heap stats.',
-                N'Consider enabling @CollectHeapForwarding=Y to surface forwarding pointer counts, and schedule periodic '
-                    + N'heap REBUILD (ALTER TABLE ... REBUILD) to remove forwarding pointers.  '
-                    + N'Adding a clustered index eliminates the heap entirely.',
-                N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @CollectHeapForwarding = N''Y'';',
+                N'Schedule periodic heap REBUILD (ALTER TABLE ... REBUILD) to remove forwarding pointers, or add a '
+                    + N'clustered index to eliminate the heap entirely.  '
+                    + N'@CollectHeapForwarding was removed in v3 -- query sys.dm_db_index_physical_stats directly '
+                    + N'(see ExampleCall) to see which heaps actually have forwarding pointers before rebuilding.',
+                N'SELECT OBJECT_SCHEMA_NAME(ips.object_id) AS SchemaName, OBJECT_NAME(ips.object_id) AS TableName, ips.forwarded_record_count '
+                    + N'FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, ''DETAILED'') AS ips '
+                    + N'WHERE ips.index_id = 0 AND ips.forwarded_record_count > 0 ORDER BY ips.forwarded_record_count DESC;',
                 70
             );
 
