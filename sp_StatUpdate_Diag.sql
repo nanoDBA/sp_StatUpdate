@@ -36,7 +36,41 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.6 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.7 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.30.7 - o2md.50: consume the proc v3.8.5 observability fields
+                           (follow-up to proc-side o2md.46/o2md.49).
+
+                           W6 EXCESSIVE_OVERHEAD now subtracts the four
+                           measured self-idle-time buckets (Summary XML
+                           DelayWaitMs / AgRedoWaitMs / RetryBackoffMs /
+                           QueueClaimMs, ingested into #runs) from the
+                           overhead percentage in both CTEs, so the figure is
+                           genuinely-unattributed time rather than
+                           "everything that isn't an UPDATE STATISTICS".
+                           Absent elements read as 0 (NULLIF-omitted on the
+                           proc side; arithmetically correct for both
+                           zero-on-3.8.5+ and unmeasured-on-older) and the
+                           evidence line states explicitly whether the worst
+                           run's figure had measured idle excluded (VersionKey
+                           >= 3008005) or predates measurement.
+
+                           W5 QS_NOT_EFFECTIVE family: per-stat
+                           ExtendedInfo/FromMopUp (reliable per-row flag)
+                           ingested through the cache into #stat_updates and
+                           preferred over the QualifyReason = MOP_UP
+                           inference on 3.8.5+ runs -- the session-scoped
+                           @in_mop_up behind QualifyReason mislabels
+                           priority-pass leftovers processed after the
+                           mop-up flag flips, so those rows now correctly
+                           count as priority-pass evidence.  Pre-3.8.5 runs
+                           and unparseable versions keep the QualifyReason
+                           inference (this was the exact upgrade path the
+                           o2md.16 comment anticipated).  Cache table gains
+                           the FromMopUp column via the existing
+                           auto-upgrade ALTER path; cache rows written
+                           before this upgrade read NULL even if the source
+                           XML had the element (accepted limitation, same
+                           as sw82).
             2026.07.30.6 - Stale v3 parameter references in user-facing
                            recommendation/@Help text (live user report:
                            @CleanupOrphanedRuns was appearing in Diag alert
@@ -761,7 +795,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.30.6',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.30.7',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -1623,6 +1657,9 @@ BEGIN
                        breaks the very next cache write (caught 2026-07-02). */
                     IsCritical          bit             NULL,
                     CriticalSampleOverride bit          NULL,
+                    /* o2md.50: per-row mop-up-origin flag (proc v3.8.5+); NULL = absent
+                       element (priority-pass row on 3.8.5+, or any pre-3.8.5 row) */
+                    FromMopUp           bit             NULL,
 
                     CONSTRAINT PK_StatUpdateDiagCache PRIMARY KEY CLUSTERED (CommandLogID)
                         WITH (DATA_COMPRESSION = PAGE)
@@ -1653,6 +1690,9 @@ BEGIN
                     ALTER TABLE ' + @cache_ref + N' ADD IsCritical bit NULL;
                 IF COL_LENGTH(N''' + REPLACE(@cache_ref, N'''', N'''''') + N''', N''CriticalSampleOverride'') IS NULL
                     ALTER TABLE ' + @cache_ref + N' ADD CriticalSampleOverride bit NULL;
+                /* o2md.50: FromMopUp added in this batch */
+                IF COL_LENGTH(N''' + REPLACE(@cache_ref, N'''', N'''''') + N''', N''FromMopUp'') IS NULL
+                    ALTER TABLE ' + @cache_ref + N' ADD FromMopUp bit NULL;
             ';
             EXECUTE sys.sp_executesql @col_check_sql;
 
@@ -1730,6 +1770,15 @@ BEGIN
         /* END Summary fields added in this batch (70hh, 1h2l) */
         StatsToctou integer NULL,               /* Summary/StatsToctou  -- count of TOCTOU_SKIP catches per run (v3.5.9+) */
         QSEnrichmentSkipped bit NULL,           /* Summary/QSEnrichmentSkipped -- 1 when QS phase was skipped (v3+) */
+        /* o2md.50: self-idle-time buckets from END Summary XML (proc v3.8.5+).
+           Emitted with NULLIF-omit-when-zero on the proc side, so NULL here means
+           EITHER zero (3.8.5+ run) or unmeasured (older run) -- W6 subtracts
+           ISNULL(x, 0), which is arithmetically correct in both cases, and gates
+           its "measured" wording on #run_version_keys.VersionKey >= 3008005. */
+        DelayWaitMs bigint NULL,                /* Summary/DelayWaitMs   -- inter-stat delay total */
+        AgRedoWaitMs bigint NULL,               /* Summary/AgRedoWaitMs  -- AG-redo recheck wait total */
+        RetryBackoffMs bigint NULL,             /* Summary/RetryBackoffMs -- deadlock/lock-timeout retry backoff total */
+        QueueClaimMs bigint NULL,               /* Summary/QueueClaimMs  -- parallel claim-cycle overhead total */
         /* Recurring-warning support (t8lj) */
         WarningsCodes nvarchar(max) NULL,       /* Summary/WarningsCodes -- pipe-delimited code tokens (v3.5.9+) */
         /* sw82: CriticalTables parameters (v3.5.0+); NULL on older rows (absent element) */
@@ -1794,6 +1843,9 @@ BEGIN
         /* sw82: CriticalTables per-stat markers (v3.5.0+); NULL on older rows */
         IsCritical bit NULL,                /* ExtendedInfo/IsCritical -- 1 when stat matched a CriticalTables pattern */
         CriticalSampleOverride bit NULL,    /* ExtendedInfo/CriticalSampleOverride -- 1 when per-table sample override was applied */
+        /* o2md.50: per-row mop-up-origin flag (proc v3.8.5+); NULL on older rows and
+           on 3.8.5+ priority-pass rows (NULLIF-omitted element) */
+        FromMopUp bit NULL,
         /* 70hh: skip-row flag -- 1 when Command begins 'SKIPPED:' or ErrorMessage begins 'TOCTOU_SKIP'.
            Rows with IsSkip=1 are excluded from duration/appearance/success aggregates. */
         IsSkip bit NOT NULL DEFAULT 0,
@@ -1870,6 +1922,7 @@ BEGIN
         FilteredStatsMode, BatchLimit, FailFast,
         MopUpTriggered, MopUpFound, MopUpProcessed,
         StatsToctou, QSEnrichmentSkipped, WarningsCodes,
+        DelayWaitMs, AgRedoWaitMs, RetryBackoffMs, QueueClaimMs,
         CriticalTables, CriticalSamplePercent, CriticalTablesFirst,
         HasFullParamsLog,
         IsKilled
@@ -1920,6 +1973,11 @@ BEGIN
         qs_enrichment_skipped = e.ExtendedInfo.value(N''(Summary/QSEnrichmentSkipped)[1]'', N''bit''),
         /* t8lj: pipe-delimited warning code tokens from END Summary XML (v3.5.9+); NULL on older rows */
         warnings_codes      = e.ExtendedInfo.value(N''(Summary/WarningsCodes)[1]'', N''nvarchar(max)''),
+        /* o2md.50: self-idle-time buckets (proc v3.8.5+); NULL = zero-or-unmeasured (NULLIF-omitted) */
+        delay_wait_ms       = e.ExtendedInfo.value(N''(Summary/DelayWaitMs)[1]'', N''bigint''),
+        ag_redo_wait_ms     = e.ExtendedInfo.value(N''(Summary/AgRedoWaitMs)[1]'', N''bigint''),
+        retry_backoff_ms    = e.ExtendedInfo.value(N''(Summary/RetryBackoffMs)[1]'', N''bigint''),
+        queue_claim_ms      = e.ExtendedInfo.value(N''(Summary/QueueClaimMs)[1]'', N''bigint''),
         /* sw82: CriticalTables params from START XML (v3.5.0+); NULL on older rows */
         critical_tables         = s.ExtendedInfo.value(N''(Parameters/CriticalTables)[1]'', N''nvarchar(max)''),
         critical_sample_pct     = s.ExtendedInfo.value(N''(Parameters/CriticalSamplePercent)[1]'', N''tinyint''),
@@ -2082,7 +2140,7 @@ BEGIN
             QSTotalMemoryGrantKB, QSTotalTempdbPages,
             EffectiveSamplePct, SampleSource, HasFilter, FilteredDriftRatio, IsIncremental,
             ProcessingPosition, ObjectId, StatsId,
-            IsCritical, CriticalSampleOverride
+            IsCritical, CriticalSampleOverride, FromMopUp
         )
         SELECT
             c.ID,
@@ -2116,7 +2174,9 @@ BEGIN
             c.ExtendedInfo.value(N''(ExtendedInfo/StatsId)[1]'', N''int''),
             /* sw82: IsCritical + CriticalSampleOverride from per-stat ExtendedInfo (v3.5.0+) */
             c.ExtendedInfo.value(N''(ExtendedInfo/IsCritical)[1]'', N''bit''),
-            c.ExtendedInfo.value(N''(ExtendedInfo/CriticalSampleOverride)[1]'', N''bit'')
+            c.ExtendedInfo.value(N''(ExtendedInfo/CriticalSampleOverride)[1]'', N''bit''),
+            /* o2md.50: NULLIF-omitted on the proc side -- NULL = priority-pass row or pre-3.8.5 */
+            c.ExtendedInfo.value(N''(ExtendedInfo/FromMopUp)[1]'', N''bit'')
         FROM ' + @commandlog_ref + N' AS c
         WHERE c.CommandType = N''UPDATE_STATISTICS''
         AND   c.ID > @watermark
@@ -2145,7 +2205,7 @@ BEGIN
             QSTotalMemoryGrantKB, QSTotalTempdbPages,
             EffectiveSamplePct, SampleSource, HasFilter, FilteredDriftRatio, IsIncremental,
             ProcessingPosition, ObjectId, StatsId,
-            IsCritical, CriticalSampleOverride
+            IsCritical, CriticalSampleOverride, FromMopUp
         )
         SELECT
             ca.CommandLogID, ca.RunLabel, ca.DatabaseName, ca.SchemaName, ca.ObjectName, ca.StatisticsName,
@@ -2157,7 +2217,10 @@ BEGIN
             ca.EffectiveSamplePct, ca.SampleSource, ca.HasFilter, ca.FilteredDriftRatio, ca.IsIncremental,
             ca.ProcessingPosition, ca.ObjectId, ca.StatsId,
             /* sw82: read from cache when present; NULL when cache rows predate sw82 (column upgrade handles this) */
-            ca.IsCritical, ca.CriticalSampleOverride
+            ca.IsCritical, ca.CriticalSampleOverride,
+            /* o2md.50: NULL for cache rows written before this upgrade even if the source
+               XML had the element (accepted limitation, same as sw82) */
+            ca.FromMopUp
         FROM ' + @cache_ref + N' AS ca
         WHERE ca.StartTime >= DATEADD(DAY, -@days_back, GETDATE());
         ';
@@ -3679,12 +3742,14 @@ BEGIN
 
            TODO (o2md.5): mop-up rows are identified here by the existing
            QualifyReason = 'MOP_UP' tag emitted by sp_StatUpdate (see the
-           @in_mop_up CASE in the per-stat ExtendedInfo).  If o2md.5 lands a
-           dedicated mop-up flag column on the per-stat ExtendedInfo, ingest it
-           into #stat_updates and prefer it here -- QualifyReason is a single
-           value, so a mop-up stat that also has another qualify reason is
-           reported as MOP_UP and this guard stays correct, but a dedicated flag
-           is less fragile.
+           @in_mop_up CASE in the per-stat ExtendedInfo).
+           o2md.50: proc v3.8.5 (o2md.49) added the anticipated dedicated flag --
+           per-stat ExtendedInfo/FromMopUp, ingested into #stat_updates.  On
+           3.8.5+ runs (VersionKey >= 3008005) it is authoritative: unlike the
+           session-scoped @in_mop_up behind QualifyReason, it cannot mislabel
+           priority-pass leftovers processed after the mop-up flag flips, so
+           those rows now correctly count as priority-pass evidence.  Pre-3.8.5
+           runs (or unparseable versions) keep the QualifyReason inference.
            ------------------------------------------------------------------ */
         DECLARE @w5_qs_runs integer = (
             SELECT COUNT_BIG(*)
@@ -3694,9 +3759,13 @@ BEGIN
                   (
                       SELECT 1
                       FROM #stat_updates AS su
+                      LEFT JOIN #run_version_keys AS rvk ON rvk.RunLabel = su.RunLabel
                       WHERE su.RunLabel = r.RunLabel
                       AND   ISNULL(su.IsSkip, 0) = 0
-                      AND   ISNULL(su.QualifyReason, N'') <> N'MOP_UP'
+                      AND   CASE WHEN rvk.VersionKey >= 3008005
+                                 THEN CONVERT(int, ISNULL(su.FromMopUp, 0))
+                                 ELSE CASE WHEN ISNULL(su.QualifyReason, N'') = N'MOP_UP' THEN 1 ELSE 0 END
+                            END = 0
                   )
         );
         DECLARE @w5_mopup_only_runs integer = (
@@ -3707,16 +3776,24 @@ BEGIN
                   (
                       SELECT 1
                       FROM #stat_updates AS su
+                      LEFT JOIN #run_version_keys AS rvk ON rvk.RunLabel = su.RunLabel
                       WHERE su.RunLabel = r.RunLabel
                       AND   ISNULL(su.IsSkip, 0) = 0
-                      AND   ISNULL(su.QualifyReason, N'') <> N'MOP_UP'
+                      AND   CASE WHEN rvk.VersionKey >= 3008005
+                                 THEN CONVERT(int, ISNULL(su.FromMopUp, 0))
+                                 ELSE CASE WHEN ISNULL(su.QualifyReason, N'') = N'MOP_UP' THEN 1 ELSE 0 END
+                            END = 0
                   )
         );
         DECLARE @w5_qs_data_runs integer = (
             SELECT COUNT(DISTINCT su.RunLabel)
             FROM #stat_updates AS su
+            LEFT JOIN #run_version_keys AS rvk ON rvk.RunLabel = su.RunLabel
             WHERE su.QSPlanCount IS NOT NULL /* 0 = enrichment ran (no match), >0 = matched; NULL = skipped */
-            AND   ISNULL(su.QualifyReason, N'') <> N'MOP_UP'   /* o2md.16 */
+            AND   CASE WHEN rvk.VersionKey >= 3008005
+                                 THEN CONVERT(int, ISNULL(su.FromMopUp, 0))
+                                 ELSE CASE WHEN ISNULL(su.QualifyReason, N'') = N'MOP_UP' THEN 1 ELSE 0 END
+                            END = 0   /* o2md.16 + o2md.50 */
         );
 
         /* 1h2l: QSEnrichmentSkipped direct signal from END Summary XML (v3+ only).
@@ -3882,15 +3959,24 @@ BEGIN
                 r.DurationSeconds,
                 r.StatsProcessed,
                 stat_seconds = CONVERT(decimal(10,1), ISNULL(su_agg.TotalStatMs, 0) / 1000.0),
+                /* o2md.50: measured self-idle time (proc v3.8.5+ END Summary buckets).
+                   NULL buckets (older proc, or genuinely zero -- NULLIF-omitted) read as 0,
+                   which is the arithmetically correct subtraction either way. */
+                idle_seconds = CONVERT(decimal(10,1),
+                    (ISNULL(r.DelayWaitMs, 0) + ISNULL(r.AgRedoWaitMs, 0)
+                     + ISNULL(r.RetryBackoffMs, 0) + ISNULL(r.QueueClaimMs, 0)) / 1000.0),
                 /* gh-478: Clamp to [0, 100].  DurationMs sums can exceed wall-clock when stats run
                    in overlapping transactions or when clock skew occurs across workers, producing
-                   negative overhead percentages. */
+                   negative overhead percentages.
+                   o2md.50: measured idle time is subtracted alongside stat time, so the
+                   percentage is genuinely-unattributed time, not "everything that isn't
+                   an UPDATE STATISTICS". */
                 overhead_pct = CASE
                     WHEN r.DurationSeconds > 0
                     THEN CASE
-                        WHEN (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100 < 0 THEN CONVERT(decimal(5,1), 0)
-                        WHEN (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100 > 100 THEN CONVERT(decimal(5,1), 100)
-                        ELSE CONVERT(decimal(5,1), (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100)
+                        WHEN (1.0 - (ISNULL(su_agg.TotalStatMs, 0) + ISNULL(r.DelayWaitMs, 0) + ISNULL(r.AgRedoWaitMs, 0) + ISNULL(r.RetryBackoffMs, 0) + ISNULL(r.QueueClaimMs, 0)) / 1000.0 / r.DurationSeconds) * 100 < 0 THEN CONVERT(decimal(5,1), 0)
+                        WHEN (1.0 - (ISNULL(su_agg.TotalStatMs, 0) + ISNULL(r.DelayWaitMs, 0) + ISNULL(r.AgRedoWaitMs, 0) + ISNULL(r.RetryBackoffMs, 0) + ISNULL(r.QueueClaimMs, 0)) / 1000.0 / r.DurationSeconds) * 100 > 100 THEN CONVERT(decimal(5,1), 100)
+                        ELSE CONVERT(decimal(5,1), (1.0 - (ISNULL(su_agg.TotalStatMs, 0) + ISNULL(r.DelayWaitMs, 0) + ISNULL(r.AgRedoWaitMs, 0) + ISNULL(r.RetryBackoffMs, 0) + ISNULL(r.QueueClaimMs, 0)) / 1000.0 / r.DurationSeconds) * 100)
                     END
                     ELSE 0
                 END
@@ -3928,13 +4014,14 @@ BEGIN
             (
                 SELECT
                     r.RunLabel,
-                    /* gh-478: Clamp to [0, 100] (see primary run_overhead CTE above). */
+                    /* gh-478: Clamp to [0, 100] (see primary run_overhead CTE above).
+                       o2md.50: idle buckets subtracted -- must match primary CTE's formula. */
                     overhead_pct = CASE
                         WHEN r.DurationSeconds > 0
                         THEN CASE
-                            WHEN (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100 < 0 THEN CONVERT(decimal(5,1), 0)
-                            WHEN (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100 > 100 THEN CONVERT(decimal(5,1), 100)
-                            ELSE CONVERT(decimal(5,1), (1.0 - ISNULL(su_agg.TotalStatMs, 0) / 1000.0 / r.DurationSeconds) * 100)
+                            WHEN (1.0 - (ISNULL(su_agg.TotalStatMs, 0) + ISNULL(r.DelayWaitMs, 0) + ISNULL(r.AgRedoWaitMs, 0) + ISNULL(r.RetryBackoffMs, 0) + ISNULL(r.QueueClaimMs, 0)) / 1000.0 / r.DurationSeconds) * 100 < 0 THEN CONVERT(decimal(5,1), 0)
+                            WHEN (1.0 - (ISNULL(su_agg.TotalStatMs, 0) + ISNULL(r.DelayWaitMs, 0) + ISNULL(r.AgRedoWaitMs, 0) + ISNULL(r.RetryBackoffMs, 0) + ISNULL(r.QueueClaimMs, 0)) / 1000.0 / r.DurationSeconds) * 100 > 100 THEN CONVERT(decimal(5,1), 100)
+                            ELSE CONVERT(decimal(5,1), (1.0 - (ISNULL(su_agg.TotalStatMs, 0) + ISNULL(r.DelayWaitMs, 0) + ISNULL(r.AgRedoWaitMs, 0) + ISNULL(r.RetryBackoffMs, 0) + ISNULL(r.QueueClaimMs, 0)) / 1000.0 / r.DurationSeconds) * 100)
                         END
                         ELSE 0
                     END
@@ -3955,10 +4042,32 @@ BEGIN
 
         IF @w6_overhead_runs > 0
         BEGIN
+            /* o2md.50: itemize the worst run's measured idle-time buckets (proc v3.8.5+
+               emits them; already subtracted from the percentage above), and say plainly
+               when the run predates measurement so "overhead" is understood to still
+               include any delay/AG/retry/claim time. */
+            DECLARE
+                @w6_worst_idle_ms bigint = 0,
+                @w6_worst_measured bit = 0;
+            SELECT
+                @w6_worst_idle_ms = ISNULL(r.DelayWaitMs, 0) + ISNULL(r.AgRedoWaitMs, 0)
+                                  + ISNULL(r.RetryBackoffMs, 0) + ISNULL(r.QueueClaimMs, 0),
+                @w6_worst_measured = CASE WHEN rvk.VersionKey >= 3008005 THEN 1 ELSE 0 END
+            FROM #runs AS r
+            LEFT JOIN #run_version_keys AS rvk ON rvk.RunLabel = r.RunLabel
+            WHERE r.RunLabel = @w6_worst_label;
+
             SET @w6_detail =
                 CONVERT(nvarchar(10), @w6_overhead_runs) + N' run(s) spent >40% of wall-clock time on overhead (discovery, environment checks, per-stat validations) '
                 + N'rather than actual UPDATE STATISTICS. Worst: ' + @w6_worst_label
-                + N' at ' + CONVERT(nvarchar(10), @w6_worst_pct) + N'% overhead.';
+                + N' at ' + CONVERT(nvarchar(10), @w6_worst_pct) + N'% overhead.'
+                + CASE
+                      WHEN @w6_worst_measured = 1
+                      THEN N' Measured idle time in that run ('
+                           + CONVERT(nvarchar(20), @w6_worst_idle_ms / 1000) + N's of inter-stat delay / AG-redo wait / retry backoff / parallel claim-cycle) '
+                           + N'is already excluded from the percentage -- the figure is genuinely-unattributed time.'
+                      ELSE N' That run predates sp_StatUpdate 3.8.5 (no idle-time measurement), so the figure still includes any inter-stat delay, AG-redo wait, retry backoff, and parallel claim-cycle time.'
+                  END;
 
             INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
             VALUES
@@ -3978,8 +4087,9 @@ BEGIN
                    variables (@i_delay_between_stats, @i_command_log_retention_days) in the v2->v3
                    migration. Described as concepts below, not as settable flags. */
                 N'This is the difference between wall-clock and measured stat-update time -- discovery/environment cost is one possible cause, not a measured one. '
-                    + N'Before assuming it is discovery overhead, rule out: an inter-stat delay (OLTP_LIGHT preset uses 2s; preset-controlled, not a separate parameter in v3), AG secondary redo-queue waits, lock waits/blocking during the run, '
-                    + N'and (in parallel mode) workers idling on the queue. If those are ruled out, review recent parameter changes -- features like @QueryStore (CPU/DURATION/READS) and extended discovery options do add real overhead. '
+                    + N'On sp_StatUpdate 3.8.5+ the inter-stat delay, AG-redo waits, retry backoff, and parallel claim-cycle time are measured per run and already excluded from this figure; '
+                    + N'on older versions those are unmeasured and still included -- rule them out manually before assuming discovery overhead. '
+                    + N'Lock waits/blocking during the run remain unmeasured on all versions. If those are ruled out, review recent parameter changes -- features like @QueryStore (CPU/DURATION/READS) and extended discovery options do add real overhead. '
                     + N'Check whether the CommandLog table needs an index on StartTime for faster history lookups. '
                     + N'If SQL Server is under memory pressure (check sys.dm_os_memory_brokers, sys.dm_os_process_memory), high overhead may indicate page cache eviction during stat scans.',
                 N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @Debug = 1; /* Review per-phase timing in debug output */',
