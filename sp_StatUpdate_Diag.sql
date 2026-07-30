@@ -36,7 +36,49 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.7 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.8 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.30.8 - Maintainer-decision batch 1 (o2md.19, o2md.14,
+                           o2md.33, o2md.35).  All four implement explicit
+                           maintainer choices recorded on the bd issues.
+
+                           o2md.19 - W3 STALE_BACKLOG zero-processed guard:
+                           when EVERY non-killed run in the window confirmed
+                           StatsProcessed = 0, W3 defers to C6 (throughput
+                           advice is nonsense for pure no-op windows).  Mixed
+                           windows keep current behavior including the kzx0
+                           un-suppression (untouched on @w3_parallel_complete,
+                           so the COMPLETION fast-path effect is unchanged).
+                           NULL StatsProcessed blocks the deferral (o2md.12:
+                           NULL is unconfirmed, not zero).
+
+                           o2md.14 - C4 thin-window cap: either window under
+                           5 runs caps severity at WARNING (2-run floor still
+                           fires).  Evidence gains thin-baseline + explicit
+                           survivorship wording (windows contain only runs
+                           that completed and processed work).
+
+                           o2md.33 - AG-secondary by-design stops (StopReason
+                           = AG_SECONDARY with StatsFound = 0) excluded from
+                           grading aggregates (completion average +
+                           kill/time-limit percentage denominators) and
+                           surfaced as new INFO check I19
+                           AG_SECONDARY_BY_DESIGN.  The genuine secondary-
+                           host defect signature (StatsFound > 0, processed
+                           0) still fires C6/W3 -- their StatsFound > 0 gates
+                           already excluded the by-design state.  Verified
+                           proc-side: non-AG user databases on secondary
+                           hosts are already maintained (per-database
+                           deselection, hard stop only when nothing remains).
+
+                           o2md.35 - RS5/RS7 blank-column reason tokens,
+                           additive only (existing column types/positions
+                           untouched): RS5 Top Tables gains ImpactDataStatus
+                           (OK / NO_QS_DATA) explaining
+                           WorkloadImpactPct/ImpactScore NULLs; RS7 Long-
+                           Running gains SampleDataStatus (OK /
+                           RESAMPLE_PERSIST) explaining AvgSamplePct NULLs.
+                           Applied in both output modes (direct SELECT and
+                           FOR JSON).
             2026.07.30.7 - o2md.50: consume the proc v3.8.5 observability fields
                            (follow-up to proc-side o2md.46/o2md.49).
 
@@ -795,7 +837,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.30.7',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.30.8',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -895,6 +937,7 @@ BEGIN
                 (N'C5', N'CRITICAL', N'SAMPLE_RATE_DEGRADATION', N'Effective sample rates trending down on large stats -- estimate quality at risk'),
                 (N'C6', N'CRITICAL', N'SILENT_NOOP_RUN',        N'Run self-reported normal completion (PARALLEL_COMPLETE/COMPLETED) with StatsFound > 0 but zero stats processed across the worker window -- zombied parallel queue or claim-nothing failure masquerading as success'),
                 (N'I18', N'INFO',    N'NOOP_UNCONFIRMED',      N'Run has StatsFound > 0 but StatsProcessed is missing from the END record (older proc build or truncated END write) -- cannot confirm a silent no-op from CommandLog alone'),
+                (N'I19', N'INFO',    N'AG_SECONDARY_BY_DESIGN', N'Runs ended AG_SECONDARY with zero eligible databases (all selected databases are secondary replicas) -- by design, excluded from grading; non-AG databases on the host are still maintained when selected'),
                 (N'I9', N'INFO',     N'WORKLOAD_CONCENTRATION', N'Few tables drive most measured query CPU -- prioritization opportunity'),
                 (N'I11', N'INFO',    N'FAILURE_CLUSTERING',    N'Failures cluster on one dominant ErrorNumber -- single root cause likely'),
                 (N'I12', N'INFO',    N'QS_COVERAGE_DRIFT',     N'QS workload coverage percentage trending down across runs'),
@@ -2100,6 +2143,20 @@ BEGIN
     DECLARE @run_count integer = (SELECT COUNT_BIG(*) FROM #runs);
     DECLARE @killed_count integer = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 1);
 
+    /* o2md.33: legitimate AG-secondary stops -- the proc deselected every selected
+       database because all were secondary replicas on this host, and returned
+       StopReason = AG_SECONDARY with StatsFound = 0.  By design, not a failure;
+       these runs are excluded from the grading aggregates (completion average +
+       reliability/time-limit percentage denominators) and surfaced as INFO
+       instead.  The StatsFound > 0 gate on C6/I18/W3 already keeps this state
+       out of the finding checks, so the genuine defect signature on secondaries
+       (StatsFound > 0, StatsProcessed = 0 -- real work found in non-AG databases
+       and not done) still fires everything it should. */
+    DECLARE @ag_secondary_stop_runs integer = (
+        SELECT COUNT_BIG(*) FROM #runs
+        WHERE StopReason = N'AG_SECONDARY' AND ISNULL(StatsFound, 0) = 0
+    );
+
     RAISERROR(N'  Runs found: %i (killed: %i)', 10, 1, @run_count, @killed_count) WITH NOWAIT;
 
     IF @Debug = 1
@@ -3095,8 +3152,12 @@ BEGIN
     SELECT
         /* o2md.13: sec/stat alone must not raise CRITICAL for parallel windows -- see the
            CROSS APPLY below.  (The mode-mismatch ELSE is unreachable: parity is enforced
-           in the WHERE clause by gh-479.) */
+           in the WHERE clause by gh-479.)
+           o2md.14: thin windows (either side under 5 runs) cap at WARNING -- the 2-run
+           minimum stays as the firing floor, but a 2-run baseline is too noisy to
+           justify CRITICAL on its own. */
         CASE
+            WHEN recent_w.run_count < 5 OR prior_w.run_count < 5 THEN N'WARNING'
             WHEN recent_w.parallel_mode <> N'Y' THEN N'CRITICAL'
             WHEN agree.gb_degraded = 1 THEN N'CRITICAL'
             ELSE N'WARNING'
@@ -3131,6 +3192,12 @@ BEGIN
                   WHEN agree.gb_degraded = 0
                       THEN N' NOTE: parallel runs -- GB/min did NOT degrade past the 1.5x threshold, so the sec/stat delta is most likely worker slice-composition noise rather than a real slowdown (in parallel mode StatsProcessed is only this worker''s slice while DurationSeconds covers the whole worker lifetime). Reported as WARNING, not CRITICAL.'
                   ELSE N' NOTE: parallel runs -- GB/min was unavailable to corroborate the sec/stat delta, which in parallel mode is dominated by worker slice composition. Reported as WARNING, not CRITICAL.'
+              END
+            /* o2md.14: thin-baseline + survivorship caveats in the evidence itself */
+            + CASE WHEN recent_w.run_count < 5 OR prior_w.run_count < 5
+                  THEN N' NOTE: thin baseline -- a window has fewer than 5 runs, so the averages are noise-prone; capped at WARNING. '
+                       + N'Both windows contain only runs that completed and processed work (killed runs are excluded), so a stretch of failing runs can leave a survivor-only average that is not representative of the period.'
+                  ELSE N''
               END,
         /* o2md.15: recent_w.parallel_mode is already computed and printed in Evidence above
            (StatsInParallel=Y/N) but the recommendation and ExampleCall were constants that
@@ -3441,6 +3508,35 @@ BEGIN
     END;
 
     /* ======================================================================
+       I19: AG_SECONDARY_BY_DESIGN (o2md.33)
+       Legitimate AG-secondary stops surfaced as INFO instead of silently
+       dragging grades: half the fleet was permanently red for doing what a
+       secondary is supposed to do.  Excluded from grading aggregates above;
+       the genuine secondary-host defect signature (StatsFound > 0 with
+       StatsProcessed = 0) still hits C6/W3 like any other host.
+       ====================================================================== */
+    IF @ag_secondary_stop_runs > 0
+    BEGIN
+        INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+        VALUES
+        (
+            N'INFO', N'AG_SECONDARY_BY_DESIGN',
+            N'AG secondary: ' + CONVERT(nvarchar(10), @ag_secondary_stop_runs) + N' run(s) ended AG_SECONDARY with zero eligible databases -- by design',
+            CONVERT(nvarchar(10), @ag_secondary_stop_runs) + N' of ' + CONVERT(nvarchar(10), @run_count)
+                + N' run(s) stopped with StopReason = AG_SECONDARY and StatsFound = 0: every selected database is a '
+                + N'secondary replica on this host, where UPDATE STATISTICS is not possible. '
+                + N'These runs are excluded from the dashboard grading aggregates. '
+                + N'Non-AG user databases on this host are still maintained when selected -- the proc filters '
+                + N'AG-secondary databases individually and only stops when nothing remains.',
+            N'No action needed on this host for AG databases (the primary maintains them and changes flow through the AG). '
+                + N'If this host also has non-AG user databases that should be maintained, confirm @Databases includes them.',
+            NULL,
+            60
+        );
+        RAISERROR(N'  [INFO] I19: %i AG-secondary by-design stop(s) excluded from grading', 10, 1, @ag_secondary_stop_runs) WITH NOWAIT;
+    END;
+
+    /* ======================================================================
        W1: SUBOPTIMAL PARAMETERS (checks against most recent run)
        ====================================================================== */
     DECLARE @latest_run_label nvarchar(100) = (SELECT TOP (1) RunLabel FROM #runs ORDER BY StartTime DESC);
@@ -3653,7 +3749,25 @@ BEGIN
     IF @c6_silent_noop = 1
         SET @w3_parallel_complete = 0;
 
-    IF @w3_parallel_complete = 0
+    /* o2md.19: zero-processed-window guard.  When EVERY non-killed run in the
+       window confirmed StatsProcessed = 0, the backlog is not a throughput
+       problem -- it is the no-op problem C6 owns, and W3's advice (raise
+       @TimeLimit, enable parallel, raise thresholds) is nonsense for runs that
+       processed literally nothing.  Defer to C6 in that case only; mixed
+       windows keep current behavior, including the kzx0 un-suppression above
+       (which stays on @w3_parallel_complete so the COMPLETION fast-path effect
+       is unchanged).  NULL StatsProcessed rows block the deferral -- per the
+       o2md.12 lesson, NULL is unconfirmed, not zero. */
+    DECLARE @w3_all_noop bit = 0;
+    IF EXISTS (SELECT 1 FROM #runs WHERE IsKilled = 0)
+    AND NOT EXISTS (SELECT 1 FROM #runs WHERE IsKilled = 0 AND (StatsProcessed IS NULL OR StatsProcessed > 0))
+    BEGIN
+        SET @w3_all_noop = 1;
+        RAISERROR(N'  W3: all non-killed runs processed 0 stats -- deferring backlog finding to C6 SILENT_NOOP_RUN (o2md.19)', 10, 1) WITH NOWAIT;
+    END;
+
+    IF @w3_all_noop = 0
+    AND @w3_parallel_complete = 0
     AND EXISTS (
         SELECT 1
         FROM #runs AS r
@@ -6839,6 +6953,9 @@ BEGIN
             SET @avg_completion = (
                 SELECT AVG(CASE WHEN r.StatsFound > 0 THEN CONVERT(decimal(5, 1), ISNULL(r.StatsProcessed, 0) * 100.0 / r.StatsFound) ELSE 100.0 END)
                 FROM #runs AS r WHERE r.IsKilled = 0
+                /* o2md.33: legitimate AG-secondary stops neither help nor hurt completion
+                   (previously counted as 100% via the StatsFound = 0 branch) */
+                AND NOT (r.StopReason = N'AG_SECONDARY' AND ISNULL(r.StatsFound, 0) = 0)
             );
             SET @score_completion = CASE
                 WHEN @avg_completion >= 95 THEN 100
@@ -6850,8 +6967,9 @@ BEGIN
             END;
 
             /* #238: If majority of runs hit TIME_LIMIT, cap completion score --
-               a 95% avg looks great but means nothing if the window is too short */
-            SET @tl_run_pct = @time_limit_runs * 100.0 / @run_count;
+               a 95% avg looks great but means nothing if the window is too short.
+               o2md.33: AG-secondary stops excluded from the denominator. */
+            SET @tl_run_pct = @time_limit_runs * 100.0 / NULLIF(@run_count - @ag_secondary_stop_runs, 0);
 
             IF @tl_run_pct >= 80.0 AND @score_completion > 60
                 SET @score_completion = 60;     /* Can't exceed C if 80%+ runs hit time limit */
@@ -6863,10 +6981,12 @@ BEGIN
     /* Reliability score: penalize killed runs, failures, time limit exhaustion */
     IF @run_count > 0
     BEGIN
+        /* o2md.33: AG-secondary stops excluded from the run-count denominators --
+           they are neither reliable nor unreliable, they are by-design no-ops. */
         DECLARE
-            @kill_pct decimal(5, 1) = @killed_count * 100.0 / @run_count,
+            @kill_pct decimal(5, 1) = @killed_count * 100.0 / NULLIF(@run_count - @ag_secondary_stop_runs, 0),
             @fail_pct decimal(5, 1) = (SELECT COUNT_BIG(*) FROM #stat_updates WHERE ErrorNumber > 0) * 100.0 / NULLIF(@stat_update_count, 0),
-            @tl_pct decimal(5, 1) = @time_limit_runs * 100.0 / @run_count;
+            @tl_pct decimal(5, 1) = @time_limit_runs * 100.0 / NULLIF(@run_count - @ag_secondary_stop_runs, 0);
 
         SET @score_reliability = 100
             - CONVERT(integer, ISNULL(@kill_pct, 0) * 3)     /* heavy penalty for killed runs */
@@ -7752,7 +7872,17 @@ BEGIN
             /* #261: Workload impact from QS data */
             WorkloadImpactPct = CONVERT(decimal(5, 1), 100.0 * SUM(ISNULL(su.QSTotalCpuMs, 0)) / NULLIF(@total_qs_cpu_ms, 0)),
             /* #255: Percentile rank (0.00-1.00) */
-            ImpactScore = MAX(wi.ImpactScore)
+            ImpactScore = MAX(wi.ImpactScore),
+            /* o2md.35: shared reason token for the two QS-derived columns above --
+               additive (existing column types/positions untouched).  NO_QS_DATA:
+               the server has no QS CPU data in the window, or this table never
+               matched workload-impact enrichment; blank numerics are legitimate,
+               not broken. */
+            ImpactDataStatus = CASE
+                WHEN NULLIF(@total_qs_cpu_ms, 0) IS NULL THEN N'NO_QS_DATA'
+                WHEN MAX(wi.ImpactScore) IS NULL THEN N'NO_QS_DATA'
+                ELSE N'OK'
+            END
         FROM #stat_updates AS su
         LEFT JOIN #workload_impact AS wi
             ON wi.DatabaseName = su.DatabaseName
@@ -7785,7 +7915,13 @@ BEGIN
                     HasNorecompute   = MAX(CONVERT(integer, ISNULL(su2.HasNorecompute, 0))),
                     DistinctStats    = COUNT(DISTINCT su2.StatisticsName),
                     WorkloadImpactPct = CONVERT(decimal(5, 1), 100.0 * SUM(ISNULL(su2.QSTotalCpuMs, 0)) / NULLIF(@total_qs_cpu_ms, 0)),
-                    ImpactScore      = MAX(wi2.ImpactScore)
+                    ImpactScore      = MAX(wi2.ImpactScore),
+                    /* o2md.35: see direct-SELECT mode above */
+                    ImpactDataStatus = CASE
+                        WHEN NULLIF(@total_qs_cpu_ms, 0) IS NULL THEN N'NO_QS_DATA'
+                        WHEN MAX(wi2.ImpactScore) IS NULL THEN N'NO_QS_DATA'
+                        ELSE N'OK'
+                    END
                 FROM #stat_updates AS su2
                 LEFT JOIN #workload_impact AS wi2
                     ON wi2.DatabaseName = su2.DatabaseName
@@ -7919,7 +8055,14 @@ BEGIN
                 AND   su3.StatisticsName = su.StatisticsName
                 FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N''),
             /* #255: Workload impact percentile */
-            ImpactScore = MAX(wi.ImpactScore)
+            ImpactScore = MAX(wi.ImpactScore),
+            /* o2md.35: shared reason token -- AvgSamplePct is NULL when every update
+               of this stat used RESAMPLE / persisted sample (no explicit percent to
+               average); additive, existing column types/positions untouched. */
+            SampleDataStatus = CASE
+                WHEN AVG(su.EffectiveSamplePct) IS NULL THEN N'RESAMPLE_PERSIST'
+                ELSE N'OK'
+            END
         FROM #stat_updates AS su
         LEFT JOIN #workload_impact AS wi
             ON wi.DatabaseName = su.DatabaseName
@@ -7973,7 +8116,12 @@ BEGIN
                         AND   su4.ObjectName     = su2.ObjectName
                         AND   su4.StatisticsName = su2.StatisticsName
                         FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N''),
-                    ImpactScore    = MAX(wi3.ImpactScore)
+                    ImpactScore    = MAX(wi3.ImpactScore),
+                    /* o2md.35: see direct-SELECT mode above */
+                    SampleDataStatus = CASE
+                        WHEN AVG(su2.EffectiveSamplePct) IS NULL THEN N'RESAMPLE_PERSIST'
+                        ELSE N'OK'
+                    END
                 FROM #stat_updates AS su2
                 LEFT JOIN #workload_impact AS wi3
                     ON wi3.DatabaseName = su2.DatabaseName
