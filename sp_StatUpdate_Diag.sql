@@ -36,7 +36,44 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.8 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.9 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.30.9 - o2md.24: I10 RECOMMENDED_CONFIG severity-precedence
+                           rewrite (maintainer option a).  I10 -- the "just run
+                           this" output -- previously consumed only 4 finding
+                           categories and contradicted higher-severity findings
+                           on the same server (recommended @StatsInParallel=Y
+                           where CRITICAL SILENT_NOOP_RUN implicated parallel
+                           mode; echoed thresholds W12 said to change; never
+                           emitted @MopUpPass on parallel fleets).
+
+                           Precedence policy: CRITICAL > WARNING > baseline
+                           echo; conflicts render as explicit /* CONFLICT */
+                           and /* CAVEAT */ comment lines appended to the
+                           generated call instead of silently picking a side.
+
+                           - SILENT_NOOP_RUN (CRITICAL): blocks W3's newly-
+                             enable-parallel suggestion (conflict comment);
+                             baseline parallel=Y is kept (the remedy is the
+                             version fix, not disabling parallel) with a
+                             caveat gated on max observed VersionKey vs
+                             3008002 (3.8.2 mop-up fall-through fix).
+                           - PRIORITY_PASS_EMPTY (W12): version-gated per
+                             the o2md.17 convention -- below 3.7.0 emit an
+                             upgrade-first caveat (retuning changes nothing
+                             on the effective_counter defect); 3.7.0+ halve
+                             @ModificationThreshold (floor 100).
+                           - QS_PERFORMANCE_TREND (I8): with QS off and real
+                             trend data (UNAVAILABLE sentinel rows ignored),
+                             enable @QueryStore=CPU + QUERY_STORE sort --
+                             unless QS_NOT_EFFECTIVE also fired (WARNING
+                             beats INFO; conflict comment).
+                           - Stale v2.24-era gate removed: @MopUpPass now
+                             emits on parallel configurations too (v3
+                             validation only requires @TimeLimit/@StopByTime,
+                             always present in the generated call).  This
+                             gate was why 31/40 parallel fleet servers never
+                             saw the @MopUpPass their own W12 recommended.
+
             2026.07.30.8 - Maintainer-decision batch 1 (o2md.19, o2md.14,
                            o2md.33, o2md.35).  All four implement explicit
                            maintainer choices recorded on the bd issues.
@@ -837,7 +874,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.30.8',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.30.9',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -6247,7 +6284,21 @@ BEGIN
                    accommodate @CriticalTables hint which can carry multiple table names */
                 @rc_call            nvarchar(max),
                 @rc_rationale       nvarchar(2000) = N'',
-                @rc_safeguards      nvarchar(500);
+                @rc_safeguards      nvarchar(500),
+                /* o2md.24: conflict/caveat lines rendered as comments inside the call --
+                   when findings disagree about a parameter, say so instead of silently
+                   picking one (or worse, echoing a baseline a CRITICAL implicates). */
+                @rc_conflicts       nvarchar(max) = N'';
+
+            /* o2md.24: newest proc version observed in the window -- several precedence
+               rules below depend on whether a fix has actually shipped to this host.
+               NULL = unparseable/unknown, treated as 'not proven fixed'. */
+            DECLARE @rc_max_vkey integer = (
+                SELECT MAX(rvk.VersionKey)
+                FROM #run_version_keys AS rvk
+                INNER JOIN #runs AS r ON r.RunLabel = rvk.RunLabel
+                WHERE r.IsKilled = 0
+            );
 
             SELECT
                 @rc_databases     = ISNULL([Databases], N'USER_DATABASES'),
@@ -6363,12 +6414,74 @@ BEGIN
                 SET @rc_long_pct = ISNULL(@rc_long_pct, 10);
             END;
 
-            /* W3: Stale backlog -- suggest parallel if not already on */
+            /* W3: Stale backlog -- suggest parallel if not already on.
+               o2md.24 precedence: C6 SILENT_NOOP_RUN (CRITICAL) implicates parallel
+               mode, so it beats W3's (WARNING) suggestion to newly enable it --
+               conflict is surfaced as a comment instead of silently picking. */
             IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'STALE_BACKLOG')
             AND ISNULL(@rc_parallel, N'N') = N'N'
             BEGIN
-                SET @rc_parallel = N'Y';
-                SET @rc_rationale += N'Parallel enabled (W3: persistent backlog). ';
+                IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'SILENT_NOOP_RUN')
+                    SET @rc_conflicts += N'  /* CONFLICT: W3 backlog suggests @StatsInParallel = Y, but CRITICAL SILENT_NOOP_RUN implicates parallel mode on this host -- resolve the no-op findings before enabling parallel. */' + NCHAR(13) + NCHAR(10);
+                ELSE
+                BEGIN
+                    SET @rc_parallel = N'Y';
+                    SET @rc_rationale += N'Parallel enabled (W3: persistent backlog). ';
+                END;
+            END;
+
+            /* o2md.24: C6 SILENT_NOOP_RUN with parallel already on in the baseline --
+               keep it (the remedy is the version fix, not disabling parallel) but
+               carry an explicit caveat gated on whether the no-op fixes have
+               actually shipped to this host (3.8.2 = o2md.1 CONTINUE fix -> key
+               3008002; 3.5.7 = queue-leadership fix). */
+            IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'SILENT_NOOP_RUN')
+            AND ISNULL(@rc_parallel, N'N') = N'Y'
+            BEGIN
+                IF @rc_max_vkey IS NULL OR @rc_max_vkey < 3008002
+                    SET @rc_conflicts += N'  /* CAVEAT: CRITICAL SILENT_NOOP_RUN fired and the observed proc version predates the silent-no-op fixes (3.5.7 queue leadership, 3.8.2 mop-up fall-through). Upgrade sp_StatUpdate BEFORE relying on this parallel configuration. */' + NCHAR(13) + NCHAR(10);
+                ELSE
+                    SET @rc_conflicts += N'  /* NOTE: SILENT_NOOP_RUN fired in the window, but the observed proc version already includes the known no-op fixes -- if new no-op runs appear on this version, report it. */' + NCHAR(13) + NCHAR(10);
+            END;
+
+            /* o2md.24: W12 PRIORITY_PASS_EMPTY -- version-gated per the o2md.17
+               convention: below 3.7.0 the zero-qualifying state is the
+               effective_counter defect and retuning thresholds changes nothing;
+               3.7.0+ it is a real tuning signal, so halve the threshold. */
+            IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'PRIORITY_PASS_EMPTY')
+            BEGIN
+                IF @rc_max_vkey IS NULL OR @rc_max_vkey < 3007000
+                    SET @rc_conflicts += N'  /* CAVEAT: PRIORITY_PASS_EMPTY fired and the observed proc version predates 3.7.0 (effective_counter fix) -- upgrade first; do NOT retune @ModificationThreshold until the priority pass runs on 3.7.0+. */' + NCHAR(13) + NCHAR(10);
+                ELSE
+                BEGIN
+                    SET @rc_mod_thresh = CASE
+                        WHEN ISNULL(@rc_mod_thresh, 5000) / 2 < 100 THEN 100
+                        ELSE ISNULL(@rc_mod_thresh, 5000) / 2
+                    END;
+                    SET @rc_rationale += N'ModificationThreshold halved (W12: priority pass empty on 3.7.0+). ';
+                END;
+            END;
+
+            /* o2md.24: I8 QS_PERFORMANCE_TREND with QS currently off -- historical
+               QS-era runs show a measurable trend, so recommend enabling.  Loses to
+               W5 QS_NOT_EFFECTIVE (WARNING beats INFO: no point enabling QS
+               prioritization while enrichment demonstrably captures nothing) and
+               ignores I8's UNAVAILABLE sentinel rows (no data, nothing to act on). */
+            IF ISNULL(@rc_qs_pri, N'N') = N'N'
+            AND EXISTS (
+                SELECT 1 FROM #recommendations
+                WHERE Category = N'QS_PERFORMANCE_TREND'
+                AND   Finding NOT LIKE N'%DataStatus: UNAVAILABLE%'
+            )
+            BEGIN
+                IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'QS_NOT_EFFECTIVE')
+                    SET @rc_conflicts += N'  /* CONFLICT: QS_PERFORMANCE_TREND shows per-stat CPU trend data, but QS_NOT_EFFECTIVE says enrichment captured nothing recently -- fix Query Store health before enabling @QueryStore prioritization. */' + NCHAR(13) + NCHAR(10);
+                ELSE
+                BEGIN
+                    SET @rc_qs_pri = N'Y';
+                    SET @rc_sort   = N'QUERY_STORE';
+                    SET @rc_rationale += N'QS prioritization enabled (I8: measurable per-stat CPU trend). ';
+                END;
             END;
 
             /* ---- Build the EXEC call ---- */
@@ -6396,13 +6509,17 @@ BEGIN
             IF ISNULL(@rc_parallel, N'N') = N'Y'
                 SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @StatsInParallel = N''Y''';
 
-            /* Add @MopUpPass if runs consistently complete early and it's not already enabled */
+            /* Add @MopUpPass when the mop-up-unused feature check or W12
+               PRIORITY_PASS_EMPTY fired.  o2md.24: the old ISNULL(@rc_parallel)='N'
+               gate was stale v2.24-era logic -- v3 fully supports @MopUpPass with
+               @StatsInParallel (validation only requires @TimeLimit/@StopByTime,
+               which this call always emits).  That gate was why 31/40 parallel
+               fleet servers never saw the @MopUpPass the W12 finding recommended. */
             IF EXISTS (
                 SELECT 1 FROM #recommendations
-                WHERE Category = N'UNUSED_FEATURES'
-                AND   Finding LIKE N'%mop-up%'
+                WHERE (Category = N'UNUSED_FEATURES' AND Finding LIKE N'%mop-up%')
+                OR    Category = N'PRIORITY_PASS_EMPTY'
             )
-            AND ISNULL(@rc_parallel, N'N') = N'N'
                 SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @MopUpPass = N''Y''';
 
             /* sp_StatUpdate-6x80: @CriticalTables hint.
@@ -6440,6 +6557,10 @@ BEGIN
             END;
 
             SET @rc_call += N';';
+
+            /* o2md.24: append accumulated conflict/caveat comment lines after the call */
+            IF @rc_conflicts <> N''
+                SET @rc_call += NCHAR(13) + NCHAR(10) + RTRIM(@rc_conflicts);
 
             /* ---- Safeguard parameters (not tracked in CommandLog) ---- */
             SET @rc_safeguards = N'Also consider safeguards not tracked in CommandLog: @MinTempdbFreeMB = 500, @MaxConsecutiveFailures = 5';
