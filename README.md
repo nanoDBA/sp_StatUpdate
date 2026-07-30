@@ -639,13 +639,27 @@ EXEC dbo.sp_StatUpdate_Diag
 
 #### PowerShell: Multi-Server Obfuscated Reports
 
-When running the wrapper with `-Obfuscate`, three files are produced per run:
+`-Obfuscate` **requires** `-ObfuscationSeed`. Unseeded, the tokens are bare
+hashes of the real names and a recipient can recover `dbo`, `Orders`,
+`Production` and your instance names from a short dictionary -- so the wrapper
+refuses rather than write a file called SAFE_TO_SHARE that isn't. Keep the seed
+constant across runs so two reports stay comparable; changing it renumbers
+every token.
+
+Each obfuscated run produces:
 
 | File | Contains | Share externally? |
 |------|----------|-------------------|
 | `*_SAFE_TO_SHARE.{md,html,json}` | Obfuscated names only | Yes |
+| `*_SAFE_TO_SHARE_csv/` | One CSV per result set, obfuscated | Yes |
 | `*_CONFIDENTIAL.{md,html,json}` | Real server/database/table names | **No** |
+| `*_CONFIDENTIAL_csv/` | One CSV per result set, real names | **No** |
 | `*_CONFIDENTIAL_DECODE.sql` | Standalone T-SQL script to decode tokens | **No** |
+
+The CSV folders are written on every run (suppress with `-NoCsv`). Each file
+unions that result set across the whole fleet with a leading `Server` column,
+which is the shape you want for Excel or Power BI -- the narrative report tells
+you which instances to look at, the CSVs let you pivot across all of them.
 
 ```powershell
 # Generate reports for 3 servers -- Markdown format, seeded obfuscation
@@ -677,9 +691,9 @@ Without `-Obfuscate`, a single report file is produced (no suffix).
 ```
 1. DBA runs:     Invoke-StatUpdateDiag.ps1 -Servers ... -Obfuscate -ObfuscationSeed "..."
 2. DBA sends:    *_SAFE_TO_SHARE.md to consultant (no real names visible)
-3. Consultant:   "TBL_e4c1 has a C2 finding -- stat IX_STAT_9b3d fails every run"
-4. DBA decodes:  Opens _CONFIDENTIAL_DECODE.sql in SSMS, searches for TBL_e4c1
-5. DBA finds:    TBL_e4c1 = dbo.OrderHistory, IX_STAT_9b3d = IX_OrderHistory_Date
+3. Consultant:   "On SRV_1A2B3C4D, TBL_e4c1 has a C2 finding -- stat IX_STAT_9b3d fails every run"
+4. DBA decodes:  Opens _CONFIDENTIAL_DECODE.sql in SSMS, searches for SRV_1A2B3C4D and TBL_e4c1
+5. DBA finds:    SRV_1A2B3C4D = PROD-SQL07, TBL_e4c1 = dbo.OrderHistory, IX_STAT_9b3d = IX_OrderHistory_Date
 6. DBA fixes:    The actual object, shares updated SAFE_TO_SHARE report to confirm
 ```
 
