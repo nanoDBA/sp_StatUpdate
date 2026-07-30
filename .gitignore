@@ -20,6 +20,7 @@
 !README.md
 !LICENSE
 !.gitignore
+!.gitattributes
 
 # README demo screenshots (colorized terminal output, rendered to PNG)
 !assets/
