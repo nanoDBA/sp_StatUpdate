@@ -36,11 +36,32 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.8.3.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.8.4.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.8.3.2026.07.30 - Query Store diagnostics + priority-pass/mop-up
+History:    3.8.4.2026.07.30 - o2md.8: bounded retry extended to lock timeouts.
+                            The existing #163 deadlock-retry loop (up to 3
+                            attempts, exponential backoff) retried error 1205
+                            only.  A lock timeout (1222) is just as transient
+                            as a deadlock -- the blocker's own transaction is
+                            expected to release -- but previously burned the
+                            stat as a hard failure on the first hit and
+                            counted against @MaxConsecutiveFailures.  Found on
+                            a production server where 1222 accounted for 5/5
+                            (100%) of all recorded failures.  Same backoff now
+                            applies to both error numbers; the existing
+                            DEADLOCK_RETRY_OK/FAIL warning text is unchanged
+                            for 1205, with new LOCK_TIMEOUT_RETRY_OK/FAIL for
+                            1222.  Caught during testing: RAISERROR only
+                            accepts variables or literals as substitution
+                            arguments, not arbitrary expressions -- an inline
+                            CASE in the retry RAISERROR call failed to deploy
+                            ("Incorrect syntax near the keyword 'CASE'");
+                            fixed by assigning the CASE result to a local
+                            variable first.
+
+            3.8.3.2026.07.30 - Query Store diagnostics + priority-pass/mop-up
                             inversion warning (o2md.6, QuickieStore comparison).
 
                             Four Query Store observability gaps closed after
@@ -787,7 +808,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.8.3.2026.07.30',
+        @procedure_version varchar(20) = '3.8.4.2026.07.30',
         @procedure_version_date datetime = '20260730',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -9330,7 +9351,11 @@ OPTION (RECOMPILE);';
 
             /* #163 (P2): Deadlock retry -- up to 3 total attempts with exponential backoff on error 1205.
                ROWLOCK+READPAST skips locked rows but cannot prevent Sch-M conflicts when multiple
-               workers update the same stat simultaneously. Retry loop handles that residual race. */
+               workers update the same stat simultaneously. Retry loop handles that residual race.
+               o2md.8: same bounded retry extended to error 1222 (lock timeout) -- a lock timeout is
+               transient (the blocker's own transaction is expected to release), so the same
+               backoff-and-retry gives it a second chance instead of burning the stat as a hard
+               failure on the first contention hit and counting it against @MaxConsecutiveFailures. */
             DECLARE
                 @exec_retry      int    = 0,
                 @exec_retry_delay char(8),
@@ -9345,35 +9370,46 @@ OPTION (RECOMPILE);';
                         SET @exec_done = 1; /* Success -- exit retry loop */
                     END TRY
                     BEGIN CATCH
-                        IF ERROR_NUMBER() = 1205 AND @exec_retry < 2
+                        DECLARE @exec_err_number int = ERROR_NUMBER();
+                        IF @exec_err_number IN (1205, 1222) AND @exec_retry < 2
                         BEGIN
-                            /* Deadlock -- back off and retry */
+                            /* Deadlock (1205) or lock timeout (1222) -- back off and retry.
+                               RAISERROR only accepts variables/literals as substitution args
+                               (not arbitrary expressions), so the CASE result is assigned to
+                               a variable first. */
+                            DECLARE @exec_err_label nvarchar(20) =
+                                CASE WHEN @exec_err_number = 1205 THEN N'Deadlock' ELSE N'Lock timeout' END;
                             SET @exec_retry_delay =
                                 CASE @exec_retry WHEN 0 THEN '00:00:01' WHEN 1 THEN '00:00:02' ELSE '00:00:04' END;
                             SET @exec_retry += 1;
-                            RAISERROR(N'  ~ Deadlock on stat update (retry %d/2) -- waiting %s before retry (#163)',
-                                10, 1, @exec_retry, @exec_retry_delay) WITH NOWAIT;
+                            RAISERROR(N'  ~ %s on stat update (retry %d/2) -- waiting %s before retry (#163/o2md.8)',
+                                10, 1, @exec_err_label, @exec_retry, @exec_retry_delay) WITH NOWAIT;
                             WAITFOR DELAY @exec_retry_delay;
                         END
                         ELSE
                         BEGIN
-                            /* Non-deadlock error, or all retries exhausted -- re-raise to outer CATCH */
+                            /* Non-retryable error, or all retries exhausted -- re-raise to outer CATCH */
                             IF @exec_retry > 0
                                 SET @warnings = @warnings
-                                    + N'DEADLOCK_RETRY_FAIL: [' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name + N'] '
-                                    + N'deadlocked, failed after ' + CONVERT(nvarchar(5), @exec_retry + 1) + N' attempt(s); ';
+                                    + CASE WHEN @exec_err_number = 1205 THEN N'DEADLOCK_RETRY_FAIL: ' ELSE N'LOCK_TIMEOUT_RETRY_FAIL: ' END
+                                    + N'[' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name + N'] '
+                                    + CASE WHEN @exec_err_number = 1205 THEN N'deadlocked, ' ELSE N'lock timed out, ' END
+                                    + N'failed after ' + CONVERT(nvarchar(5), @exec_retry + 1) + N' attempt(s); ';
                             SET @exec_done = 1; /* Force loop exit before re-raise */
                             ;THROW; /* Propagates to outer BEGIN CATCH */
                         END;
                     END CATCH;
                 END; /* WHILE @exec_done = 0 */
 
-                /* Emit note if stat update succeeded after one or more deadlock retries */
+                /* Emit note if stat update succeeded after one or more deadlock/lock-timeout retries.
+                   o2md.8: @exec_err_number reflects whichever error triggered the last retry --
+                   good enough to label the success note without tracking a per-attempt history. */
                 IF @exec_retry > 0
                 BEGIN
-                    RAISERROR(N'  ~ Stat update succeeded after %d deadlock retry(s) (#163)', 10, 1, @exec_retry) WITH NOWAIT;
+                    RAISERROR(N'  ~ Stat update succeeded after %d retry(s) (#163/o2md.8)', 10, 1, @exec_retry) WITH NOWAIT;
                     SET @warnings = @warnings
-                        + N'DEADLOCK_RETRY_OK: [' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name + N'] '
+                        + CASE WHEN @exec_err_number = 1205 THEN N'DEADLOCK_RETRY_OK: ' ELSE N'LOCK_TIMEOUT_RETRY_OK: ' END
+                        + N'[' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name + N'] '
                         + N'succeeded after ' + CONVERT(nvarchar(5), @exec_retry) + N' retry(s); ';
                 END;
 
