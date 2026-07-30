@@ -36,11 +36,47 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.8.2.2026.07.28 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.8.3.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.8.2.2026.07.28 - SILENT NO-OP: fleet analysis batch (o2md).
+History:    3.8.3.2026.07.30 - Query Store diagnostics + priority-pass/mop-up
+                            inversion warning (o2md.6, QuickieStore comparison).
+
+                            Four Query Store observability gaps closed after
+                            comparing Phase 6 enrichment against Erik Darling's
+                            sp_QuickieStore (see research/quickiestore-comparison-
+                            2026-07-30.md for the full analysis): (1)
+                            wait_stats_capture_mode is now checked before the
+                            WAITS/WAIT_CPU enrichment queries sys.query_store_
+                            wait_stats -- capture-mode OFF previously produced
+                            silent zero enrichment indistinguishable from "no
+                            matching workload".  (2) READ_ONLY Query Store state
+                            now decodes readonly_reason (storage limit with
+                            current/max MB, AG secondary, single-user/emergency
+                            mode, internal memory limits) instead of a single
+                            generic "may be stale" message.  (3) query_capture_
+                            mode is surfaced (NONE/CUSTOM) when it may be
+                            silently biasing which queries QS-based prioritization
+                            even sees -- informational only, no behavior change.
+                            (4) The post-run forced-plan-failure-delta warning
+                            now samples last_force_failure_reason_desc so the
+                            message is self-contained instead of "go investigate".
+                            All four are additive diagnostics (debug/warning text
+                            only) -- no change to qualification, ordering, or
+                            enrichment logic.
+
+                            o2md.6 -- the priority pass qualifying 0 stats while
+                            mop-up (raw modification_counter > 0, no threshold
+                            filtering) finds N > 0 is never legitimate; it means
+                            priority-pass qualification is broken (the exact
+                            failure mode behind the icjq effective_counter
+                            incident, gh-502), not that the fleet has nothing to
+                            do.  Now detected and surfaced via @WarningsOut /
+                            @WarningsCodesOut (PRIORITY_PASS_ZERO_MOPUP_FOUND)
+                            instead of mop-up silently absorbing the gap.
+
+            3.8.2.2026.07.28 - SILENT NO-OP: fleet analysis batch (o2md).
                             Found by the 40-server production diagnostic sweep
                             of 2026-07-28, where ~50 nightly maintenance windows
                             reported SUCCESS while processing zero statistics.
@@ -751,8 +787,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.8.2.2026.07.28',
-        @procedure_version_date datetime = '20260725',
+        @procedure_version varchar(20) = '3.8.3.2026.07.30',
+        @procedure_version_date datetime = '20260730',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -5311,17 +5347,63 @@ OPTION (RECOMPILE);';
 
                 v1.9: Warn if Query Store is READ_ONLY (state 1) as data may be stale.
                 */
-                /* bd -67s: consolidate 3 reads of sys.database_query_store_options into 1 */
-                DECLARE @qs_actual_state tinyint, @qs_retention_days int;
-                SELECT @qs_actual_state = actual_state, @qs_retention_days = stale_query_threshold_days
+                /* bd -67s: consolidate reads of sys.database_query_store_options into 1.
+                   o2md (QuickieStore comparison, 2026-07-30): added readonly_reason,
+                   current_storage_size_mb, max_storage_size_mb, query_capture_mode -- all
+                   present since SQL 2016, unlike wait_stats_capture_mode (2017+, read
+                   separately below inside its own DMV-existence guard). */
+                DECLARE @qs_actual_state tinyint, @qs_retention_days int,
+                    @qs_readonly_reason int, @qs_current_storage_mb bigint,
+                    @qs_max_storage_mb bigint, @qs_capture_mode tinyint;
+                SELECT @qs_actual_state = actual_state, @qs_retention_days = stale_query_threshold_days,
+                    @qs_readonly_reason = readonly_reason, @qs_current_storage_mb = current_storage_size_mb,
+                    @qs_max_storage_mb = max_storage_size_mb, @qs_capture_mode = query_capture_mode
                 FROM sys.database_query_store_options;
 
                 IF @i_qs_enabled_param = 1
                 AND @qs_actual_state IN (1, 2)
                 BEGIN
-                    /* v1.9: Warn if Query Store is READ_ONLY (might have stale data) */
+                    /* v1.9: Warn if Query Store is READ_ONLY (might have stale data).
+                       o2md: decode readonly_reason (Microsoft docs bitmask) instead of a
+                       generic message -- storage pressure and AG-secondary are the two an
+                       operator can actually act on or dismiss as expected. */
                     IF @qs_actual_state = 1 AND @Debug_param = 1
-                        RAISERROR(N''    Warning: Query Store is READ_ONLY - priority data may be stale'', 10, 1) WITH NOWAIT;
+                    BEGIN
+                        DECLARE @qs_ro_msg nvarchar(500) = N''    Warning: Query Store is READ_ONLY'';
+                        IF @qs_readonly_reason IS NOT NULL
+                        BEGIN
+                            IF @qs_readonly_reason & 65536 = 65536
+                                SET @qs_ro_msg += N'' -- reached max size ('' + CONVERT(nvarchar(20), @qs_current_storage_mb) + N'' of '' + CONVERT(nvarchar(20), @qs_max_storage_mb) + N'' MB); raise MAX_STORAGE_SIZE_MB'';
+                            ELSE IF @qs_readonly_reason & 8 = 8
+                                SET @qs_ro_msg += N'' -- this is a readable AG secondary (expected)'';
+                            ELSE IF @qs_readonly_reason & 1 = 1
+                                SET @qs_ro_msg += N'' -- database is in read-only mode'';
+                            ELSE IF @qs_readonly_reason & 2 = 2
+                                SET @qs_ro_msg += N'' -- database is in single-user mode'';
+                            ELSE IF @qs_readonly_reason & 4 = 4
+                                SET @qs_ro_msg += N'' -- database is in emergency mode'';
+                            ELSE IF @qs_readonly_reason & 131072 = 131072
+                                SET @qs_ro_msg += N'' -- distinct-statement internal memory limit reached'';
+                            ELSE IF @qs_readonly_reason & 262144 = 262144
+                                SET @qs_ro_msg += N'' -- in-memory items awaiting disk flush hit internal limit (temporary)'';
+                            ELSE IF @qs_readonly_reason & 524288 = 524288
+                                SET @qs_ro_msg += N'' -- database reached its disk size limit'';
+                        END;
+                        SET @qs_ro_msg += N'' -- priority data may be stale'';
+                        RAISERROR(@qs_ro_msg, 10, 1) WITH NOWAIT;
+                    END;
+
+                    /* o2md: query_capture_mode NONE/CUSTOM silently bias which queries QS
+                       ever sees, which biases which stats look "hot". Surface, don''t gate
+                       -- QS enrichment already degrades gracefully to non-QS ordering when
+                       it finds nothing, so no behavior change here, only visibility. */
+                    IF @Debug_param = 1
+                    BEGIN
+                        IF @qs_capture_mode = 3 /* NONE */
+                            RAISERROR(N''    Warning: Query Store query_capture_mode=NONE on this database -- QS-based prioritization will find no new data (already-captured queries still accrue runtime stats)'', 10, 1) WITH NOWAIT;
+                        ELSE IF @qs_capture_mode = 4 /* CUSTOM, SQL 2019+ */
+                            RAISERROR(N''    Note: Query Store query_capture_mode=CUSTOM -- QS enrichment coverage depends on the CUSTOM capture policy; rankings may be biased toward whatever it captures'', 10, 1) WITH NOWAIT;
+                    END;
 
                     IF @qs_retention_days IS NOT NULL AND @i_qs_recent_hours_param > (@qs_retention_days * 24)
                     BEGIN
@@ -5536,6 +5618,21 @@ OPTION (RECOMPILE);';
                     IF OBJECT_ID(N''sys.query_store_wait_stats'') IS NOT NULL
                     AND @i_qs_metric_param IN (N''WAITS'', N''WAIT_CPU'')
                     BEGIN
+                        /* o2md (QuickieStore comparison): wait_stats_capture_mode is a
+                           SQL 2017+ column, safe to read unconditionally here since it''s
+                           already inside the 2017+ query_store_wait_stats existence guard
+                           above. OFF means this whole enrichment silently finds zero rows
+                           -- indistinguishable from "no matching workload" without this. */
+                        DECLARE @qs_wait_capture_mode tinyint;
+                        SELECT @qs_wait_capture_mode = wait_stats_capture_mode FROM sys.database_query_store_options;
+
+                        IF ISNULL(@qs_wait_capture_mode, 1) = 0
+                        BEGIN
+                            IF @Debug_param = 1
+                                RAISERROR(N''    Warning: Query Store wait_stats_capture_mode=OFF on this database -- WAITS/WAIT_CPU enrichment will find no data (enable via ALTER DATABASE ... SET QUERY_STORE (WAIT_STATS_CAPTURE_MODE = ON))'', 10, 1) WITH NOWAIT;
+                        END
+                        ELSE
+                        BEGIN
                         /* #431: compute TopPlanIds for WAITS FIRST, then parse XML only for those plans.
                            gh-544: wait_category filtered via {{WAITS_CATEGORIES}} token
                            (Buffer Latch=5, Buffer IO=6, Memory=17, Other Disk IO=21). */
@@ -5590,6 +5687,7 @@ OPTION (RECOMPILE);';
                         FROM #stat_candidates AS sc
                         INNER JOIN WaitByTable AS wbt ON wbt.object_id = sc.object_id
                         WHERE sc.qs_cache_hit = 0; /* rcng / gh-556: hits keep their cached WAITS boost */
+                        END; /* ELSE from wait_stats_capture_mode check */
                     END;
 
                     /* #366: Update priority boost for WAITS metric (must run after wait stats UPDATE).
@@ -10136,7 +10234,14 @@ OPTION (RECOMPILE);';
     mop-up discovery.  It populates QueueStatistic with mop-up tables so all
     workers can claim them via the normal parallel queue.  Workers that did not
     run discovery use lazy per-table discovery when claiming mop-up tables.
+
+    o2md.6: @total_stats is not mutated between the priority-pass discovery
+    assignment and this point, so this snapshot is the priority pass's true
+    qualification count -- used below (region 11-FINALIZE) to detect the
+    "priority pass qualified 0 but mop-up found N>0" inversion, which is
+    never legitimate (see o2md.6 / the icjq effective_counter incident).
     */
+    DECLARE @priority_pass_stats_found int = @total_stats;
     IF  @i_mop_up_pass = N'Y'
     AND @mop_up_done = 0
     AND @stop_reason IN (N'COMPLETED', N'NATURAL_END', N'PARALLEL_COMPLETE')
@@ -10750,6 +10855,23 @@ OPTION (RECOMPILE);';
         END;
     END;
     SkipMopUp: /* #340: GOTO target for pre-flight safety check failures */
+
+    /* o2md.6: priority pass qualified 0 while mop-up (raw modification_counter > 0,
+       no threshold filtering) found stats to process.  This inversion is never
+       legitimate -- it means the priority pass's qualification logic is broken
+       (e.g. the icjq effective_counter double-count, gh-502), not that the fleet
+       genuinely has nothing to do.  Silent because mop-up quietly does the work
+       anyway; loud here so it gets fixed instead of relied upon. */
+    IF  @priority_pass_stats_found = 0
+    AND @mop_up_stats_found > 0
+    BEGIN
+        DECLARE @p6_msg nvarchar(300) = N'WARNING: Priority pass qualified 0 stat(s) but mop-up found '
+            + CONVERT(nvarchar(10), @mop_up_stats_found)
+            + N'.  This inversion is never legitimate -- check the priority-pass qualification thresholds/logic, not just mop-up.';
+        RAISERROR(@p6_msg, 10, 1) WITH NOWAIT;
+        SET @warnings = ISNULL(@warnings, N'') + N'PRIORITY_PASS_ZERO_MOPUP_FOUND: ' + CONVERT(nvarchar(10), @mop_up_stats_found) + N' stat(s); ';
+        SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'PRIORITY_PASS_ZERO_MOPUP_FOUND';
+    END;
     /*#endregion 10-MOP-UP */
     /*#region 11-FINALIZE: Summary, CommandLog footer, output params */
     /* #434: restore caller's session LOCK_TIMEOUT before finalization */
@@ -10936,7 +11058,10 @@ OPTION (RECOMPILE);';
                @qs_forced_failure_delta_total is declared at batch scope (~line 1223)
                so the Summary XML builder can reference it unconditionally. */
             @qs_forced_failure_delta_db bigint = 0,
-            @qs_delta_details nvarchar(max) = N'';
+            @qs_delta_details nvarchar(max) = N'',
+            /* o2md (QuickieStore comparison): first sampled last_force_failure_reason_desc
+               across all databases, for the delta warning below. */
+            @qs_sample_failure_reason nvarchar(128) = NULL;
 
         DECLARE @qs_databases TABLE
         (
@@ -10952,7 +11077,11 @@ OPTION (RECOMPILE);';
         (
             plan_id bigint NOT NULL PRIMARY KEY,
             query_id bigint NOT NULL,
-            force_failure_count bigint NOT NULL DEFAULT 0
+            force_failure_count bigint NOT NULL DEFAULT 0,
+            /* o2md (QuickieStore comparison, 2026-07-30): built-in description column
+               (no manual enum decode needed, unlike readonly_reason above) -- turns the
+               "go investigate force_failure_reason" advisory into a self-contained one. */
+            last_force_failure_reason_desc nvarchar(128) NULL
         );
 
         INSERT INTO @qs_databases (database_name)
@@ -11113,8 +11242,8 @@ OPTION (RECOMPILE);';
                         SET @qs_check_sql = CONVERT(nvarchar(max), N'')
                             + N'
                             SET LOCK_TIMEOUT 10000;
-                            INSERT INTO #qs_forced_post (plan_id, query_id, force_failure_count)
-                            SELECT qsp.plan_id, qsp.query_id, qsp.force_failure_count
+                            INSERT INTO #qs_forced_post (plan_id, query_id, force_failure_count, last_force_failure_reason_desc)
+                            SELECT qsp.plan_id, qsp.query_id, qsp.force_failure_count, qsp.last_force_failure_reason_desc
                             FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan AS qsp
                             WHERE qsp.is_forced_plan = 1'
                             + CASE WHEN @has_plan_forcing_type = 1
@@ -11141,6 +11270,23 @@ OPTION (RECOMPILE);';
                                 SET @qs_delta_details = @qs_delta_details
                                     + @qs_check_db + N'(+' + CONVERT(nvarchar(20), @qs_forced_failure_delta_db)
                                     + N') ';
+
+                                /* o2md (QuickieStore comparison, 2026-07-30): sample one
+                                   failure-reason description so the warning below is
+                                   self-contained instead of "go investigate". Keeps the
+                                   first one found across all databases -- one example is
+                                   enough to point the DBA in the right direction. */
+                                IF @qs_sample_failure_reason IS NULL
+                                BEGIN
+                                    SELECT TOP (1) @qs_sample_failure_reason = post.last_force_failure_reason_desc
+                                    FROM #qs_forced_post AS post
+                                    LEFT JOIN #qs_forced_baseline AS pre
+                                        ON pre.database_name = @qs_check_db
+                                        AND pre.plan_id = post.plan_id
+                                    WHERE post.force_failure_count - ISNULL(pre.force_failure_count, 0) > 0
+                                    AND   post.last_force_failure_reason_desc IS NOT NULL
+                                    ORDER BY post.plan_id;
+                                END;
                             END;
                         END TRY
                         BEGIN CATCH
@@ -11200,7 +11346,13 @@ OPTION (RECOMPILE);';
                 + N' failures (' + RTRIM(@qs_delta_details) + N'); ';
             RAISERROR(N'', 10, 1) WITH NOWAIT;
             RAISERROR(@qs_delta_msg, 10, 1) WITH NOWAIT;
-            RAISERROR(N'         Investigate sys.query_store_plan.force_failure_count and force_failure_reason for the affected plans.', 10, 1) WITH NOWAIT;
+            /* o2md (QuickieStore comparison): show a sampled reason directly instead of
+               only pointing at the DMV -- last_force_failure_reason_desc is a built-in
+               description column, no manual enum decode needed. */
+            IF @qs_sample_failure_reason IS NOT NULL
+                RAISERROR(N'         Sample reason: %s (see sys.query_store_plan.last_force_failure_reason_desc for all affected plans).', 10, 1, @qs_sample_failure_reason) WITH NOWAIT;
+            ELSE
+                RAISERROR(N'         Investigate sys.query_store_plan.force_failure_count and force_failure_reason for the affected plans.', 10, 1) WITH NOWAIT;
         END;
 
         /* gh-452: the forced-plan check issued SET LOCK_TIMEOUT 10000/30000 via
