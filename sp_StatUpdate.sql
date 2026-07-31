@@ -36,11 +36,51 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.9.0.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.10.0.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.9.0.2026.07.30 - BEHAVIOR CHANGE (maintainer-authorized, o2md.7):
+History:    3.10.0.2026.07.30 - MOP-UP QS + two silent pre-existing bugs
+                            (o2md.5 + fixes found verifying it).
+
+                            o2md.5 (maintainer option a) -- Phase 6 QS
+                            enrichment extracted into @qs_phase6_sql, a
+                            fragment variable the staged path concatenates
+                            back at the exact original position (assembly is
+                            byte-identical, so the two paths cannot drift)
+                            and the mop-up paths (parallel-leader + serial)
+                            execute against a mop-up-built #stat_candidates
+                            per database.  Mop-up rows now carry real qs_*
+                            values in per-stat ExtendedInfo (the o2md.16/W5
+                            "QS not applicable to this pass" dependency) and
+                            @SortOrder = QUERY_STORE is honored by a
+                            post-enrichment re-rank; the parallel-leader
+                            TablePriority fan-out now inherits the per-stat
+                            priority ranking instead of re-deriving from
+                            modification counter.  Verified live: FromMopUp
+                            rows log QSPlanCount from the shared fragment.
+
+                            PRE-EXISTING BUG (silent, since sw82): the
+                            zero-candidate/zero-qualify early-exit shape
+                            (@empty_disc_select) was missing is_critical,
+                            so every empty-discovery database failed the
+                            INSERT...EXECUTE column-count check and was
+                            silently skipped (DB_SKIPPED swallow).
+
+                            PRE-EXISTING BUG (silent, since gh-462 /
+                            36cea09, 2026-04-18): @mop_up_where_sql carried
+                            QUADRUPLED quotes, correct only for a
+                            doubly-nested dynamic string -- both consumers
+                            concatenate it directly, so serial and
+                            parallel-leader mop-up discovery died with
+                            'Incorrect syntax near IsUserTable' on every
+                            run, the per-database CATCH swallowed it, and
+                            'no additional stats found' masqueraded as
+                            normal.  Mop-up discovery had been broken for
+                            ~3 months of green gates; a regression test now
+                            asserts discovery actually finds seeded rows.
+
+            3.9.0.2026.07.30 - BEHAVIOR CHANGE (maintainer-authorized, o2md.7):
                             adaptive sampling on by default in the NIGHTLY and
                             WEEKLY_FULL presets.  A single large stat with a
                             100% sample could burn 20+ minutes of NIGHTLY's
@@ -880,7 +920,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.9.0.2026.07.30',
+        @procedure_version varchar(20) = '3.10.0.2026.07.30',
         @procedure_version_date datetime = '20260730',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -4700,6 +4740,15 @@ OPTION (RECOMPILE);';
             */
             BEGIN
                 DECLARE @staged_sql nvarchar(max);
+    /* o2md.5 (maintainer option a): Phase 6 QS enrichment extracted into its own
+       fragment variable.  The staged path concatenates it back into @staged_sql at
+       the exact original position (byte-identical assembly -- the two paths CANNOT
+       drift), and the mop-up paths execute the same fragment against a
+       mop-up-built #stat_candidates.  @qs_phase6_resolved is the fragment with the
+       version/metric token REPLACEs applied (the staged path applies them to the
+       whole assembled @staged_sql instead, unchanged). */
+    DECLARE @qs_phase6_sql nvarchar(max);
+    DECLARE @qs_phase6_resolved nvarchar(max);
                 /* gh-465: Zero-row sentinel SELECT shared by all Phase 1-6 bailout paths.
                    Column order and types are the INSERT...EXEC contract.
                    Any schema change needs updating only here. */
@@ -4716,6 +4765,12 @@ OPTION (RECOMPILE);';
                     N'                        is_memory_optimized = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
                     N'                        is_heap = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
                     N'                        auto_created = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
+                    /* pre-existing bug found 2026-07-30 during o2md.5 verification: the sw82
+                       batch added is_critical to the staged INSERT + FINAL SELECT but not to
+                       this empty-path shape -- every zero-candidate/zero-qualify early exit
+                       then failed the INSERT...EXECUTE column-count check and the whole
+                       database was silently skipped (DB_SKIPPED swallow). */
+                    N'                        is_critical = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
                     N'                        modification_counter = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
                     N'                        row_count = CONVERT(bigint, NULL),' + CHAR(13)+CHAR(10) +
                     N'                        days_stale = CONVERT(int, NULL),' + CHAR(13)+CHAR(10) +
@@ -5472,7 +5527,9 @@ OPTION (RECOMPILE);';
                         RAISERROR(N''    Phase 5B (QS cache): %d of %d stats have fresh cached QS scores (%d ms)'', 10, 1, @qs_cache_hits, @qs_cache_total, @phase_ms) WITH NOWAIT;
                 END;
 
-                /*
+';
+
+                SET @qs_phase6_sql = N'                /*
                 ================================================================
                 PHASE 6: Add Query Store data (only if enabled)
                 P2 #20: Skip QS operations when QS is disabled.
@@ -5863,6 +5920,8 @@ OPTION (RECOMPILE);';
                         RAISERROR(N''    Phase 6 (Query Store): %d stats enriched with QS data (%d ms)'', 10, 1, @phase6_enriched, @phase_ms) WITH NOWAIT;
                 END;
 
+';
+                SET @staged_sql = @staged_sql + @qs_phase6_sql + N'
                 /*
                 ================================================================
                 FINAL: Return results with priority ordering
@@ -10315,18 +10374,26 @@ OPTION (RECOMPILE);';
     /* gh-462: Shared WHERE filter for mop-up discovery (parallel-leader and serial).
        Both paths concatenate @mop_up_where_sql then append @commandlog_3part + tail.
        Any filter change needs updating only here -- one source of truth. */
+    /* pre-existing bug found 2026-07-30 during o2md.5 verification: this block
+       carried QUADRUPLED quotes -- correct only for a doubly-nested dynamic string,
+       but both consuming sites concatenate it directly into @mop_up_sql (single
+       nesting).  The executed SQL therefore contained doubled quotes and died with
+       'Incorrect syntax near IsUserTable'; the per-database CATCH swallowed it and
+       'Mop-up: no additional stats found' masqueraded as a normal result.  Serial
+       and parallel-leader mop-up discovery had been silently broken since the
+       gh-462 refactor (36cea09, 2026-04-18). */
     DECLARE @mop_up_where_sql nvarchar(max) = CAST(N'
                 WHERE ISNULL(sp.modification_counter, 0) > 0
                 AND   (
-                          OBJECTPROPERTY(s.object_id, N''''IsUserTable'''') = 1
-                       OR @i_include_system_objects_param = N''''Y''''
-                       OR (o.type = N''''V'''' AND @i_include_indexed_views_param = N''''Y''''
+                          OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
+                       OR @i_include_system_objects_param = N''Y''
+                       OR (o.type = N''V'' AND @i_include_indexed_views_param = N''Y''
                            AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
                       )
-                AND   (o.is_ms_shipped = 0 OR @i_include_system_objects_param = N''''Y'''')
-                AND   o.type NOT IN (N''''ET'''', N''''S'''')
+                AND   (o.is_ms_shipped = 0 OR @i_include_system_objects_param = N''Y'')
+                AND   o.type NOT IN (N''ET'', N''S'')
                 /* v2.27: Stretch Database auto-skip (#55) */
-                AND   ISNULL(OBJECTPROPERTY(s.object_id, N''''TableHasRemoteDataArchive''''), 0) = 0
+                AND   ISNULL(OBJECTPROPERTY(s.object_id, N''TableHasRemoteDataArchive''), 0) = 0
                 /* v2.27: Skip tables on READ_ONLY filegroups (#65) */
                 AND   NOT EXISTS
                       (
@@ -10339,17 +10406,17 @@ OPTION (RECOMPILE);';
                           AND   rfg.is_read_only = 1
                       )
                 AND   (
-                          (@TargetNorecompute_param = N''''N'''' AND s.no_recompute = 0)
-                       OR (@TargetNorecompute_param = N''''Y'''' AND s.no_recompute = 1)
-                       OR @TargetNorecompute_param = N''''BOTH''''
+                          (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
+                       OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
+                       OR @TargetNorecompute_param = N''BOTH''
                       )
                 /* v2.27: Table inclusion filter */
                 AND   (
                           @Tables_param IS NULL
-                       OR OBJECT_SCHEMA_NAME(s.object_id) + N''''.'''' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'''','''') AS ss)
+                       OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
                        OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'''','''') AS ss)
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
                       )
                 /* v2.26: Table exclusion filter (was missing from mop-up) */
                 AND   (
@@ -10357,8 +10424,8 @@ OPTION (RECOMPILE);';
                        OR NOT EXISTS
                           (
                               SELECT 1
-                              FROM STRING_SPLIT(@ExcludeTables_param, N'''','''') AS ex
-                              WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''''.'''' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                              FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
+                              WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                           )
                       )
                 /* v2.26: Statistics exclusion filter (was missing from mop-up) */
@@ -10367,25 +10434,25 @@ OPTION (RECOMPILE);';
                        OR NOT EXISTS
                           (
                               SELECT 1
-                              FROM STRING_SPLIT(@ExcludeStatistics_param, N'''','''') AS ex
+                              FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
                               WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                                  OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                           )
                       )
                 /* v2.27: Filtered stats mode filter */
                 AND   (
-                          @i_filtered_stats_mode_param = N''''INCLUDE''''
-                       OR @i_filtered_stats_mode_param = N''''PRIORITY''''
-                       OR (@i_filtered_stats_mode_param = N''''EXCLUDE'''' AND s.has_filter = 0)
-                       OR (@i_filtered_stats_mode_param = N''''ONLY'''' AND s.has_filter = 1)
+                          @i_filtered_stats_mode_param = N''INCLUDE''
+                       OR @i_filtered_stats_mode_param = N''PRIORITY''
+                       OR (@i_filtered_stats_mode_param = N''EXCLUDE'' AND s.has_filter = 0)
+                       OR (@i_filtered_stats_mode_param = N''ONLY'' AND s.has_filter = 1)
                       )
                 /* gh-427: Per-type columnstore skip (NCCI=6, CCI=5) */
                 AND   (
-                          @i_skip_ncci_param = N''''N''''
+                          @i_skip_ncci_param = N''N''
                        OR NOT EXISTS (SELECT 1 FROM sys.indexes AS ci WHERE ci.object_id = s.object_id AND ci.type = 6)
                       )
                 AND   (
-                          @i_skip_cci_param = N''''N''''
+                          @i_skip_cci_param = N''N''
                        OR NOT EXISTS (SELECT 1 FROM sys.indexes AS ci WHERE ci.object_id = s.object_id AND ci.type = 5)
                       )
                 /* v2.27: Minimum page count filter */
@@ -10684,6 +10751,136 @@ OPTION (RECOMPILE);';
 
                 SET @mop_up_found = (SELECT COUNT(*) FROM #stats_to_process WHERE processed = 0);
 
+                /* o2md.5 (maintainer option a): QS-enrich the mop-up rows with the SAME
+                   Phase 6 fragment the priority pass uses (@qs_phase6_sql -- one shared
+                   string, so the two paths cannot drift).  Fills per-stat qs_* so mop-up
+                   ExtendedInfo rows stop logging QSPlanCount NULL (the o2md.16/W5
+                   dependency), and feeds the QUERY_STORE re-rank below.  Each database is
+                   enriched in its own USE-scoped batch, mirroring staged discovery. */
+                IF @i_qs_enabled = 1 AND @qs_phase6_sql IS NOT NULL AND @mop_up_found > 0
+                BEGIN
+                    /* Same token REPLACEs the staged path applies to the assembled @staged_sql */
+                    SET @qs_phase6_resolved = REPLACE(@qs_phase6_sql, N'{{MAX_GRANT_HINT}}', N';');
+                    SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{TEMPDB_SPILLS_EXPR}}',
+                        CASE WHEN @sql_major_version >= 14 THEN N'SUM(CONVERT(bigint, qsrs2.avg_tempdb_space_used * qsrs2.count_executions))' ELSE N'CONVERT(bigint, 0)' END);
+                    SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{TEMPDB_SPILLS_ORDER}}',
+                        CASE WHEN @sql_major_version >= 14 THEN N'SUM(CONVERT(float, qsrs.avg_tempdb_space_used * qsrs.count_executions))' ELSE N'SUM(CONVERT(float, 0))' END);
+                    SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{PHYSICAL_READS_EXPR}}',
+                        CASE WHEN @sql_major_version >= 14 THEN N'SUM(CONVERT(bigint, qsrs2.avg_num_physical_io_reads * qsrs2.count_executions))' ELSE N'CONVERT(bigint, 0)' END);
+                    SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{PHYSICAL_READS_ORDER}}',
+                        CASE WHEN @sql_major_version >= 14 THEN N'SUM(CONVERT(float, qsrs.avg_num_physical_io_reads * qsrs.count_executions))' ELSE N'SUM(CONVERT(float, 0))' END);
+                    SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{WAITS_CATEGORIES}}', @qs_wait_categories);
+                    SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{WAITS_CTE}}',
+                        CASE WHEN @sql_major_version >= 14
+                        THEN N'WaitsByPlan AS (
+                            SELECT qsws.plan_id, SUM(CONVERT(float, qsws.total_query_wait_time_ms)) AS wait_ms
+                            FROM sys.query_store_wait_stats AS qsws
+                            JOIN sys.query_store_runtime_stats_interval AS qsrsi2
+                                ON qsrsi2.runtime_stats_interval_id = qsws.runtime_stats_interval_id
+                            WHERE qsws.wait_category IN (' + @qs_wait_categories + N')
+                              AND qsrsi2.end_time >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME())
+                            GROUP BY qsws.plan_id
+                        ),
+                        '
+                        ELSE N''
+                        END);
+                    SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{WAITS_JOIN}}',
+                        CASE WHEN @sql_major_version >= 14 THEN N'LEFT JOIN WaitsByPlan AS wbp ON wbp.plan_id = qsp.plan_id' ELSE N'' END);
+                    SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{WAITS_ORDER}}',
+                        CASE WHEN @sql_major_version >= 14 THEN N'ISNULL(MAX(wbp.wait_ms), 0)' ELSE N'SUM(CONVERT(float, 0))' END);
+
+                    DECLARE @mop_qs_sql nvarchar(max), @mop_qs_db sysname;
+                    SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list;
+                    WHILE @mop_up_db_idx IS NOT NULL
+                    BEGIN
+                        SELECT @mop_qs_db = database_name FROM @mop_up_db_list WHERE idx = @mop_up_db_idx;
+                        SET @mop_qs_sql = CAST(N'
+                        USE ' AS nvarchar(max)) + QUOTENAME(@mop_qs_db) + N';
+                        DECLARE @phase_timer datetime2(7) = SYSDATETIME(), @phase_ms int = 0;
+                        CREATE TABLE #stat_candidates
+                        (
+                            object_id int NOT NULL, stats_id int NOT NULL,
+                            stat_name sysname NULL, schema_name sysname NULL, table_name sysname NULL,
+                            qs_plan_count int NULL, qs_total_executions bigint NULL, qs_total_cpu_ms bigint NULL,
+                            qs_total_duration_ms bigint NULL, qs_total_logical_reads bigint NULL,
+                            qs_total_memory_grant_kb bigint NULL, qs_total_tempdb_pages bigint NULL,
+                            qs_total_physical_reads bigint NULL, qs_total_logical_writes bigint NULL,
+                            qs_total_wait_time_ms bigint NULL, qs_max_dop smallint NULL,
+                            qs_active_feedback_count int NULL, qs_last_execution datetime2 NULL,
+                            qs_priority_boost bigint NULL, qs_cache_hit bit NOT NULL DEFAULT 0,
+                            PRIMARY KEY CLUSTERED (object_id, stats_id)
+                        );
+                        INSERT INTO #stat_candidates (object_id, stats_id, stat_name, schema_name, table_name)
+                        SELECT stp.object_id, stp.stats_id, stp.stat_name, stp.schema_name, stp.table_name
+                        FROM #stats_to_process AS stp
+                        WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
+                        AND   stp.from_mop_up = 1 AND stp.processed = 0;
+
+                        IF EXISTS (SELECT 1 FROM #stat_candidates)
+                        BEGIN
+                        ' + @qs_phase6_resolved + N'
+                            UPDATE stp SET
+                                stp.qs_plan_count = sc.qs_plan_count,
+                                stp.qs_total_executions = sc.qs_total_executions,
+                                stp.qs_total_cpu_ms = sc.qs_total_cpu_ms,
+                                stp.qs_total_duration_ms = sc.qs_total_duration_ms,
+                                stp.qs_total_logical_reads = sc.qs_total_logical_reads,
+                                stp.qs_total_memory_grant_kb = sc.qs_total_memory_grant_kb,
+                                stp.qs_total_tempdb_pages = sc.qs_total_tempdb_pages,
+                                stp.qs_total_physical_reads = sc.qs_total_physical_reads,
+                                stp.qs_total_logical_writes = sc.qs_total_logical_writes,
+                                stp.qs_total_wait_time_ms = sc.qs_total_wait_time_ms,
+                                stp.qs_max_dop = sc.qs_max_dop,
+                                stp.qs_active_feedback_count = sc.qs_active_feedback_count,
+                                stp.qs_last_execution = sc.qs_last_execution,
+                                stp.qs_priority_boost = ISNULL(sc.qs_priority_boost, 0)
+                            FROM #stats_to_process AS stp
+                            JOIN #stat_candidates AS sc
+                                ON  sc.object_id = stp.object_id AND sc.stats_id = stp.stats_id
+                            WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
+                            AND   stp.from_mop_up = 1 AND stp.processed = 0;
+                        END;
+                        DROP TABLE #stat_candidates;';
+                        BEGIN TRY
+                            EXECUTE sys.sp_executesql
+                                @mop_qs_sql,
+                                N'@i_qs_enabled_param bit, @i_qs_metric_param nvarchar(20), @i_qs_min_executions_param bigint, @i_qs_recent_hours_param integer, @i_qs_top_plans_param integer, @Debug_param bit',
+                                @i_qs_enabled_param = @i_qs_enabled,
+                                @i_qs_metric_param = @i_qs_metric,
+                                @i_qs_min_executions_param = @i_qs_min_executions,
+                                @i_qs_recent_hours_param = @i_qs_recent_hours,
+                                @i_qs_top_plans_param = @i_qs_top_plans,
+                                @Debug_param = @Debug;
+                        END TRY
+                        BEGIN CATCH
+                            IF @Debug = 1
+                            BEGIN
+                                DECLARE @mop_qs_err nvarchar(500) = ERROR_MESSAGE();
+                                RAISERROR(N'  Mop-up QS enrichment warning (%s): %s', 10, 1, @mop_qs_db, @mop_qs_err) WITH NOWAIT;
+                            END;
+                        END CATCH;
+                        SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list WHERE idx > @mop_up_db_idx;
+                    END;
+
+                    /* o2md.5: with fresh boosts in hand, honor QUERY_STORE ordering for the
+                       mop-up rows (the non-QS orders were handled at discovery by o2md.49's
+                       @mop_up_order_expr; QUERY_STORE needed enrichment first). */
+                    IF @i_sort_order = N'QUERY_STORE'
+                    BEGIN
+                        ;WITH rr AS (
+                            SELECT stp.priority,
+                                   new_priority = ROW_NUMBER() OVER (ORDER BY
+                                       CASE WHEN @CriticalTablesFirst = N'Y' THEN CONVERT(int, stp.is_critical) ELSE 0 END DESC,
+                                       ISNULL(stp.qs_priority_boost, 0) DESC,
+                                       stp.modification_counter DESC,
+                                       stp.database_name ASC, stp.object_id ASC, stp.stats_id ASC)
+                            FROM #stats_to_process AS stp
+                            WHERE stp.from_mop_up = 1 AND stp.processed = 0
+                        )
+                        UPDATE rr SET priority = new_priority;
+                    END;
+                END;
+
                 IF @mop_up_found > 0
                 BEGIN
                     /* #436: Wrap DELETE+INSERT in TRY/CATCH to release mop_lock_resource on error.
@@ -10726,7 +10923,10 @@ OPTION (RECOMPILE);';
                             ObjectName = stp.table_name,
                             ObjectID = stp.object_id,
                             TablePriority = @phase_a_max_priority + ROW_NUMBER() OVER (
-                                ORDER BY MAX(stp.modification_counter) DESC,
+                                /* o2md.5: inherit the per-stat priority ranking (which now
+                                   honors @SortOrder incl. QUERY_STORE after enrichment)
+                                   instead of re-deriving from modification counter. */
+                                ORDER BY MIN(stp.priority) ASC,
                                          stp.object_id ASC
                             ),
                             StatsCount = COUNT_BIG(*),
@@ -11022,6 +11222,136 @@ OPTION (RECOMPILE);';
             END;
 
             SET @mop_up_found = (SELECT COUNT(*) FROM #stats_to_process WHERE processed = 0);
+
+            /* o2md.5 (maintainer option a): QS-enrich the mop-up rows with the SAME
+               Phase 6 fragment the priority pass uses (@qs_phase6_sql -- one shared
+               string, so the two paths cannot drift).  Fills per-stat qs_* so mop-up
+               ExtendedInfo rows stop logging QSPlanCount NULL (the o2md.16/W5
+               dependency), and feeds the QUERY_STORE re-rank below.  Each database is
+               enriched in its own USE-scoped batch, mirroring staged discovery. */
+            IF @i_qs_enabled = 1 AND @qs_phase6_sql IS NOT NULL AND @mop_up_found > 0
+            BEGIN
+                /* Same token REPLACEs the staged path applies to the assembled @staged_sql */
+                SET @qs_phase6_resolved = REPLACE(@qs_phase6_sql, N'{{MAX_GRANT_HINT}}', N';');
+                SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{TEMPDB_SPILLS_EXPR}}',
+                    CASE WHEN @sql_major_version >= 14 THEN N'SUM(CONVERT(bigint, qsrs2.avg_tempdb_space_used * qsrs2.count_executions))' ELSE N'CONVERT(bigint, 0)' END);
+                SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{TEMPDB_SPILLS_ORDER}}',
+                    CASE WHEN @sql_major_version >= 14 THEN N'SUM(CONVERT(float, qsrs.avg_tempdb_space_used * qsrs.count_executions))' ELSE N'SUM(CONVERT(float, 0))' END);
+                SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{PHYSICAL_READS_EXPR}}',
+                    CASE WHEN @sql_major_version >= 14 THEN N'SUM(CONVERT(bigint, qsrs2.avg_num_physical_io_reads * qsrs2.count_executions))' ELSE N'CONVERT(bigint, 0)' END);
+                SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{PHYSICAL_READS_ORDER}}',
+                    CASE WHEN @sql_major_version >= 14 THEN N'SUM(CONVERT(float, qsrs.avg_num_physical_io_reads * qsrs.count_executions))' ELSE N'SUM(CONVERT(float, 0))' END);
+                SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{WAITS_CATEGORIES}}', @qs_wait_categories);
+                SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{WAITS_CTE}}',
+                    CASE WHEN @sql_major_version >= 14
+                    THEN N'WaitsByPlan AS (
+                        SELECT qsws.plan_id, SUM(CONVERT(float, qsws.total_query_wait_time_ms)) AS wait_ms
+                        FROM sys.query_store_wait_stats AS qsws
+                        JOIN sys.query_store_runtime_stats_interval AS qsrsi2
+                            ON qsrsi2.runtime_stats_interval_id = qsws.runtime_stats_interval_id
+                        WHERE qsws.wait_category IN (' + @qs_wait_categories + N')
+                          AND qsrsi2.end_time >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME())
+                        GROUP BY qsws.plan_id
+                    ),
+                    '
+                    ELSE N''
+                    END);
+                SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{WAITS_JOIN}}',
+                    CASE WHEN @sql_major_version >= 14 THEN N'LEFT JOIN WaitsByPlan AS wbp ON wbp.plan_id = qsp.plan_id' ELSE N'' END);
+                SET @qs_phase6_resolved = REPLACE(@qs_phase6_resolved, N'{{WAITS_ORDER}}',
+                    CASE WHEN @sql_major_version >= 14 THEN N'ISNULL(MAX(wbp.wait_ms), 0)' ELSE N'SUM(CONVERT(float, 0))' END);
+
+                DECLARE @mop_qs_sql_s nvarchar(max), @mop_qs_db_s sysname;
+                SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list_s;
+                WHILE @mop_up_db_idx IS NOT NULL
+                BEGIN
+                    SELECT @mop_qs_db_s = database_name FROM @mop_up_db_list_s WHERE idx = @mop_up_db_idx;
+                    SET @mop_qs_sql_s = CAST(N'
+                    USE ' AS nvarchar(max)) + QUOTENAME(@mop_qs_db_s) + N';
+                    DECLARE @phase_timer datetime2(7) = SYSDATETIME(), @phase_ms int = 0;
+                    CREATE TABLE #stat_candidates
+                    (
+                        object_id int NOT NULL, stats_id int NOT NULL,
+                        stat_name sysname NULL, schema_name sysname NULL, table_name sysname NULL,
+                        qs_plan_count int NULL, qs_total_executions bigint NULL, qs_total_cpu_ms bigint NULL,
+                        qs_total_duration_ms bigint NULL, qs_total_logical_reads bigint NULL,
+                        qs_total_memory_grant_kb bigint NULL, qs_total_tempdb_pages bigint NULL,
+                        qs_total_physical_reads bigint NULL, qs_total_logical_writes bigint NULL,
+                        qs_total_wait_time_ms bigint NULL, qs_max_dop smallint NULL,
+                        qs_active_feedback_count int NULL, qs_last_execution datetime2 NULL,
+                        qs_priority_boost bigint NULL, qs_cache_hit bit NOT NULL DEFAULT 0,
+                        PRIMARY KEY CLUSTERED (object_id, stats_id)
+                    );
+                    INSERT INTO #stat_candidates (object_id, stats_id, stat_name, schema_name, table_name)
+                    SELECT stp.object_id, stp.stats_id, stp.stat_name, stp.schema_name, stp.table_name
+                    FROM #stats_to_process AS stp
+                    WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
+                    AND   stp.from_mop_up = 1 AND stp.processed = 0;
+
+                    IF EXISTS (SELECT 1 FROM #stat_candidates)
+                    BEGIN
+                    ' + @qs_phase6_resolved + N'
+                        UPDATE stp SET
+                            stp.qs_plan_count = sc.qs_plan_count,
+                            stp.qs_total_executions = sc.qs_total_executions,
+                            stp.qs_total_cpu_ms = sc.qs_total_cpu_ms,
+                            stp.qs_total_duration_ms = sc.qs_total_duration_ms,
+                            stp.qs_total_logical_reads = sc.qs_total_logical_reads,
+                            stp.qs_total_memory_grant_kb = sc.qs_total_memory_grant_kb,
+                            stp.qs_total_tempdb_pages = sc.qs_total_tempdb_pages,
+                            stp.qs_total_physical_reads = sc.qs_total_physical_reads,
+                            stp.qs_total_logical_writes = sc.qs_total_logical_writes,
+                            stp.qs_total_wait_time_ms = sc.qs_total_wait_time_ms,
+                            stp.qs_max_dop = sc.qs_max_dop,
+                            stp.qs_active_feedback_count = sc.qs_active_feedback_count,
+                            stp.qs_last_execution = sc.qs_last_execution,
+                            stp.qs_priority_boost = ISNULL(sc.qs_priority_boost, 0)
+                        FROM #stats_to_process AS stp
+                        JOIN #stat_candidates AS sc
+                            ON  sc.object_id = stp.object_id AND sc.stats_id = stp.stats_id
+                        WHERE stp.database_name = DB_NAME() COLLATE DATABASE_DEFAULT
+                        AND   stp.from_mop_up = 1 AND stp.processed = 0;
+                    END;
+                    DROP TABLE #stat_candidates;';
+                    BEGIN TRY
+                        EXECUTE sys.sp_executesql
+                            @mop_qs_sql_s,
+                            N'@i_qs_enabled_param bit, @i_qs_metric_param nvarchar(20), @i_qs_min_executions_param bigint, @i_qs_recent_hours_param integer, @i_qs_top_plans_param integer, @Debug_param bit',
+                            @i_qs_enabled_param = @i_qs_enabled,
+                            @i_qs_metric_param = @i_qs_metric,
+                            @i_qs_min_executions_param = @i_qs_min_executions,
+                            @i_qs_recent_hours_param = @i_qs_recent_hours,
+                            @i_qs_top_plans_param = @i_qs_top_plans,
+                            @Debug_param = @Debug;
+                    END TRY
+                    BEGIN CATCH
+                        IF @Debug = 1
+                        BEGIN
+                            DECLARE @mop_qs_err_s nvarchar(500) = ERROR_MESSAGE();
+                            RAISERROR(N'  Mop-up QS enrichment warning (%s): %s', 10, 1, @mop_qs_db_s, @mop_qs_err_s) WITH NOWAIT;
+                        END;
+                    END CATCH;
+                    SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list_s WHERE idx > @mop_up_db_idx;
+                END;
+
+                /* o2md.5: with fresh boosts in hand, honor QUERY_STORE ordering for the
+                   mop-up rows (the non-QS orders were handled at discovery by o2md.49's
+                   @mop_up_order_expr; QUERY_STORE needed enrichment first). */
+                IF @i_sort_order = N'QUERY_STORE'
+                BEGIN
+                    ;WITH rr AS (
+                        SELECT stp.priority,
+                               new_priority = ROW_NUMBER() OVER (ORDER BY
+                                   CASE WHEN @CriticalTablesFirst = N'Y' THEN CONVERT(int, stp.is_critical) ELSE 0 END DESC,
+                                   ISNULL(stp.qs_priority_boost, 0) DESC,
+                                   stp.modification_counter DESC,
+                                   stp.database_name ASC, stp.object_id ASC, stp.stats_id ASC)
+                        FROM #stats_to_process AS stp
+                        WHERE stp.from_mop_up = 1 AND stp.processed = 0
+                    )
+                    UPDATE rr SET priority = new_priority;
+                END;
+            END;
 
             IF @mop_up_found > 0
             BEGIN
