@@ -36,7 +36,19 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.10 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.07.30.11 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.07.30.11 - o2md.18 (maintainer decision): W13
+                           PERPETUALLY_SKIPPED consumes the proc v3.11.0
+                           SP_STATUPDATE_REMAINING discovery-candidate log as
+                           its authoritative source.  When every one of the
+                           last N completed runs carries the log, the finding
+                           counts stats present in ALL of their remaining
+                           lists -- a real qualifies-but-never-reached
+                           intersection -- with deepest-queued examples and a
+                           truncation caveat when any run capped its list at
+                           500.  The prior inference (with its documented
+                           over-counting) remains as fallback for runs from
+                           older proc versions.
             2026.07.30.10 - o2md.52: @CriticalTables parameter values leaked
                            real table names into the obfuscated SAFE_TO_SHARE
                            report.  The obfuscation pass rewrites
@@ -895,7 +907,7 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.30.10',  /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.07.30.11',  /* orchestrator bumps this */
         @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
@@ -5127,11 +5139,14 @@ BEGIN
            must not be asserted when no run in the window was actually time-limited. */
         DECLARE @w13_time_limited_runs int = 0;
 
-        /* Count non-killed, time-limited runs */
+        /* Count non-killed graceful-stop runs.  o2md.18: BATCH_LIMIT/STOP_BY_TIME
+           added so the authoritative REMAINING-log path can engage for those runs;
+           the inference fallback keeps its own narrower recent_runs filter and its
+           degenerate-aggregate suppression, so it is unaffected by this wider gate. */
         SELECT @w13_run_count = COUNT(*)
         FROM #runs
         WHERE IsKilled = 0
-        AND   StopReason IN (N'TIME_LIMIT', N'NATURAL_END', N'COMPLETED');
+        AND   StopReason IN (N'TIME_LIMIT', N'NATURAL_END', N'COMPLETED', N'BATCH_LIMIT', N'STOP_BY_TIME');
 
         SELECT @w13_time_limited_runs = COUNT(*)
         FROM #runs
@@ -5141,6 +5156,123 @@ BEGIN
 
         IF @w13_run_count >= @w13_min_consecutive
         BEGIN
+            /* o2md.18 (maintainer decision 2026-07-30): prefer the authoritative
+               discovery-candidate log.  Proc v3.11.0+ writes one
+               SP_STATUPDATE_REMAINING row per run listing the qualifying stats
+               left unprocessed at run end -- the population that was previously
+               unobservable from CommandLog.  When the recent runs carry that
+               log, "perpetually skipped" = stats present in EVERY covered run's
+               remaining list (a real qualifies-but-never-reached intersection);
+               the inference below stays as the fallback for older runs. */
+            CREATE TABLE #w13_remaining
+            (
+                RunLabel nvarchar(100) NOT NULL,
+                Db sysname NULL, Sch sysname NULL, Tbl sysname NULL, Stat sysname NULL,
+                Priority bigint NULL,
+                Truncated bit NOT NULL DEFAULT 0
+            );
+            DECLARE @w13_rem_sql nvarchar(max) = CONVERT(nvarchar(max), N'') + N'
+                INSERT INTO #w13_remaining (RunLabel, Db, Sch, Tbl, Stat, Priority, Truncated)
+                SELECT
+                    cl.ExtendedInfo.value(N''(/ExtendedInfo/RunLabel)[1]'', N''nvarchar(100)''),
+                    r.n.value(N''(Db)[1]'', N''sysname''),
+                    r.n.value(N''(Sch)[1]'', N''sysname''),
+                    r.n.value(N''(Tbl)[1]'', N''sysname''),
+                    r.n.value(N''(Stat)[1]'', N''sysname''),
+                    r.n.value(N''(Priority)[1]'', N''bigint''),
+                    ISNULL(cl.ExtendedInfo.value(N''(/ExtendedInfo/Truncated)[1]'', N''bit''), 0)
+                FROM ' + @commandlog_ref + N' AS cl
+                CROSS APPLY cl.ExtendedInfo.nodes(N''/ExtendedInfo/Remaining/R'') AS r(n)
+                WHERE cl.CommandType = N''SP_STATUPDATE_REMAINING''
+                AND   cl.StartTime >= DATEADD(DAY, -@DaysBack_param, SYSDATETIME())
+                AND   cl.ExtendedInfo.value(N''(/ExtendedInfo/Kind)[1]'', N''nvarchar(10)'') = N''STAT'';';
+            BEGIN TRY
+                EXECUTE sys.sp_executesql @w13_rem_sql, N'@DaysBack_param int', @DaysBack_param = @DaysBack;
+            END TRY
+            BEGIN CATCH
+                IF @Debug = 1 RAISERROR(N'  W13: REMAINING-log extraction failed (non-critical, using inference)', 10, 1) WITH NOWAIT;
+            END CATCH;
+
+            DECLARE @w13_logged_runs int = 0, @w13_logged_skipped int = 0, @w13_logged_truncated int = 0,
+                    @w13_logged_examples nvarchar(1000) = N'';
+            ;WITH recent_labels AS (
+                SELECT TOP (@w13_min_consecutive) r.RunLabel
+                FROM #runs AS r
+                WHERE r.IsKilled = 0
+                AND   r.StopReason IN (N'TIME_LIMIT', N'NATURAL_END', N'COMPLETED', N'BATCH_LIMIT', N'STOP_BY_TIME')
+                /* logged path accepts every graceful stop that can leave qualifying
+                   work -- BATCH_LIMIT/STOP_BY_TIME skip stats exactly like TIME_LIMIT.
+                   (The inference fallback keeps its original narrower list.) */
+                AND   r.StatsProcessed > 0
+                ORDER BY r.StartTime DESC
+            )
+            SELECT @w13_logged_runs = COUNT(DISTINCT wr.RunLabel)
+            FROM #w13_remaining AS wr
+            INNER JOIN recent_labels AS rl ON rl.RunLabel = wr.RunLabel;
+
+            IF @w13_logged_runs >= @w13_min_consecutive
+            BEGIN
+                /* intersection: qualifying-and-unprocessed in EVERY covered recent run */
+                ;WITH recent_labels AS (
+                    SELECT TOP (@w13_min_consecutive) r.RunLabel
+                    FROM #runs AS r
+                    WHERE r.IsKilled = 0
+                    AND   r.StopReason IN (N'TIME_LIMIT', N'NATURAL_END', N'COMPLETED', N'BATCH_LIMIT', N'STOP_BY_TIME') /* o2md.18: match the coverage CTE above */
+                    AND   r.StatsProcessed > 0
+                    ORDER BY r.StartTime DESC
+                ),
+                per_stat AS (
+                    SELECT wr.Db, wr.Sch, wr.Tbl, wr.Stat,
+                           run_hits = COUNT(DISTINCT wr.RunLabel),
+                           best_priority = MIN(wr.Priority)
+                    FROM #w13_remaining AS wr
+                    INNER JOIN recent_labels AS rl ON rl.RunLabel = wr.RunLabel
+                    GROUP BY wr.Db, wr.Sch, wr.Tbl, wr.Stat
+                )
+                SELECT
+                    @w13_logged_skipped = COUNT(*),
+                    @w13_logged_examples = ISNULL(STUFF((
+                        SELECT TOP (3) N', ' + ps2.Db + N'.' + ps2.Sch + N'.' + ps2.Tbl + N'.' + ps2.Stat
+                            + N' (priority ' + CONVERT(nvarchar(20), ps2.best_priority) + N')'
+                        FROM per_stat AS ps2
+                        WHERE ps2.run_hits >= @w13_min_consecutive
+                        ORDER BY ps2.best_priority
+                        FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N''), N'')
+                FROM per_stat
+                WHERE run_hits >= @w13_min_consecutive;
+
+                SELECT @w13_logged_truncated = COUNT(DISTINCT wr.RunLabel)
+                FROM #w13_remaining AS wr WHERE wr.Truncated = 1;
+
+                IF @w13_logged_skipped > 0
+                BEGIN
+                    INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
+                    VALUES (
+                        N'WARNING',
+                        N'PERPETUALLY_SKIPPED',
+                        CONVERT(nvarchar(10), @w13_logged_skipped) + N' stat(s) qualified in all of the last '
+                            + CONVERT(nvarchar(10), @w13_min_consecutive) + N' runs and were never processed',
+                        N'From the SP_STATUPDATE_REMAINING discovery-candidate log (authoritative -- these stats '
+                            + N'QUALIFIED in every one of the last ' + CONVERT(nvarchar(10), @w13_min_consecutive)
+                            + N' completed runs and were still unprocessed at each run''s end). '
+                            + CASE WHEN @w13_logged_examples <> N'' THEN N'Deepest-queued examples: ' + @w13_logged_examples + N'. ' ELSE N'' END
+                            + CASE WHEN @w13_logged_truncated > 0
+                                   THEN N'NOTE: ' + CONVERT(nvarchar(10), @w13_logged_truncated)
+                                        + N' run(s) truncated their remaining list at 500 entries, so this count is a floor. '
+                                   ELSE N'' END,
+                        N'These are real, repeatedly-qualifying stats the run never reaches. Increase @TimeLimit, '
+                            + N'use @SortOrder=MODIFICATION_VELOCITY to pull high-churn stats forward, or enable '
+                            + N'@MopUpPass so leftover qualifying stats get swept with remaining time.',
+                        N'EXECUTE dbo.sp_StatUpdate @Databases = N''USER_DATABASES'', @MopUpPass = N''Y'', @TimeLimit = 7200;',
+                        40
+                    );
+                    RAISERROR(N'  [WARNING] W13: %d stats perpetually skipped (authoritative REMAINING log)', 10, 1, @w13_logged_skipped) WITH NOWAIT;
+                END;
+                DROP TABLE #w13_remaining;
+            END
+            ELSE
+            BEGIN
+            DROP TABLE #w13_remaining;
             /* Find stats that appeared in discovery but were never updated.
                A stat is "perpetually skipped" if it appears in 0 UPDATE_STATISTICS
                entries across the most recent N completed runs, while those runs
@@ -5194,7 +5326,10 @@ BEGIN
                 @w13_avg_last_position = (SELECT AVG(max_position) FROM run_positions),
                 @w13_avg_total = (SELECT AVG(NULLIF(StatsFound, 0)) FROM recent_runs);
 
-            /* o2md.18(c) NOT FIXED -- deliberately.  @w13_skipped_count counts every distinct
+            /* o2md.18(c): the inference below remains the FALLBACK ONLY -- when the
+               recent runs carry the SP_STATUPDATE_REMAINING log (proc v3.11.0+), the
+               authoritative branch above replaces it entirely.
+               Original caveat, still true for this fallback: @w13_skipped_count counts every distinct
                stat seen anywhere in the @DaysBack window that is absent from the last N runs,
                with no requirement that the stat still qualifies for an update.  Requiring
                "currently qualifies" is not derivable from CommandLog: it only records stats
@@ -5246,6 +5381,7 @@ BEGIN
 
                 RAISERROR(N'  [WARNING] W13: %d stats perpetually skipped across %d runs', 10, 1, @w13_skipped_count, @w13_min_consecutive) WITH NOWAIT;
             END;
+            END; /* o2md.18: ELSE (inference fallback -- no/partial REMAINING log coverage) */
         END;
     END;
 
