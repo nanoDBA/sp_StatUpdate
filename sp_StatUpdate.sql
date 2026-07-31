@@ -36,11 +36,33 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.11.0.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.11.1.2026.07.31 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.11.0.2026.07.30 - o2md.18 (maintainer decision): discovery-
+History:    3.11.1.2026.07.31 - o2md.54 (found by the SQL 2025 primary-source
+                            compatibility audit): the #369 plan-feedback
+                            awareness filter used state_desc IN (ACTIVE,
+                            PENDING_VALIDATION) -- but sys.query_store_
+                            plan_feedback has NO documented ACTIVE state, so
+                            the count silently degraded to
+                            PENDING_VALIDATION-only on every version
+                            (magnified on SQL 2025 where DOP feedback is on
+                            by default).  Now filters the four states a stats
+                            update could invalidate: PENDING_VALIDATION,
+                            IN_VALIDATION, VERIFICATION_PASSED,
+                            FEEDBACK_VALID.  Also from the audit: the
+                            plan_forcing_type "SQL 2022+" comments corrected
+                            to 2017+ (docs; behavior was already
+                            metadata-detected), and #qs_forced_baseline.
+                            plan_forcing_type int-typed to match the source
+                            column.  Audit verified all other hardcoded QS
+                            value maps (readonly_reason bitmask, wait
+                            categories, capture modes, version gates) match
+                            current documentation; no other mismatches --
+                            see research/sql2025-compat-audit-2026-07-31.md.
+
+            3.11.0.2026.07.30 - o2md.18 (maintainer decision): discovery-
                             candidate log.  When qualifying work remains
                             unprocessed at run end, ONE compact
                             SP_STATUPDATE_REMAINING CommandLog row lists the
@@ -372,7 +394,7 @@ History:    3.11.0.2026.07.30 - o2md.18 (maintainer decision): discovery-
                             (1) gh-533 (zks1): pre-run QS forced-plan baseline --
                             #qs_forced_baseline snapshots force_failure_count per
                             database before any stat is touched (MANUAL-only
-                            filter on SQL 2022+ via plan_forcing_type; APC noise
+                            filter on SQL 2017+ via plan_forcing_type; APC noise
                             excluded).  Post-run delta: rising failure counts
                             emit a QS_FORCED_PLAN_FAILURE_DELTA warning naming
                             per-database deltas, and the END Summary XML gains a
@@ -950,8 +972,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.11.0.2026.07.30',
-        @procedure_version_date datetime = '20260730',
+        @procedure_version varchar(20) = '3.11.1.2026.07.31',
+        @procedure_version_date datetime = '20260731',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -4146,7 +4168,7 @@ BEGIN
     with no joins, wrapped in its own TRY/CATCH so inaccessible/QS-off
     databases skip silently.
 
-    plan_forcing_type filter (SQL 2022+): when @has_plan_forcing_type = 1
+    plan_forcing_type filter (SQL 2017+ per docs; o2md.54 audit): when @has_plan_forcing_type = 1
     the baseline is limited to plan_forcing_type = 1 (MANUAL; int column -- o2md.53) -- excludes
     Automatic-Plan-Correction (APC) noise that we cannot attribute to
     stat maintenance.  Pre-2022 behavior unchanged (no filter).
@@ -4157,7 +4179,7 @@ BEGIN
         query_id bigint NOT NULL,
         plan_id bigint NOT NULL,
         force_failure_count bigint NOT NULL DEFAULT 0,
-        plan_forcing_type nvarchar(20) NULL,
+        plan_forcing_type int NULL, /* o2md.54: int, matching the source column (was nvarchar(20) -- implicit-converted the int values) */
         PRIMARY KEY (database_name, plan_id)
     );
 
@@ -4188,8 +4210,8 @@ BEGIN
         BEGIN
             SET @fb_msg = N'QS forced-plan baseline: capturing force_failure_count snapshot'
                 + CASE WHEN @has_plan_forcing_type = 1
-                       THEN N' (filter: plan_forcing_type = MANUAL, SQL 2022+ column)'
-                       ELSE N' (no plan_forcing_type filter -- pre-2022 or column absent)'
+                       THEN N' (filter: plan_forcing_type = 1/MANUAL, SQL 2017+ column)'
+                       ELSE N' (no plan_forcing_type filter -- column absent, pre-2017)'
                   END
                 + N'.';
             RAISERROR(@fb_msg, 10, 1) WITH NOWAIT;
@@ -5811,7 +5833,12 @@ OPTION (RECOMPILE);';
                                 feedback_count = COUNT(*)
                             FROM sys.query_store_plan_feedback AS pf2
                             INNER JOIN sys.query_store_plan AS p2 ON p2.plan_id = pf2.plan_id
-                            WHERE pf2.state_desc IN (N''ACTIVE'', N''PENDING_VALIDATION'')
+                            WHERE pf2.state_desc IN (N''PENDING_VALIDATION'', N''IN_VALIDATION'', N''VERIFICATION_PASSED'', N''FEEDBACK_VALID'')
+                              /* o2md.54: there is NO documented ACTIVE state -- the old
+                                 (N''ACTIVE'', N''PENDING_VALIDATION'') filter silently degraded to
+                                 PENDING_VALIDATION-only on every version.  These four states are
+                                 the feedback a stats update could invalidate (verified against
+                                 the sys.query_store_plan_feedback doc, 2026-07-31 audit). */
                               AND (pf2.last_updated_time IS NULL
                                    OR pf2.last_updated_time >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME()))
                             GROUP BY pf2.plan_id
