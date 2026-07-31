@@ -36,11 +36,28 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.10.1.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.11.0.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.10.1.2026.07.30 - o2md.53: the zks1/gh-533 forced-plan baseline
+History:    3.11.0.2026.07.30 - o2md.18 (maintainer decision): discovery-
+                            candidate log.  When qualifying work remains
+                            unprocessed at run end, ONE compact
+                            SP_STATUPDATE_REMAINING CommandLog row lists the
+                            remaining qualifying stats (db/schema/table/stat,
+                            priority, modification counter; capped at 500
+                            with Truncated flag + TotalRemaining).  In
+                            parallel skip-discovery mode the per-stat detail
+                            is structurally unavailable, so the row lists
+                            remaining TABLES from the queue (Kind=TABLE).
+                            Previously the qualifying-but-unprocessed
+                            population was unobservable from CommandLog --
+                            Diag''s W13 PERPETUALLY_SKIPPED could only infer;
+                            it now consumes this log as the authoritative
+                            source (diag 2026.07.30.11).  Non-critical
+                            TRY/CATCH write; one row per run.
+
+            3.10.1.2026.07.30 - o2md.53: the zks1/gh-533 forced-plan baseline
                             and post-run delta filtered on plan_forcing_type =
                             N'MANUAL', but plan_forcing_type is an INT column
                             (1 = MANUAL) -- the comparison raised a conversion
@@ -933,7 +950,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.10.1.2026.07.30',
+        @procedure_version varchar(20) = '3.11.0.2026.07.30',
         @procedure_version_date datetime = '20260730',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -11451,6 +11468,99 @@ OPTION (RECOMPILE);';
             WHERE qs.QueueID = @queue_id
             AND   qs.TableEndTime IS NULL
         );
+
+    /*
+    o2md.18 (maintainer decision 2026-07-30): discovery-candidate log.
+    When qualifying work remains unprocessed at run end (TIME_LIMIT, batch
+    limit, early stop, killed-mid-queue recovery...), write ONE compact
+    SP_STATUPDATE_REMAINING row whose ExtendedInfo lists the remaining
+    qualifying stats -- previously that population was unobservable from
+    CommandLog (only stats that WERE updated left a trace), so Diag's W13
+    PERPETUALLY_SKIPPED could only infer.  Capped at 500 entries with a
+    Truncated flag; one row per run keeps volume negligible.  In parallel
+    skip-discovery mode #stats_to_process is structurally empty, so the log
+    lists remaining TABLES from the queue instead (Kind=TABLE).
+    */
+    IF  @LogToTable = N'Y'
+    AND @commandlog_exists = 1
+    AND @Execute = N'Y'
+    AND @remaining_stats > 0
+    BEGIN
+        BEGIN TRY
+            DECLARE
+                @remaining_xml xml,
+                @remaining_total int = 0,
+                @remaining_kind nvarchar(10);
+
+            IF @skip_discovery = 1
+            BEGIN
+                SET @remaining_kind = N'TABLE';
+                SELECT @remaining_total = COUNT(*)
+                FROM dbo.QueueStatistic
+                WHERE QueueID = @queue_id AND TableEndTime IS NULL;
+                SET @remaining_xml = (
+                    SELECT TOP (500)
+                        qs.DatabaseName AS Db, qs.SchemaName AS Sch,
+                        qs.ObjectName AS Tbl, qs.StatsCount AS StatsCount
+                    FROM dbo.QueueStatistic AS qs
+                    WHERE qs.QueueID = @queue_id AND qs.TableEndTime IS NULL
+                    ORDER BY qs.TablePriority
+                    FOR XML RAW(N'R'), ELEMENTS
+                );
+            END
+            ELSE
+            BEGIN
+                SET @remaining_kind = N'STAT';
+                SELECT @remaining_total = COUNT(*)
+                FROM #stats_to_process
+                WHERE processed = 0;
+                SET @remaining_xml = (
+                    SELECT TOP (500)
+                        stp.database_name AS Db, stp.schema_name AS Sch,
+                        stp.table_name AS Tbl, stp.stat_name AS Stat,
+                        stp.priority AS Priority,
+                        stp.modification_counter AS ModificationCounter
+                    FROM #stats_to_process AS stp
+                    WHERE stp.processed = 0
+                    ORDER BY stp.priority
+                    FOR XML RAW(N'R'), ELEMENTS
+                );
+            END;
+
+            INSERT INTO dbo.CommandLog
+                (DatabaseName, SchemaName, ObjectName, ObjectType, Command, CommandType, StartTime, EndTime, ExtendedInfo)
+            VALUES
+            (
+                DB_NAME(), N'dbo', N'sp_StatUpdate', N'P',
+                N'Qualifying work remaining at run end: ' + CONVERT(nvarchar(10), @remaining_total)
+                    + CASE WHEN @remaining_kind = N'TABLE' THEN N' table(s)' ELSE N' stat(s)' END
+                    + N' (' + ISNULL(@stop_reason, N'?') + N')',
+                N'SP_STATUPDATE_REMAINING',
+                SYSDATETIME(), SYSDATETIME(),
+                (
+                    SELECT
+                        @run_label AS RunLabel,
+                        @procedure_version AS [Version],
+                        @remaining_kind AS Kind,
+                        @remaining_total AS TotalRemaining,
+                        CASE WHEN @remaining_total > 500 THEN 500 ELSE @remaining_total END AS Listed,
+                        CASE WHEN @remaining_total > 500 THEN 1 ELSE 0 END AS Truncated,
+                        /* xml-typed column named Remaining wraps the <R> sequence exactly
+                           once -> /ExtendedInfo/Remaining/R (an [*] alias emitted a literal
+                           <_x002A_> wrapper element, caught in live verification) */
+                        @remaining_xml AS Remaining
+                    FOR XML RAW(N'ExtendedInfo'), ELEMENTS
+                )
+            );
+        END TRY
+        BEGIN CATCH
+            IF @Debug = 1
+            BEGIN
+                DECLARE @rem_log_err nvarchar(500) = ERROR_MESSAGE();
+                RAISERROR(N'  Note: SP_STATUPDATE_REMAINING log failed (%s) -- non-critical, continuing.', 10, 1, @rem_log_err) WITH NOWAIT;
+            END;
+        END CATCH;
+    END;
 
     /*
     o2md.3: a run that discovered work and processed none of it is a silent no-op,

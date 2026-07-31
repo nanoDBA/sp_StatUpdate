@@ -924,11 +924,12 @@ EXEC dbo.sp_StatUpdate
 
 ## Version History 📜
 
-**Current version:** `3.10.1.2026.07.30` (proc) &nbsp;·&nbsp; `2026.07.30.10` (diag)
+**Current version:** `3.11.0.2026.07.30` (proc) &nbsp;·&nbsp; `2026.07.30.11` (diag)
 
 <details>
 <summary><strong>📜 Show full changelog (60+ releases)</strong></summary>
 
+- **3.11.0 / Diag 2026.07.30.11** - o2md.18 (maintainer decision): discovery-candidate log. The proc writes one compact `SP_STATUPDATE_REMAINING` row per run listing the qualifying stats left unprocessed at run end (capped 500, truncation-flagged; table-level in parallel skip-discovery mode) -- the population that was previously unobservable from CommandLog. Diag's W13 `PERPETUALLY_SKIPPED` consumes it as the authoritative source (intersection across the last N runs, deepest-queued examples), keeping the old inference only as a fallback for older-proc runs.
 - **3.10.1** - o2md.53: the forced-plan baseline/delta filtered `plan_forcing_type = N'MANUAL'` against an INT column -- conversion error on every SQL 2022+/2025 run, TRY/CATCH-swallowed, so the MANUAL-only filter never applied where the column existed. Now compares the integer value (1); live-verified capturing on SQL 2025.
 - **3.10.0** - Mop-up Query Store support (o2md.5) + two silent pre-existing bugs found verifying it. Phase 6 QS enrichment extracted into a shared fragment: the staged path reassembles it byte-identically (the two paths cannot drift) and mop-up executes the same fragment per database -- mop-up rows now log real `QSPlanCount`/boost values and `@SortOrder=QUERY_STORE` is honored via post-enrichment re-rank (parallel TablePriority fan-out inherits it). Pre-existing bug 1: the empty-discovery result shape was missing `is_critical` (since the CriticalTables batch), so every zero-qualify database was silently skipped. Pre-existing bug 2 (worse): `@mop_up_where_sql` carried quadrupled quotes since the April gh-462 refactor -- serial and parallel-leader mop-up discovery had failed with a swallowed syntax error on *every run for ~3 months* while gates stayed green ("no additional stats found" looked normal). A live regression test now asserts mop-up discovery actually finds seeded work.
 - **3.9.0** - BEHAVIOR CHANGE (maintainer-authorized, o2md.7): adaptive sampling on by default in the NIGHTLY (10-min threshold) and WEEKLY_FULL (30-min) presets -- historically-slow stats fall back to the sampled rate instead of burning a third of the window on one FULLSCAN. DEFAULT/OLTP_LIGHT/WAREHOUSE unchanged; explicit `@LongRunningThresholdMinutes`/`@LongRunningSamplePercent` still override. To restore old preset behavior pass an unreachable threshold (e.g. 100000; NULL means "preset decides", validation floor is 1).
