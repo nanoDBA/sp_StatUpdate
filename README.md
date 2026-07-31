@@ -26,7 +26,6 @@
 ⚖️ [When to Use This](#when-to-use-this-vs-indexoptimize-) &nbsp;·&nbsp;
 🙏 [Acknowledgments](#acknowledgments-)
 
-<sub>Anchor links assume GitHub's heading-slug behavior (trailing emoji → trailing `-` in the anchor). If a link doesn't jump correctly on your renderer, the section is still right there in reading order.</sub>
 
 ## See It Run 📸
 
