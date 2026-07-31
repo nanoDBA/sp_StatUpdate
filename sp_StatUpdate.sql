@@ -36,11 +36,24 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.10.0.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.10.1.2026.07.30 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.10.0.2026.07.30 - MOP-UP QS + two silent pre-existing bugs
+History:    3.10.1.2026.07.30 - o2md.53: the zks1/gh-533 forced-plan baseline
+                            and post-run delta filtered on plan_forcing_type =
+                            N'MANUAL', but plan_forcing_type is an INT column
+                            (1 = MANUAL) -- the comparison raised a conversion
+                            error on every SQL 2022+/2025 run and was
+                            TRY/CATCH-swallowed, so the MANUAL-only filter
+                            never actually applied anywhere it existed (2019
+                            lacks the column and skipped the filter, which is
+                            why gates stayed green).  All four sites now
+                            compare against the integer value.  Live-verified
+                            on SQL 2025: baseline captures instead of
+                            skipping.
+
+            3.10.0.2026.07.30 - MOP-UP QS + two silent pre-existing bugs
                             (o2md.5 + fixes found verifying it).
 
                             o2md.5 (maintainer option a) -- Phase 6 QS
@@ -920,7 +933,7 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.10.0.2026.07.30',
+        @procedure_version varchar(20) = '3.10.1.2026.07.30',
         @procedure_version_date datetime = '20260730',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
@@ -1395,7 +1408,7 @@ BEGIN
         @supports_auto_drop bit = 0,
         /* zks1 / gh-533: sys.query_store_plan.plan_forcing_type column availability.
            Column added in SQL 2022 (16.x).  When present, forced-plan baseline and
-           post-run check filter to plan_forcing_type = N'MANUAL' -- excludes
+           post-run check filter to plan_forcing_type = 1 (MANUAL; int column -- o2md.53) -- excludes
            Automatic-Plan-Correction (APC) noise.  Detected via metadata lookup
            (not @sql_major_version) so managed platforms that backport can pick it up. */
         @has_plan_forcing_type bit = 0;
@@ -4117,7 +4130,7 @@ BEGIN
     databases skip silently.
 
     plan_forcing_type filter (SQL 2022+): when @has_plan_forcing_type = 1
-    the baseline is limited to plan_forcing_type = N'MANUAL' -- excludes
+    the baseline is limited to plan_forcing_type = 1 (MANUAL; int column -- o2md.53) -- excludes
     Automatic-Plan-Correction (APC) noise that we cannot attribute to
     stat maintenance.  Pre-2022 behavior unchanged (no filter).
     */
@@ -4188,7 +4201,7 @@ BEGIN
                     + N'FROM ' + QUOTENAME(@fb_db) + N'.sys.query_store_plan AS qsp '
                     + N'WHERE qsp.is_forced_plan = 1'
                     + CASE WHEN @has_plan_forcing_type = 1
-                           THEN N' AND qsp.plan_forcing_type = N''MANUAL'';'
+                           THEN N' AND qsp.plan_forcing_type = 1 /* MANUAL -- int column; o2md.53: comparing to N''MANUAL'' failed with a conversion error on every 2022+ version and was CATCH-swallowed */;'
                            ELSE N';'
                       END;
 
@@ -11665,7 +11678,7 @@ OPTION (RECOMPILE);';
                     FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan
                     WHERE is_forced_plan = 1'
                     + CASE WHEN @has_plan_forcing_type = 1
-                           THEN N' AND plan_forcing_type = N''MANUAL'';'
+                           THEN N' AND plan_forcing_type = 1 /* MANUAL -- o2md.53 */;'
                            ELSE N';'
                       END;
 
@@ -11693,7 +11706,7 @@ OPTION (RECOMPILE);';
                     WHERE qsp.is_forced_plan = 1'
                     + CASE WHEN @has_plan_forcing_type = 1
                            THEN N'
-                    AND qsp.plan_forcing_type = N''MANUAL'''
+                    AND qsp.plan_forcing_type = 1 /* MANUAL -- o2md.53 */'
                            ELSE N''
                       END
                     + N'
@@ -11790,7 +11803,7 @@ OPTION (RECOMPILE);';
                             FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan AS qsp
                             WHERE qsp.is_forced_plan = 1'
                             + CASE WHEN @has_plan_forcing_type = 1
-                                   THEN N' AND qsp.plan_forcing_type = N''MANUAL'';'
+                                   THEN N' AND qsp.plan_forcing_type = 1 /* MANUAL -- int column; o2md.53: comparing to N''MANUAL'' failed with a conversion error on every 2022+ version and was CATCH-swallowed */;'
                                    ELSE N';'
                               END;
 
