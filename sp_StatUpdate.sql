@@ -36,11 +36,22 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.11.1.2026.07.31 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.11.2.2026.08.02 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.11.1.2026.07.31 - o2md.54 (found by the SQL 2025 primary-source
+History:    3.11.2.2026.08.02 - 0859.9 (DarlingData-audit finding): the gh-505
+                            TablePriority estimate read historical durations
+                            from CommandLog with the int-returning
+                            DATEDIFF(MILLISECOND) -- a row spanning more than
+                            ~24.8 days (orphan-cleanup END markers) raised
+                            error 535 during discovery.  Now DATEDIFF_BIG,
+                            plus a 24-hour span sanity filter so cleanup
+                            artifacts cannot skew the per-table average
+                            either.  The end-of-run @duration_ms_total
+                            computation gets the same DATEDIFF_BIG hardening.
+
+            3.11.1.2026.07.31 - o2md.54 (found by the SQL 2025 primary-source
                             compatibility audit): the #369 plan-feedback
                             awareness filter used state_desc IN (ACTIVE,
                             PENDING_VALIDATION) -- but sys.query_store_
@@ -972,8 +983,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.11.1.2026.07.31',
-        @procedure_version_date datetime = '20260731',
+        @procedure_version varchar(20) = '3.11.2.2026.08.02',
+        @procedure_version_date datetime = '20260802',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -7460,11 +7471,12 @@ OPTION (RECOMPILE);';
                         SELECT
                             cl.DatabaseName,
                             cl.ObjectName,
-                            avg_seconds_per_stat = AVG(CONVERT(float, DATEDIFF(MILLISECOND, cl.StartTime, cl.EndTime)) / 1000.0),
+                            avg_seconds_per_stat = AVG(CONVERT(float, DATEDIFF_BIG(MILLISECOND, cl.StartTime, cl.EndTime)) / 1000.0),
                             run_count = COUNT(*)
                         FROM dbo.CommandLog AS cl
                         WHERE cl.CommandType = N'UPDATE_STATISTICS'
                         AND   cl.EndTime IS NOT NULL
+                        AND   cl.EndTime < DATEADD(HOUR, 24, cl.StartTime) /* 0859.9: rows spanning days are orphan-cleanup artifacts; plain DATEDIFF(MILLISECOND) also overflowed (535) past ~24.8 days */
                         AND   cl.ErrorNumber = 0
                         AND   cl.StartTime >= DATEADD(DAY, -@i_command_log_retention_days, SYSDATETIME())
                         GROUP BY cl.DatabaseName, cl.ObjectName
@@ -11465,7 +11477,7 @@ OPTION (RECOMPILE);';
     DECLARE
         @end_time datetime2(7) = SYSDATETIME(),
         @duration_seconds integer = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
-        @duration_ms_total bigint = DATEDIFF(MILLISECOND, @start_time, SYSDATETIME()),
+        @duration_ms_total bigint = DATEDIFF_BIG(MILLISECOND, @start_time, SYSDATETIME()), /* 0859.9: plain DATEDIFF overflows past ~24.8 days */
         @remaining_stats integer =
         (
             SELECT

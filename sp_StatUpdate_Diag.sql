@@ -36,7 +36,32 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.07.30.11 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.08.02.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.08.02.1 - 0859.9 + 0859.10 (DarlingData-audit findings).
+                           0859.9: #stat_updates extraction computed
+                           DATEDIFF(MILLISECOND, StartTime, EndTime) with the
+                           int-returning DATEDIFF -- a CommandLog row spanning
+                           more than ~24.8 days (orphaned START whose END was
+                           written by orphan cleanup weeks later) raised error
+                           535 and hard-failed the ENTIRE diag run.  Both
+                           extraction paths (cache + direct) now use
+                           DATEDIFF_BIG and store NULL for such spans: a
+                           duration measured to a cleanup marker is fiction,
+                           and NULL also keeps it out of W2/throughput math.
+                           0859.10: the four RS 13 ChangePct columns
+                           (Cpu/CpuPerExec/MemoryGrant/Tempdb) had no
+                           denominator floor -- a 2 ms baseline reported
+                           +249,900%, and past ~1e9% the CONVERT to
+                           decimal(10, 1) overflowed (8115) and killed the
+                           run.  Both emission paths now floor the baseline
+                           (100 ms CPU / 0.1 ms-per-exec / 1 MB grant /
+                           128 tempdb pages -- aligned with the o2md.22 I8
+                           headline constants, NULL below floor) and clamp at
+                           +1000%.  The raw First/LastCpuPerExec display
+                           columns widened decimal(10, 2) -> decimal(18, 2):
+                           the regression fixture proved the row itself
+                           overflowed (8115) before any pct math.  Trend
+                           label columns are unchanged (bounded).
             2026.07.30.11 - o2md.18 (maintainer decision): W13
                            PERPETUALLY_SKIPPED consumes the proc v3.11.0
                            SP_STATUPDATE_REMAINING discovery-candidate log as
@@ -907,8 +932,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.07.30.11',  /* orchestrator bumps this */
-        @procedure_version_date datetime = '20260730';     /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.08.02.1',   /* orchestrator bumps this */
+        @procedure_version_date datetime = '20260802';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -2275,7 +2300,10 @@ BEGIN
             c.DatabaseName, c.SchemaName, c.ObjectName,
             ISNULL(c.StatisticsName, c.IndexName),
             c.StartTime, c.EndTime,
-            DATEDIFF(MILLISECOND, c.StartTime, c.EndTime),
+            CASE WHEN DATEDIFF_BIG(MILLISECOND, c.StartTime, c.EndTime) > 2147483647
+                 THEN NULL /* 0859.9: spans past ~24.8 days are orphan-cleanup artifacts, not durations; plain DATEDIFF raises error 535 here */
+                 ELSE CONVERT(integer, DATEDIFF_BIG(MILLISECOND, c.StartTime, c.EndTime))
+            END,
             c.ErrorNumber, c.ErrorMessage,
             c.ExtendedInfo.value(N''(ExtendedInfo/ModificationCounter)[1]'', N''bigint''),
             c.ExtendedInfo.value(N''(ExtendedInfo/RowCount)[1]'', N''bigint''),
@@ -2381,7 +2409,10 @@ BEGIN
             statistics_name     = ISNULL(c.StatisticsName, c.IndexName),
             start_time          = c.StartTime,
             end_time            = c.EndTime,
-            duration_ms         = DATEDIFF(MILLISECOND, c.StartTime, c.EndTime),
+            duration_ms         = CASE WHEN DATEDIFF_BIG(MILLISECOND, c.StartTime, c.EndTime) > 2147483647
+                                       THEN NULL /* 0859.9: see cache-path note -- orphan spans overflow plain DATEDIFF */
+                                       ELSE CONVERT(integer, DATEDIFF_BIG(MILLISECOND, c.StartTime, c.EndTime))
+                                  END,
             error_number        = c.ErrorNumber,
             error_message       = c.ErrorMessage,
             mod_counter         = c.ExtendedInfo.value(N''(ExtendedInfo/ModificationCounter)[1]'', N''bigint''),
@@ -2528,8 +2559,8 @@ BEGIN
                     FirstCpuMs              = CONVERT(bigint, NULL),
                     LastCpuMs               = CONVERT(bigint, NULL),
                     CpuChangePct            = CONVERT(decimal(10, 1), NULL),
-                    FirstCpuPerExec         = CONVERT(decimal(10, 2), NULL),
-                    LastCpuPerExec          = CONVERT(decimal(10, 2), NULL),
+                    FirstCpuPerExec         = CONVERT(decimal(18, 2), NULL),
+                    LastCpuPerExec          = CONVERT(decimal(18, 2), NULL),
                     CpuPerExecChangePct     = CONVERT(decimal(10, 1), NULL),
                     CpuTrend                = CONVERT(nvarchar(30), NULL),
                     FirstExecs              = CONVERT(bigint, NULL),
@@ -9063,15 +9094,20 @@ BEGIN
                 fl.LastRunDate,
                 fl.FirstCpuMs,
                 fl.LastCpuMs,
-                CpuChangePct            = CASE WHEN fl.FirstCpuMs > 0
-                                               THEN CONVERT(decimal(10, 1), (fl.LastCpuMs - fl.FirstCpuMs) * 100.0 / fl.FirstCpuMs)
-                                               ELSE NULL
+                /* 0859.10: every ChangePct below gets a baseline floor (sub-floor baselines make
+                   the ratio meaningless -- one 2 ms stat reporting +249,900% swamps the result) and
+                   a +1000% clamp (unclamped, CONVERT to decimal(10, 1) overflows with error 8115 and
+                   kills the whole diag run).  Floors match the I8 headline constants (o2md.22). */
+                CpuChangePct            = CASE WHEN fl.FirstCpuMs < 100 THEN NULL /* floor: 100 ms total CPU */
+                                               WHEN (fl.LastCpuMs - fl.FirstCpuMs) * 100.0 / fl.FirstCpuMs > 1000.0 THEN CONVERT(decimal(10, 1), 1000.0)
+                                               ELSE CONVERT(decimal(10, 1), (fl.LastCpuMs - fl.FirstCpuMs) * 100.0 / fl.FirstCpuMs)
                                           END,
-                FirstCpuPerExec         = CONVERT(decimal(10, 2), fl.FirstCpuPerExec),
-                LastCpuPerExec          = CONVERT(decimal(10, 2), fl.LastCpuPerExec),
-                CpuPerExecChangePct     = CASE WHEN fl.FirstCpuPerExec > 0
-                                               THEN CONVERT(decimal(10, 1), (fl.LastCpuPerExec - fl.FirstCpuPerExec) * 100.0 / fl.FirstCpuPerExec)
-                                               ELSE NULL
+                /* 0859.10: decimal(18, 2) -- a per-exec value can exceed decimal(10, 2) range (5e10 ms/exec seeded in the regression fixture overflowed with 8115) */
+                FirstCpuPerExec         = CONVERT(decimal(18, 2), fl.FirstCpuPerExec),
+                LastCpuPerExec          = CONVERT(decimal(18, 2), fl.LastCpuPerExec),
+                CpuPerExecChangePct     = CASE WHEN fl.FirstCpuPerExec < 0.1 THEN NULL /* floor: 0.1 ms/exec */
+                                               WHEN (fl.LastCpuPerExec - fl.FirstCpuPerExec) * 100.0 / fl.FirstCpuPerExec > 1000.0 THEN CONVERT(decimal(10, 1), 1000.0)
+                                               ELSE CONVERT(decimal(10, 1), (fl.LastCpuPerExec - fl.FirstCpuPerExec) * 100.0 / fl.FirstCpuPerExec)
                                           END,
                 CpuTrend                = CASE
                                               WHEN fl.FirstCpuPerExec > 0 AND fl.LastCpuPerExec < fl.FirstCpuPerExec * 0.95 THEN N'IMPROVING'
@@ -9092,9 +9128,9 @@ BEGIN
                                           END,
                 fl.FirstMemoryGrantKB,
                 fl.LastMemoryGrantKB,
-                MemoryGrantChangePct    = CASE WHEN ISNULL(fl.FirstMemoryGrantKB, 0) > 0
-                                               THEN CONVERT(decimal(10, 1), (fl.LastMemoryGrantKB - fl.FirstMemoryGrantKB) * 100.0 / fl.FirstMemoryGrantKB)
-                                               ELSE NULL
+                MemoryGrantChangePct    = CASE WHEN ISNULL(fl.FirstMemoryGrantKB, 0) < 1024 THEN NULL /* floor: 1 MB grant */
+                                               WHEN (fl.LastMemoryGrantKB - fl.FirstMemoryGrantKB) * 100.0 / fl.FirstMemoryGrantKB > 1000.0 THEN CONVERT(decimal(10, 1), 1000.0)
+                                               ELSE CONVERT(decimal(10, 1), (fl.LastMemoryGrantKB - fl.FirstMemoryGrantKB) * 100.0 / fl.FirstMemoryGrantKB)
                                           END,
                 MemoryGrantTrend        = CASE
                                               WHEN ISNULL(fl.FirstMemoryGrantKB, 0) > 0 AND fl.LastMemoryGrantKB < fl.FirstMemoryGrantKB * 0.95 THEN N'IMPROVING'
@@ -9104,9 +9140,9 @@ BEGIN
                                           END,
                 fl.FirstTempdbPages,
                 fl.LastTempdbPages,
-                TempdbChangePct         = CASE WHEN ISNULL(fl.FirstTempdbPages, 0) > 0
-                                               THEN CONVERT(decimal(10, 1), (fl.LastTempdbPages - fl.FirstTempdbPages) * 100.0 / fl.FirstTempdbPages)
-                                               ELSE NULL
+                TempdbChangePct         = CASE WHEN ISNULL(fl.FirstTempdbPages, 0) < 128 THEN NULL /* floor: 1 MB = 128 pages */
+                                               WHEN (fl.LastTempdbPages - fl.FirstTempdbPages) * 100.0 / fl.FirstTempdbPages > 1000.0 THEN CONVERT(decimal(10, 1), 1000.0)
+                                               ELSE CONVERT(decimal(10, 1), (fl.LastTempdbPages - fl.FirstTempdbPages) * 100.0 / fl.FirstTempdbPages)
                                           END,
                 TempdbTrend             = CASE
                                               WHEN ISNULL(fl.FirstTempdbPages, 0) > 0 AND fl.LastTempdbPages < fl.FirstTempdbPages * 0.95 THEN N'IMPROVING'
@@ -9158,8 +9194,8 @@ BEGIN
                 FirstCpuMs              = CONVERT(bigint, NULL),
                 LastCpuMs               = CONVERT(bigint, NULL),
                 CpuChangePct            = CONVERT(decimal(10, 1), NULL),
-                FirstCpuPerExec         = CONVERT(decimal(10, 2), NULL),
-                LastCpuPerExec          = CONVERT(decimal(10, 2), NULL),
+                FirstCpuPerExec         = CONVERT(decimal(18, 2), NULL),
+                LastCpuPerExec          = CONVERT(decimal(18, 2), NULL),
                 CpuPerExecChangePct     = CONVERT(decimal(10, 1), NULL),
                 CpuTrend                = CONVERT(nvarchar(30), NULL),
                 FirstExecs              = CONVERT(bigint, NULL),
@@ -9205,15 +9241,16 @@ BEGIN
                         Appearances         = fl2.Appearances,
                         FirstCpuMs          = fl2.FirstCpuMs,
                         LastCpuMs           = fl2.LastCpuMs,
-                        CpuChangePct        = CASE WHEN fl2.FirstCpuMs > 0
-                                                   THEN CONVERT(decimal(10, 1), (fl2.LastCpuMs - fl2.FirstCpuMs) * 100.0 / fl2.FirstCpuMs)
-                                                   ELSE NULL
+                        /* 0859.10: baseline floor + clamp -- see main-path RS 13 note */
+                        CpuChangePct        = CASE WHEN fl2.FirstCpuMs < 100 THEN NULL
+                                                   WHEN (fl2.LastCpuMs - fl2.FirstCpuMs) * 100.0 / fl2.FirstCpuMs > 1000.0 THEN CONVERT(decimal(10, 1), 1000.0)
+                                                   ELSE CONVERT(decimal(10, 1), (fl2.LastCpuMs - fl2.FirstCpuMs) * 100.0 / fl2.FirstCpuMs)
                                               END,
-                        FirstCpuPerExec     = CONVERT(decimal(10, 2), fl2.FirstCpuPerExec),
-                        LastCpuPerExec      = CONVERT(decimal(10, 2), fl2.LastCpuPerExec),
-                        CpuPerExecChangePct = CASE WHEN fl2.FirstCpuPerExec > 0
-                                                   THEN CONVERT(decimal(10, 1), (fl2.LastCpuPerExec - fl2.FirstCpuPerExec) * 100.0 / fl2.FirstCpuPerExec)
-                                                   ELSE NULL
+                        FirstCpuPerExec     = CONVERT(decimal(18, 2), fl2.FirstCpuPerExec), /* 0859.10: widened, see main path */
+                        LastCpuPerExec      = CONVERT(decimal(18, 2), fl2.LastCpuPerExec),
+                        CpuPerExecChangePct = CASE WHEN fl2.FirstCpuPerExec < 0.1 THEN NULL
+                                                   WHEN (fl2.LastCpuPerExec - fl2.FirstCpuPerExec) * 100.0 / fl2.FirstCpuPerExec > 1000.0 THEN CONVERT(decimal(10, 1), 1000.0)
+                                                   ELSE CONVERT(decimal(10, 1), (fl2.LastCpuPerExec - fl2.FirstCpuPerExec) * 100.0 / fl2.FirstCpuPerExec)
                                               END,
                         CpuTrend            = CASE
                                                  WHEN fl2.FirstCpuPerExec > 0 AND fl2.LastCpuPerExec < fl2.FirstCpuPerExec * 0.95 THEN N'IMPROVING'
@@ -9230,9 +9267,9 @@ BEGIN
                                              END,
                         FirstMemoryGrantKB    = fl2.FirstMemoryGrantKB,
                         LastMemoryGrantKB     = fl2.LastMemoryGrantKB,
-                        MemoryGrantChangePct  = CASE WHEN ISNULL(fl2.FirstMemoryGrantKB, 0) > 0
-                                                     THEN CONVERT(decimal(10, 1), (fl2.LastMemoryGrantKB - fl2.FirstMemoryGrantKB) * 100.0 / fl2.FirstMemoryGrantKB)
-                                                     ELSE NULL
+                        MemoryGrantChangePct  = CASE WHEN ISNULL(fl2.FirstMemoryGrantKB, 0) < 1024 THEN NULL
+                                                     WHEN (fl2.LastMemoryGrantKB - fl2.FirstMemoryGrantKB) * 100.0 / fl2.FirstMemoryGrantKB > 1000.0 THEN CONVERT(decimal(10, 1), 1000.0)
+                                                     ELSE CONVERT(decimal(10, 1), (fl2.LastMemoryGrantKB - fl2.FirstMemoryGrantKB) * 100.0 / fl2.FirstMemoryGrantKB)
                                                 END,
                         MemoryGrantTrend      = CASE
                                                     WHEN ISNULL(fl2.FirstMemoryGrantKB, 0) > 0 AND fl2.LastMemoryGrantKB < fl2.FirstMemoryGrantKB * 0.95 THEN N'IMPROVING'
@@ -9242,9 +9279,9 @@ BEGIN
                                                 END,
                         FirstTempdbPages      = fl2.FirstTempdbPages,
                         LastTempdbPages        = fl2.LastTempdbPages,
-                        TempdbChangePct       = CASE WHEN ISNULL(fl2.FirstTempdbPages, 0) > 0
-                                                     THEN CONVERT(decimal(10, 1), (fl2.LastTempdbPages - fl2.FirstTempdbPages) * 100.0 / fl2.FirstTempdbPages)
-                                                     ELSE NULL
+                        TempdbChangePct       = CASE WHEN ISNULL(fl2.FirstTempdbPages, 0) < 128 THEN NULL
+                                                     WHEN (fl2.LastTempdbPages - fl2.FirstTempdbPages) * 100.0 / fl2.FirstTempdbPages > 1000.0 THEN CONVERT(decimal(10, 1), 1000.0)
+                                                     ELSE CONVERT(decimal(10, 1), (fl2.LastTempdbPages - fl2.FirstTempdbPages) * 100.0 / fl2.FirstTempdbPages)
                                                 END,
                         TempdbTrend           = CASE
                                                     WHEN ISNULL(fl2.FirstTempdbPages, 0) > 0 AND fl2.LastTempdbPages < fl2.FirstTempdbPages * 0.95 THEN N'IMPROVING'
@@ -9338,8 +9375,8 @@ BEGIN
                         FirstCpuMs              = CONVERT(bigint, NULL),
                         LastCpuMs               = CONVERT(bigint, NULL),
                         CpuChangePct            = CONVERT(decimal(10, 1), NULL),
-                        FirstCpuPerExec         = CONVERT(decimal(10, 2), NULL),
-                        LastCpuPerExec          = CONVERT(decimal(10, 2), NULL),
+                        FirstCpuPerExec         = CONVERT(decimal(18, 2), NULL),
+                        LastCpuPerExec          = CONVERT(decimal(18, 2), NULL),
                         CpuPerExecChangePct     = CONVERT(decimal(10, 1), NULL),
                         CpuTrend                = CONVERT(nvarchar(30), NULL),
                         ForcedPlanCount         = CONVERT(integer, NULL),
