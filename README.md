@@ -923,11 +923,12 @@ EXEC dbo.sp_StatUpdate
 
 ## Version History 📜
 
-**Current version:** `3.11.1.2026.07.31` (proc) &nbsp;·&nbsp; `2026.07.30.11` (diag)
+**Current version:** `3.11.2.2026.08.02` (proc) &nbsp;·&nbsp; `2026.08.02.1` (diag)
 
 <details>
 <summary><strong>📜 Show full changelog (60+ releases)</strong></summary>
 
+- **3.11.2 / Diag 2026.08.02.1** - two crash-class fixes found by auditing the codebase against a deep study of the DarlingData diagnostic procedures. (1) `DATEDIFF(MILLISECOND)` int overflow: a CommandLog row spanning more than ~24.8 days (orphaned START whose END marker was written by orphan cleanup weeks later) raised error 535 and hard-failed the entire Diag run; the proc's TablePriority duration estimate read the same rows during discovery. Both now use `DATEDIFF_BIG`; Diag stores NULL for such spans (a duration measured to a cleanup marker is fiction) and the estimate filters them out. (2) Diag RS13 `ChangePct` columns had no denominator floor: a 2 ms CPU baseline reported +249,900%, and a large enough delta overflowed `decimal(10,1)` (error 8115) and killed the run -- now floored (NULL below 100 ms CPU / 0.1 ms-per-exec / 1 MB grant / 128 tempdb pages, matching the I8 headline constants) and clamped at +1000%. Regression tests seed both crash fixtures live.
 - **3.11.1** - o2md.54, found by a primary-source SQL 2025 compatibility audit: the plan-feedback awareness filter used a nonexistent `ACTIVE` state (`sys.query_store_plan_feedback` has no such state), silently degrading the count to PENDING_VALIDATION-only on every version -- now filters the four states a stats update could invalidate. Audit verified every other hardcoded QS value map (readonly_reason bitmask, wait categories, capture modes, version gates) against current docs; no other mismatches.
 - **3.11.0 / Diag 2026.07.30.11** - o2md.18 (maintainer decision): discovery-candidate log. The proc writes one compact `SP_STATUPDATE_REMAINING` row per run listing the qualifying stats left unprocessed at run end (capped 500, truncation-flagged; table-level in parallel skip-discovery mode) -- the population that was previously unobservable from CommandLog. Diag's W13 `PERPETUALLY_SKIPPED` consumes it as the authoritative source (intersection across the last N runs, deepest-queued examples), keeping the old inference only as a fallback for older-proc runs.
 - **3.10.1** - o2md.53: the forced-plan baseline/delta filtered `plan_forcing_type = N'MANUAL'` against an INT column -- conversion error on every SQL 2022+/2025 run, TRY/CATCH-swallowed, so the MANUAL-only filter never applied where the column existed. Now compares the integer value (1); live-verified capturing on SQL 2025.
