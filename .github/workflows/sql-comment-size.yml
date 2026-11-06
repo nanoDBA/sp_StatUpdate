@@ -1,0 +1,17 @@
+name: SQL comment size
+
+on:
+  push:
+    paths: ['*.sql', '.github/**']
+  pull_request:
+    paths: ['*.sql', '.github/**']
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 .github/scripts/check_sql_comment_size.py

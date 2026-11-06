@@ -1,12 +1,13 @@
 # sp_StatUpdate .gitignore
 # WHITELIST APPROACH: Ignore everything, then allow only specific files
 #
-# Files published to GitHub (7 files, all at root):
+# Files published to GitHub (root files, plus assets/ and .github/):
 #   - sp_StatUpdate.sql          (main procedure)
 #   - sp_StatUpdate_Diag.sql     (diagnostic procedure)
 #   - sp_StatUpdate_XE_Session.sql (Extended Events troubleshooting)
 #   - Invoke-StatUpdateDiag.ps1  (multi-server diagnostic wrapper)
 #   - README.md
+#   - CHANGELOG.md
 #   - LICENSE
 
 # Ignore everything by default
@@ -18,6 +19,7 @@
 !sp_StatUpdate_XE_Session.sql
 !Invoke-StatUpdateDiag.ps1
 !README.md
+!CHANGELOG.md
 !LICENSE
 !.gitignore
 !.gitattributes
@@ -25,6 +27,13 @@
 # README demo screenshots (colorized terminal output, rendered to PNG)
 !assets/
 !assets/*.png
+
+# CI: SQL comment size check
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+!.github/scripts/
+!.github/scripts/*.py
 
 # Beads / Dolt files (added by bd init)
 .dolt/
