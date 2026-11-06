@@ -36,7 +36,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.08.02.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.11.06.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.11.06.1 - SSMS 22.11 failed on this script with Msg 102 near GO,
+                           then Msg 111.  Its batch splitter appears not to nest
+                           block comments, so two markers in the 2026.07.30.9
+                           entry ended this header early and a quote later in
+                           the text hid the GO.  Markers reworded.  No code
+                           change.
+
             2026.08.02.1 - 0859.9 + 0859.10 (DarlingData-audit findings).
                            0859.9: #stat_updates extraction computed
                            DATEDIFF(MILLISECOND, StartTime, EndTime) with the
@@ -932,8 +939,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.08.02.1',   /* orchestrator bumps this */
-        @procedure_version_date datetime = '20260802';     /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.11.06.1',   /* orchestrator bumps this */
+        @procedure_version_date datetime = '20261106';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
