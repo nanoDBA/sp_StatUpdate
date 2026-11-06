@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""Fail when a T-SQL block comment is large enough to break batch splitting in SSMS.
+"""Fail when a T-SQL block comment contains another block comment.
 
-SSMS 22.11 stops recognising GO after a block comment larger than 64 KiB, so the
-script reaches the server as one batch and fails with Msg 102 and Msg 111. The limit
-here is half that, to leave room. Sizes are measured with CRLF line endings because
-that is how the files look when opened on Windows, whatever the repository stores.
+SQL Server nests block comments, but the batch splitter in SSMS 22.11 does not: the
+first */ ends the comment for it. The rest of the comment is then read as code, so a
+quote in that text can hide the next GO. The script reaches the server as one batch
+and fails with Msg 102 and Msg 111, even though the server parses the comment fine.
 
-Usage: check_sql_comment_size.py [file.sql ...]   (default: *.sql in the current directory)
+Usage: check_sql_nested_comments.py [file.sql ...]   (default: *.sql in the current directory)
 """
 import glob
 import sys
 
-LIMIT = 32_000
 
-
-def block_comments(sql):
-    """Yield (start_offset, end_offset) for each outermost block comment."""
+def nested_comments(sql):
+    """Yield the offset of each /* found inside a block comment."""
     i, n = 0, len(sql)
     while i < n:
         if sql.startswith("--", i):
@@ -28,12 +26,12 @@ def block_comments(sql):
                 if i >= n:
                     raise ValueError(f"unterminated block comment at offset {start}")
                 if sql.startswith("/*", i):
+                    yield i
                     depth, i = depth + 1, i + 2
                 elif sql.startswith("*/", i):
                     depth, i = depth - 1, i + 2
                 else:
                     i += 1
-            yield start, i
         elif sql[i] in "'\"[":
             i = skip_delimited(sql, i)
         else:
@@ -53,25 +51,19 @@ def skip_delimited(sql, start):
         i += 2
 
 
-def violations(sql):
-    """Yield (line_number, size) for each block comment over the limit."""
-    crlf = sql.replace("\r\n", "\n").replace("\n", "\r\n")
-    for start, end in block_comments(crlf):
-        if end - start > LIMIT:
-            yield crlf.count("\n", 0, start) + 1, end - start
-
-
 def main(paths):
     failed = False
     for path in paths:
         with open(path, encoding="utf-8-sig", newline="") as f:
-            for line, size in violations(f.read()):
-                print(f"{path}:{line}: block comment is {size:,} chars (limit {LIMIT:,})")
-                failed = True
+            sql = f.read()
+        for offset in nested_comments(sql):
+            line = sql.count("\n", 0, offset) + 1
+            print(f"{path}:{line}: block comment nested inside a block comment")
+            failed = True
     if failed:
-        print("Split the comment into smaller /* */ blocks, keeping the text in the file.")
+        print("Reword the text so it has no /* or */. SSMS 22 does not nest comments.")
         return 1
-    print(f"OK: {len(paths)} file(s), no block comment over {LIMIT:,} chars")
+    print(f"OK: {len(paths)} file(s), no nested block comments")
     return 0
 
 

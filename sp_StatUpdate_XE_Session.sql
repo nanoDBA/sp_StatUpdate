@@ -381,7 +381,7 @@ SELECT
     event_data.value('(event/@timestamp)[1]', 'datetime2(3)') AS event_time_utc,
     event_data.value('(event/action[@name="session_id"]/value)[1]', 'int') AS session_id,
     event_data.value('(event/action[@name="database_name"]/value)[1]', 'sysname') AS database_name,
-    /* sort_warning_type: single-pass vs multiple-pass (field absent on some builds -> NULL, harmless) */
+    -- sort_warning_type: single-pass vs multiple-pass (field absent on some builds -> NULL, harmless)
     event_data.value('(event/data[@name="sort_warning_type"]/text)[1]', 'varchar(30)') AS sort_warning_type,
     event_data.value('(event/action[@name="context_info"]/value)[1]', 'varchar(256)') AS context_info,  -- sp_StatUpdate run tag (gh-423)
     LEFT(event_data.value('(event/action[@name="sql_text"]/value)[1]', 'nvarchar(max)'), 300) AS sql_text
@@ -408,7 +408,7 @@ spills AS
 (
     SELECT
         event_data.value('(event/@name)[1]', 'varchar(50)') AS spill_event,
-        /* UTC -> server-local using the live offset (robust to absolute clock skew) */
+        -- UTC -> server-local using the live offset (robust to absolute clock skew)
         DATEADD(MINUTE, DATEDIFF(MINUTE, SYSUTCDATETIME(), SYSDATETIME()),
                 event_data.value('(event/@timestamp)[1]', 'datetime2(3)')) AS event_time_local,
         event_data.value('(event/action[@name="session_id"]/value)[1]', 'int') AS session_id,

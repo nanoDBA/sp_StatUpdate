@@ -36,10 +36,6 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Comments:   The change history spans several comment blocks. SSMS 22 stops splitting
-            batches on GO after a block comment larger than 64 KiB. Keep each block
-            under 32,000 characters; CI enforces this.
-
 Version:    3.11.2.2026.08.02 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
@@ -346,9 +342,7 @@ History:    3.11.2.2026.08.02 - 0859.9 (DarlingData-audit finding): the gh-505
                             into console RAISERROR text ONLY.  SSMS ignores the
                             codes; use a color-aware terminal (Windows Terminal,
                             sqlcmd piped to a color-aware pager) to see them.
-*/
 
-/*
             3.7.4.2026.07.25 - SPILL PROOF: preselection-vs-proof @Help topic
                             (sp_StatUpdate-ggnq / gh-552).  Query Store metrics
                             (TEMPDB_SPILLS/WAITS/WAIT_CPU) preselect candidates
@@ -657,9 +651,6 @@ History:    3.11.2.2026.08.02 - 0859.9 (DarlingData-audit finding): the gh-505
                               missed every failure.  TOCTOU rows (errors 208,
                               15009, 2767) intentionally keep NULL ExtendedInfo
                               so they don't aggregate as real failures.
-*/
-
-/*
             3.5.0.2026.04.23 - @CriticalTables feature: per-table sample rate
                               override with optional priority boost (gh-508).
                               Three new params: @CriticalTables (comma-delimited
