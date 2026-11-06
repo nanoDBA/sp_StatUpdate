@@ -925,8 +925,6 @@ EXEC dbo.sp_StatUpdate
 
 **Current version:** `3.11.2.2026.08.02` (proc) &nbsp;·&nbsp; `2026.08.02.1` (diag)
 
-Full per-release detail is in [CHANGELOG.md](CHANGELOG.md).
-
 <details>
 <summary><strong>📜 Show full changelog (60+ releases)</strong></summary>
 

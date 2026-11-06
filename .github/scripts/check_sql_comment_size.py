@@ -69,7 +69,7 @@ def main(paths):
                 print(f"{path}:{line}: block comment is {size:,} chars (limit {LIMIT:,})")
                 failed = True
     if failed:
-        print("Move long text out of the comment. Release notes belong in CHANGELOG.md.")
+        print("Split the comment into smaller /* */ blocks, keeping the text in the file.")
         return 1
     print(f"OK: {len(paths)} file(s), no block comment over {LIMIT:,} chars")
     return 0

@@ -36,13 +36,771 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
+Comments:   The change history spans several comment blocks. SSMS 22 stops splitting
+            batches on GO after a block comment larger than 64 KiB. Keep each block
+            under 32,000 characters; CI enforces this.
+
 Version:    3.11.2.2026.08.02 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    https://github.com/nanoDBA/sp_StatUpdate/blob/main/CHANGELOG.md
-            Release notes go in CHANGELOG.md, never in this header. SSMS 22 stops
-            splitting batches on GO after a block comment larger than 64 KiB.
+History:    3.11.2.2026.08.02 - 0859.9 (DarlingData-audit finding): the gh-505
+                            TablePriority estimate read historical durations
+                            from CommandLog with the int-returning
+                            DATEDIFF(MILLISECOND) -- a row spanning more than
+                            ~24.8 days (orphan-cleanup END markers) raised
+                            error 535 during discovery.  Now DATEDIFF_BIG,
+                            plus a 24-hour span sanity filter so cleanup
+                            artifacts cannot skew the per-table average
+                            either.  The end-of-run @duration_ms_total
+                            computation gets the same DATEDIFF_BIG hardening.
+
+            3.11.1.2026.07.31 - o2md.54 (found by the SQL 2025 primary-source
+                            compatibility audit): the #369 plan-feedback
+                            awareness filter used state_desc IN (ACTIVE,
+                            PENDING_VALIDATION) -- but sys.query_store_
+                            plan_feedback has NO documented ACTIVE state, so
+                            the count silently degraded to
+                            PENDING_VALIDATION-only on every version
+                            (magnified on SQL 2025 where DOP feedback is on
+                            by default).  Now filters the four states a stats
+                            update could invalidate: PENDING_VALIDATION,
+                            IN_VALIDATION, VERIFICATION_PASSED,
+                            FEEDBACK_VALID.  Also from the audit: the
+                            plan_forcing_type "SQL 2022+" comments corrected
+                            to 2017+ (docs; behavior was already
+                            metadata-detected), and #qs_forced_baseline.
+                            plan_forcing_type int-typed to match the source
+                            column.  Audit verified all other hardcoded QS
+                            value maps (readonly_reason bitmask, wait
+                            categories, capture modes, version gates) match
+                            current documentation; no other mismatches --
+                            see research/sql2025-compat-audit-2026-07-31.md.
+
+            3.11.0.2026.07.30 - o2md.18 (maintainer decision): discovery-
+                            candidate log.  When qualifying work remains
+                            unprocessed at run end, ONE compact
+                            SP_STATUPDATE_REMAINING CommandLog row lists the
+                            remaining qualifying stats (db/schema/table/stat,
+                            priority, modification counter; capped at 500
+                            with Truncated flag + TotalRemaining).  In
+                            parallel skip-discovery mode the per-stat detail
+                            is structurally unavailable, so the row lists
+                            remaining TABLES from the queue (Kind=TABLE).
+                            Previously the qualifying-but-unprocessed
+                            population was unobservable from CommandLog --
+                            Diag''s W13 PERPETUALLY_SKIPPED could only infer;
+                            it now consumes this log as the authoritative
+                            source (diag 2026.07.30.11).  Non-critical
+                            TRY/CATCH write; one row per run.
+
+            3.10.1.2026.07.30 - o2md.53: the zks1/gh-533 forced-plan baseline
+                            and post-run delta filtered on plan_forcing_type =
+                            N'MANUAL', but plan_forcing_type is an INT column
+                            (1 = MANUAL) -- the comparison raised a conversion
+                            error on every SQL 2022+/2025 run and was
+                            TRY/CATCH-swallowed, so the MANUAL-only filter
+                            never actually applied anywhere it existed (2019
+                            lacks the column and skipped the filter, which is
+                            why gates stayed green).  All four sites now
+                            compare against the integer value.  Live-verified
+                            on SQL 2025: baseline captures instead of
+                            skipping.
+
+            3.10.0.2026.07.30 - MOP-UP QS + two silent pre-existing bugs
+                            (o2md.5 + fixes found verifying it).
+
+                            o2md.5 (maintainer option a) -- Phase 6 QS
+                            enrichment extracted into @qs_phase6_sql, a
+                            fragment variable the staged path concatenates
+                            back at the exact original position (assembly is
+                            byte-identical, so the two paths cannot drift)
+                            and the mop-up paths (parallel-leader + serial)
+                            execute against a mop-up-built #stat_candidates
+                            per database.  Mop-up rows now carry real qs_*
+                            values in per-stat ExtendedInfo (the o2md.16/W5
+                            "QS not applicable to this pass" dependency) and
+                            @SortOrder = QUERY_STORE is honored by a
+                            post-enrichment re-rank; the parallel-leader
+                            TablePriority fan-out now inherits the per-stat
+                            priority ranking instead of re-deriving from
+                            modification counter.  Verified live: FromMopUp
+                            rows log QSPlanCount from the shared fragment.
+
+                            PRE-EXISTING BUG (silent, since sw82): the
+                            zero-candidate/zero-qualify early-exit shape
+                            (@empty_disc_select) was missing is_critical,
+                            so every empty-discovery database failed the
+                            INSERT...EXECUTE column-count check and was
+                            silently skipped (DB_SKIPPED swallow).
+
+                            PRE-EXISTING BUG (silent, since gh-462 /
+                            36cea09, 2026-04-18): @mop_up_where_sql carried
+                            QUADRUPLED quotes, correct only for a
+                            doubly-nested dynamic string -- both consumers
+                            concatenate it directly, so serial and
+                            parallel-leader mop-up discovery died with
+                            'Incorrect syntax near IsUserTable' on every
+                            run, the per-database CATCH swallowed it, and
+                            'no additional stats found' masqueraded as
+                            normal.  Mop-up discovery had been broken for
+                            ~3 months of green gates; a regression test now
+                            asserts discovery actually finds seeded rows.
+
+            3.9.0.2026.07.30 - BEHAVIOR CHANGE (maintainer-authorized, o2md.7):
+                            adaptive sampling on by default in the NIGHTLY and
+                            WEEKLY_FULL presets.  A single large stat with a
+                            100% sample could burn 20+ minutes of NIGHTLY's
+                            60-minute window; historically-slow stats (from
+                            CommandLog history) now fall back to the sampled
+                            rate automatically -- NIGHTLY threshold 10 min,
+                            WEEKLY_FULL 30 min, sample percent stays at the
+                            internal default (10%).  DEFAULT / OLTP_LIGHT /
+                            WAREHOUSE presets unchanged.  Explicit
+                            @LongRunningThresholdMinutes /
+                            @LongRunningSamplePercent still override (applied
+                            after presets).  Also in 3.9.0 (o2md.4, found by
+                            the kill-recovery repro): a parallel run that
+                            joins a carried-over queue, verifies every
+                            carried stat was already updated (CommandLog
+                            freshness check), and drains the queue no longer
+                            classifies as SILENT_NOOP/ERROR -- it reports
+                            the new QUEUE_ALREADY_SATISFIED warning code and
+                            grades normally.  A genuine zombie abandons a
+                            non-empty queue (remaining > 0) and still
+                            classifies.  Minor version bump because
+                            existing NIGHTLY/WEEKLY_FULL callers see changed
+                            sampling behavior on historically-slow stats.
+                            To restore pre-3.9.0 behavior on those presets,
+                            pass a threshold no run can reach (validation
+                            floor is 1; e.g. @LongRunningThresholdMinutes =
+                            100000) -- NULL cannot disable it, NULL means
+                            "preset decides".
+
+            3.8.5.2026.07.30 - OBSERVABILITY: self-idle-time buckets + mop-up
+                            sort-order/tagging (o2md.46, o2md.49).
+
+                            o2md.46 - the proc's own wait time was invisible:
+                            no field captured time spent in the inter-stat
+                            delay, the AG-redo recheck loop, deadlock/lock-
+                            timeout retry backoff, or parallel claim-cycle
+                            overhead (dead-worker sweep + claim + lazy
+                            discovery), so Diag's W6 EXCESSIVE_OVERHEAD could
+                            only infer "discovery cost" from wall-clock minus
+                            per-stat time.  Four accumulators (SYSDATETIME()
+                            bracketing, DATEDIFF_BIG ms) now emit in the END
+                            Summary XML as DelayWaitMs / AgRedoWaitMs /
+                            RetryBackoffMs / QueueClaimMs -- NULLIF omits each
+                            when zero (matches ForcedPlanFailureDelta; no
+                            XSINIL in that block, so absent == 0).  The
+                            claim-cycle bracket stays open across the
+                            lazy-discovery zero-rows/CATCH CONTINUE loops
+                            (o2md.1) so failed claim cycles are counted, and
+                            is never opened in serial mode.
+
+                            o2md.49 (split from o2md.5) - all three mop-up
+                            discovery sites (lazy per-table, parallel-leader,
+                            serial) hard-coded modification-counter ordering,
+                            silently ignoring @SortOrder.  A shared
+                            @mop_up_order_expr now honors ROWS, PAGE_COUNT,
+                            DAYS_STALE, AUTO_CREATED, and RANDOM (expressions
+                            mirror the main pass's staged-discovery CASE
+                            minus the qs_priority_boost term -- mop-up qs_*
+                            is structurally NULL).  QUERY_STORE and other
+                            enrichment-dependent sorts keep the
+                            modification-counter fallback (pre-fix behavior)
+                            pending the o2md.5 design decision.  Also new:
+                            #stats_to_process.from_mop_up per-row flag,
+                            emitted as FromMopUp in per-stat ExtendedInfo --
+                            unlike QualifyReason's MOP_UP branch (driven by
+                            the session-scoped @in_mop_up flag) it cannot
+                            mislabel priority-pass leftovers processed after
+                            the mop-up flag flips, giving Diag a reliable way
+                            to tell "no QS data" from "QS not applicable to
+                            this pass".
+
+            3.8.4.2026.07.30 - o2md.8: bounded retry extended to lock timeouts.
+                            The existing #163 deadlock-retry loop (up to 3
+                            attempts, exponential backoff) retried error 1205
+                            only.  A lock timeout (1222) is just as transient
+                            as a deadlock -- the blocker's own transaction is
+                            expected to release -- but previously burned the
+                            stat as a hard failure on the first hit and
+                            counted against @MaxConsecutiveFailures.  Found on
+                            a production server where 1222 accounted for 5/5
+                            (100%) of all recorded failures.  Same backoff now
+                            applies to both error numbers; the existing
+                            DEADLOCK_RETRY_OK/FAIL warning text is unchanged
+                            for 1205, with new LOCK_TIMEOUT_RETRY_OK/FAIL for
+                            1222.  Caught during testing: RAISERROR only
+                            accepts variables or literals as substitution
+                            arguments, not arbitrary expressions -- an inline
+                            CASE in the retry RAISERROR call failed to deploy
+                            ("Incorrect syntax near the keyword 'CASE'");
+                            fixed by assigning the CASE result to a local
+                            variable first.
+
+            3.8.3.2026.07.30 - Query Store diagnostics + priority-pass/mop-up
+                            inversion warning (o2md.6, QuickieStore comparison).
+
+                            Four Query Store observability gaps closed after
+                            comparing Phase 6 enrichment against Erik Darling's
+                            sp_QuickieStore (see research/quickiestore-comparison-
+                            2026-07-30.md for the full analysis): (1)
+                            wait_stats_capture_mode is now checked before the
+                            WAITS/WAIT_CPU enrichment queries sys.query_store_
+                            wait_stats -- capture-mode OFF previously produced
+                            silent zero enrichment indistinguishable from "no
+                            matching workload".  (2) READ_ONLY Query Store state
+                            now decodes readonly_reason (storage limit with
+                            current/max MB, AG secondary, single-user/emergency
+                            mode, internal memory limits) instead of a single
+                            generic "may be stale" message.  (3) query_capture_
+                            mode is surfaced (NONE/CUSTOM) when it may be
+                            silently biasing which queries QS-based prioritization
+                            even sees -- informational only, no behavior change.
+                            (4) The post-run forced-plan-failure-delta warning
+                            now samples last_force_failure_reason_desc so the
+                            message is self-contained instead of "go investigate".
+                            All four are additive diagnostics (debug/warning text
+                            only) -- no change to qualification, ordering, or
+                            enrichment logic.
+
+                            o2md.6 -- the priority pass qualifying 0 stats while
+                            mop-up (raw modification_counter > 0, no threshold
+                            filtering) finds N > 0 is never legitimate; it means
+                            priority-pass qualification is broken (the exact
+                            failure mode behind the icjq effective_counter
+                            incident, gh-502), not that the fleet has nothing to
+                            do.  Now detected and surfaced via @WarningsOut /
+                            @WarningsCodesOut (PRIORITY_PASS_ZERO_MOPUP_FOUND)
+                            instead of mop-up silently absorbing the gap.
+
+            3.8.2.2026.07.28 - SILENT NO-OP: fleet analysis batch (o2md).
+                            Found by the 40-server production diagnostic sweep
+                            of 2026-07-28, where ~50 nightly maintenance windows
+                            reported SUCCESS while processing zero statistics.
+
+                            o2md.1 (P0) -- the lazy mop-up branches that discover
+                            0 stats for a claimed table, and their CATCH, released
+                            the claim and NULLed @claimed_table_* but had no
+                            CONTINUE.  Control fell through to the work-claim
+                            block, whose parallel predicate compares against those
+                            now-NULL variables, matched 0 rows, and exited the run
+                            with @stop_reason = COMPLETED -- abandoning every
+                            remaining queued table.  Signature in the wild:
+                            StatsFound decaying by roughly one table per night
+                            (1779 -> 1746 -> 1710 -> 1704) with StatsProcessed = 0.
+                            Distinct from sp_StatUpdate-v31y, which covers the
+                            PARALLEL_COMPLETE variant.
+
+                            o2md.2 (P1) -- @remaining_stats counted
+                            #stats_to_process, which is structurally empty when
+                            @skip_discovery = 1 (worker joined an existing queue),
+                            so StatsRemaining reported 0 no matter how much work
+                            was outstanding.  Now derived from dbo.QueueStatistic
+                            in parallel mode, split under its own IF so the
+                            optional table is not name-resolved on non-parallel
+                            runs (cf. sp_StatUpdate-isa2).
+
+                            o2md.3 (P1) -- StatsFound > 0 with StatsProcessed = 0
+                            now grades Status = ERROR, emits the SILENT_NOOP
+                            warning code, and returns 2 so SQL Agent fails the
+                            job.  Detection previously existed only in
+                            sp_StatUpdate_Diag, so no-ops went unnoticed for weeks.
+
+                            o2md.9 (P3) -- the lazy mop-up zero-stats debug message
+                            interpolated @claimed_table_* after they were NULLed
+                            and always rendered NULL.NULL.
+
+            3.8.1.2026.07.25 - MONITORING: per-stat CONTEXT_INFO refresh
+                            (sp_StatUpdate-03i3 / gh-538).  The gh-423
+                            CONTEXT_INFO set at proc entry was static for the
+                            whole run (DB/Job/Preset only) -- a DBA using
+                            sp_WhoIsActive mid-run saw no run label, no stat
+                            index/total, no current stat name; only the inner
+                            dynamic UPDATE STATISTICS SQL was visible.
+                            CONTEXT_INFO is now refreshed every loop iteration
+                            with a compact 'SU|<n>/<total>|<schema.table.stat>
+                            |Run:<label>' payload (varchar, not nvarchar, to
+                            use the full 128-BYTE budget instead of 64 chars).
+                            Restored to the caller's original value on every
+                            exit path (unchanged).  The v2-era
+                            ##sp_StatUpdate_Progress global temp table this
+                            issue also proposed extending no longer exists --
+                            removed in the v3 API simplification -- so that
+                            part of the original ask is moot; CONTEXT_INFO
+                            plus the existing RAISERROR job-log progress
+                            already cover both the DMV/sp_WhoIsActive and
+                            job-log monitoring surfaces.
+
+            3.8.0.2026.07.25 - COLOR: opt-in @Ansi param (sp_StatUpdate-w0xp).
+                            @Ansi = N'Y' colorizes console (RAISERROR) output
+                            with ANSI SGR escape codes -- banners, discovery
+                            line, "Found N qualifying", the per-stat progress
+                            line, and the summary Succeeded/Failed/Remaining
+                            counts.  Default N'N' is byte-identical to prior
+                            output (all color variables are empty strings), so
+                            existing behavior, tests, CommandLog, OUTPUT params,
+                            and result sets are unchanged -- codes are injected
+                            into console RAISERROR text ONLY.  SSMS ignores the
+                            codes; use a color-aware terminal (Windows Terminal,
+                            sqlcmd piped to a color-aware pager) to see them.
+*/
+
+/*
+            3.7.4.2026.07.25 - SPILL PROOF: preselection-vs-proof @Help topic
+                            (sp_StatUpdate-ggnq / gh-552).  Query Store metrics
+                            (TEMPDB_SPILLS/WAITS/WAIT_CPU) preselect candidates
+                            before a run; they do NOT prove a sort spill in the
+                            UPDATE STATISTICS statement itself.  @Help now says
+                            so and points to sp_StatUpdate_XE_Session.sql, whose
+                            new sort_warning (primary) + hash_warning (secondary)
+                            events are the truthful proof surface.  No behavioral
+                            change to QS enrichment, ranking, or sort logic.
+
+            3.7.3.2026.07.23 - Publish early-rejection outcomes before severity-16
+                            signaling (sp_StatUpdate-2zla / gh-555):  the
+                            open-transaction guard and the ALREADY_RUNNING
+                            branch raised their severity-16 error BEFORE
+                            setting OUTPUT params, emitting the structured
+                            summary row, and (ALREADY_RUNNING) writing the
+                            gh-551 SP_STATUPDATE_DENIED artifact.  A caller
+                            wrapping EXEC in TRY/CATCH transfers control at
+                            the RAISERROR, so it received the exception
+                            WITHOUT the summary row or denial telemetry.
+                            Both paths now publish first and signal last
+                            (message/severity/state and return codes are
+                            unchanged; the lock transaction still commits
+                            before any signal).  Known T-SQL limit: OUTPUT
+                            parameters are not copied back when the caller
+                            catches the error, so TRY/CATCH callers should
+                            key off the streamed summary row, the denial
+                            CommandLog row, or ERROR_MESSAGE().  Callers
+                            without TRY/CATCH see identical behavior except
+                            the error message now follows the result set.
+
+            3.7.2.2026.07.23 - Phase 3B delta-enrichment cache key omits SchemaName
+                            (sp_StatUpdate-mtt4):  the gh-502 cl_lookup CTE
+                            joined CommandLog on DatabaseName + ObjectName +
+                            StatisticsName -- the same incomplete key fixed for
+                            Phase 5B in v3.7.1.  Same-named table+stat pairs in
+                            different schemas could read the other schema's last
+                            ModificationCounter, producing wrong
+                            effective_counter deltas (a stat could be skipped
+                            as already-current based on the wrong counter)
+                            and wrong modification_velocity.  SchemaName is now
+                            part of the join key.
+
+            3.7.1.2026.07.23 - QS score cache value + identity fix (sp_StatUpdate-rcng
+                            / gh-556):  Phase 5B cache hits were zeroed by the
+                            unconditional Phase 6 qs_priority_boost
+                            initialization while the live enrichment still
+                            skipped them, so every hit ranked as 0.  Zero-init
+                            now applies to cache misses only; the WAITS/WAIT_CPU
+                            wait-stats UPDATEs gain the same qs_cache_hit
+                            exclusion.  The cache key now also matches
+                            SchemaName (same-named table+stat in different
+                            schemas no longer share scores) and requires the
+                            cached QSMetric to equal the current run metric
+                            (the gh-503 invalidation contract); legacy rows
+                            without QSMetric are cache misses.
+
+            3.7.0.2026.07.03 - QS attribution + guardrail batch (sp_StatUpdate-zks1,
+                            -6aa2, -sss6, -o7gf, -u6n7, -l4ui, -lfbv):
+                            (1) gh-533 (zks1): pre-run QS forced-plan baseline --
+                            #qs_forced_baseline snapshots force_failure_count per
+                            database before any stat is touched (MANUAL-only
+                            filter on SQL 2017+ via plan_forcing_type; APC noise
+                            excluded).  Post-run delta: rising failure counts
+                            emit a QS_FORCED_PLAN_FAILURE_DELTA warning naming
+                            per-database deltas, and the END Summary XML gains a
+                            ForcedPlanFailureDelta element (omitted when zero).
+                            Databases whose baseline capture failed transiently
+                            are excluded from the delta (#qs_forced_baseline_dbs
+                            success markers) so pre-existing failures are never
+                            misattributed to the run.  (2) gh-534 (6aa2):
+                            @QueryStore = WAIT_CPU -- prioritizes by CPU-category
+                            waits only (sys.query_store_wait_stats
+                            wait_category = 1); complements WAITS (all
+                            categories).  (3) gh-539 (sss6): P2c budget-guard
+                            overshoot prevention -- before starting each stat,
+                            estimates duration from CommandLog history (MAX of
+                            last 10 successful updates, not AVG -- one 4-hour
+                            outlier must count) and defers stats that cannot fit
+                            the remaining @TimeLimit/@StopByTime budget.
+                            (4) gh-551 (o7gf): denied runs (ALREADY_RUNNING) now
+                            write a durable SP_STATUPDATE_DENIED CommandLog row
+                            with denial XML (denied session, holder session,
+                            holder login time / lock acquire time); suppressed
+                            under @LogToTable = N'N'.  (5) gh-554 (u6n7):
+                            filtered-drift proof surface -- FILTERED_DRIFT now
+                            outranks QUERY_STORE_PRIORITY in QualifyReason, and
+                            @FilteredStatsMode / @FilteredStatsStaleFactor are
+                            re-promoted to public parameters (the v3.0 API
+                            collapse had absorbed them with no preset exposing
+                            EXCLUDE/ONLY/PRIORITY, leaving those modes and the
+                            FILTERED_DRIFT sort unreachable).  Public input
+                            params: 42.  (6) gh-553 (l4ui): @Help preset topic
+                            rewritten as a bounded override contract -- presets
+                            are packaged configurations; the documented override
+                            set (@TimeLimit, @ModificationThreshold, @SortOrder,
+                            @StatisticsSample, @MopUpPass, @QueryStore,
+                            @LockTimeout) is the supported surface.  (7) lfbv:
+                            IO-corruption warning (severity 823/824 pattern)
+                            deduped via flag instead of LIKE-scan; fresh-stat
+                            physical_row_count aggregated once per object
+                            (GROUP BY derived table) instead of per stat.
+            3.6.0.2026.07.02 - Telemetry contract batch (sp_StatUpdate-mvgb, -r2d0,
+                            -ibyc, -6zvp, -wuq2, -hdls):
+                            (1) mvgb: END Summary XML gains a WarningsCodes
+                            element (pipe-delimited, same tokens as
+                            @WarningsCodesOut) on all five live END writers --
+                            the four early-return paths and the normal finalize.
+                            The orphan-cleanup fabricated END keeps no element
+                            (no live warnings context).  TOCTOU_SKIPS append
+                            moved above the Summary build so it lands in the
+                            element.  (2) r2d0: COMPLETED_WITH_SKIPPED_DBS is
+                            now applied to @stop_reason BEFORE the END row is
+                            written -- CommandLog previously always recorded
+                            plain COMPLETED and only the OUTPUT param showed
+                            the upgraded reason.  (3) gh-546: new
+                            @max_consecutive_failures_seen peak tracker +
+                            CONSECUTIVE_FAILURES_ELEVATED warning code (peak
+                            >= 3 without hitting the bailout); @Help WARNINGS
+                            topic expanded into the full format contract (all
+                            code tokens enumerated; codes may be added, never
+                            renamed/removed without a major version bump).
+                            (4) gh-518/545: EngineEdition 9 now emits
+                            AZURE_SQL_EDGE (DB/MI split shipped earlier).
+                            (5) gh-516: per-stat progress line gains wall-clock
+                            + ETA suffix (after 5 completed stats); startup
+                            advisory for the dangerous combo of a 0-1s lock
+                            timeout with @MaxConsecutiveFailures = 1.
+            3.5.9.2026.07.02 - Three fixes (sp_StatUpdate-7pqu, -f14h, -lh23):
+                            (1) gh-550: statistics that have NEVER been computed
+                            (dm_db_stats_properties returns last_updated NULL /
+                            modification_counter NULL) over POPULATED tables were
+                            silently never updated -- the Phase 4 outer gate
+                            effective_counter > 0 excluded them from every
+                            qualification branch including @StaleHours.  Fresh
+                            candidates now get a targeted sys.partitions row
+                            count (physical_row_count, fresh stats only) and a
+                            NEVER_UPDATED rescue branch in Phase 4; QualifyReason
+                            reports NEVER_UPDATED.  Fresh stats on EMPTY tables
+                            still do not qualify.  Same root cause as Ola
+                            IndexOptimize #990.  Mop-up pass intentionally
+                            unchanged (still requires modification_counter > 0).
+                            (2) gh-549: new @AbortOnIntegrityError bit = 1
+                            parameter -- default 1 preserves the existing
+                            abort-on-823/824/825 behavior; 0 emits the CHECKDB
+                            advisory + IO_CORRUPTION warning code (deduped),
+                            counts the stat as failed, and continues.  @FailFast
+                            = 1 still aborts regardless.  TOCTOU CATCH skips
+                            (208/15009/2767) now close their pre-inserted
+                            CommandLog row (EndTime + TOCTOU_SKIP message;
+                            ErrorNumber intentionally NULL so diag failure
+                            aggregations ignore them) instead of leaving it
+                            dangling with NULL EndTime like a killed stat.
+                            (3) gh-544: @QueryStore = WAITS filtered
+                            wait_category IN (3, 12, 15) = Lock, Preemptive,
+                            Network IO -- classes stats updates cannot influence.
+                            Corrected to 5, 6, 17, 21 (Buffer Latch, Buffer IO,
+                            Memory, Other Disk IO) and centralized into
+                            @qs_wait_categories ({{WAITS_CATEGORIES}} token) so
+                            the three consumer sites can no longer drift.
+            3.5.8.2026.06.12 - Telemetry bug fix (sp_StatUpdate-rse2):
+                            Four mid-run early returns (NO_QUALIFYING_STATS,
+                            FINGERPRINT_CONFLICT, MAX_WORKERS,
+                            QUEUE_INIT_ERROR) exited after the
+                            SP_STATUPDATE_START insert without writing an
+                            SP_STATUPDATE_END row.  Healthy runs were orphaned:
+                            diag C1 raised false KILLED_RUNS criticals, orphan
+                            cleanup later fabricated END rows with
+                            StopReason=KILLED, and the RELIABILITY grade was
+                            poisoned.  All four paths now write a real END row
+                            with full Summary XML and the true StopReason.
+                            Also fixed: the FINGERPRINT_CONFLICT branch was
+                            dead code -- its severity-16 RAISERROR fired inside
+                            a TRY whose CATCH was empty, so the RETURN 50001 /
+                            result-set block never ran and conflicting workers
+                            silently joined the queue anyway.  The conflict now
+                            sets a flag inside the TRY and exits via a label
+                            outside it, so the error surfaces to the caller AND
+                            the documented refuse-the-join semantics actually
+                            execute.
+            3.5.7.2026.06.12 - Parallel bug fix (sp_StatUpdate-v31y):
+                            Queue leadership re-claim no longer blocked by
+                            recycled SPIDs or idle pooled leader sessions.  The
+                            claim UPDATE judged liveness by bare session_id, so
+                            once a drained queue's old SessionID was reused by
+                            any live session (guaranteed sooner or later), every
+                            new worker with the same @parameters_string joined
+                            the completed queue, claimed nothing, and exited
+                            PARALLEL_COMPLETE with StatsFound > 0 but
+                            StatsProcessed = 0 -- a silent no-op maintenance
+                            run.  Liveness is now login_time-qualified
+                            (genuine claimer logged in before claiming; a
+                            recycled SPID logged in after), same-SPID rows are
+                            unconditionally stale (i7by semantics), a fully
+                            drained queue is re-claimable regardless of leader
+                            session state, and the active-worker guard is
+                            scoped to open claims (TableEndTime IS NULL).
+                            Found by ConcurrentParallel P3 on a fresh gate
+                            container.
+            3.5.6.2026.06.10 - Code-review batch (sp_StatUpdate-r77t, -orec, -mc03):
+                            r77t (P1 bug): fingerprint conflict check hoisted out
+                              of the queue-CREATOR branch so it also runs for
+                              queue JOINERS.  Previously any worker whose first
+                              non-locking Queue SELECT found an existing queue
+                              bypassed the @stored_fingerprint comparison
+                              entirely, so fingerprint-only params (gh-513
+                              critical-table params, mop-up params) could differ
+                              silently between members of one queue.
+                              Intentionally NOT fixed by adding those params to
+                              @parameters_string: differing strings would create
+                              separate queues that each process the full stat
+                              set (duplicate work).  FINGERPRINT_CONFLICT
+                              refusal is the designed semantic.
+                            orec (P2 bug): CONTEXT_INFO is now restored on all
+                              7 early-return paths after it is set (gh-423):
+                              PARAMETER_ERROR, NO_DATABASES, AG_SECONDARY,
+                              NO_QUALIFYING_STATS, FINGERPRINT_CONFLICT,
+                              MAX_WORKERS, QUEUE_INIT_ERROR.  Previously only
+                              FINALIZE restored it, so pooled sessions kept a
+                              stale sp_StatUpdate|... tag after early exits.
+                            mc03 (P3 batch): (a) removed the dead
+                              /StatInfo/StatisticName XPath limb from the three
+                              CommandLog readers (adaptive lookup + known-stats
+                              prefetch x2) -- no writer ever produced that XML
+                              shape; the StatisticsName column is authoritative.
+                              (b) @FirstTimeFullScanCapRows now also intercepts
+                              the RESAMPLE-of-persisted-100 path: a stat with
+                              PERSIST_SAMPLE_PERCENT = 100 under
+                              @StatisticsSample NULL previously re-ran an
+                              effective FULLSCAN via RESAMPLE that the
+                              =100 cap branch never saw.  (c) reworded the
+                              re-entrancy guard branch-A comment (a running call
+                              always has an active request; the branch guards
+                              the post-call idle window, not "between stats").
+                              (d) two em dashes in comments replaced with --.
+            3.5.5.2026.06.08 - Bug fix (sp_StatUpdate-i7by): false ALREADY_RUNNING
+                              on consecutive calls after a validation-error exit.
+                              Three-part fix in the re-entrancy guard:
+                              (S) When the existing lock holder is the caller's own
+                              session (SessionID = @@SPID), the row is unconditionally
+                              stale -- the prior call has by definition ended (we are
+                              now executing in that same session) so reclaim.
+                              Required because callers that wrap EXEC in TRY/CATCH
+                              catch the validation-error RAISERROR before the proc
+                              reaches its DELETE cleanup, leaving the row.
+                              (A) For DIFFERENT sessions: dead-holder reclaim treats
+                              a session as dead when it has no active request AND its
+                              last request finished > 60 seconds ago (catches async
+                              TCP teardown where the SPID lingers briefly in
+                              sys.dm_exec_sessions after client disconnect).
+                              (D) TTL guard: any lock row with AcquiredAt > 8 hours
+                              old reclaims unconditionally regardless of session state.
+            3.5.4.2026.06.08 - Two fixes (sp_StatUpdate-mhje, sp_StatUpdate-mknv):
+                            mhje: parallel TablePriority ordering inverted gh-505
+                              LPT vs the user's explicit @SortOrder.  LPT was
+                              PRIMARY (est_total_seconds DESC) and min_priority
+                              (which embeds @SortOrder=QUERY_STORE intent) was
+                              fallback.  On mature fleets with CommandLog
+                              history, LPT silently overrode QS prioritization
+                              -- QS-top stats landed at ProcessingPosition
+                              285-296 instead of 1-10.  Now: min_priority is
+                              PRIMARY, LPT is tiebreaker.  Preserves gh-505's
+                              wall-clock optimization within priority bands
+                              while honoring user @SortOrder.
+                            mknv: new @FirstTimeFullScanCapRows public param
+                              caps unbounded FULLSCAN on very large stats
+                              that have no CommandLog history yet.  Adaptive
+                              sampling (@LongRunningThresholdMinutes) only
+                              helps after a prior slow run is logged; first
+                              encounters on 770M-15.9B-row tables ran 3000+s
+                              FULLSCANs.  When @FirstTimeFullScanCapRows is
+                              set and @current_row_count exceeds it AND the
+                              stat has no completed CommandLog entry, the
+                              cap formula (CEILING(10M / row_count * 100),
+                              min 1%) overrides the FULLSCAN.  Default NULL
+                              = disabled (non-breaking).  Critical-table
+                              override (@CriticalSamplePercent) still wins.
+            3.5.3.2026.05.29 - Bug fix (sp_StatUpdate-isa2): @total_stats was
+                              initialized by a CASE inside a multi-variable
+                              DECLARE whose parallel branch reads the optional
+                              dbo.QueueStatistic table.  A CASE in a DECLARE is a
+                              single always-compiled statement, so SQL Server
+                              name-resolved the QueueStatistic branch even on
+                              non-parallel runs and failed with Msg 208 when the
+                              table was absent (it is auto-created only when
+                              @StatsInParallel = Y).  @total_stats is now assigned
+                              via IF/ELSE so the QueueStatistic reference is only
+                              resolved in parallel mode where the table exists.
+            3.5.2.2026.05.28 - Bug fix (sp_StatUpdate-trla): orphaned-run
+                              cleanup added a lower bound to the orphan START
+                              candidate hunt so it only considers STARTs within
+                              the same window as #orphan_end_labels (now minus
+                              (@i_orphaned_run_threshold_hours + 24h)).  A START
+                              older than that window whose real END also
+                              predated the window was not found in
+                              #orphan_end_labels and received a fabricated
+                              KILLED end, falsely flagging long-completed
+                              parallel runs as killed.
+            3.5.1.2026.05.07 - Bug fix (gh-515): failed UPDATE STATISTICS rows
+                              now write ExtendedInfo with RunLabel + full
+                              discovery context to CommandLog. Previously the
+                              per-stat CATCH branch UPDATE'd EndTime / ErrorNumber
+                              / ErrorMessage but left ExtendedInfo NULL, so
+                              sp_StatUpdate_Diag's C2 (REPEATED_FAILURES) check
+                              -- which extracts RunLabel from XML -- silently
+                              missed every failure.  TOCTOU rows (errors 208,
+                              15009, 2767) intentionally keep NULL ExtendedInfo
+                              so they don't aggregate as real failures.
+*/
+
+/*
+            3.5.0.2026.04.23 - @CriticalTables feature: per-table sample rate
+                              override with optional priority boost (gh-508).
+                              Three new params: @CriticalTables (comma-delimited
+                              table patterns with % wildcards), @CriticalSamplePercent
+                              (1-100, forces sample rate on critical tables only),
+                              @CriticalTablesFirst (Y/N, processes critical tables
+                              before everything else regardless of @SortOrder).
+                              PERSIST_SAMPLE_PERCENT auto-enabled for critical tables.
+                              ExtendedInfo includes IsCritical + CriticalSampleOverride.
+            3.4.1.2026.04.23 - @LockTimeout promoted to public parameter.
+                              Overrides preset @i_lock_timeout.  Values:
+                              -1 = wait forever, 0 = no wait, N > 0 = seconds.
+                              Addresses P3 Error 1222 lock-timeout failures
+                              observed in 2026-04-22 diagnostic run.
+            3.4.0.2026.04.22 - CommandLog intelligence: Phase 3B uses CommandLog
+                              ModificationCounter delta for threshold qualification
+                              instead of raw counter; stats with delta=0 skip
+                              qualification entirely (gh-502).  New sort order
+                              MODIFICATION_VELOCITY ranks by mods/hour (gh-507).
+                              Phase 5B caches QS scores from CommandLog; Phase 6
+                              skips expensive QS DMV joins for stats with fresh
+                              cached scores (gh-503).
+            3.3.5.2026.04.22 - QS forced plan check: replace CHARINDEX scan with
+                              sql_expression_dependencies integer join for compiled
+                              objects (gh-500); ad-hoc fallback retained.  Parallel
+                              mode: lead-worker gate prevents N-worker redundancy
+                              (gh-498).  Progress entries: parallel mode now shows
+                              global QueueStatistic total as denominator + GlobalStatsDone
+                              field in ExtendedInfo XML (gh-499).
+            3.3.4.2026.04.20 - Bug fix (gh-428 follow-up): removed server-level
+                              AG-secondary hard-error from parallel pre-flight.
+                              Previously @StatsInParallel=Y failed with severity-16
+                              ERROR whenever the server hosted any AG-secondary
+                              replicas, even when non-AG USER_DATABASES were
+                              also present -- regressing v2 behavior of silently
+                              skipping unreadable AG databases and proceeding
+                              against the remainder.  Region 04-DB-PARSE
+                              already filters AG-secondary databases out of
+                              @tmpDatabases and short-circuits when no
+                              eligible database remains, so the pre-flight
+                              guard was both redundant and incorrect.  Kept
+                              gh-428 Check 2 (orphan QueueStatistic row
+                              backlog warning).
+            3.3.1.2026.04.20 - Deploy fix: pre-ALTER-PROCEDURE migration for
+                              dbo.QueueStatistic.  ALTER PROCEDURE body has
+                              static references to ClaimLoginTime (bd -h9a) and
+                              LastStatCompletedAt (v2.3); upgrades from v2.26 or
+                              earlier failed compilation with "Invalid column
+                              name".  In-proc runtime migrations fire only when
+                              @StatsInParallel = Y (too late for compile).  New
+                              batches between stub CREATE and ALTER PROCEDURE
+                              add both columns if the table exists without
+                              them.  Idempotent; no-op on fresh installs.
+            3.3.0.2026.04.18 - Additive enhancements (5 issues):
+                            gh-423 @JobName input param -- optional context tag written
+                              to CONTEXT_INFO at entry and restored at exit.  Surfaced
+                              via Extended Events sessions and sys.dm_exec_requests.
+                            gh-425 @DeadWorkerTimeoutMinutes NULL coercion (floor 30s)
+                              + cross-QueueID stale-row sweep on parallel leader path.
+                              Old rows without matching sys.dm_exec_sessions entries are
+                              removed to prevent phantom worker inflation.
+                            gh-426 @WarningsCodesOut OUTPUT param -- pipe-delimited
+                              stable code tokens paired with existing @WarningsOut.
+                              Every @warnings site now also emits a code token so
+                              callers can parse warnings without string matching.
+                            gh-427 @SkipTablesWithNCCI / @SkipTablesWithCCI params --
+                              replaces the single @i_skip_tables_with_columnstore
+                              internal flag with per-type controls (type 6 NCCI,
+                              type 5 CCI).  Default: skip NCCI (Y), update CCI (N).
+                            gh-428 Parallel pre-flight validation -- AG-secondary guard
+                              and orphan-row backlog check added before queue init when
+                              @StatsInParallel = Y.
+            3.2.2.2026.04.17 - Internal refactors (3 issues, behavior-preserving):
+                            gh-461 @parameters_string built unconditionally in region 07B;
+                              removed duplicate construction in region 08.
+                            gh-462 mop-up discovery WHERE filter extracted into
+                              @mop_up_where_sql -- both parallel-leader and serial
+                              paths reference the shared variable.
+                            gh-465 empty-schema SELECT (WHERE 1=0 sentinel, ~35 cols)
+                              extracted into @empty_disc_select -- all 6 staged
+                              discovery bailout paths reference the shared variable.
+            3.2.1.2026.04.17 - Phase 5 bug fix (1 issue):
+                            gh-492 DIRECT_STRING discovery path (@Statistics param)
+                              now honors @TargetNorecompute and @ExcludeStatistics.
+                              Previously both filters were only applied in the
+                              staged discovery path.
+            3.2.2026.04.17 - Phase 4 quality/perf batch (9 issues):
+                            gh-470 per-database warning block (6 checks) now
+                              short-circuits when the database has zero stats
+                              in #stats_to_process -- saves up to 6 sp_executesql
+                              compilations + DMV scans per skipped db.
+                            gh-460 Phase 6 plan feedback query now bounded by
+                              @i_qs_recent_hours + @i_qs_top_plans -- prevents
+                              unbounded XML parsing on deep QS retention.
+                            gh-463 five COUNT_BIG(*) full-scans of #stats_to_process
+                              collapsed to one SUM(CASE) pass (NORECOMPUTE,
+                              incremental, heap, memory-opt, persisted sample).
+                            gh-464 orphan CommandLog cleanup materializes END
+                              RunLabels into a temp table -- replaces correlated
+                              per-row XML NOT EXISTS.
+                            gh-466 MAX_GRANT_PERCENT hint now token-replaced
+                              ({{MAX_GRANT_HINT}}) instead of sentinel-replacing
+                              the literal '= 25)' (fragile).
+                            gh-467 sys.partitions count for incremental stats
+                              cached per (database, object_id) across consecutive
+                              stats on the same table.
+                            gh-468 six per-database warning checks (RLS, wide stats,
+                              filter mismatch, columnstore, compressed, computed
+                              cols) now log failures to @warnings instead of
+                              silently swallowing in empty CATCH blocks.
+                            gh-469 threshold-logic explanation block now gated
+                              on @Debug = 1 (was firing on every run).
+            3.1.2026.04.17 - Phase 1 correctness batch (9 issues):
+                            gh-451 parallel early-return paths (FINGERPRINT_CONFLICT,
+                              MAX_WORKERS, QUEUE_INIT_ERROR) now set all OUTPUT params
+                              and return the summary result set.
+                            gh-452 second LOCK_TIMEOUT restore after the forced-plan
+                              check (sp_executesql SET LOCK_TIMEOUT persists).
+                            gh-453 @QueryStore = AVG_CPU now sorts by average CPU
+                              (divides SUM by SUM(count_executions)), not total CPU.
+                            gh-454 @parameter_fingerprint now includes
+                              @QueryStoreMinExecutions and @QueryStoreRecentHours so
+                              workers with different QS criteria cannot share a queue.
+                            gh-455 @MopUpPass + @StopByTime (without @TimeLimit) no
+                              longer rejected at validation.
+                            gh-456 bracket-quoted names in @Statistics
+                              (e.g. 'dbo.[My Table].[My Stat]') are now matched --
+                              brackets stripped from PARSENAME output.
+                            gh-457 @log_used_pct reset per-iteration so a failed
+                              sp_executesql cannot carry a stale value across dbs.
+                            gh-458 @SortOrder = RANDOM + @QueryStore enabled now
+                              raises a startup warning (QS boost is ignored).
+                            gh-459 parallel mop-up follower now reports correct
+                              MopUpFound (uses @mop_up_queued, not local
+                              #stats_to_process which has 0 unprocessed rows).
+            3.0.2026.04.07 - v3 architecture: preset-first API, 33 input params (was 58),
+                            + 10 OUTPUT params.  Absorbed 25 params into @i_ internal
+                            variables controlled by presets.  Table-driven validation,
+                            6-phase staged discovery only (no fallback path), removed join
+                            pattern grouping, removed global temp progress table, unified
+                            mop-up filters.  Full behavioral parity with v2.37.
 
 Key Features:
     - Preset-first API: DEFAULT, NIGHTLY, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE
