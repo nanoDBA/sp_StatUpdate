@@ -36,11 +36,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.11.2.2026.08.02 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.11.3.2026.11.06 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.11.2.2026.08.02 - 0859.9 (DarlingData-audit finding): the gh-505
+History:    3.11.3.2026.11.06 - Release carrying the SSMS 22 fix in sp_StatUpdate_Diag.sql
+                            (Msg 102 near GO, then Msg 111).  No code change here:
+                            this procedure has no nested comments and was not
+                            affected.
+
+            3.11.2.2026.08.02 - 0859.9 (DarlingData-audit finding): the gh-505
                             TablePriority estimate read historical durations
                             from CommandLog with the int-returning
                             DATEDIFF(MILLISECOND) -- a row spanning more than
@@ -983,8 +988,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.11.2.2026.08.02',
-        @procedure_version_date datetime = '20260802',
+        @procedure_version varchar(20) = '3.11.3.2026.11.06',
+        @procedure_version_date datetime = '20261106',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
