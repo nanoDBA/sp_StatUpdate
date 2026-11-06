@@ -26,6 +26,13 @@
 !assets/
 !assets/*.png
 
+# CI: SQL comment size check
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+!.github/scripts/
+!.github/scripts/*.py
+
 # Beads / Dolt files (added by bd init)
 .dolt/
 *.db

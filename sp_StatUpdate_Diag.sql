@@ -36,6 +36,10 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
+Comments:   The change history spans several comment blocks. SSMS 22 stops splitting
+            batches on GO after a block comment larger than 64 KiB. Keep each block
+            under 32,000 characters; CI enforces this.
+
 Version:    2026.08.02.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
             2026.08.02.1 - 0859.9 + 0859.10 (DarlingData-audit findings).
                            0859.9: #stat_updates extraction computed
@@ -356,7 +360,9 @@ Version:    2026.08.02.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            waits, and parallel-worker queue-idle as untested
                            alternative causes before attributing to
                            discovery/environment cost.
+*/
 
+/*
             2026.07.30.3 - o2md.12: C6 SILENT_NOOP_RUN evidence + NULL-vs-0
                            split.  Evidence previously carried only
                            StartTime/StopReason/StatsFound -- the
@@ -657,6 +663,9 @@ History:    2026.07.23.2 - Empty-CommandLog single-result envelope (0pgq / gh-55
                            suggested @CriticalTables comment to the recommended
                            EXEC call listing the top contended tables so the
                            operator can apply per-table priority boost.
+*/
+
+/*
             2026.05.28.1 - Two parallel-mode false-positive fixes.
                            (1) sp_StatUpdate-772k: #runs dedup tiebreaker is now
                            ORDER BY StartTime DESC, IsKilled ASC, EndTime DESC.
