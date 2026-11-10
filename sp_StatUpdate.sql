@@ -36,14 +36,14 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.11.3.2026.11.06 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.11.4.2026.11.10 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.11.3.2026.11.06 - Release carrying the SSMS 22 fix in sp_StatUpdate_Diag.sql
-                            (Msg 102 near GO, then Msg 111).  No code change here:
-                            this procedure has no nested comments and was not
-                            affected.
+History:    3.11.4.2026.11.10 - Release fixes from GitHub issues #657-#661:
+                            complete help output, explicit collation handling,
+                            skipped-stat logging, cache reset after CommandLog
+                            reuse, and clear StopByTime overshoot guidance.
 
             3.11.2.2026.08.02 - 0859.9 (DarlingData-audit finding): the gh-505
                             TablePriority estimate read historical durations
@@ -988,8 +988,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.11.3.2026.11.06',
-        @procedure_version_date datetime = '20261106',
+        @procedure_version varchar(20) = '3.11.4.2026.11.10',
+        @procedure_version_date datetime = '20261110',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -1046,6 +1046,7 @@ BEGIN
             description = r.description
         FROM (VALUES
             (N'@Statistics',        N'sysname',       N'NULL',      N'Direct mode: Schema.Table.Stat (comma-separated)'),
+            (N'@JobName',           N'sysname',       N'NULL',      N'Optional caller tag written to CONTEXT_INFO for XE and live session monitoring'),
             (N'@Preset',            N'nvarchar(20)',   N'DEFAULT',   N'DEFAULT, NIGHTLY, WEEKLY_FULL, OLTP_LIGHT, WAREHOUSE'),
             (N'@Databases',         N'nvarchar(max)',  N'NULL',      N'NULL=current DB. USER_DATABASES, ALL_DATABASES, wildcards, exclusions'),
             (N'@Tables',            N'nvarchar(max)',  N'NULL',      N'NULL=all tables, or Schema.Table list'),
@@ -1064,6 +1065,7 @@ BEGIN
             (N'@MopUpPass',         N'nvarchar(1)',    N'NULL',      N'Y/N. Broad sweep with remaining time'),
             (N'@StatisticsSample',  N'integer',        N'NULL',      N'1-100 (100=FULLSCAN), NULL=auto'),
             (N'@MaxDOP',            N'integer',        N'NULL',      N'MAXDOP for UPDATE STATISTICS'),
+            (N'@LockTimeout',        N'integer',        N'NULL',      N'Override preset lock timeout in seconds; -1 waits indefinitely, 0 does not wait'),
             (N'@ModificationThreshold', N'bigint',     N'NULL',      N'Override preset mod threshold floor. NULL=preset decides'),
             (N'@LongRunningThresholdMinutes', N'integer', N'NULL',   N'Stats slower than this get forced sample. NULL=disabled'),
             (N'@LongRunningSamplePercent', N'integer',  N'NULL',     N'Sample pct for long-running stats. NULL=preset (10%)'),
@@ -1084,6 +1086,8 @@ BEGIN
             (N'@FilteredStatsStaleFactor', N'float',       N'NULL', N'A filtered stat counts as drifted when unfiltered_rows / rows exceeds this factor (default 2.0).  Drift-qualified stats under PRIORITY mode report QualifyReason = FILTERED_DRIFT.'),
             (N'@Debug',                 N'bit',            N'0',   N'Verbose output'),
             (N'@Ansi',                  N'nvarchar(1)',    N'N',   N'Y = colorize console (RAISERROR) output with ANSI escape codes; N (default) = plain text.  Console-only -- never touches CommandLog, OUTPUT params, or result sets.  SSMS ignores the codes; use a color-aware terminal.'),
+            (N'@SkipTablesWithNCCI', N'nchar(1)',       N'Y',      N'Y skips tables with nonclustered columnstore indexes; N includes them'),
+            (N'@SkipTablesWithCCI',  N'nchar(1)',       N'N',      N'Y skips tables with clustered columnstore indexes; N includes them'),
             (N'@StatsInParallel',       N'nvarchar(1)',    N'N',   N'Queue-based parallel processing'),
             (N'@Help',                  N'nvarchar(50)',   N'0',   N'1 = show this help')
         ) AS r(parameter, data_type, default_value, description);
@@ -2294,7 +2298,7 @@ BEGIN
         @i_long_running_sample_pct int = 10,
         @i_max_grant_percent int = 10,
         @i_progress_log_interval int = 50,
-        @i_log_skipped nvarchar(1) = N'N',
+        @i_log_skipped nvarchar(1) = N'Y', /* Audit TOCTOU skips whenever @LogToTable is enabled. */
         @i_orphaned_run_threshold_hours int = 48,
         @i_command_log_retention_days int = 90,
         @i_max_seconds_per_stat int = NULL,
@@ -4470,8 +4474,8 @@ SELECT
         WHEN @CriticalTables_param IS NOT NULL
              AND EXISTS (
                  SELECT 1
-                 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
-                 WHERE ISNULL(ps.parsed_schema, OBJECT_SCHEMA_NAME(s.object_id)) + N''.'' + ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                 FROM STRING_SPLIT(@CriticalTables_param COLLATE DATABASE_DEFAULT, N'','') AS ct
+                 WHERE ((ISNULL(ps.parsed_schema, OBJECT_SCHEMA_NAME(s.object_id)) COLLATE DATABASE_DEFAULT) + N''.'' + (ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                     OR ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
              )
         THEN CONVERT(bit, 1)
@@ -4488,10 +4492,10 @@ SELECT
     unfiltered_rows = sp.unfiltered_rows,
     priority = ROW_NUMBER() OVER (ORDER BY
         /* gh-511: Critical tables first */
-        CASE WHEN @CriticalTablesFirst_param = N''Y'' THEN
+        CASE WHEN @CriticalTablesFirst_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2 THEN
             CASE WHEN @CriticalTables_param IS NOT NULL
-                 AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
-                     WHERE ISNULL(ps.parsed_schema, OBJECT_SCHEMA_NAME(s.object_id)) + N''.'' + ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                 AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param COLLATE DATABASE_DEFAULT, N'','') AS ct
+                     WHERE ((ISNULL(ps.parsed_schema, OBJECT_SCHEMA_NAME(s.object_id)) COLLATE DATABASE_DEFAULT) + N''.'' + (ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                         OR ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
             THEN 1 ELSE 0 END
         ELSE 0 END DESC,
@@ -4518,12 +4522,12 @@ OUTER APPLY
     WHERE p.object_id = s.object_id
     AND   p.index_id IN (0, 1)
 ) AS pgs
-WHERE (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @i_include_system_objects_param = N''Y'')
+WHERE (OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1 OR @i_include_system_objects_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2)
 /* gh-492: NORECOMPUTE filter (was missing in DIRECT_STRING path) */
 AND   (
-          (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
-       OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
-       OR @TargetNorecompute_param = N''BOTH''
+          (@TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''N'' COLLATE Latin1_General_100_BIN2 AND s.no_recompute = 0)
+       OR (@TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2 AND s.no_recompute = 1)
+       OR @TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''BOTH'' COLLATE Latin1_General_100_BIN2
       )
 /* gh-492: Statistics exclusion filter (was missing in DIRECT_STRING path) */
 AND   (
@@ -4531,7 +4535,7 @@ AND   (
        OR NOT EXISTS
           (
               SELECT 1
-              FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
+              FROM STRING_SPLIT(@ExcludeStatistics_param COLLATE DATABASE_DEFAULT, N'','') AS ex
               WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                  OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
           )
@@ -4977,11 +4981,11 @@ OPTION (RECOMPILE);';
                 FROM sys.stats AS s
                 JOIN sys.objects AS o ON o.object_id = s.object_id
                 LEFT JOIN sys.tables AS t ON t.object_id = s.object_id
-                WHERE (o.is_ms_shipped = 0 OR @i_include_system_objects_param = N''Y'')
+                WHERE (o.is_ms_shipped = 0 OR @i_include_system_objects_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2)
                 AND   (
                           OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
-                       OR @i_include_system_objects_param = N''Y''
-                       OR (o.type = N''V'' AND @i_include_indexed_views_param = N''Y''
+                       OR @i_include_system_objects_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2
+                       OR (o.type = N''V'' AND @i_include_indexed_views_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2
                            AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
                       ) /* #49: Include indexed views when requested */
                 AND   o.type NOT IN (N''ET'', N''S'') /* Exclude external tables (#54) and system tables */
@@ -5000,17 +5004,17 @@ OPTION (RECOMPILE);';
                       )
                 /* NORECOMPUTE filter */
                 AND   (
-                          (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
-                       OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
-                       OR @TargetNorecompute_param = N''BOTH''
+                          (@TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''N'' COLLATE Latin1_General_100_BIN2 AND s.no_recompute = 0)
+                       OR (@TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2 AND s.no_recompute = 1)
+                       OR @TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''BOTH'' COLLATE Latin1_General_100_BIN2
                       )
                 /* Table filter */
                 AND   (
                           @Tables_param IS NULL
-                       OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                       OR ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT IN
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param COLLATE DATABASE_DEFAULT, N'','') AS ss)
                        OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param COLLATE DATABASE_DEFAULT, N'','') AS ss)
                       )
                 /* Table exclusion filter */
                 AND   (
@@ -5018,8 +5022,8 @@ OPTION (RECOMPILE);';
                        OR NOT EXISTS
                           (
                               SELECT 1
-                              FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
-                              WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                              FROM STRING_SPLIT(@ExcludeTables_param COLLATE DATABASE_DEFAULT, N'','') AS ex
+                              WHERE ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                           )
                       )
                 /* Statistics exclusion filter */
@@ -5028,17 +5032,17 @@ OPTION (RECOMPILE);';
                        OR NOT EXISTS
                           (
                               SELECT 1
-                              FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
+                              FROM STRING_SPLIT(@ExcludeStatistics_param COLLATE DATABASE_DEFAULT, N'','') AS ex
                               WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                                  OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                           )
                       )
                 /* Filtered stats mode filter */
                 AND   (
-                          @i_filtered_stats_mode_param = N''INCLUDE''
-                       OR @i_filtered_stats_mode_param = N''PRIORITY''
-                       OR (@i_filtered_stats_mode_param = N''EXCLUDE'' AND s.has_filter = 0)
-                       OR (@i_filtered_stats_mode_param = N''ONLY'' AND s.has_filter = 1)
+                          @i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''INCLUDE'' COLLATE Latin1_General_100_BIN2
+                       OR @i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''PRIORITY'' COLLATE Latin1_General_100_BIN2
+                       OR (@i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''EXCLUDE'' COLLATE Latin1_General_100_BIN2 AND s.has_filter = 0)
+                       OR (@i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''ONLY'' COLLATE Latin1_General_100_BIN2 AND s.has_filter = 1)
                       )
                 /* gh-427: Per-type columnstore skip (NCCI=type 6, CCI=type 5).
                    @i_skip_ncci_param=Y skips tables with nonclustered columnstore (plan stability).
@@ -5047,7 +5051,7 @@ OPTION (RECOMPILE);';
                    and both new params are N, emulates the previous combined skip. */
                 AND   (
                           /* NCCI check */
-                          @i_skip_ncci_param = N''N''
+                          @i_skip_ncci_param COLLATE Latin1_General_100_BIN2 = N''N'' COLLATE Latin1_General_100_BIN2
                        OR NOT EXISTS
                           (
                               SELECT 1
@@ -5058,7 +5062,7 @@ OPTION (RECOMPILE);';
                       )
                 AND   (
                           /* CCI check */
-                          @i_skip_cci_param = N''N''
+                          @i_skip_cci_param COLLATE Latin1_General_100_BIN2 = N''N'' COLLATE Latin1_General_100_BIN2
                        OR NOT EXISTS
                           (
                               SELECT 1
@@ -5376,7 +5380,7 @@ OPTION (RECOMPILE);';
                 sys.identity_columns. This prevents histogram staleness for insert-heavy
                 tables where modification_counter hasn''t hit threshold yet.
                 */
-                IF @i_ascending_key_boost_param = N''Y''
+                IF @i_ascending_key_boost_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2
                 BEGIN
                     DECLARE @ascending_rescued int = 0;
 
@@ -5729,7 +5733,7 @@ OPTION (RECOMPILE);';
                         {{WAITS_JOIN}}
                         WHERE qsrsi.end_time >= DATEADD(HOUR, -@i_qs_recent_hours_param, SYSDATETIME())
                         GROUP BY qsp.plan_id
-                        ORDER BY CASE @i_qs_metric_param
+                        ORDER BY CASE @i_qs_metric_param COLLATE Latin1_General_100_BIN2
                             WHEN N''CPU''        THEN SUM(qsrs.avg_cpu_time * qsrs.count_executions)
                             WHEN N''DURATION''    THEN SUM(qsrs.avg_duration * qsrs.count_executions)
                             WHEN N''READS''       THEN SUM(CONVERT(float, qsrs.avg_logical_io_reads * qsrs.count_executions))
@@ -5765,8 +5769,8 @@ OPTION (RECOMPILE);';
                         FROM PlanTableRefs AS ptr
                         JOIN (SELECT DISTINCT object_id, schema_name, table_name
                               FROM #stat_candidates) AS sc
-                            ON sc.schema_name = ptr.ref_schema COLLATE DATABASE_DEFAULT
-                            AND sc.table_name = ptr.ref_table COLLATE DATABASE_DEFAULT
+                            ON sc.schema_name COLLATE Latin1_General_100_BIN2 = ptr.ref_schema COLLATE Latin1_General_100_BIN2
+                            AND sc.table_name COLLATE Latin1_General_100_BIN2 = ptr.ref_table COLLATE Latin1_General_100_BIN2
                     ),
                     QSByTable AS (
                         SELECT
@@ -5807,7 +5811,7 @@ OPTION (RECOMPILE);';
                         sc.qs_priority_boost =
                             CASE
                                 WHEN ISNULL(qs.total_executions, 0) >= @i_qs_min_executions_param
-                                THEN CASE @i_qs_metric_param
+                                THEN CASE @i_qs_metric_param COLLATE Latin1_General_100_BIN2
                                          WHEN N''CPU'' THEN ISNULL(qs.total_cpu_ms, 0)
                                          WHEN N''DURATION'' THEN ISNULL(qs.total_duration_ms, 0)
                                          WHEN N''READS'' THEN ISNULL(qs.total_logical_reads, 0) / 1000
@@ -5888,7 +5892,7 @@ OPTION (RECOMPILE);';
                        {{WAITS_CATEGORIES}} token is switched to N''1'' (SOS_SCHEDULER_YIELD)
                        upstream when the metric is WAIT_CPU. */
                     IF OBJECT_ID(N''sys.query_store_wait_stats'') IS NOT NULL
-                    AND @i_qs_metric_param IN (N''WAITS'', N''WAIT_CPU'')
+                    AND @i_qs_metric_param COLLATE Latin1_General_100_BIN2 IN (N''WAITS'' COLLATE Latin1_General_100_BIN2, N''WAIT_CPU'' COLLATE Latin1_General_100_BIN2)
                     BEGIN
                         /* o2md (QuickieStore comparison): wait_stats_capture_mode is a
                            SQL 2017+ column, safe to read unconditionally here since it''s
@@ -5938,8 +5942,8 @@ OPTION (RECOMPILE);';
                             FROM WaitPlanTableRefs AS wptr
                             JOIN (SELECT DISTINCT object_id, schema_name, table_name
                                   FROM #stat_candidates) AS sc2
-                                ON sc2.schema_name = wptr.ref_schema COLLATE DATABASE_DEFAULT
-                                AND sc2.table_name = wptr.ref_table COLLATE DATABASE_DEFAULT
+                                ON sc2.schema_name COLLATE Latin1_General_100_BIN2 = wptr.ref_schema COLLATE Latin1_General_100_BIN2
+                                AND sc2.table_name COLLATE Latin1_General_100_BIN2 = wptr.ref_table COLLATE Latin1_General_100_BIN2
                         ),
                         WaitByTable AS (
                             SELECT
@@ -5966,7 +5970,7 @@ OPTION (RECOMPILE);';
                        6aa2 / gh-534: WAIT_CPU uses the same boost formula -- the total_wait_ms is
                        simply the sum of wait_category = 1 (SOS_SCHEDULER_YIELD) instead of the
                        Buffer/Memory/IO set. */
-                    IF @i_qs_metric_param IN (N''WAITS'', N''WAIT_CPU'')
+                    IF @i_qs_metric_param COLLATE Latin1_General_100_BIN2 IN (N''WAITS'' COLLATE Latin1_General_100_BIN2, N''WAIT_CPU'' COLLATE Latin1_General_100_BIN2)
                     BEGIN
                         UPDATE sc
                         SET sc.qs_priority_boost = CASE
@@ -6016,7 +6020,7 @@ OPTION (RECOMPILE);';
                         WHEN @CriticalTables_param IS NOT NULL
                              AND EXISTS (
                                  SELECT 1
-                                 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                                 FROM STRING_SPLIT(@CriticalTables_param COLLATE DATABASE_DEFAULT, N'','') AS ct
                                  WHERE schema_name + N''.'' + table_name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                                     OR table_name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                              )
@@ -6060,15 +6064,15 @@ OPTION (RECOMPILE);';
                     priority = ROW_NUMBER() OVER (
                         ORDER BY
                             /* gh-511: Critical tables first -- when @CriticalTablesFirst=Y, process critical tables before everything else */
-                            CASE WHEN @CriticalTablesFirst_param = N''Y'' THEN
+                            CASE WHEN @CriticalTablesFirst_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2 THEN
                                 CASE WHEN @CriticalTables_param IS NOT NULL
-                                     AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
+                                     AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param COLLATE DATABASE_DEFAULT, N'','') AS ct
                                          WHERE schema_name + N''.'' + table_name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                                             OR table_name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
                                 THEN 1 ELSE 0 END
                             ELSE 0 END DESC,
                             /* #167: Filtered stats priority boost -- when @i_filtered_stats_mode=PRIORITY, boost filtered stats showing drift */
-                            CASE WHEN @i_filtered_stats_mode_param = N''PRIORITY''
+                            CASE WHEN @i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''PRIORITY'' COLLATE Latin1_General_100_BIN2
                                       AND has_filter = 1
                                       AND ISNULL(rows, 0) > 0
                                       AND unfiltered_rows IS NOT NULL
@@ -6076,7 +6080,7 @@ OPTION (RECOMPILE);';
                                  THEN CONVERT(bigint, 500000000000)
                                  ELSE 0
                             END +
-                            CASE @i_sort_order_param
+                            CASE @i_sort_order_param COLLATE Latin1_General_100_BIN2
                                 WHEN N''MODIFICATION_COUNTER'' THEN ISNULL(effective_counter, modification_counter) + ISNULL(qs_priority_boost, 0)
                                 WHEN N''MODIFICATION_VELOCITY'' THEN ISNULL(CONVERT(bigint, modification_velocity), 0) + ISNULL(qs_priority_boost, 0)
                                 WHEN N''DAYS_STALE'' THEN days_stale + ISNULL(qs_priority_boost, 0)
@@ -8249,8 +8253,8 @@ OPTION (RECOMPILE);';
                                 WHEN @CriticalTables_param IS NOT NULL
                                      AND EXISTS (
                                          SELECT 1
-                                         FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
-                                         WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                         FROM STRING_SPLIT(@CriticalTables_param COLLATE DATABASE_DEFAULT, N'','') AS ct
+                                         WHERE ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                                             OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                                      )
                                 THEN CONVERT(bit, 1)
@@ -8284,10 +8288,10 @@ OPTION (RECOMPILE);';
                             temporal_type = ISNULL(t.temporal_type, 0),
                             priority = ROW_NUMBER() OVER (ORDER BY
                                 /* gh-511: Critical tables first */
-                                CASE WHEN @CriticalTablesFirst_param = N''Y'' THEN
+                                CASE WHEN @CriticalTablesFirst_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2 THEN
                                     CASE WHEN @CriticalTables_param IS NOT NULL
-                                         AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
-                                             WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                         AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param COLLATE DATABASE_DEFAULT, N'','') AS ct
+                                             WHERE ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                                                 OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
                                     THEN 1 ELSE 0 END
                                 ELSE 0 END DESC,
@@ -8307,22 +8311,22 @@ OPTION (RECOMPILE);';
                         /* v2.28: Object type filter (defense-in-depth, matches main discovery) */
                         AND   (
                                   OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
-                               OR @i_include_system_objects_param = N''Y''
-                               OR (o.type = N''V'' AND @i_include_indexed_views_param = N''Y''
+                               OR @i_include_system_objects_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2
+                               OR (o.type = N''V'' AND @i_include_indexed_views_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2
                                    AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
                               )
-                        AND   (o.is_ms_shipped = 0 OR @i_include_system_objects_param = N''Y'')
+                        AND   (o.is_ms_shipped = 0 OR @i_include_system_objects_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2)
                         AND   o.type NOT IN (N''ET'', N''S'')
-                        AND   (@TargetNorecompute_param = N''BOTH''
-                               OR (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
-                               OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1))
+                        AND   (@TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''BOTH'' COLLATE Latin1_General_100_BIN2
+                               OR (@TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''N'' COLLATE Latin1_General_100_BIN2 AND s.no_recompute = 0)
+                               OR (@TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2 AND s.no_recompute = 1))
                         /* v2.28: Table inclusion filter (defense-in-depth) */
                         AND   (
                                   @Tables_param IS NULL
-                               OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                                  (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                               OR ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT IN
+                                  (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param COLLATE DATABASE_DEFAULT, N'','') AS ss)
                                OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                                  (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                                  (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param COLLATE DATABASE_DEFAULT, N'','') AS ss)
                               )
                         /* v2.28: Table exclusion filter (defense-in-depth) */
                         AND   (
@@ -8330,8 +8334,8 @@ OPTION (RECOMPILE);';
                                OR NOT EXISTS
                                   (
                                       SELECT 1
-                                      FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
-                                      WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                                      FROM STRING_SPLIT(@ExcludeTables_param COLLATE DATABASE_DEFAULT, N'','') AS ex
+                                      WHERE ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                                   )
                               )
                         /* v2.26: Statistics exclusion filter (was missing from lazy mop-up) */
@@ -8340,17 +8344,17 @@ OPTION (RECOMPILE);';
                                OR NOT EXISTS
                                   (
                                       SELECT 1
-                                      FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
+                                      FROM STRING_SPLIT(@ExcludeStatistics_param COLLATE DATABASE_DEFAULT, N'','') AS ex
                                       WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                                          OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                                   )
                               )
                         /* v2.27: Filtered stats mode filter */
                         AND   (
-                                  @i_filtered_stats_mode_param = N''INCLUDE''
-                               OR @i_filtered_stats_mode_param = N''PRIORITY''
-                               OR (@i_filtered_stats_mode_param = N''EXCLUDE'' AND s.has_filter = 0)
-                               OR (@i_filtered_stats_mode_param = N''ONLY'' AND s.has_filter = 1)
+                                  @i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''INCLUDE'' COLLATE Latin1_General_100_BIN2
+                               OR @i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''PRIORITY'' COLLATE Latin1_General_100_BIN2
+                               OR (@i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''EXCLUDE'' COLLATE Latin1_General_100_BIN2 AND s.has_filter = 0)
+                               OR (@i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''ONLY'' COLLATE Latin1_General_100_BIN2 AND s.has_filter = 1)
                               )
                         /* v2.27: Stretch Database auto-skip (#55, defense-in-depth) */
                         AND   ISNULL(OBJECTPROPERTY(s.object_id, N''TableHasRemoteDataArchive''), 0) = 0
@@ -8367,12 +8371,12 @@ OPTION (RECOMPILE);';
                               )
                         /* gh-427: Per-type columnstore skip for lazy mop-up discovery */
                         AND   (
-                                  @i_skip_ncci_param = N''N''
+                                  @i_skip_ncci_param COLLATE Latin1_General_100_BIN2 = N''N'' COLLATE Latin1_General_100_BIN2
                                OR NOT EXISTS
                                   (SELECT 1 FROM sys.indexes AS ci WHERE ci.object_id = s.object_id AND ci.type = 6)
                               )
                         AND   (
-                                  @i_skip_cci_param = N''N''
+                                  @i_skip_cci_param COLLATE Latin1_General_100_BIN2 = N''N'' COLLATE Latin1_General_100_BIN2
                                OR NOT EXISTS
                                   (SELECT 1 FROM sys.indexes AS ci WHERE ci.object_id = s.object_id AND ci.type = 5)
                               )
@@ -10460,11 +10464,11 @@ OPTION (RECOMPILE);';
                 WHERE ISNULL(sp.modification_counter, 0) > 0
                 AND   (
                           OBJECTPROPERTY(s.object_id, N''IsUserTable'') = 1
-                       OR @i_include_system_objects_param = N''Y''
-                       OR (o.type = N''V'' AND @i_include_indexed_views_param = N''Y''
+                       OR @i_include_system_objects_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2
+                       OR (o.type = N''V'' AND @i_include_indexed_views_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2
                            AND EXISTS (SELECT 1 FROM sys.indexes AS vi WHERE vi.object_id = s.object_id AND vi.index_id = 1))
                       )
-                AND   (o.is_ms_shipped = 0 OR @i_include_system_objects_param = N''Y'')
+                AND   (o.is_ms_shipped = 0 OR @i_include_system_objects_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2)
                 AND   o.type NOT IN (N''ET'', N''S'')
                 /* v2.27: Stretch Database auto-skip (#55) */
                 AND   ISNULL(OBJECTPROPERTY(s.object_id, N''TableHasRemoteDataArchive''), 0) = 0
@@ -10480,17 +10484,17 @@ OPTION (RECOMPILE);';
                           AND   rfg.is_read_only = 1
                       )
                 AND   (
-                          (@TargetNorecompute_param = N''N'' AND s.no_recompute = 0)
-                       OR (@TargetNorecompute_param = N''Y'' AND s.no_recompute = 1)
-                       OR @TargetNorecompute_param = N''BOTH''
+                          (@TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''N'' COLLATE Latin1_General_100_BIN2 AND s.no_recompute = 0)
+                       OR (@TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2 AND s.no_recompute = 1)
+                       OR @TargetNorecompute_param COLLATE Latin1_General_100_BIN2 = N''BOTH'' COLLATE Latin1_General_100_BIN2
                       )
                 /* v2.27: Table inclusion filter */
                 AND   (
                           @Tables_param IS NULL
-                       OR OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                       OR ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT IN
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param COLLATE DATABASE_DEFAULT, N'','') AS ss)
                        OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT IN
-                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param, N'','') AS ss)
+                          (SELECT LTRIM(RTRIM(ss.value)) COLLATE DATABASE_DEFAULT FROM STRING_SPLIT(@Tables_param COLLATE DATABASE_DEFAULT, N'','') AS ss)
                       )
                 /* v2.26: Table exclusion filter (was missing from mop-up) */
                 AND   (
@@ -10498,8 +10502,8 @@ OPTION (RECOMPILE);';
                        OR NOT EXISTS
                           (
                               SELECT 1
-                              FROM STRING_SPLIT(@ExcludeTables_param, N'','') AS ex
-                              WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
+                              FROM STRING_SPLIT(@ExcludeTables_param COLLATE DATABASE_DEFAULT, N'','') AS ex
+                              WHERE ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                           )
                       )
                 /* v2.26: Statistics exclusion filter (was missing from mop-up) */
@@ -10508,25 +10512,25 @@ OPTION (RECOMPILE);';
                        OR NOT EXISTS
                           (
                               SELECT 1
-                              FROM STRING_SPLIT(@ExcludeStatistics_param, N'','') AS ex
+                              FROM STRING_SPLIT(@ExcludeStatistics_param COLLATE DATABASE_DEFAULT, N'','') AS ex
                               WHERE s.name COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                                  OR s.name COLLATE DATABASE_DEFAULT = LTRIM(RTRIM(ex.value)) COLLATE DATABASE_DEFAULT
                           )
                       )
                 /* v2.27: Filtered stats mode filter */
                 AND   (
-                          @i_filtered_stats_mode_param = N''INCLUDE''
-                       OR @i_filtered_stats_mode_param = N''PRIORITY''
-                       OR (@i_filtered_stats_mode_param = N''EXCLUDE'' AND s.has_filter = 0)
-                       OR (@i_filtered_stats_mode_param = N''ONLY'' AND s.has_filter = 1)
+                          @i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''INCLUDE'' COLLATE Latin1_General_100_BIN2
+                       OR @i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''PRIORITY'' COLLATE Latin1_General_100_BIN2
+                       OR (@i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''EXCLUDE'' COLLATE Latin1_General_100_BIN2 AND s.has_filter = 0)
+                       OR (@i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''ONLY'' COLLATE Latin1_General_100_BIN2 AND s.has_filter = 1)
                       )
                 /* gh-427: Per-type columnstore skip (NCCI=6, CCI=5) */
                 AND   (
-                          @i_skip_ncci_param = N''N''
+                          @i_skip_ncci_param COLLATE Latin1_General_100_BIN2 = N''N'' COLLATE Latin1_General_100_BIN2
                        OR NOT EXISTS (SELECT 1 FROM sys.indexes AS ci WHERE ci.object_id = s.object_id AND ci.type = 6)
                       )
                 AND   (
-                          @i_skip_cci_param = N''N''
+                          @i_skip_cci_param COLLATE Latin1_General_100_BIN2 = N''N'' COLLATE Latin1_General_100_BIN2
                        OR NOT EXISTS (SELECT 1 FROM sys.indexes AS ci WHERE ci.object_id = s.object_id AND ci.type = 5)
                       )
                 /* v2.27: Minimum page count filter */
@@ -10695,8 +10699,8 @@ OPTION (RECOMPILE);';
                             WHEN @CriticalTables_param IS NOT NULL
                                  AND EXISTS (
                                      SELECT 1
-                                     FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
-                                     WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                     FROM STRING_SPLIT(@CriticalTables_param COLLATE DATABASE_DEFAULT, N'','') AS ct
+                                     WHERE ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                                         OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                                  )
                             THEN CONVERT(bit, 1)
@@ -10730,10 +10734,10 @@ OPTION (RECOMPILE);';
                         temporal_type = ISNULL(t.temporal_type, 0),
                         priority = ROW_NUMBER() OVER (ORDER BY
                             /* gh-511: Critical tables first */
-                            CASE WHEN @CriticalTablesFirst_param = N''Y'' THEN
+                            CASE WHEN @CriticalTablesFirst_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2 THEN
                                 CASE WHEN @CriticalTables_param IS NOT NULL
-                                     AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
-                                         WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                     AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param COLLATE DATABASE_DEFAULT, N'','') AS ct
+                                         WHERE ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                                             OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
                                 THEN 1 ELSE 0 END
                             ELSE 0 END DESC,
@@ -11167,8 +11171,8 @@ OPTION (RECOMPILE);';
                         WHEN @CriticalTables_param IS NOT NULL
                              AND EXISTS (
                                  SELECT 1
-                                 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
-                                 WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                 FROM STRING_SPLIT(@CriticalTables_param COLLATE DATABASE_DEFAULT, N'','') AS ct
+                                 WHERE ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                                     OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                              )
                         THEN CONVERT(bit, 1)
@@ -11202,10 +11206,10 @@ OPTION (RECOMPILE);';
                     temporal_type = ISNULL(t.temporal_type, 0),
                     priority = ROW_NUMBER() OVER (ORDER BY
                         /* gh-511: Critical tables first */
-                        CASE WHEN @CriticalTablesFirst_param = N''Y'' THEN
+                        CASE WHEN @CriticalTablesFirst_param COLLATE Latin1_General_100_BIN2 = N''Y'' COLLATE Latin1_General_100_BIN2 THEN
                             CASE WHEN @CriticalTables_param IS NOT NULL
-                                 AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param, N'','') AS ct
-                                     WHERE OBJECT_SCHEMA_NAME(s.object_id) + N''.'' + OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
+                                 AND EXISTS (SELECT 1 FROM STRING_SPLIT(@CriticalTables_param COLLATE DATABASE_DEFAULT, N'','') AS ct
+                                     WHERE ((OBJECT_SCHEMA_NAME(s.object_id) COLLATE DATABASE_DEFAULT) + N''.'' + (OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT
                                         OR OBJECT_NAME(s.object_id) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
                             THEN 1 ELSE 0 END
                         ELSE 0 END DESC,
@@ -11725,7 +11729,7 @@ OPTION (RECOMPILE);';
             DECLARE @p333_msg nvarchar(500) =
                 N'WARNING: Run exceeded @StopByTime (' + @StopByTime + N') by '
                 + CONVERT(nvarchar(10), @p333_overshoot_sec) + N' seconds. '
-                + N'Consider setting @i_max_seconds_per_stat to guard against large-table overshoot. (#333)';
+                + N'Consider setting @StopByTime earlier to reduce large-table overshoot. (#333)';
             RAISERROR(@p333_msg, 10, 1) WITH NOWAIT;
             SET @warnings += N'STOPBYTIME_OVERSHOOT: ' + CONVERT(nvarchar(10), @p333_overshoot_sec) + N's past ' + @StopByTime + N'; ';
             SET @WarningsCodesOut = ISNULL(@WarningsCodesOut + N'|', N'') + N'STOPBYTIME_OVERSHOOT';

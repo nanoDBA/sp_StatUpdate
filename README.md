@@ -1,11 +1,11 @@
 # sp_StatUpdate
 
-**Priority-based statistics maintenance for SQL Server 2016+**
+**Priority-based statistics maintenance for SQL Server 2019+**
 
 *Updates worst stats first. Stops when you tell it to. Tells you if it got killed.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![SQL Server 2016+](https://img.shields.io/badge/SQL%20Server-2016%2B-blue.svg)](https://www.microsoft.com/sql-server)
+[![SQL Server 2019+](https://img.shields.io/badge/SQL%20Server-2019%2B-blue.svg)](https://www.microsoft.com/sql-server)
 [![Azure SQL](https://img.shields.io/badge/Azure%20SQL-Supported-0078D4.svg)](https://azure.microsoft.com/products/azure-sql)
 
 ### Contents
@@ -91,7 +91,7 @@ EXEC dbo.sp_StatUpdate
 
 | Requirement | Details |
 |-------------|---------|
-| **SQL Server** | 2016+ (uses `STRING_SPLIT`). 2016 SP2+ recommended for MAXDOP support |
+| **SQL Server** | 2019+. Each release is tested on 2019, 2022 and 2025. Earlier versions are not supported. |
 | **Azure SQL** | Database (EngineEdition 5), Managed Instance (8), and Edge (9) supported |
 | **dbo.CommandLog** | [CommandLog.sql](https://ola.hallengren.com/scripts/CommandLog.sql) or set `@LogToTable = 'N'` |
 | **dbo.Queue** | [Queue.sql](https://ola.hallengren.com/scripts/Queue.sql) -- only for `@StatsInParallel = 'Y'` |
@@ -158,7 +158,7 @@ EXEC dbo.sp_StatUpdate
     @TimeLimit = 3600;
 ```
 
-**Available QS metrics:** `CPU`, `DURATION`, `READS`, `EXECUTIONS`, `AVG_CPU`, `MEMORY_GRANT`, `TEMPDB_SPILLS` (SQL 2017+), `PHYSICAL_READS`, `AVG_MEMORY`, `WAITS`
+**Available QS metrics:** `CPU`, `DURATION`, `READS`, `EXECUTIONS`, `AVG_CPU`, `MEMORY_GRANT`, `TEMPDB_SPILLS`, `PHYSICAL_READS`, `AVG_MEMORY`, `WAITS`
 
 ⚡ **Performance note:** Phase 6 (QS enrichment) parses plan XML to find table references. On databases with 10,000+ QS plans, this can take minutes. `@QueryStoreTopPlans` limits XML parsing to the most impactful plans. The proc also skips Phase 6 entirely when QS has no recent runtime stats within `@QueryStoreRecentHours`.
 
@@ -301,7 +301,7 @@ v3 has **42 input parameters** (was 58 in v2) plus **11 OUTPUT parameters**.  23
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@StatisticsSample` | Preset-dependent | `NULL`=SQL Server decides, `100`=FULLSCAN |
-| `@MaxDOP` | `NULL` | MAXDOP for UPDATE STATISTICS (SQL 2016 SP2+) |
+| `@MaxDOP` | `NULL` | MAXDOP for UPDATE STATISTICS |
 | `@LongRunningThresholdMinutes` | `NULL` | Stats that took longer get forced sample rate |
 | `@LongRunningSamplePercent` | `10` | Sample percent for long-running stats |
 
@@ -923,11 +923,12 @@ EXEC dbo.sp_StatUpdate
 
 ## Version History 📜
 
-**Current version:** `3.11.3.2026.11.06` (proc) &nbsp;·&nbsp; `2026.11.06.1` (diag)
+**Current version:** `3.11.4.2026.11.10` (proc) &nbsp;·&nbsp; `2026.11.10.1` (diag)
 
 <details>
 <summary><strong>📜 Show full changelog (60+ releases)</strong></summary>
 
+- **3.11.4 / Diag 2026.11.10.1** - Fixes for GitHub issues #657-#661: complete help output, explicit collation handling, skipped-stat logging, cache reset after CommandLog ID reuse, and clearer StopByTime overshoot guidance.
 - **3.11.3 / Diag 2026.11.06.1** - SSMS 22 fix. `sp_StatUpdate_Diag.sql` failed to parse or run in SSMS 22.11 (Msg 102 near `GO`, then Msg 111). The SSMS batch splitter appears not to nest block comments, so two markers in a change-history entry ended the header comment early and a quote later in the text hid the `GO`. The markers are reworded, two nested comments in the XE session's sample query are now line comments, and a CI check fails on any nested block comment. Neither procedure's code changed beyond its version numbers.
 - **3.11.2 / Diag 2026.08.02.1** - two crash-class fixes found by auditing the codebase against a deep study of the DarlingData diagnostic procedures. (1) `DATEDIFF(MILLISECOND)` int overflow: a CommandLog row spanning more than ~24.8 days (orphaned START whose END marker was written by orphan cleanup weeks later) raised error 535 and hard-failed the entire Diag run; the proc's TablePriority duration estimate read the same rows during discovery. Both now use `DATEDIFF_BIG`; Diag stores NULL for such spans (a duration measured to a cleanup marker is fiction) and the estimate filters them out. (2) Diag RS13 `ChangePct` columns had no denominator floor: a 2 ms CPU baseline reported +249,900%, and a large enough delta overflowed `decimal(10,1)` (error 8115) and killed the run -- now floored (NULL below 100 ms CPU / 0.1 ms-per-exec / 1 MB grant / 128 tempdb pages, matching the I8 headline constants) and clamped at +1000%. Regression tests seed both crash fixtures live.
 - **3.11.1** - o2md.54, found by a primary-source SQL 2025 compatibility audit: the plan-feedback awareness filter used a nonexistent `ACTIVE` state (`sys.query_store_plan_feedback` has no such state), silently degrading the count to PENDING_VALIDATION-only on every version -- now filters the four states a stats update could invalidate. Audit verified every other hardcoded QS value map (readonly_reason bitmask, wait categories, capture modes, version gates) against current docs; no other mismatches.
