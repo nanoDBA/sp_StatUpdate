@@ -32,6 +32,8 @@
 !.github/workflows/*.yml
 !.github/scripts/
 !.github/scripts/*.py
+!.github/scripts/fixtures/
+!.github/scripts/fixtures/*.sql
 
 # Beads / Dolt files (added by bd init)
 .dolt/

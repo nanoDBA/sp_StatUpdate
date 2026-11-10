@@ -14,4 +14,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: python3 .github/scripts/test_check_sql_nested_comments.py
       - run: python3 .github/scripts/check_sql_nested_comments.py
