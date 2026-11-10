@@ -45,6 +45,11 @@ History:    3.11.4.2026.11.10 - Release fixes from GitHub issues #657-#661:
                             skipped-stat logging, cache reset after CommandLog
                             reuse, and clear StopByTime overshoot guidance.
 
+            3.11.3.2026.11.06 - Release carrying the SSMS 22 fix in sp_StatUpdate_Diag.sql
+                            (Msg 102 near GO, then Msg 111).  No code change here:
+                            this procedure has no nested comments and was not
+                            affected.
+
             3.11.2.2026.08.02 - 0859.9 (DarlingData-audit finding): the gh-505
                             TablePriority estimate read historical durations
                             from CommandLog with the int-returning

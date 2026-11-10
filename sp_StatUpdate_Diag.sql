@@ -42,6 +42,13 @@ Version:    2026.11.10.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            cache reset after CommandLog reuse, and clearer
                            StopByTime overshoot guidance.
 
+            2026.11.06.1 - SSMS 22.11 failed on this script with Msg 102 near GO,
+                           then Msg 111.  Its batch splitter appears not to nest
+                           block comments, so two markers in the 2026.07.30.9
+                           entry ended this header early and a quote later in
+                           the text hid the GO.  Markers reworded.  No code
+                           change.
+
             2026.08.02.1 - 0859.9 + 0859.10 (DarlingData-audit findings).
                            0859.9: #stat_updates extraction computed
                            DATEDIFF(MILLISECOND, StartTime, EndTime) with the
