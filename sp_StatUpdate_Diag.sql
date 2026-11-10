@@ -36,13 +36,11 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.11.06.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
-            2026.11.06.1 - SSMS 22.11 failed on this script with Msg 102 near GO,
-                           then Msg 111.  Its batch splitter appears not to nest
-                           block comments, so two markers in the 2026.07.30.9
-                           entry ended this header early and a quote later in
-                           the text hid the GO.  Markers reworded.  No code
-                           change.
+Version:    2026.11.10.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.11.10.1 - GitHub issues #657-#661: complete help output,
+                           explicit collation handling, skipped-stat logging,
+                           cache reset after CommandLog reuse, and clearer
+                           StopByTime overshoot guidance.
 
             2026.08.02.1 - 0859.9 + 0859.10 (DarlingData-audit findings).
                            0859.9: #stat_updates extraction computed
@@ -939,8 +937,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.11.06.1',   /* orchestrator bumps this */
-        @procedure_version_date datetime = '20261106';     /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.11.10.1',   /* orchestrator bumps this */
+        @procedure_version_date datetime = '20261110';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -1845,16 +1843,39 @@ BEGIN
             SET @sql = N'SELECT @wm = ISNULL(MAX(CommandLogID), 0) FROM ' + @cache_ref + N';';
             EXECUTE sys.sp_executesql @sql, N'@wm integer OUTPUT', @wm = @cache_watermark OUTPUT;
 
-            /* Watermark gap detection: same as history table (#232) */
-            DECLARE @cl_max_id_cache integer;
-            SET @sql = N'SELECT @mx = ISNULL(MAX(ID), 0) FROM ' + @commandlog_ref + N';';
-            EXECUTE sys.sp_executesql @sql, N'@mx integer OUTPUT', @mx = @cl_max_id_cache OUTPUT;
-
-            IF @cl_max_id_cache > 0 AND @cache_watermark > @cl_max_id_cache
+            /* Validate the watermark row itself. A truncate followed by enough new rows can
+               make MAX(ID) exceed the old watermark while reusing IDs with different data. */
+            DECLARE @cache_watermark_valid bit = 0;
+            IF @cache_watermark > 0
             BEGIN
-                RAISERROR(N'  WARNING: Cache watermark (%i) exceeds CommandLog max ID (%i). Resetting -- CommandLog may have been archived.', 10, 1,
-                    @cache_watermark, @cl_max_id_cache) WITH NOWAIT;
-                SET @cache_watermark = 0;    /* #312: reset to 0, not @cl_max_id_cache -- NOT EXISTS dedup guard prevents duplicates */
+                SET @sql = N'
+                    SELECT @valid = CASE WHEN EXISTS
+                    (
+                        SELECT 1
+                        FROM ' + @commandlog_ref + N' AS c
+                        INNER JOIN ' + @cache_ref + N' AS cached
+                            ON cached.CommandLogID = c.ID
+                        WHERE cached.CommandLogID = @watermark
+                          AND (cached.StartTime = c.StartTime
+                               OR (cached.StartTime IS NULL AND c.StartTime IS NULL))
+                    ) THEN 1 ELSE 0 END;';
+                EXECUTE sys.sp_executesql
+                    @sql,
+                    N'@watermark integer, @valid bit OUTPUT',
+                    @watermark = @cache_watermark,
+                    @valid = @cache_watermark_valid OUTPUT;
+            END;
+
+            IF @cache_watermark > 0 AND @cache_watermark_valid = 0
+            BEGIN
+                RAISERROR(N'  WARNING: Cache watermark (%i) no longer matches its CommandLog row. Resetting cache.', 10, 1,
+                    @cache_watermark) WITH NOWAIT;
+                /* Cache rows are derived entirely from CommandLog. If the log was truncated or reseeded,
+                   discard the obsolete rows before replaying the retained IDs. Unlike History's
+                   RunLabel insert, the cache insert has no NOT EXISTS deduplication guard. */
+                SET @sql = N'DELETE FROM ' + @cache_ref + N';';
+                EXECUTE sys.sp_executesql @sql;
+                SET @cache_watermark = 0;
             END;
 
             RAISERROR(N'  Cache table: %s (watermark ID %i)', 10, 1, @cache_ref, @cache_watermark) WITH NOWAIT;
