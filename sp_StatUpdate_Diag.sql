@@ -36,7 +36,16 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    2026.11.10.1 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, etc.)
+            2026.11.12.2 - Accept the full documented integer range for grade
+                           weights; generate valid SingleResultSet Efficacy
+                           Detail JSON; detect changed cache watermark payloads
+                           and upgrade existing cache tables.
+
+            2026.11.12.1 - Correct @Help prerequisites and SingleResultSet
+                           documentation; explain QualifyReason compatibility
+                           and record this update in Help version history.
+
             2026.11.10.1 - GitHub issues #657-#661: complete help output,
                            explicit collation handling, skipped-stat logging,
                            cache reset after CommandLog reuse, and clearer
@@ -944,8 +953,8 @@ BEGIN
     ============================================================================
     */
     DECLARE
-        @procedure_version varchar(20) = '2026.11.10.1',   /* orchestrator bumps this */
-        @procedure_version_date datetime = '20261110';     /* orchestrator bumps this */
+        @procedure_version varchar(20) = '2026.11.12.2',   /* orchestrator bumps this */
+        @procedure_version_date datetime = '20261112';     /* orchestrator bumps this */
 
     SET @Version = @procedure_version;
     SET @VersionDate = @procedure_version_date;
@@ -1168,7 +1177,9 @@ BEGIN
                 (N'Overlapping Runs (W4)',
                  N'Detects concurrent sp_StatUpdate executions by checking for overlapping StartTime/EndTime ranges. Excludes killed runs to prevent false positives from orphan-cleanup END records.'),
                 (N'SingleResultSet Mode',
-                 N'@SingleResultSet=1 wraps all 8 result sets into one table with columns: ResultSetID (int), ResultSetName (nvarchar), RowNum (int), RowData (nvarchar(max) as JSON). Use OPENJSON(RowData) to parse. Enables INSERT...EXEC patterns that fail with multiple result sets.  When CommandLog has no usable data, IDs 3-13 are each represented by one marker row whose RowData JSON contains DataStatus = UNAVAILABLE, Reason = NO_COMMANDLOG_DATA, and the ResultSetName -- distinguish unavailable surfaces from zero-finding surfaces by the DataStatus property, never by message text.'),
+                 N'@SingleResultSet=1 returns one unified table with ResultSetID values 1-13 and columns: ResultSetID (int), ResultSetName (nvarchar), RowNum (int), RowData (nvarchar(max) as JSON). Use OPENJSON(RowData) to parse. Enables INSERT...EXEC patterns that fail with multiple result sets. When CommandLog has no usable data, IDs 3-13 are each represented by one marker row whose RowData JSON contains DataStatus = UNAVAILABLE, Reason = NO_COMMANDLOG_DATA, and the ResultSetName -- distinguish unavailable surfaces from zero-finding surfaces by the DataStatus property, never by message text.'),
+                (N'Qualification Reason',
+                 N'Diag passes through QualifyReason values from CommandLog, including ASCENDING_KEY on newer rows and QUERY_STORE_PRIORITY on historical rows. The Query Store boost is recorded separately in the source ExtendedInfo as QSPriorityBoost; it is not a QualifyReason.'),
                 (N'CommandLog Requirements',
                  N'Requires Ola Hallengren''s dbo.CommandLog table with sp_StatUpdate entries (CommandType IN SP_STATUPDATE_START, SP_STATUPDATE_END, UPDATE_STATISTICS). No data = no diagnostics (graceful empty result sets). @CommandLogDatabase lets you point to a central logging database.'),
                 (N'PowerShell Wrapper',
@@ -1216,7 +1227,7 @@ BEGIN
         (
             VALUES
                 (N'SQL Server Version',
-                 N'Requires SQL Server 2016+ (STRING_SPLIT dependency).  Best on 2017+ for STRING_AGG.'),
+                 N'Supported on SQL Server 2019 or later. The implementation uses STRING_SPLIT and STRING_AGG, which require SQL Server 2017 or later.'),
                 (N'CommandLog Table',
                  N'Requires dbo.CommandLog from Ola Hallengren''s Maintenance Solution.  sp_StatUpdate writes SP_STATUPDATE_START, SP_STATUPDATE_END, and UPDATE_STATISTICS entries.  No CommandLog = no diagnostics.'),
                 (N'sp_StatUpdate Version',
@@ -1268,6 +1279,8 @@ BEGIN
         FROM
         (
             VALUES
+                (N'2026.11.12.2', N'GradeWeights integer range, valid SingleResultSet Efficacy Detail JSON, and cache watermark payload validation with in-place schema upgrade'),
+                (N'2026.11.12', N'Correct @Help SQL Server support floor, SingleResultSet IDs, QualifyReason compatibility, and current version history'),
                 (N'2026.03.23', N'NULL RunLabel fix, INSERT...EXEC safety, ObfuscationMapTable dedup, nvarchar overflow fixes, enhanced debug output, improved @Help'),
                 (N'2026.03.20', N'26-issue bulk resolution: workload impact, check improvements, AG detection, 15 new tests'),
                 (N'2026.03.13', N'RS 12 WorkloadRank fix, RS 11 DeltaVsPrior fix in SingleResultSet mode'),
@@ -1359,10 +1372,10 @@ BEGIN
         @override_reliability char(1) = NULL,
         @override_speed       char(1) = NULL,
         @override_workload    char(1) = NULL,
-        @weight_completion    decimal(5, 2) = 30.0,
-        @weight_reliability   decimal(5, 2) = 25.0,
-        @weight_speed         decimal(5, 2) = 20.0,
-        @weight_workload      decimal(5, 2) = 25.0,
+        @weight_completion    decimal(12, 2) = 30.0,
+        @weight_reliability   decimal(12, 2) = 25.0,
+        @weight_speed         decimal(12, 2) = 20.0,
+        @weight_workload      decimal(12, 2) = 25.0,
         @has_overrides        bit = 0;
 
     IF @GradeOverrides IS NOT NULL
@@ -1442,10 +1455,10 @@ BEGIN
 
         /* Apply valid weights (ISNULL preserves defaults for unmentioned categories) */
         SELECT
-            @weight_completion  = ISNULL(MAX(CASE WHEN p.cat = N'COMPLETION'  THEN CONVERT(decimal(5, 2), CONVERT(integer, p.val_str)) END), @weight_completion),
-            @weight_reliability = ISNULL(MAX(CASE WHEN p.cat = N'RELIABILITY' THEN CONVERT(decimal(5, 2), CONVERT(integer, p.val_str)) END), @weight_reliability),
-            @weight_speed       = ISNULL(MAX(CASE WHEN p.cat = N'SPEED'       THEN CONVERT(decimal(5, 2), CONVERT(integer, p.val_str)) END), @weight_speed),
-            @weight_workload    = ISNULL(MAX(CASE WHEN p.cat = N'WORKLOAD'    THEN CONVERT(decimal(5, 2), CONVERT(integer, p.val_str)) END), @weight_workload)
+            @weight_completion  = ISNULL(MAX(CASE WHEN p.cat = N'COMPLETION'  THEN CONVERT(decimal(12, 2), CONVERT(integer, p.val_str)) END), @weight_completion),
+            @weight_reliability = ISNULL(MAX(CASE WHEN p.cat = N'RELIABILITY' THEN CONVERT(decimal(12, 2), CONVERT(integer, p.val_str)) END), @weight_reliability),
+            @weight_speed       = ISNULL(MAX(CASE WHEN p.cat = N'SPEED'       THEN CONVERT(decimal(12, 2), CONVERT(integer, p.val_str)) END), @weight_speed),
+            @weight_workload    = ISNULL(MAX(CASE WHEN p.cat = N'WORKLOAD'    THEN CONVERT(decimal(12, 2), CONVERT(integer, p.val_str)) END), @weight_workload)
         FROM @gw_parsed AS p
         WHERE p.cat IN (N'COMPLETION', N'RELIABILITY', N'SPEED', N'WORKLOAD')
         AND   TRY_CONVERT(integer, p.val_str) IS NOT NULL
@@ -1463,7 +1476,7 @@ BEGIN
     IF @weight_workload    = 0 AND @override_workload    IS NULL SET @override_workload    = 'X';
 
     /* Normalize weights to sum to 1.0 */
-    DECLARE @weight_sum decimal(10, 2) = @weight_completion + @weight_reliability + @weight_speed + @weight_workload;
+    DECLARE @weight_sum decimal(13, 2) = @weight_completion + @weight_reliability + @weight_speed + @weight_workload;
 
     IF @has_overrides = 1 AND @weight_sum = 0
         SET @errors = @errors + N'All categories are IGNOREd or have weight 0 -- cannot compute OVERALL score. ';
@@ -1810,6 +1823,7 @@ BEGIN
                     /* o2md.50: per-row mop-up-origin flag (proc v3.8.5+); NULL = absent
                        element (priority-pass row on 3.8.5+, or any pre-3.8.5 row) */
                     FromMopUp           bit             NULL,
+                    SourceExtendedInfoHash binary(32)   NULL,
 
                     CONSTRAINT PK_StatUpdateDiagCache PRIMARY KEY CLUSTERED (CommandLogID)
                         WITH (DATA_COMPRESSION = PAGE)
@@ -1843,6 +1857,8 @@ BEGIN
                 /* o2md.50: FromMopUp added in this batch */
                 IF COL_LENGTH(N''' + REPLACE(@cache_ref, N'''', N'''''') + N''', N''FromMopUp'') IS NULL
                     ALTER TABLE ' + @cache_ref + N' ADD FromMopUp bit NULL;
+                IF COL_LENGTH(N''' + REPLACE(@cache_ref, N'''', N'''''') + N''', N''SourceExtendedInfoHash'') IS NULL
+                    ALTER TABLE ' + @cache_ref + N' ADD SourceExtendedInfoHash binary(32) NULL;
             ';
             EXECUTE sys.sp_executesql @col_check_sql;
 
@@ -1850,8 +1866,8 @@ BEGIN
             SET @sql = N'SELECT @wm = ISNULL(MAX(CommandLogID), 0) FROM ' + @cache_ref + N';';
             EXECUTE sys.sp_executesql @sql, N'@wm integer OUTPUT', @wm = @cache_watermark OUTPUT;
 
-            /* Validate the watermark row itself. A truncate followed by enough new rows can
-               make MAX(ID) exceed the old watermark while reusing IDs with different data. */
+            /* Validate the watermark row identity and payload. A truncate followed by enough new
+               rows can reuse the ID and StartTime with different ExtendedInfo. */
             DECLARE @cache_watermark_valid bit = 0;
             IF @cache_watermark > 0
             BEGIN
@@ -1865,6 +1881,8 @@ BEGIN
                         WHERE cached.CommandLogID = @watermark
                           AND (cached.StartTime = c.StartTime
                                OR (cached.StartTime IS NULL AND c.StartTime IS NULL))
+                          AND (cached.SourceExtendedInfoHash = HASHBYTES(N''SHA2_256'', CONVERT(varbinary(max), CONVERT(nvarchar(max), c.ExtendedInfo)))
+                               OR (cached.SourceExtendedInfoHash IS NULL AND c.ExtendedInfo IS NULL))
                     ) THEN 1 ELSE 0 END;';
                 EXECUTE sys.sp_executesql
                     @sql,
@@ -1877,9 +1895,9 @@ BEGIN
             BEGIN
                 RAISERROR(N'  WARNING: Cache watermark (%i) no longer matches its CommandLog row. Resetting cache.', 10, 1,
                     @cache_watermark) WITH NOWAIT;
-                /* Cache rows are derived entirely from CommandLog. If the log was truncated or reseeded,
-                   discard the obsolete rows before replaying the retained IDs. Unlike History's
-                   RunLabel insert, the cache insert has no NOT EXISTS deduplication guard. */
+                /* Cache rows are derived entirely from CommandLog. If the watermark row is absent,
+                   its StartTime changed, or its ExtendedInfo payload changed, discard the cache
+                   before replaying retained IDs. The cache insert has no NOT EXISTS deduplication guard. */
                 SET @sql = N'DELETE FROM ' + @cache_ref + N';';
                 EXECUTE sys.sp_executesql @sql;
                 SET @cache_watermark = 0;
@@ -2327,7 +2345,7 @@ BEGIN
             QSTotalMemoryGrantKB, QSTotalTempdbPages,
             EffectiveSamplePct, SampleSource, HasFilter, FilteredDriftRatio, IsIncremental,
             ProcessingPosition, ObjectId, StatsId,
-            IsCritical, CriticalSampleOverride, FromMopUp
+            IsCritical, CriticalSampleOverride, FromMopUp, SourceExtendedInfoHash
         )
         SELECT
             c.ID,
@@ -2366,7 +2384,8 @@ BEGIN
             c.ExtendedInfo.value(N''(ExtendedInfo/IsCritical)[1]'', N''bit''),
             c.ExtendedInfo.value(N''(ExtendedInfo/CriticalSampleOverride)[1]'', N''bit''),
             /* o2md.50: NULLIF-omitted on the proc side -- NULL = priority-pass row or pre-3.8.5 */
-            c.ExtendedInfo.value(N''(ExtendedInfo/FromMopUp)[1]'', N''bit'')
+            c.ExtendedInfo.value(N''(ExtendedInfo/FromMopUp)[1]'', N''bit''),
+            HASHBYTES(N''SHA2_256'', CONVERT(varbinary(max), CONVERT(nvarchar(max), c.ExtendedInfo)))
         FROM ' + @commandlog_ref + N' AS c
         WHERE c.CommandType = N''UPDATE_STATISTICS''
         AND   c.ID > @watermark
@@ -8900,40 +8919,42 @@ BEGIN
             ResultSetID   = 11,
             ResultSetName = N'Efficacy Detail',
             RowNum        = ROW_NUMBER() OVER (ORDER BY dr.StartTime DESC),
-            RowData       = N'{'
-                + N'"RunLabel":' + CASE WHEN dr.RunLabel IS NULL THEN N'null' ELSE N'"' + dr.RunLabel + N'"' END
-                + N',"StartTime":"' + CONVERT(nvarchar(30), dr.StartTime, 126) + N'"'
-                + N',"SortStrategy":"' + CASE WHEN dr.IsQSRun = 1 THEN N'Query Store CPU' ELSE ISNULL(dr.SortOrder, N'Modification Counter') END + N'"'
-                + N',"StatsFound":' + ISNULL(CONVERT(nvarchar(10), dr.StatsFound), N'null')
-                + N',"StatsProcessed":' + ISNULL(CONVERT(nvarchar(10), dr.StatsProcessed), N'null')
-                + N',"CompletionPct":' + ISNULL(CONVERT(nvarchar(10), dr.CompletionPct), N'null')
-                + N',"HighCpuInFirstQuartilePct":' + ISNULL(CONVERT(nvarchar(10), dr.HighCpuInFirstQuartilePct), N'null')
-                + N',"MinutesToHighCpuComplete":' + ISNULL(CONVERT(nvarchar(20), dr.MinutesToHighCpuComplete), N'null')
-                + N',"WorkloadCoveragePct":' + ISNULL(CONVERT(nvarchar(10), dr.WorkloadCoveragePct), N'null')
-                + N',"AvgSecPerStat":' + ISNULL(CONVERT(nvarchar(20), dr.AvgSecPerStat), N'null')
-                + N',"StopReason":' + CASE WHEN dr.StopReason IS NULL THEN N'null' ELSE N'"' + dr.StopReason + N'"' END
-                + N',"DeltaVsPrior":"' + CASE
-                    WHEN dr.prior_completion IS NULL THEN N'(first run in window)'
-                    ELSE CASE
-                        WHEN dr.CompletionPct > dr.prior_completion
-                        THEN N'+' + CONVERT(nvarchar(10), CONVERT(integer, dr.CompletionPct - dr.prior_completion)) + N'% completion'
-                        WHEN dr.CompletionPct < dr.prior_completion
-                        THEN CONVERT(nvarchar(10), CONVERT(integer, dr.CompletionPct - dr.prior_completion)) + N'% completion'
-                        ELSE N'0% completion'
-                    END
-                    + CASE
-                        WHEN dr.prior_minutes IS NOT NULL AND dr.MinutesToHighCpuComplete IS NOT NULL
-                        THEN N', ' + CASE
-                            WHEN dr.MinutesToHighCpuComplete < dr.prior_minutes
-                            THEN N'-' + CONVERT(nvarchar(20), CONVERT(integer, dr.prior_minutes - dr.MinutesToHighCpuComplete)) + N'min to critical'
-                            WHEN dr.MinutesToHighCpuComplete > dr.prior_minutes
-                            THEN N'+' + CONVERT(nvarchar(20), CONVERT(integer, dr.MinutesToHighCpuComplete - dr.prior_minutes)) + N'min to critical'
-                            ELSE N'0min to critical'
-                        END
-                        ELSE N''
-                    END
-                END + N'"'
-                + N'}'
+            RowData       = (
+                SELECT
+                    RunLabel                  = dr.RunLabel,
+                    StartTime                 = CONVERT(nvarchar(30), dr.StartTime, 126),
+                    SortStrategy              = CASE WHEN dr.IsQSRun = 1 THEN N'Query Store CPU' ELSE ISNULL(dr.SortOrder, N'Modification Counter') END,
+                    StatsFound                = dr.StatsFound,
+                    StatsProcessed            = dr.StatsProcessed,
+                    CompletionPct             = dr.CompletionPct,
+                    HighCpuInFirstQuartilePct = dr.HighCpuInFirstQuartilePct,
+                    MinutesToHighCpuComplete  = dr.MinutesToHighCpuComplete,
+                    WorkloadCoveragePct       = dr.WorkloadCoveragePct,
+                    AvgSecPerStat             = dr.AvgSecPerStat,
+                    StopReason                = dr.StopReason,
+                    DeltaVsPrior              = CASE
+                                                    WHEN dr.prior_completion IS NULL THEN N'(first run in window)'
+                                                    ELSE CASE
+                                                        WHEN dr.CompletionPct > dr.prior_completion
+                                                        THEN N'+' + CONVERT(nvarchar(10), CONVERT(integer, dr.CompletionPct - dr.prior_completion)) + N'% completion'
+                                                        WHEN dr.CompletionPct < dr.prior_completion
+                                                        THEN CONVERT(nvarchar(10), CONVERT(integer, dr.CompletionPct - dr.prior_completion)) + N'% completion'
+                                                        ELSE N'0% completion'
+                                                    END
+                                                    + CASE
+                                                        WHEN dr.prior_minutes IS NOT NULL AND dr.MinutesToHighCpuComplete IS NOT NULL
+                                                        THEN N', ' + CASE
+                                                            WHEN dr.MinutesToHighCpuComplete < dr.prior_minutes
+                                                            THEN N'-' + CONVERT(nvarchar(20), CONVERT(integer, dr.prior_minutes - dr.MinutesToHighCpuComplete)) + N'min to critical'
+                                                            WHEN dr.MinutesToHighCpuComplete > dr.prior_minutes
+                                                            THEN N'+' + CONVERT(nvarchar(20), CONVERT(integer, dr.MinutesToHighCpuComplete - dr.prior_minutes)) + N'min to critical'
+                                                            ELSE N'0min to critical'
+                                                        END
+                                                        ELSE N''
+                                                    END
+                                                END
+                FOR JSON PATH, WITHOUT_ARRAY_WRAPPER, INCLUDE_NULL_VALUES
+            )
         FROM (
             SELECT
                 e.*,

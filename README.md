@@ -917,11 +917,12 @@ EXEC dbo.sp_StatUpdate
 
 ## Version History 📜
 
-**Current version:** `3.11.5.2026.11.11` (proc) &nbsp;·&nbsp; `2026.11.10.1` (diag)
+**Current version:** `3.11.6.2026.11.12` (proc) &nbsp;·&nbsp; `2026.11.12.2` (diag)
 
 <details>
 <summary><strong>📜 Show full changelog (60+ releases)</strong></summary>
 
+- **3.11.6 / Diag 2026.11.12.2** - Diag accepts the full integer range documented for `@GradeWeights`, emits valid JSON for SingleResultSet Efficacy Detail text, and refreshes its cache when the CommandLog watermark row's payload changes. Existing cache tables upgrade in place. The statistics procedure has no code change in this release.
 - **3.11.5** - CommandLog rows now record the qualification rule that admitted each statistic. Ascending-key rescue reports `ASCENDING_KEY`; Query Store boost stays visible in `QSPriorityBoost`. New CommandLog rows no longer carry `QUERY_STORE_PRIORITY` in `QualifyReason`, which may affect filters that match that value. Existing rows remain readable by Diag.
 - **3.11.4 / Diag 2026.11.10.1** - Fixes for GitHub issues #657-#661: complete help output, explicit collation handling, skipped-stat logging, cache reset after CommandLog ID reuse, and clearer StopByTime overshoot guidance.
 - **3.11.3 / Diag 2026.11.06.1** - SSMS 22 fix. `sp_StatUpdate_Diag.sql` failed to parse or run in SSMS 22.11 (Msg 102 near `GO`, then Msg 111). The SSMS batch splitter appears not to nest block comments, so two markers in a change-history entry ended the header comment early and a quote later in the text hid the `GO`. The markers are reworded, two nested comments in the XE session's sample query are now line comments, and a CI check fails on any nested block comment. Neither procedure's code changed beyond its version numbers.

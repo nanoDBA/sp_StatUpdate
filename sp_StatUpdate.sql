@@ -36,7 +36,7 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.11.5.2026.11.11 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.11.6.2026.11.12 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
@@ -47,6 +47,9 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             no longer written as QualifyReason. Existing
                             CommandLog rows with QUERY_STORE_PRIORITY remain
                             readable by Diag.
+
+            3.11.6.2026.11.12 - No procedure code change; released with Diag
+                            2026.11.12.2.
 
             3.11.4.2026.11.10 - Release fixes from GitHub issues #657-#661:
                             complete help output, explicit collation handling,
@@ -1001,8 +1004,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.11.5.2026.11.11',
-        @procedure_version_date datetime = '20261111',
+        @procedure_version varchar(20) = '3.11.6.2026.11.12',
+        @procedure_version_date datetime = '20261112',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
