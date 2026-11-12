@@ -1,31 +1,52 @@
 # sp_StatUpdate
 
-**Priority-based statistics maintenance for SQL Server 2019+**
+**Priority-based statistics maintenance for SQL Server 2019+.**
 
-*Updates worst stats first. Stops when you tell it to. Tells you if it got killed.*
+Updates important statistics first. Stops at your time limit. Reports what completed.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![SQL Server 2019+](https://img.shields.io/badge/SQL%20Server-2019%2B-blue.svg)](https://www.microsoft.com/sql-server)
-[![Azure SQL](https://img.shields.io/badge/Azure%20SQL-Supported-0078D4.svg)](https://azure.microsoft.com/products/azure-sql)
+**Supported:** [SQL Server 2019+](#requirements-) and [Azure SQL](#requirements-) · [MIT License](LICENSE)
 
-### Contents
+**Start here:** [Quick Start](#quick-start-) · [Requirements](#requirements-) · [Presets](#presets-%EF%B8%8F)
 
-📸 [See It Run](#see-it-run-) &nbsp;·&nbsp;
-🎯 [Why This Exists](#why-this-exists-) &nbsp;·&nbsp;
-🚀 [Quick Start](#quick-start-) &nbsp;·&nbsp;
-📋 [Requirements](#requirements-) &nbsp;·&nbsp;
-⚙️ [Presets](#presets-) &nbsp;·&nbsp;
-🛠️ [Common Scenarios](#common-scenarios-) &nbsp;·&nbsp;
-📖 [Parameter Reference](#parameter-reference-) &nbsp;·&nbsp;
-🔍 [Environment Detection](#environment-detection-) &nbsp;·&nbsp;
-📊 [Monitoring](#monitoring-) &nbsp;·&nbsp;
-🩺 [Diagnostic Tool](#diagnostic-tool-) &nbsp;·&nbsp;
-🔬 [Extended Events](#extended-events-) &nbsp;·&nbsp;
-🔄 [Migrating from v2](#migrating-from-v2-) &nbsp;·&nbsp;
-📜 [Version History](#version-history-) &nbsp;·&nbsp;
-⚖️ [When to Use This](#when-to-use-this-vs-indexoptimize-) &nbsp;·&nbsp;
-🙏 [Acknowledgments](#acknowledgments-)
+<details>
+<summary>Browse all sections</summary>
 
+**Use it:** [Common Scenarios](#common-scenarios-%EF%B8%8F) · [Parameter Reference](#parameter-reference-) · [Migrating from v2](#migrating-from-v2-)
+
+**Understand results:** [Monitoring](#monitoring-) · [Diagnostic Tool](#diagnostic-tool-) · [Environment Detection](#environment-detection-) · [Extended Events](#extended-events-)
+
+**Learn more:** [See It Run](#see-it-run-) · [Why This Exists](#why-this-exists-) · [Version History](#version-history-) · [When to Use This](#when-to-use-this-vs-indexoptimize-%EF%B8%8F) · [Acknowledgments](#acknowledgments-)
+
+</details>
+
+## Quick Start 🚀
+
+```sql
+-- 1. Install prerequisites (Ola Hallengren's CommandLog table)
+-- Download from: https://ola.hallengren.com/scripts/CommandLog.sql
+
+-- 2. Install sp_StatUpdate
+-- Run sp_StatUpdate.sql in your maintenance database
+
+-- 3. Run statistics maintenance
+EXEC dbo.sp_StatUpdate
+    @Databases = N'YourDatabase',
+    @TimeLimit = 3600;                  -- 1 hour limit
+    -- Defaults: @Preset='DEFAULT', @TargetNorecompute='BOTH', @LogToTable='Y'
+```
+
+## Requirements 📋
+
+**DROP-IN COMPATIBLE** with [Ola Hallengren's SQL Server Maintenance Solution](https://ola.hallengren.com).
+
+| Requirement | Details |
+|-------------|---------|
+| **SQL Server** | 2019+. Each release is tested on 2019, 2022 and 2025. Earlier versions are not supported. |
+| **Azure SQL** | Database (EngineEdition 5), Managed Instance (8), and Edge (9) supported |
+| **dbo.CommandLog** | [CommandLog.sql](https://ola.hallengren.com/scripts/CommandLog.sql) or set `@LogToTable = 'N'` |
+| **dbo.Queue** | [Queue.sql](https://ola.hallengren.com/scripts/Queue.sql) -- only for `@StatsInParallel = 'Y'` |
+
+**Note**: `dbo.QueueStatistic` is auto-created on first parallel run. `dbo.CommandExecute` is NOT required.
 
 ## See It Run 📸
 
@@ -68,35 +89,6 @@
 | tempdb pressure during FULLSCAN | `@MinTempdbFreeMB` -- checks before each stat update |
 | Azure DTU/vCore concerns | Auto-detects Azure SQL DB vs MI, platform-specific warnings |
 | Priority pass finishes early | `@MopUpPass = 'Y'` -- broad sweep with remaining time |
-
-## Quick Start 🚀
-
-```sql
--- 1. Install prerequisites (Ola Hallengren's CommandLog table)
--- Download from: https://ola.hallengren.com/scripts/CommandLog.sql
-
--- 2. Install sp_StatUpdate
--- Run sp_StatUpdate.sql in your maintenance database
-
--- 3. Run statistics maintenance
-EXEC dbo.sp_StatUpdate
-    @Databases = N'YourDatabase',
-    @TimeLimit = 3600;                  -- 1 hour limit
-    -- Defaults: @Preset='DEFAULT', @TargetNorecompute='BOTH', @LogToTable='Y'
-```
-
-## Requirements 📋
-
-**DROP-IN COMPATIBLE** with [Ola Hallengren's SQL Server Maintenance Solution](https://ola.hallengren.com).
-
-| Requirement | Details |
-|-------------|---------|
-| **SQL Server** | 2019+. Each release is tested on 2019, 2022 and 2025. Earlier versions are not supported. |
-| **Azure SQL** | Database (EngineEdition 5), Managed Instance (8), and Edge (9) supported |
-| **dbo.CommandLog** | [CommandLog.sql](https://ola.hallengren.com/scripts/CommandLog.sql) or set `@LogToTable = 'N'` |
-| **dbo.Queue** | [Queue.sql](https://ola.hallengren.com/scripts/Queue.sql) -- only for `@StatsInParallel = 'Y'` |
-
-**Note**: `dbo.QueueStatistic` is auto-created on first parallel run. `dbo.CommandExecute` is NOT required.
 
 ## Presets ⚙️
 
