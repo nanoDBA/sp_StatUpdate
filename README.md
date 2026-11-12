@@ -317,6 +317,8 @@ v3 has **42 input parameters** (was 58 in v2) plus **11 OUTPUT parameters**.  23
 
 > 📝 **Two-phase logging:** Like Ola Hallengren's `CommandExecute`, sp_StatUpdate inserts a CommandLog row with NULL `EndTime` before each stat update, then updates `EndTime` on completion. Query in-progress stats with: `SELECT * FROM dbo.CommandLog WHERE EndTime IS NULL AND CommandType = 'UPDATE_STATISTICS';`
 
+Each per-stat `ExtendedInfo` row includes `QualifyReason`, recorded during discovery: `ASCENDING_KEY`, `DAYS_STALE`, `DIRECT_MODE`, `FILTERED_DRIFT`, `MOD_COUNTER`, `MOD_PERCENT`, `MOP_UP`, `NEVER_UPDATED`, `NORECOMPUTE_TARGET`, `THRESHOLD_MATCH`, or `TIERED_THRESHOLD`. Query Store priority is recorded separately as `QSPriorityBoost`. New rows no longer use `QUERY_STORE_PRIORITY` as `QualifyReason`; older rows with that value remain readable by Diag.
+
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `@LogToTable` | `'Y'` | Log to dbo.CommandLog |
@@ -923,11 +925,12 @@ EXEC dbo.sp_StatUpdate
 
 ## Version History 📜
 
-**Current version:** `3.11.4.2026.11.10` (proc) &nbsp;·&nbsp; `2026.11.10.1` (diag)
+**Current version:** `3.11.5.2026.11.11` (proc) &nbsp;·&nbsp; `2026.11.10.1` (diag)
 
 <details>
 <summary><strong>📜 Show full changelog (60+ releases)</strong></summary>
 
+- **3.11.5** - CommandLog rows now record the qualification rule that admitted each statistic. Ascending-key rescue reports `ASCENDING_KEY`; Query Store boost stays visible in `QSPriorityBoost`. New CommandLog rows no longer carry `QUERY_STORE_PRIORITY` in `QualifyReason`, which may affect filters that match that value. Existing rows remain readable by Diag.
 - **3.11.4 / Diag 2026.11.10.1** - Fixes for GitHub issues #657-#661: complete help output, explicit collation handling, skipped-stat logging, cache reset after CommandLog ID reuse, and clearer StopByTime overshoot guidance.
 - **3.11.3 / Diag 2026.11.06.1** - SSMS 22 fix. `sp_StatUpdate_Diag.sql` failed to parse or run in SSMS 22.11 (Msg 102 near `GO`, then Msg 111). The SSMS batch splitter appears not to nest block comments, so two markers in a change-history entry ended the header comment early and a quote later in the text hid the `GO`. The markers are reworded, two nested comments in the XE session's sample query are now line comments, and a CI check fails on any nested block comment. Neither procedure's code changed beyond its version numbers.
 - **3.11.2 / Diag 2026.08.02.1** - two crash-class fixes found by auditing the codebase against a deep study of the DarlingData diagnostic procedures. (1) `DATEDIFF(MILLISECOND)` int overflow: a CommandLog row spanning more than ~24.8 days (orphaned START whose END marker was written by orphan cleanup weeks later) raised error 535 and hard-failed the entire Diag run; the proc's TablePriority duration estimate read the same rows during discovery. Both now use `DATEDIFF_BIG`; Diag stores NULL for such spans (a duration measured to a cleanup marker is fiction) and the estimate filters them out. (2) Diag RS13 `ChangePct` columns had no denominator floor: a 2 ms CPU baseline reported +249,900%, and a large enough delta overflowed `decimal(10,1)` (error 8115) and killed the run -- now floored (NULL below 100 ms CPU / 0.1 ms-per-exec / 1 MB grant / 128 tempdb pages, matching the I8 headline constants) and clamped at +1000%. Regression tests seed both crash fixtures live.

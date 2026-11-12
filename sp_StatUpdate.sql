@@ -36,11 +36,19 @@ License:    MIT License
             OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
             SOFTWARE.
 
-Version:    3.11.4.2026.11.10 (Major.Minor.Patch.YYYY.MM.DD)
+Version:    3.11.5.2026.11.11 (Major.Minor.Patch.YYYY.MM.DD)
             - Version logged to CommandLog ExtendedInfo on each run
             - Query: ExtendedInfo.value('(/Parameters/Version)[1]', 'nvarchar(20)')
 
-History:    3.11.4.2026.11.10 - Release fixes from GitHub issues #657-#661:
+History:    3.11.5.2026.11.11 - Record the qualification rule during discovery and
+                            use it for success and failure CommandLog rows.
+                            Ascending-key rescue now reports ASCENDING_KEY;
+                            Query Store boost remains in QSPriorityBoost but is
+                            no longer written as QualifyReason. Existing
+                            CommandLog rows with QUERY_STORE_PRIORITY remain
+                            readable by Diag.
+
+            3.11.4.2026.11.10 - Release fixes from GitHub issues #657-#661:
                             complete help output, explicit collation handling,
                             skipped-stat logging, cache reset after CommandLog
                             reuse, and clear StopByTime overshoot guidance.
@@ -993,8 +1001,8 @@ BEGIN
     SET NUMERIC_ROUNDABORT OFF;
 
     DECLARE
-        @procedure_version varchar(20) = '3.11.4.2026.11.10',
-        @procedure_version_date datetime = '20261110',
+        @procedure_version varchar(20) = '3.11.5.2026.11.11',
+        @procedure_version_date datetime = '20261111',
         @procedure_name sysname = OBJECT_NAME(@@PROCID),
         @procedure_schema sysname = OBJECT_SCHEMA_NAME(@@PROCID);
 
@@ -1636,7 +1644,8 @@ BEGIN
         @current_qs_max_dop smallint = NULL,
         @current_qs_active_feedback_count int = NULL,
         @current_qs_last_execution datetime2(3) = NULL,
-        @current_qs_priority_boost bigint = NULL;
+        @current_qs_priority_boost bigint = NULL,
+        @current_qualify_reason nvarchar(40) = NULL;
 
     /*
     TOCTOU check variables (verify stat still exists before execution)
@@ -1866,6 +1875,7 @@ BEGIN
         qs_active_feedback_count int NULL, /*SQL 2022+: count of active plan feedback entries (CE/grant/DOP)*/
         qs_last_execution datetime2(3) NULL, /*most recent plan execution*/
         qs_priority_boost bigint NOT NULL DEFAULT 0, /*calculated boost for QS stats*/
+        qualify_reason nvarchar(40) NOT NULL DEFAULT N'MOP_UP', /* recorded discovery reason; direct/staged paths override the mop-up default */
         priority integer NOT NULL DEFAULT 0,
         from_mop_up bit NOT NULL DEFAULT 0, /* o2md.49: row discovered by a mop-up pass (per-row; @in_mop_up is session-scoped and mislabels priority-pass leftovers) */
         processed bit NOT NULL DEFAULT 0
@@ -4446,7 +4456,8 @@ INSERT INTO
     has_filter,
     filter_definition,
     unfiltered_rows,
-    priority
+    priority,
+    qualify_reason
 )
 SELECT
     database_name = DB_NAME(),
@@ -4504,7 +4515,8 @@ SELECT
                         OR ISNULL(ps.parsed_table, OBJECT_NAME(s.object_id)) COLLATE DATABASE_DEFAULT LIKE LTRIM(RTRIM(ct.value)) COLLATE DATABASE_DEFAULT)
             THEN 1 ELSE 0 END
         ELSE 0 END DESC,
-        (SELECT NULL))
+        (SELECT NULL)),
+    qualify_reason = N''DIRECT_MODE''
 FROM #parsed_stats AS ps
 JOIN sys.stats AS s
   ON s.name COLLATE DATABASE_DEFAULT = ps.parsed_stat COLLATE DATABASE_DEFAULT
@@ -4942,6 +4954,7 @@ OPTION (RECOMPILE);';
                     modification_velocity float NULL,
                     /* Phase 4: qualification flag */
                     qualifies bit NOT NULL DEFAULT 0,
+                    qualify_reason nvarchar(40) NULL,
                     /* Phase 5: page counts */
                     page_count bigint NULL,
                     is_heap bit NULL,
@@ -5390,7 +5403,8 @@ OPTION (RECOMPILE);';
                     DECLARE @ascending_rescued int = 0;
 
                     UPDATE sc
-                    SET sc.qualifies = 1
+                    SET sc.qualifies = 1,
+                        sc.qualify_reason = N''ASCENDING_KEY''
                     FROM #stat_candidates AS sc
                     WHERE sc.qualifies = 0
                     AND   sc.modification_counter > 0
@@ -6105,8 +6119,36 @@ OPTION (RECOMPILE);';
                             /* #185: Deterministic tie-breaker -- stable order for same priority score */
                             object_id ASC,
                             stats_id ASC
-                    )
-                FROM #stat_candidates
+                    ),
+                    qualify_reason = CASE
+                        WHEN sc.qualify_reason IS NOT NULL
+                        THEN sc.qualify_reason
+                        WHEN modification_counter = 0
+                        AND  ISNULL(days_stale, 9999) = 9999
+                        AND  CASE WHEN last_updated IS NULL AND ISNULL(rows, 0) = 0
+                                  THEN ISNULL(physical_row_count, 0) ELSE ISNULL(rows, 0) END > 0
+                        THEN N''NEVER_UPDATED''
+                        WHEN has_filter = 1
+                        AND  @i_filtered_stats_mode_param COLLATE Latin1_General_100_BIN2 = N''PRIORITY'' COLLATE Latin1_General_100_BIN2
+                        AND  CASE WHEN ISNULL(rows, 0) > 0 AND unfiltered_rows IS NOT NULL
+                                  THEN CONVERT(float, unfiltered_rows) / rows ELSE NULL END >= @i_filtered_stats_stale_factor_param
+                        THEN N''FILTERED_DRIFT''
+                        WHEN no_recompute = 1 AND @TargetNorecompute_param COLLATE Latin1_General_100_BIN2 IN (N''Y'' COLLATE Latin1_General_100_BIN2, N''BOTH'' COLLATE Latin1_General_100_BIN2)
+                        THEN N''NORECOMPUTE_TARGET''
+                        WHEN (ISNULL(days_stale, 9999) * 24) >= ISNULL(@StaleHours_param, 999999)
+                        THEN N''DAYS_STALE''
+                        WHEN @i_tiered_thresholds_param = 1
+                        THEN N''TIERED_THRESHOLD''
+                        WHEN @i_modification_percent_param IS NOT NULL
+                        AND  (modification_counter * 100.0 / NULLIF(
+                                  CASE WHEN last_updated IS NULL AND ISNULL(rows, 0) = 0
+                                       THEN ISNULL(physical_row_count, 0) ELSE ISNULL(rows, 0) END, 0)) >= @i_modification_percent_param
+                        THEN N''MOD_PERCENT''
+                        WHEN modification_counter >= ISNULL(@ModificationThreshold_param, 0)
+                        THEN N''MOD_COUNTER''
+                        ELSE N''THRESHOLD_MATCH''
+                    END
+                FROM #stat_candidates AS sc
                 {{MAX_GRANT_HINT}}
 
                 DROP TABLE #stat_candidates;
@@ -6198,7 +6240,7 @@ OPTION (RECOMPILE);';
                     qs_plan_count, qs_total_executions, qs_total_cpu_ms, qs_total_duration_ms,
                     qs_total_logical_reads, qs_total_memory_grant_kb, qs_total_tempdb_pages, qs_total_physical_reads, qs_total_logical_writes, qs_total_wait_time_ms, qs_max_dop, qs_active_feedback_count,
                     qs_last_execution, qs_priority_boost,
-                    is_published, is_tracked_by_cdc, temporal_type, priority
+                    is_published, is_tracked_by_cdc, temporal_type, priority, qualify_reason
                 )
                 EXECUTE sys.sp_executesql
                     @staged_sql,
@@ -8598,6 +8640,7 @@ OPTION (RECOMPILE);';
             @current_qs_max_dop = stp.qs_max_dop,
             @current_qs_last_execution = stp.qs_last_execution,
             @current_qs_priority_boost = stp.qs_priority_boost,
+            @current_qualify_reason = CASE WHEN @in_mop_up = 1 THEN N'MOP_UP' ELSE stp.qualify_reason END,
             /* Replication and temporal table awareness */
             @current_is_published = stp.is_published,
             @current_is_tracked_by_cdc = stp.is_tracked_by_cdc,
@@ -9831,47 +9874,7 @@ OPTION (RECOMPILE);';
                                 @current_qs_last_execution AS QSLastExecution,
                                 @current_qs_priority_boost AS QSPriorityBoost,
                                 @i_qs_metric AS QSMetric,
-                                CASE
-                                    WHEN @in_mop_up = 1
-                                    THEN N'MOP_UP'
-                                    WHEN @mode = N'DIRECT_STRING'
-                                    THEN N'DIRECT_MODE'
-                                    /* gh-550: NEVER_UPDATED rescue.  Ordered ABOVE QUERY_STORE_PRIORITY
-                                       and DAYS_STALE because it is a stronger, more specific signal
-                                       (the stat has NEVER been computed -- no histogram exists),
-                                       but BELOW mop-up/direct which describe processing mode.
-                                       days_stale = 9999 exactly: that is the ISNULL sentinel for
-                                       last_updated IS NULL; >= would also match genuinely ancient
-                                       stats (> 27 years) entering via DIRECT_STRING. */
-                                    WHEN @current_modification_counter = 0
-                                    AND  @current_days_stale = 9999
-                                    AND  @current_row_count > 0
-                                    THEN N'NEVER_UPDATED'
-                                    /* gh-554 (u6n7): FILTERED_DRIFT ordered ABOVE QUERY_STORE_PRIORITY.
-                                       A stat that exceeds the selectivity-drift ratio is a stronger,
-                                       more specific signal than a generic QS workload boost -- the
-                                       drift describes a structural histogram problem on this exact stat.
-                                       Mirrors the NEVER_UPDATED rationale: the more specific signal wins. */
-                                    WHEN @current_has_filter = 1
-                                    AND  @i_filtered_stats_mode = N'PRIORITY'
-                                    AND  @current_filtered_drift_ratio >= @i_filtered_stats_stale_factor
-                                    THEN N'FILTERED_DRIFT'
-                                    WHEN @current_qs_priority_boost > 0
-                                    THEN N'QUERY_STORE_PRIORITY'
-                                    WHEN @current_no_recompute = 1
-                                    AND  @TargetNorecompute IN (N'Y', N'BOTH')
-                                    THEN N'NORECOMPUTE_TARGET'
-                                    WHEN (@current_days_stale * 24) >= ISNULL(@StaleHours, 999999)
-                                    THEN N'DAYS_STALE'
-                                    WHEN @i_tiered_thresholds = 1
-                                    THEN N'TIERED_THRESHOLD'
-                                    WHEN @i_modification_percent IS NOT NULL
-                                    AND  (@current_modification_counter * 100.0 / NULLIF(@current_row_count, 0)) >= @i_modification_percent
-                                    THEN N'MOD_PERCENT'
-                                    WHEN @current_modification_counter >= ISNULL(@ModificationThreshold, 0)
-                                    THEN N'MOD_COUNTER'
-                                    ELSE N'THRESHOLD_MATCH'
-                                END AS QualifyReason,
+                                @current_qualify_reason AS QualifyReason,
                                 /* Sample rate traceability - answers "why this sample rate?" */
                                 @i_statistics_sample AS RequestedSamplePct,
                                 @effective_sample_percent AS EffectiveSamplePct,
@@ -10176,40 +10179,7 @@ OPTION (RECOMPILE);';
                                     @current_qs_last_execution AS QSLastExecution,
                                     @current_qs_priority_boost AS QSPriorityBoost,
                                     @i_qs_metric AS QSMetric,
-                                    CASE
-                                        WHEN @in_mop_up = 1
-                                        THEN N'MOP_UP'
-                                        WHEN @mode = N'DIRECT_STRING'
-                                        THEN N'DIRECT_MODE'
-                                        /* gh-550: NEVER_UPDATED rescue (mirrors success-path CASE;
-                                           = 9999 is the ISNULL sentinel for last_updated IS NULL) */
-                                        WHEN @current_modification_counter = 0
-                                        AND  @current_days_stale = 9999
-                                        AND  @current_row_count > 0
-                                        THEN N'NEVER_UPDATED'
-                                        /* gh-554 (u6n7): FILTERED_DRIFT ordered ABOVE QUERY_STORE_PRIORITY.
-                                           Mirrors success-path CASE: drift is the stronger, more specific
-                                           signal; the generic QS boost must not mask it. */
-                                        WHEN @current_has_filter = 1
-                                        AND  @i_filtered_stats_mode = N'PRIORITY'
-                                        AND  @current_filtered_drift_ratio >= @i_filtered_stats_stale_factor
-                                        THEN N'FILTERED_DRIFT'
-                                        WHEN @current_qs_priority_boost > 0
-                                        THEN N'QUERY_STORE_PRIORITY'
-                                        WHEN @current_no_recompute = 1
-                                        AND  @TargetNorecompute IN (N'Y', N'BOTH')
-                                        THEN N'NORECOMPUTE_TARGET'
-                                        WHEN (@current_days_stale * 24) >= ISNULL(@StaleHours, 999999)
-                                        THEN N'DAYS_STALE'
-                                        WHEN @i_tiered_thresholds = 1
-                                        THEN N'TIERED_THRESHOLD'
-                                        WHEN @i_modification_percent IS NOT NULL
-                                        AND  (@current_modification_counter * 100.0 / NULLIF(@current_row_count, 0)) >= @i_modification_percent
-                                        THEN N'MOD_PERCENT'
-                                        WHEN @current_modification_counter >= ISNULL(@ModificationThreshold, 0)
-                                        THEN N'MOD_COUNTER'
-                                        ELSE N'THRESHOLD_MATCH'
-                                    END AS QualifyReason,
+                                    @current_qualify_reason AS QualifyReason,
                                     @i_statistics_sample AS RequestedSamplePct,
                                     @effective_sample_percent AS EffectiveSamplePct,
                                     @sample_source AS SampleSource,
@@ -10464,7 +10434,7 @@ OPTION (RECOMPILE);';
        'Incorrect syntax near IsUserTable'; the per-database CATCH swallowed it and
        'Mop-up: no additional stats found' masqueraded as a normal result.  Serial
        and parallel-leader mop-up discovery had been silently broken since the
-       gh-462 refactor (36cea09, 2026-04-18). */
+       gh-462 refactor (913880a, 2026-04-18). */
     DECLARE @mop_up_where_sql nvarchar(max) = CAST(N'
                 WHERE ISNULL(sp.modification_counter, 0) > 0
                 AND   (
