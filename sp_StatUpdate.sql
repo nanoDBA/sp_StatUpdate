@@ -72,7 +72,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             either.  The end-of-run @duration_ms_total
                             computation gets the same DATEDIFF_BIG hardening.
 
-            3.11.1.2026.07.31 - o2md.54 (found by the SQL 2025 primary-source
+            3.11.1.2026.07.31 - tracking issue (found by the SQL 2025 primary-source
                             compatibility audit): the #369 plan-feedback
                             awareness filter used state_desc IN (ACTIVE,
                             PENDING_VALIDATION) -- but sys.query_store_
@@ -94,7 +94,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             current documentation; no other mismatches --
                             see research/sql2025-compat-audit-2026-07-31.md.
 
-            3.11.0.2026.07.30 - o2md.18 (maintainer decision): discovery-
+            3.11.0.2026.07.30 - tracking issue (maintainer decision): discovery-
                             candidate log.  When qualifying work remains
                             unprocessed at run end, ONE compact
                             SP_STATUPDATE_REMAINING CommandLog row lists the
@@ -111,7 +111,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             source (diag 2026.07.30.11).  Non-critical
                             TRY/CATCH write; one row per run.
 
-            3.10.1.2026.07.30 - o2md.53: the zks1/gh-533 forced-plan baseline
+            3.10.1.2026.07.30 - tracking issue: the zks1/gh-533 forced-plan baseline
                             and post-run delta filtered on plan_forcing_type =
                             N'MANUAL', but plan_forcing_type is an INT column
                             (1 = MANUAL) -- the comparison raised a conversion
@@ -125,9 +125,9 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             skipping.
 
             3.10.0.2026.07.30 - MOP-UP QS + two silent pre-existing bugs
-                            (o2md.5 + fixes found verifying it).
+                            (tracking issue + fixes found verifying it).
 
-                            o2md.5 (maintainer option a) -- Phase 6 QS
+                            tracking issue (maintainer option a) -- Phase 6 QS
                             enrichment extracted into @qs_phase6_sql, a
                             fragment variable the staged path concatenates
                             back at the exact original position (assembly is
@@ -135,7 +135,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             and the mop-up paths (parallel-leader + serial)
                             execute against a mop-up-built #stat_candidates
                             per database.  Mop-up rows now carry real qs_*
-                            values in per-stat ExtendedInfo (the o2md.16/W5
+                            values in per-stat ExtendedInfo (the tracking issue/W5
                             "QS not applicable to this pass" dependency) and
                             @SortOrder = QUERY_STORE is honored by a
                             post-enrichment re-rank; the parallel-leader
@@ -164,7 +164,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             ~3 months of green gates; a regression test now
                             asserts discovery actually finds seeded rows.
 
-            3.9.0.2026.07.30 - BEHAVIOR CHANGE (maintainer-authorized, o2md.7):
+            3.9.0.2026.07.30 - BEHAVIOR CHANGE (maintainer-authorized, tracking issue):
                             adaptive sampling on by default in the NIGHTLY and
                             WEEKLY_FULL presets.  A single large stat with a
                             100% sample could burn 20+ minutes of NIGHTLY's
@@ -176,7 +176,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             WAREHOUSE presets unchanged.  Explicit
                             @LongRunningThresholdMinutes /
                             @LongRunningSamplePercent still override (applied
-                            after presets).  Also in 3.9.0 (o2md.4, found by
+                            after presets).  Also in 3.9.0 (tracking issue, found by
                             the kill-recovery repro): a parallel run that
                             joins a carried-over queue, verifies every
                             carried stat was already updated (CommandLog
@@ -195,9 +195,9 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             "preset decides".
 
             3.8.5.2026.07.30 - OBSERVABILITY: self-idle-time buckets + mop-up
-                            sort-order/tagging (o2md.46, o2md.49).
+                            sort-order/tagging (tracking issue, tracking issue).
 
-                            o2md.46 - the proc's own wait time was invisible:
+                            tracking issue - the proc's own wait time was invisible:
                             no field captured time spent in the inter-stat
                             delay, the AG-redo recheck loop, deadlock/lock-
                             timeout retry backoff, or parallel claim-cycle
@@ -212,10 +212,10 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             XSINIL in that block, so absent == 0).  The
                             claim-cycle bracket stays open across the
                             lazy-discovery zero-rows/CATCH CONTINUE loops
-                            (o2md.1) so failed claim cycles are counted, and
+                            (tracking issue) so failed claim cycles are counted, and
                             is never opened in serial mode.
 
-                            o2md.49 (split from o2md.5) - all three mop-up
+                            tracking issue (split from tracking issue) - all three mop-up
                             discovery sites (lazy per-table, parallel-leader,
                             serial) hard-coded modification-counter ordering,
                             silently ignoring @SortOrder.  A shared
@@ -226,7 +226,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             is structurally NULL).  QUERY_STORE and other
                             enrichment-dependent sorts keep the
                             modification-counter fallback (pre-fix behavior)
-                            pending the o2md.5 design decision.  Also new:
+                            pending the tracking issue design decision.  Also new:
                             #stats_to_process.from_mop_up per-row flag,
                             emitted as FromMopUp in per-stat ExtendedInfo --
                             unlike QualifyReason's MOP_UP branch (driven by
@@ -236,7 +236,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             to tell "no QS data" from "QS not applicable to
                             this pass".
 
-            3.8.4.2026.07.30 - o2md.8: bounded retry extended to lock timeouts.
+            3.8.4.2026.07.30 - tracking issue: bounded retry extended to lock timeouts.
                             The existing #163 deadlock-retry loop (up to 3
                             attempts, exponential backoff) retried error 1205
                             only.  A lock timeout (1222) is just as transient
@@ -258,7 +258,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             variable first.
 
             3.8.3.2026.07.30 - Query Store diagnostics + priority-pass/mop-up
-                            inversion warning (o2md.6, QuickieStore comparison).
+                            inversion warning (tracking issue, QuickieStore comparison).
 
                             Four Query Store observability gaps closed after
                             comparing Phase 6 enrichment against Erik Darling's
@@ -283,7 +283,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             only) -- no change to qualification, ordering, or
                             enrichment logic.
 
-                            o2md.6 -- the priority pass qualifying 0 stats while
+                            tracking issue -- the priority pass qualifying 0 stats while
                             mop-up (raw modification_counter > 0, no threshold
                             filtering) finds N > 0 is never legitimate; it means
                             priority-pass qualification is broken (the exact
@@ -298,7 +298,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             of 2026-07-28, where ~50 nightly maintenance windows
                             reported SUCCESS while processing zero statistics.
 
-                            o2md.1 (P0) -- the lazy mop-up branches that discover
+                            tracking issue (P0) -- the lazy mop-up branches that discover
                             0 stats for a claimed table, and their CATCH, released
                             the claim and NULLed @claimed_table_* but had no
                             CONTINUE.  Control fell through to the work-claim
@@ -308,30 +308,30 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             remaining queued table.  Signature in the wild:
                             StatsFound decaying by roughly one table per night
                             (1779 -> 1746 -> 1710 -> 1704) with StatsProcessed = 0.
-                            Distinct from sp_StatUpdate-v31y, which covers the
+                            Distinct from tracking issue, which covers the
                             PARALLEL_COMPLETE variant.
 
-                            o2md.2 (P1) -- @remaining_stats counted
+                            tracking issue (P1) -- @remaining_stats counted
                             #stats_to_process, which is structurally empty when
                             @skip_discovery = 1 (worker joined an existing queue),
                             so StatsRemaining reported 0 no matter how much work
                             was outstanding.  Now derived from dbo.QueueStatistic
                             in parallel mode, split under its own IF so the
                             optional table is not name-resolved on non-parallel
-                            runs (cf. sp_StatUpdate-isa2).
+                            runs (cf. tracking issue).
 
-                            o2md.3 (P1) -- StatsFound > 0 with StatsProcessed = 0
+                            tracking issue (P1) -- StatsFound > 0 with StatsProcessed = 0
                             now grades Status = ERROR, emits the SILENT_NOOP
                             warning code, and returns 2 so SQL Agent fails the
                             job.  Detection previously existed only in
                             sp_StatUpdate_Diag, so no-ops went unnoticed for weeks.
 
-                            o2md.9 (P3) -- the lazy mop-up zero-stats debug message
+                            tracking issue (P3) -- the lazy mop-up zero-stats debug message
                             interpolated @claimed_table_* after they were NULLed
                             and always rendered NULL.NULL.
 
             3.8.1.2026.07.25 - MONITORING: per-stat CONTEXT_INFO refresh
-                            (sp_StatUpdate-03i3 / gh-538).  The gh-423
+                            (tracking issue / gh-538).  The gh-423
                             CONTEXT_INFO set at proc entry was static for the
                             whole run (DB/Job/Preset only) -- a DBA using
                             sp_WhoIsActive mid-run saw no run label, no stat
@@ -351,7 +351,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             already cover both the DMV/sp_WhoIsActive and
                             job-log monitoring surfaces.
 
-            3.8.0.2026.07.25 - COLOR: opt-in @Ansi param (sp_StatUpdate-w0xp).
+            3.8.0.2026.07.25 - COLOR: opt-in @Ansi param (tracking issue).
                             @Ansi = N'Y' colorizes console (RAISERROR) output
                             with ANSI SGR escape codes -- banners, discovery
                             line, "Found N qualifying", the per-stat progress
@@ -365,7 +365,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             sqlcmd piped to a color-aware pager) to see them.
 
             3.7.4.2026.07.25 - SPILL PROOF: preselection-vs-proof @Help topic
-                            (sp_StatUpdate-ggnq / gh-552).  Query Store metrics
+                            (tracking issue / gh-552).  Query Store metrics
                             (TEMPDB_SPILLS/WAITS/WAIT_CPU) preselect candidates
                             before a run; they do NOT prove a sort spill in the
                             UPDATE STATISTICS statement itself.  @Help now says
@@ -375,7 +375,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             change to QS enrichment, ranking, or sort logic.
 
             3.7.3.2026.07.23 - Publish early-rejection outcomes before severity-16
-                            signaling (sp_StatUpdate-2zla / gh-555):  the
+                            signaling (tracking issue / gh-555):  the
                             open-transaction guard and the ALREADY_RUNNING
                             branch raised their severity-16 error BEFORE
                             setting OUTPUT params, emitting the structured
@@ -396,7 +396,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             the error message now follows the result set.
 
             3.7.2.2026.07.23 - Phase 3B delta-enrichment cache key omits SchemaName
-                            (sp_StatUpdate-mtt4):  the gh-502 cl_lookup CTE
+                            (tracking issue):  the gh-502 cl_lookup CTE
                             joined CommandLog on DatabaseName + ObjectName +
                             StatisticsName -- the same incomplete key fixed for
                             Phase 5B in v3.7.1.  Same-named table+stat pairs in
@@ -407,7 +407,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             and wrong modification_velocity.  SchemaName is now
                             part of the join key.
 
-            3.7.1.2026.07.23 - QS score cache value + identity fix (sp_StatUpdate-rcng
+            3.7.1.2026.07.23 - QS score cache value + identity fix (tracking issue
                             / gh-556):  Phase 5B cache hits were zeroed by the
                             unconditional Phase 6 qs_priority_boost
                             initialization while the live enrichment still
@@ -421,7 +421,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             (the gh-503 invalidation contract); legacy rows
                             without QSMetric are cache misses.
 
-            3.7.0.2026.07.03 - QS attribution + guardrail batch (sp_StatUpdate-zks1,
+            3.7.0.2026.07.03 - QS attribution + guardrail batch (tracking issue,
                             -6aa2, -sss6, -o7gf, -u6n7, -l4ui, -lfbv):
                             (1) gh-533 (zks1): pre-run QS forced-plan baseline --
                             #qs_forced_baseline snapshots force_failure_count per
@@ -466,7 +466,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             deduped via flag instead of LIKE-scan; fresh-stat
                             physical_row_count aggregated once per object
                             (GROUP BY derived table) instead of per stat.
-            3.6.0.2026.07.02 - Telemetry contract batch (sp_StatUpdate-mvgb, -r2d0,
+            3.6.0.2026.07.02 - Telemetry contract batch (tracking issue, -r2d0,
                             -ibyc, -6zvp, -wuq2, -hdls):
                             (1) mvgb: END Summary XML gains a WarningsCodes
                             element (pipe-delimited, same tokens as
@@ -492,7 +492,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             + ETA suffix (after 5 completed stats); startup
                             advisory for the dangerous combo of a 0-1s lock
                             timeout with @MaxConsecutiveFailures = 1.
-            3.5.9.2026.07.02 - Three fixes (sp_StatUpdate-7pqu, -f14h, -lh23):
+            3.5.9.2026.07.02 - Three fixes (tracking issue, -f14h, -lh23):
                             (1) gh-550: statistics that have NEVER been computed
                             (dm_db_stats_properties returns last_updated NULL /
                             modification_counter NULL) over POPULATED tables were
@@ -524,7 +524,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             Memory, Other Disk IO) and centralized into
                             @qs_wait_categories ({{WAITS_CATEGORIES}} token) so
                             the three consumer sites can no longer drift.
-            3.5.8.2026.06.12 - Telemetry bug fix (sp_StatUpdate-rse2):
+            3.5.8.2026.06.12 - Telemetry bug fix (tracking issue):
                             Four mid-run early returns (NO_QUALIFYING_STATS,
                             FINGERPRINT_CONFLICT, MAX_WORKERS,
                             QUEUE_INIT_ERROR) exited after the
@@ -544,7 +544,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             outside it, so the error surfaces to the caller AND
                             the documented refuse-the-join semantics actually
                             execute.
-            3.5.7.2026.06.12 - Parallel bug fix (sp_StatUpdate-v31y):
+            3.5.7.2026.06.12 - Parallel bug fix (tracking issue):
                             Queue leadership re-claim no longer blocked by
                             recycled SPIDs or idle pooled leader sessions.  The
                             claim UPDATE judged liveness by bare session_id, so
@@ -563,7 +563,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                             scoped to open claims (TableEndTime IS NULL).
                             Found by ConcurrentParallel P3 on a fresh gate
                             container.
-            3.5.6.2026.06.10 - Code-review batch (sp_StatUpdate-r77t, -orec, -mc03):
+            3.5.6.2026.06.10 - Code-review batch (tracking issue, -orec, -mc03):
                             r77t (P1 bug): fingerprint conflict check hoisted out
                               of the queue-CREATOR branch so it also runs for
                               queue JOINERS.  Previously any worker whose first
@@ -599,7 +599,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                               always has an active request; the branch guards
                               the post-call idle window, not "between stats").
                               (d) two em dashes in comments replaced with --.
-            3.5.5.2026.06.08 - Bug fix (sp_StatUpdate-i7by): false ALREADY_RUNNING
+            3.5.5.2026.06.08 - Bug fix (tracking issue): false ALREADY_RUNNING
                               on consecutive calls after a validation-error exit.
                               Three-part fix in the re-entrancy guard:
                               (S) When the existing lock holder is the caller's own
@@ -616,7 +616,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                               sys.dm_exec_sessions after client disconnect).
                               (D) TTL guard: any lock row with AcquiredAt > 8 hours
                               old reclaims unconditionally regardless of session state.
-            3.5.4.2026.06.08 - Two fixes (sp_StatUpdate-mhje, sp_StatUpdate-mknv):
+            3.5.4.2026.06.08 - Two fixes (tracking issue, tracking issue):
                             mhje: parallel TablePriority ordering inverted gh-505
                               LPT vs the user's explicit @SortOrder.  LPT was
                               PRIMARY (est_total_seconds DESC) and min_priority
@@ -641,7 +641,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                               min 1%) overrides the FULLSCAN.  Default NULL
                               = disabled (non-breaking).  Critical-table
                               override (@CriticalSamplePercent) still wins.
-            3.5.3.2026.05.29 - Bug fix (sp_StatUpdate-isa2): @total_stats was
+            3.5.3.2026.05.29 - Bug fix (tracking issue): @total_stats was
                               initialized by a CASE inside a multi-variable
                               DECLARE whose parallel branch reads the optional
                               dbo.QueueStatistic table.  A CASE in a DECLARE is a
@@ -652,7 +652,7 @@ History:    3.11.5.2026.11.11 - Record the qualification rule during discovery a
                               @StatsInParallel = Y).  @total_stats is now assigned
                               via IF/ELSE so the QueueStatistic reference is only
                               resolved in parallel mode where the table exists.
-            3.5.2.2026.05.28 - Bug fix (sp_StatUpdate-trla): orphaned-run
+            3.5.2.2026.05.28 - Bug fix (tracking issue): orphaned-run
                               cleanup added a lower bound to the orphan START
                               candidate hunt so it only considers STARTs within
                               the same window as #orphan_end_labels (now minus
@@ -945,7 +945,7 @@ ALTER PROCEDURE
     @ModificationThreshold bigint = NULL,           /* Override preset mod threshold floor (large tables). NULL = preset decides */
     @LongRunningThresholdMinutes integer = NULL,    /* Stats historically slower than this get forced sample rate. NULL = disabled */
     @LongRunningSamplePercent integer = NULL,        /* Sample percent for long-running stats (default preset: 10%). NULL = preset decides */
-    @FirstTimeFullScanCapRows bigint = NULL,         /* sp_StatUpdate-mknv: Cap FULLSCAN to sampled rate when row count exceeds this AND stat has no successful CommandLog entry yet.  Uses same 10M-row cap formula as adaptive sampling.  Critical-table override wins.  NULL = disabled (non-breaking). */
+    @FirstTimeFullScanCapRows bigint = NULL,         /* tracking issue: Cap FULLSCAN to sampled rate when row count exceeds this AND stat has no successful CommandLog entry yet.  Uses same 10M-row cap formula as adaptive sampling.  Critical-table override wins.  NULL = disabled (non-breaking). */
 
     /* QUERY STORE TUNING */
     @QueryStoreTopPlans integer = NULL,             /* Limit Phase 6 XML plan parsing to top N plans. NULL = preset decides (default 500). */
@@ -1218,7 +1218,7 @@ BEGIN
         ELSE
         BEGIN
             /*
-            sp_StatUpdate-i7by: expanded dead-holder detection.
+            tracking issue: expanded dead-holder detection.
 
             Three failure modes addressed:
 
@@ -1278,7 +1278,7 @@ BEGIN
                     )
                     BEGIN
                         /* Session present, no active request, idle < 60 s.
-                           sp_StatUpdate-mc03 (c): a RUNNING sp_StatUpdate call is one
+                           tracking issue (c): a RUNNING sp_StatUpdate call is one
                            request, so "no active request" only occurs AFTER a call
                            ends.  This branch therefore protects the brief window
                            where a session's call just finished (cleanup may still
@@ -1483,7 +1483,7 @@ BEGIN
         @supports_auto_drop bit = 0,
         /* zks1 / gh-533: sys.query_store_plan.plan_forcing_type column availability.
            Column added in SQL 2022 (16.x).  When present, forced-plan baseline and
-           post-run check filter to plan_forcing_type = 1 (MANUAL; int column -- o2md.53) -- excludes
+           post-run check filter to plan_forcing_type = 1 (MANUAL; int column -- tracking issue) -- excludes
            Automatic-Plan-Correction (APC) noise.  Detected via metadata lookup
            (not @sql_major_version) so managed platforms that backport can pick it up. */
         @has_plan_forcing_type bit = 0;
@@ -1707,8 +1707,8 @@ BEGIN
         @mop_up_stats_processed int = 0, /* v2.24: mop-up stats processed (for summary XML) */
         @mop_lock_result int = NULL, /* v2.24: parallel mop-up app lock result */
         @mop_lock_resource nvarchar(255) = NULL, /* v2.24: parallel mop-up app lock name */
-        @mop_up_order_expr nvarchar(400) = NULL, /* o2md.49: mop-up ORDER BY expression honoring non-QS @SortOrder values (set after sort-order resolution) */
-        @current_from_mop_up bit = 0, /* o2md.49: per-row mop-up-origin flag from #stats_to_process (QualifyReason's @in_mop_up is session-scoped and mislabels priority-pass leftovers) */
+        @mop_up_order_expr nvarchar(400) = NULL, /* tracking issue: mop-up ORDER BY expression honoring non-QS @SortOrder values (set after sort-order resolution) */
+        @current_from_mop_up bit = 0, /* tracking issue: per-row mop-up-origin flag from #stats_to_process (QualifyReason's @in_mop_up is session-scoped and mislabels priority-pass leftovers) */
         @io_corruption_warned bit = 0; /* lfbv: deduplication flag for IO_CORRUPTION warning code (mirrors @mop_up_done idiom) */
 
     /*
@@ -1730,7 +1730,7 @@ BEGIN
         @qs_forced_failure_delta_total bigint = 0;
 
     /*
-    o2md.46: self-idle-time accumulators.  The proc's own wait time (inter-stat
+    tracking issue: self-idle-time accumulators.  The proc's own wait time (inter-stat
     delay, AG-redo recheck loop, deadlock/lock-timeout retry backoff, parallel
     claim-cycle overhead) was previously invisible -- Diag's W6 EXCESSIVE_OVERHEAD
     could only infer "discovery cost" from wall-clock minus per-stat time.  Each
@@ -1807,7 +1807,7 @@ BEGIN
     );
 
     /*
-    sp_StatUpdate-mknv: Known-stats table (for first-time FULLSCAN cap)
+    tracking issue: Known-stats table (for first-time FULLSCAN cap)
     Populated ONLY when @FirstTimeFullScanCapRows IS NOT NULL.
     Holds stats with at least one successful CommandLog entry within retention,
     so the per-stat first-time check can NOT EXISTS against an in-memory set
@@ -1880,7 +1880,7 @@ BEGIN
         qs_priority_boost bigint NOT NULL DEFAULT 0, /*calculated boost for QS stats*/
         qualify_reason nvarchar(40) NOT NULL DEFAULT N'MOP_UP', /* recorded discovery reason; direct/staged paths override the mop-up default */
         priority integer NOT NULL DEFAULT 0,
-        from_mop_up bit NOT NULL DEFAULT 0, /* o2md.49: row discovered by a mop-up pass (per-row; @in_mop_up is session-scoped and mislabels priority-pass leftovers) */
+        from_mop_up bit NOT NULL DEFAULT 0, /* tracking issue: row discovered by a mop-up pass (per-row; @in_mop_up is session-scoped and mislabels priority-pass leftovers) */
         processed bit NOT NULL DEFAULT 0
     );
 
@@ -2342,7 +2342,7 @@ BEGIN
         SET @i_qs_enabled = 1;
         SET @i_mop_up_pass = N'Y';
         SET @i_sort_order = N'QUERY_STORE';
-        /* o2md.7 (maintainer-authorized behavior change, v3.9.0): adaptive
+        /* tracking issue (maintainer-authorized behavior change, v3.9.0): adaptive
            sampling on by default -- a single FULLSCAN stat could previously
            burn 20+ min of this preset's 60-min window.  Threshold sized to
            the window (~1/6th); explicit @LongRunningThresholdMinutes still
@@ -2357,7 +2357,7 @@ BEGIN
         SET @i_mop_up_pass = N'Y';
         SET @i_sort_order = N'QUERY_STORE';
         SET @i_statistics_sample = 100;
-        /* o2md.7 (maintainer-authorized behavior change, v3.9.0): adaptive
+        /* tracking issue (maintainer-authorized behavior change, v3.9.0): adaptive
            sampling on by default -- historically-slow stats fall back to the
            sampled rate instead of repeating a FULLSCAN that will not finish
            inside the 4-hour window. */
@@ -2535,12 +2535,12 @@ BEGIN
         INSERT INTO @errors (error_message, error_severity)
         VALUES (N'Invalid @SortOrder. Use: MODIFICATION_COUNTER, DAYS_STALE, PAGE_COUNT, RANDOM, QUERY_STORE, FILTERED_DRIFT, AUTO_CREATED, ROWS, MODIFICATION_VELOCITY.', 16);
 
-    /* o2md.49: mop-up discovery ORDER BY expression.  The three mop-up discovery
+    /* tracking issue: mop-up discovery ORDER BY expression.  The three mop-up discovery
        sites (lazy per-table, parallel-leader, serial) previously hard-coded
        modification-counter ordering, silently ignoring @SortOrder.  The non-QS sort
        orders map onto columns those sites already select (aliases s/sp/pgs are
        identical at all three).  QUERY_STORE, FILTERED_DRIFT, MODIFICATION_VELOCITY
-       and WAIT-based sorts need enrichment mop-up does not run (o2md.5, escalated)
+       and WAIT-based sorts need enrichment mop-up does not run (tracking issue, escalated)
        -- they keep the modification-counter fallback, which is the pre-fix behavior.
        Expressions mirror the main pass's staged-discovery CASE (region 05) minus the
        qs_priority_boost term (mop-up qs_* is structurally NULL). */
@@ -2595,7 +2595,7 @@ BEGIN
         INSERT INTO @errors (error_message, error_severity)
         VALUES (N'@LongRunningSamplePercent must be 1-100.', 16);
 
-    /* sp_StatUpdate-mknv: @FirstTimeFullScanCapRows must be a positive row count. */
+    /* tracking issue: @FirstTimeFullScanCapRows must be a positive row count. */
     IF @FirstTimeFullScanCapRows IS NOT NULL AND @FirstTimeFullScanCapRows < 1
         INSERT INTO @errors (error_message, error_severity)
         VALUES (N'@FirstTimeFullScanCapRows must be >= 1 row.  NULL = disabled.', 16);
@@ -2833,7 +2833,7 @@ BEGIN
             StopReason = N'PARAMETER_ERROR', RunLabel = @run_label,
             Version = @procedure_version;
 
-        /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+        /* tracking issue: restore caller CONTEXT_INFO on early return */
         IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
         IF @StatsInParallel = N'N'
             DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
@@ -3064,7 +3064,7 @@ BEGIN
             DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
             StopReason = N'PARAMETER_ERROR', RunLabel = @run_label,
             Version = @procedure_version;
-        /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+        /* tracking issue: restore caller CONTEXT_INFO on early return */
         IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
         IF @StatsInParallel = N'N'
             DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
@@ -3141,7 +3141,7 @@ BEGIN
             StopReason = N'AG_SECONDARY',
             RunLabel = @run_label,
             Version = @procedure_version;
-        /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+        /* tracking issue: restore caller CONTEXT_INFO on early return */
         IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
         IF @StatsInParallel = N'N'
             DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
@@ -3395,7 +3395,7 @@ BEGIN
         RAISERROR(N'  @LongRunningThreshold    = %d minutes', 10, 1, @i_long_running_threshold_min) WITH NOWAIT;
         RAISERROR(N'  @LongRunningSamplePct    = %d%%', 10, 1, @i_long_running_sample_pct) WITH NOWAIT;
     END;
-    /* sp_StatUpdate-mknv: first-time FULLSCAN cap */
+    /* tracking issue: first-time FULLSCAN cap */
     IF @FirstTimeFullScanCapRows IS NOT NULL
         RAISERROR(N'  @FirstTimeFullScanCap    = %I64d rows (cap FULLSCAN for stats with no CommandLog history)', 10, 1, @FirstTimeFullScanCapRows) WITH NOWAIT;
 
@@ -3879,7 +3879,7 @@ BEGIN
                     /* Adaptive sampling */
                     @LongRunningThresholdMinutes AS LongRunningThresholdMinutes,
                     @LongRunningSamplePercent AS LongRunningSamplePercent,
-                    /* sp_StatUpdate-mknv: first-time FULLSCAN cap */
+                    /* tracking issue: first-time FULLSCAN cap */
                     @FirstTimeFullScanCapRows AS FirstTimeFullScanCapRows,
 
                     /* Environmental safety */
@@ -4032,7 +4032,7 @@ BEGIN
         WHERE cl_start.CommandType = N'SP_STATUPDATE_START'
         /* #148: Only clean orphans older than @i_orphaned_run_threshold_hours (avoids concurrent run interference) */
         AND   cl_start.StartTime < DATEADD(HOUR, -@i_orphaned_run_threshold_hours, SYSDATETIME())
-        /* sp_StatUpdate-trla: lower bound must match the #orphan_end_labels
+        /* tracking issue: lower bound must match the #orphan_end_labels
            window (now - (@i_orphaned_run_threshold_hours + 24h)).  Without it,
            a START older than that window whose real END also predates the
            window is not found in #orphan_end_labels and gets a fabricated
@@ -4087,7 +4087,7 @@ BEGIN
                 database_name = cl.DatabaseName,
                 schema_name = cl.SchemaName,
                 table_name = cl.ObjectName,
-                /* sp_StatUpdate-mc03: StatisticsName column is authoritative -- no
+                /* tracking issue: StatisticsName column is authoritative -- no
                    writer ever produced a /StatInfo XML root, so the former XPath
                    COALESCE limb was dead weight (parsed XML per row, matched never). */
                 stat_name = COALESCE(
@@ -4145,7 +4145,7 @@ BEGIN
     END;
 
     /*
-    sp_StatUpdate-mknv: KNOWN-STATS PREFETCH FOR FIRST-TIME CAP
+    tracking issue: KNOWN-STATS PREFETCH FOR FIRST-TIME CAP
     Populate @known_stats with stats that have at least one completed CommandLog
     entry within retention.  Used by the per-stat first-time check to avoid
     scanning CommandLog row-by-row inside the process loop.  Only runs when
@@ -4165,7 +4165,7 @@ BEGIN
             cl.DatabaseName,
             cl.SchemaName,
             cl.ObjectName,
-            /* sp_StatUpdate-mc03: column-only -- the /StatInfo XPath limb was dead (see 07A note) */
+            /* tracking issue: column-only -- the /StatInfo XPath limb was dead (see 07A note) */
             COALESCE(
                 cl.StatisticsName,
                 cl.IndexName
@@ -4206,8 +4206,8 @@ BEGIN
     with no joins, wrapped in its own TRY/CATCH so inaccessible/QS-off
     databases skip silently.
 
-    plan_forcing_type filter (SQL 2017+ per docs; o2md.54 audit): when @has_plan_forcing_type = 1
-    the baseline is limited to plan_forcing_type = 1 (MANUAL; int column -- o2md.53) -- excludes
+    plan_forcing_type filter (SQL 2017+ per docs; tracking issue audit): when @has_plan_forcing_type = 1
+    the baseline is limited to plan_forcing_type = 1 (MANUAL; int column -- tracking issue) -- excludes
     Automatic-Plan-Correction (APC) noise that we cannot attribute to
     stat maintenance.  Pre-2022 behavior unchanged (no filter).
     */
@@ -4217,7 +4217,7 @@ BEGIN
         query_id bigint NOT NULL,
         plan_id bigint NOT NULL,
         force_failure_count bigint NOT NULL DEFAULT 0,
-        plan_forcing_type int NULL, /* o2md.54: int, matching the source column (was nvarchar(20) -- implicit-converted the int values) */
+        plan_forcing_type int NULL, /* tracking issue: int, matching the source column (was nvarchar(20) -- implicit-converted the int values) */
         PRIMARY KEY (database_name, plan_id)
     );
 
@@ -4278,7 +4278,7 @@ BEGIN
                     + N'FROM ' + QUOTENAME(@fb_db) + N'.sys.query_store_plan AS qsp '
                     + N'WHERE qsp.is_forced_plan = 1'
                     + CASE WHEN @has_plan_forcing_type = 1
-                           THEN N' AND qsp.plan_forcing_type = 1 /* MANUAL -- int column; o2md.53: comparing to N''MANUAL'' failed with a conversion error on every 2022+ version and was CATCH-swallowed */;'
+                           THEN N' AND qsp.plan_forcing_type = 1 /* MANUAL -- int column; tracking issue: comparing to N''MANUAL'' failed with a conversion error on every 2022+ version and was CATCH-swallowed */;'
                            ELSE N';'
                       END;
 
@@ -4644,7 +4644,7 @@ OPTION (RECOMPILE);';
                 N',@i_qs_min_executions=' + ISNULL(CONVERT(nvarchar(20), @i_qs_min_executions), N'') +
                 N',@i_qs_recent_hours=' + ISNULL(CONVERT(nvarchar(20), @i_qs_recent_hours), N'') +
                 N',@i_qs_top_plans=' + ISNULL(CONVERT(nvarchar(20), @i_qs_top_plans), N'') +
-                /* sp_StatUpdate-mknv: first-time cap affects sample rates -- workers with different
+                /* tracking issue: first-time cap affects sample rates -- workers with different
                    values must not share a parallel queue */
                 N',@FirstTimeFullScanCapRows=' + ISNULL(CONVERT(nvarchar(20), @FirstTimeFullScanCapRows), N'');
     END;
@@ -4832,7 +4832,7 @@ OPTION (RECOMPILE);';
             */
             BEGIN
                 DECLARE @staged_sql nvarchar(max);
-    /* o2md.5 (maintainer option a): Phase 6 QS enrichment extracted into its own
+    /* tracking issue (maintainer option a): Phase 6 QS enrichment extracted into its own
        fragment variable.  The staged path concatenates it back into @staged_sql at
        the exact original position (byte-identical assembly -- the two paths CANNOT
        drift), and the mop-up paths execute the same fragment against a
@@ -4857,7 +4857,7 @@ OPTION (RECOMPILE);';
                     N'                        is_memory_optimized = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
                     N'                        is_heap = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
                     N'                        auto_created = CONVERT(bit, NULL),' + CHAR(13)+CHAR(10) +
-                    /* pre-existing bug found 2026-07-30 during o2md.5 verification: the sw82
+                    /* pre-existing bug found 2026-07-30 during tracking issue verification: the sw82
                        batch added is_critical to the staged INSERT + FINAL SELECT but not to
                        this empty-path shape -- every zero-candidate/zero-qualify early exit
                        then failed the INSERT...EXECUTE column-count check and the whole
@@ -5876,7 +5876,7 @@ OPTION (RECOMPILE);';
                             FROM sys.query_store_plan_feedback AS pf2
                             INNER JOIN sys.query_store_plan AS p2 ON p2.plan_id = pf2.plan_id
                             WHERE pf2.state_desc IN (N''PENDING_VALIDATION'', N''IN_VALIDATION'', N''VERIFICATION_PASSED'', N''FEEDBACK_VALID'')
-                              /* o2md.54: there is NO documented ACTIVE state -- the old
+                              /* tracking issue: there is NO documented ACTIVE state -- the old
                                  (N''ACTIVE'', N''PENDING_VALIDATION'') filter silently degraded to
                                  PENDING_VALIDATION-only on every version.  These four states are
                                  the feedback a stats update could invalidate (verified against
@@ -6776,7 +6776,7 @@ OPTION (RECOMPILE);';
         @memory_optimized_stats integer = 0,
         @persisted_sample_stats integer = 0;
 
-    /* sp_StatUpdate-isa2: assign @total_stats via IF/ELSE rather than a CASE inside
+    /* tracking issue: assign @total_stats via IF/ELSE rather than a CASE inside
        the DECLARE.  The parallel branch reads dbo.QueueStatistic, which is optional
        (auto-created only when @StatsInParallel = Y).  A CASE inside a DECLARE is a
        single always-compiled statement, so SQL Server name-resolves the
@@ -6876,7 +6876,7 @@ OPTION (RECOMPILE);';
             /* Mop-up disabled or insufficient time -- exit */
             RAISERROR(N'No statistics qualify for update. Exiting.', 10, 1) WITH NOWAIT;
 
-            /* sp_StatUpdate-rse2: write a real SP_STATUPDATE_END so this healthy
+            /* tracking issue: write a real SP_STATUPDATE_END so this healthy
                early return is not orphaned (diag C1 false KILLED critical) and
                not later fabricated as StopReason=KILLED by orphan cleanup. */
             IF  @LogToTable = N'Y'
@@ -6959,7 +6959,7 @@ OPTION (RECOMPILE);';
                 RunLabel = @run_label,
                 Version = @procedure_version;
 
-            /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+            /* tracking issue: restore caller CONTEXT_INFO on early return */
             IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
             IF @StatsInParallel = N'N'
                 DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
@@ -7085,12 +7085,12 @@ OPTION (RECOMPILE);';
             ISNULL(CONVERT(nvarchar(20), @i_qs_recent_hours), N'NULL'),
             /* gh-513: critical-table params affect discovery and sample rate */
             ISNULL(@CriticalTables, N''), @CriticalSamplePercent, @CriticalTablesFirst,
-            /* sp_StatUpdate-mknv: first-time cap affects sample rate -- include in fingerprint */
+            /* tracking issue: first-time cap affects sample rate -- include in fingerprint */
             ISNULL(CONVERT(nvarchar(20), @FirstTimeFullScanCapRows), N'NULL'),
             /* f14h: abort behavior on integrity errors -- divergent workers must not share a queue */
             CONVERT(nvarchar(1), @AbortOnIntegrityError)
         );
-        /* sp_StatUpdate-rse2: conflict is flagged inside the TRY below and acted
+        /* tracking issue: conflict is flagged inside the TRY below and acted
            on at the FingerprintConflictExit label OUTSIDE all TRY scopes.  The
            prior code raised severity 16 directly inside the TRY, which jumped
            to the empty fingerprint CATCH -- the RETURN 50001 / result-set block
@@ -7166,7 +7166,7 @@ OPTION (RECOMPILE);';
             END;
 
             /*
-            sp_StatUpdate-r77t: fingerprint conflict check, hoisted OUT of the
+            tracking issue: fingerprint conflict check, hoisted OUT of the
             creator-only branch above so it runs for QUEUE JOINERS too.
             Previously the check sat inside IF @queue_id IS NULL, so any worker
             whose first non-locking SELECT found the existing queue (the normal
@@ -7194,7 +7194,7 @@ OPTION (RECOMPILE);';
                     IF  @stored_fingerprint IS NOT NULL
                     AND @stored_fingerprint <> @parameter_fingerprint
                     BEGIN
-                        /* sp_StatUpdate-rse2: flag only -- raising severity 16 here
+                        /* tracking issue: flag only -- raising severity 16 here
                            would jump to the CATCH below and skip the refuse-the-join
                            bookkeeping.  Handled at FingerprintConflictExit. */
                         SET @fingerprint_conflict = 1;
@@ -7254,7 +7254,7 @@ OPTION (RECOMPILE);';
                     SET @StatsRemainingOut = 0;
                     SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
 
-                    /* sp_StatUpdate-rse2: MAX_WORKERS rejections are by-design --
+                    /* tracking issue: MAX_WORKERS rejections are by-design --
                        write a real SP_STATUPDATE_END so parallel fleets do not
                        accumulate orphaned STARTs that diag C1 flags as killed. */
                     IF  @LogToTable = N'Y'
@@ -7312,7 +7312,7 @@ OPTION (RECOMPILE);';
                         DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
                         StopReason = N'MAX_WORKERS', RunLabel = @run_label,
                         Version = @procedure_version;
-                    /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+                    /* tracking issue: restore caller CONTEXT_INFO on early return */
                     IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
                     IF @StatsInParallel = N'N'
                         DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
@@ -7356,7 +7356,7 @@ OPTION (RECOMPILE);';
             FROM dbo.Queue AS q
             WHERE q.QueueID = @queue_id
             /*
-            sp_StatUpdate-v31y: leadership liveness must survive SPID reuse and
+            tracking issue: leadership liveness must survive SPID reuse and
             pooled sessions.  A bare session_id probe deemed a recycled SPID (or
             the leader's still-connected-but-finished pooled session) "alive",
             which made a fully drained queue permanently un-claimable: every new
@@ -7461,7 +7461,7 @@ OPTION (RECOMPILE);';
                 /*
                 Insert one row per table needing stats updates.
 
-                Ordering (sp_StatUpdate-mhje):
+                Ordering (tracking issue):
                   PRIMARY: min_priority ASC -- user-intent ordering.  Embeds the
                           @SortOrder choice (e.g., QS workload rank when
                           @SortOrder=QUERY_STORE).  Ranks set in region 09 by
@@ -7474,7 +7474,7 @@ OPTION (RECOMPILE);';
                 Prior to mhje, LPT was PRIMARY and silently overrode the user's
                 explicit @SortOrder on mature fleets (CommandLog history >= 3
                 runs per table).  QS-top stats landed at ProcessingPosition
-                285-296 instead of 1-10.  See bd: sp_StatUpdate-mhje.
+                285-296 instead of 1-10.  See bd: tracking issue.
                 */
                 INSERT INTO
                     dbo.QueueStatistic
@@ -7496,7 +7496,7 @@ OPTION (RECOMPILE);';
                     ObjectID = tbl.object_id,
                     TablePriority = ROW_NUMBER() OVER (
                         ORDER BY
-                            /* sp_StatUpdate-mhje: PRIMARY sort honors the user's explicit @SortOrder
+                            /* tracking issue: PRIMARY sort honors the user's explicit @SortOrder
                                by ranking on min_priority (which embeds the chosen ordering -- e.g.,
                                QS workload rank when @SortOrder=QUERY_STORE).  Previously LPT was
                                primary and silently overrode QS prioritization on mature fleets with
@@ -7591,7 +7591,7 @@ OPTION (RECOMPILE);';
             SET @StatsRemainingOut = 0;
             SET @DurationSecondsOut = DATEDIFF(SECOND, @start_time, SYSDATETIME());
 
-            /* sp_StatUpdate-rse2: write a real SP_STATUPDATE_END (true StopReason)
+            /* tracking issue: write a real SP_STATUPDATE_END (true StopReason)
                instead of leaving an orphaned START for cleanup to mislabel KILLED. */
             IF  @LogToTable = N'Y'
             AND @Execute = N'Y'
@@ -7648,7 +7648,7 @@ OPTION (RECOMPILE);';
                 DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
                 StopReason = N'QUEUE_INIT_ERROR', RunLabel = @run_label,
                 Version = @procedure_version;
-            /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+            /* tracking issue: restore caller CONTEXT_INFO on early return */
             IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
             IF @StatsInParallel = N'N'
                 DELETE FROM dbo.StatUpdateLock WHERE Resource = N'sp_StatUpdate' AND SessionID = @@SPID;
@@ -7656,7 +7656,7 @@ OPTION (RECOMPILE);';
         END CATCH;
 
         /*
-        sp_StatUpdate-rse2: FINGERPRINT_CONFLICT exit.  Reached only via GOTO
+        tracking issue: FINGERPRINT_CONFLICT exit.  Reached only via GOTO
         from the fingerprint check above (flag set inside its TRY).  Sits
         OUTSIDE all TRY scopes so the severity-16 RAISERROR surfaces to the
         caller AND execution continues into the refuse-the-join bookkeeping
@@ -7732,7 +7732,7 @@ OPTION (RECOMPILE);';
                 DurationSeconds = DATEDIFF(SECOND, @start_time, SYSDATETIME()),
                 StopReason = N'FINGERPRINT_CONFLICT', RunLabel = @run_label,
                 Version = @procedure_version;
-            /* sp_StatUpdate-orec: restore caller CONTEXT_INFO on early return */
+            /* tracking issue: restore caller CONTEXT_INFO on early return */
             IF @original_context_info IS NULL SET CONTEXT_INFO 0x; ELSE SET CONTEXT_INFO @original_context_info;
             RETURN 50001;
         END;
@@ -8093,8 +8093,8 @@ OPTION (RECOMPILE);';
             */
             IF @claimed_table_database IS NULL
             BEGIN
-                /* o2md.46: open the claim-cycle bracket only if not already open --
-                   the lazy-discovery zero-rows/CATCH CONTINUE paths (o2md.1) loop back
+                /* tracking issue: open the claim-cycle bracket only if not already open --
+                   the lazy-discovery zero-rows/CATCH CONTINUE paths (tracking issue) loop back
                    here with the window still open, and re-opening would undercount. */
                 IF @queue_claim_start IS NULL
                     SET @queue_claim_start = SYSDATETIME();
@@ -8505,7 +8505,7 @@ OPTION (RECOMPILE);';
                                 AND   qs.SchemaName = @claimed_table_schema
                                 AND   qs.ObjectName = @claimed_table_name;
 
-                                /* o2md.9: emit BEFORE nulling the claim variables -- the
+                                /* tracking issue: emit BEFORE nulling the claim variables -- the
                                    previous ordering always rendered NULL.NULL. */
                                 IF @Debug = 1
                                     RAISERROR(N'  Lazy mop-up: 0 stats for %s.%s -- skipping table', 10, 1,
@@ -8517,7 +8517,7 @@ OPTION (RECOMPILE);';
                                     @claimed_table_name = NULL,
                                     @claimed_table_object_id = NULL;
 
-                                /* o2md.1: MUST re-enter the loop to claim a new table.  Without
+                                /* tracking issue: MUST re-enter the loop to claim a new table.  Without
                                    CONTINUE, control falls through to the work-claim block whose
                                    parallel predicate compares against the now-NULL
                                    @claimed_table_* variables, matches 0 rows, and exits the run
@@ -8551,7 +8551,7 @@ OPTION (RECOMPILE);';
                                 @claimed_table_name = NULL,
                                 @claimed_table_object_id = NULL;
 
-                            /* o2md.1: same fall-through hazard as the zero-rows branch above --
+                            /* tracking issue: same fall-through hazard as the zero-rows branch above --
                                re-enter the loop rather than dropping into the work-claim block
                                with a NULL claim. */
                             CONTINUE;
@@ -8587,7 +8587,7 @@ OPTION (RECOMPILE);';
 
         /*#endregion 09C-PARALLEL-CLAIM */
 
-        /* o2md.46: close the claim-cycle bracket -- covers the dead-worker sweep,
+        /* tracking issue: close the claim-cycle bracket -- covers the dead-worker sweep,
            claim UPDATE, and lazy per-table discovery for this cycle.  NULL outside
            parallel mode (never opened) and on the already-claimed fast path. */
         IF @queue_claim_start IS NOT NULL
@@ -8648,7 +8648,7 @@ OPTION (RECOMPILE);';
             @current_is_published = stp.is_published,
             @current_is_tracked_by_cdc = stp.is_tracked_by_cdc,
             @current_temporal_type = stp.temporal_type,
-            /* o2md.49: per-row mop-up-origin flag */
+            /* tracking issue: per-row mop-up-origin flag */
             @current_from_mop_up = stp.from_mop_up
         FROM #stats_to_process AS stp
         WHERE stp.processed = 0
@@ -8836,7 +8836,7 @@ OPTION (RECOMPILE);';
         END;
 
         /*
-        sp_StatUpdate-mknv: FIRST-TIME FULLSCAN CAP (size-based)
+        tracking issue: FIRST-TIME FULLSCAN CAP (size-based)
         Caps unbounded FULLSCAN on very large stats that have NO completed
         CommandLog history yet.  Adaptive sampling cannot help on first
         encounter (no history to consult).  Once a successful run logs an
@@ -9024,7 +9024,7 @@ OPTION (RECOMPILE);';
                 @has_with_option = 1;
         END;
         /*
-        sp_StatUpdate-mc03 (b): FIRST-TIME CAP, RESAMPLE-of-persisted-100 path.
+        tracking issue (b): FIRST-TIME CAP, RESAMPLE-of-persisted-100 path.
         A stat with PERSIST_SAMPLE_PERCENT = 100 under @i_statistics_sample NULL
         falls through to the RESAMPLE branch below, which re-runs the persisted
         100% -- an effective FULLSCAN that the @effective_sample_percent = 100
@@ -9433,7 +9433,7 @@ OPTION (RECOMPILE);';
         */
 
         /*
-        sp_StatUpdate-03i3: per-stat CONTEXT_INFO refresh.
+        tracking issue: per-stat CONTEXT_INFO refresh.
         The gh-423 CONTEXT_INFO set at proc entry is static for the whole run
         (DB/Job/Preset only) -- a DBA using sp_WhoIsActive mid-run sees no run
         label, no stat index/total, no current stat name.  Refresh it every
@@ -9682,7 +9682,7 @@ OPTION (RECOMPILE);';
             /* #163 (P2): Deadlock retry -- up to 3 total attempts with exponential backoff on error 1205.
                ROWLOCK+READPAST skips locked rows but cannot prevent Sch-M conflicts when multiple
                workers update the same stat simultaneously. Retry loop handles that residual race.
-               o2md.8: same bounded retry extended to error 1222 (lock timeout) -- a lock timeout is
+               tracking issue: same bounded retry extended to error 1222 (lock timeout) -- a lock timeout is
                transient (the blocker's own transaction is expected to release), so the same
                backoff-and-retry gives it a second chance instead of burning the stat as a hard
                failure on the first contention hit and counting it against @MaxConsecutiveFailures. */
@@ -9712,7 +9712,7 @@ OPTION (RECOMPILE);';
                             SET @exec_retry_delay =
                                 CASE @exec_retry WHEN 0 THEN '00:00:01' WHEN 1 THEN '00:00:02' ELSE '00:00:04' END;
                             SET @exec_retry += 1;
-                            RAISERROR(N'  ~ %s on stat update (retry %d/2) -- waiting %s before retry (#163/o2md.8)',
+                            RAISERROR(N'  ~ %s on stat update (retry %d/2) -- waiting %s before retry (#163)',
                                 10, 1, @exec_err_label, @exec_retry, @exec_retry_delay) WITH NOWAIT;
                             SET @wait_bracket_start = SYSDATETIME();
                             WAITFOR DELAY @exec_retry_delay;
@@ -9734,11 +9734,11 @@ OPTION (RECOMPILE);';
                 END; /* WHILE @exec_done = 0 */
 
                 /* Emit note if stat update succeeded after one or more deadlock/lock-timeout retries.
-                   o2md.8: @exec_err_number reflects whichever error triggered the last retry --
+                   tracking issue: @exec_err_number reflects whichever error triggered the last retry --
                    good enough to label the success note without tracking a per-attempt history. */
                 IF @exec_retry > 0
                 BEGIN
-                    RAISERROR(N'  ~ Stat update succeeded after %d retry(s) (#163/o2md.8)', 10, 1, @exec_retry) WITH NOWAIT;
+                    RAISERROR(N'  ~ Stat update succeeded after %d retry(s) (#163)', 10, 1, @exec_retry) WITH NOWAIT;
                     SET @warnings = @warnings
                         + CASE WHEN @exec_err_number = 1205 THEN N'DEADLOCK_RETRY_OK: ' ELSE N'LOCK_TIMEOUT_RETRY_OK: ' END
                         + N'[' + @current_schema_name + N'].[' + @current_table_name + N'].[' + @current_stat_name + N'] '
@@ -9885,7 +9885,7 @@ OPTION (RECOMPILE);';
                                 @mode AS Mode,
                                 @run_label AS RunLabel,
                                 @stats_processed AS ProcessingPosition,
-                                /* o2md.49: per-row mop-up-origin flag.  NULLIF omits when 0
+                                /* tracking issue: per-row mop-up-origin flag.  NULLIF omits when 0
                                    (no XSINIL here, absent == priority-pass row).  Unlike
                                    QualifyReason's MOP_UP branch (@in_mop_up, session-scoped)
                                    this cannot mislabel priority-pass leftovers processed
@@ -10189,7 +10189,7 @@ OPTION (RECOMPILE);';
                                     @mode AS Mode,
                                     @run_label AS RunLabel,
                                     @stats_processed AS ProcessingPosition,
-                                    /* o2md.49: per-row mop-up-origin flag (see success-path note) */
+                                    /* tracking issue: per-row mop-up-origin flag (see success-path note) */
                                     NULLIF(@current_from_mop_up, 0) AS FromMopUp,
                                     @procedure_version AS Version
                                 FOR
@@ -10430,7 +10430,7 @@ OPTION (RECOMPILE);';
     /* gh-462: Shared WHERE filter for mop-up discovery (parallel-leader and serial).
        Both paths concatenate @mop_up_where_sql then append @commandlog_3part + tail.
        Any filter change needs updating only here -- one source of truth. */
-    /* pre-existing bug found 2026-07-30 during o2md.5 verification: this block
+    /* pre-existing bug found 2026-07-30 during tracking issue verification: this block
        carried QUADRUPLED quotes -- correct only for a doubly-nested dynamic string,
        but both consuming sites concatenate it directly into @mop_up_sql (single
        nesting).  The executed SQL therefore contained doubled quotes and died with
@@ -10548,11 +10548,11 @@ OPTION (RECOMPILE);';
     workers can claim them via the normal parallel queue.  Workers that did not
     run discovery use lazy per-table discovery when claiming mop-up tables.
 
-    o2md.6: @total_stats is not mutated between the priority-pass discovery
+    tracking issue: @total_stats is not mutated between the priority-pass discovery
     assignment and this point, so this snapshot is the priority pass's true
     qualification count -- used below (region 11-FINALIZE) to detect the
     "priority pass qualified 0 but mop-up found N>0" inversion, which is
-    never legitimate (see o2md.6 / the icjq effective_counter incident).
+    never legitimate (see tracking issue / the icjq effective_counter incident).
     */
     DECLARE @priority_pass_stats_found int = @total_stats;
     IF  @i_mop_up_pass = N'Y'
@@ -10807,10 +10807,10 @@ OPTION (RECOMPILE);';
 
                 SET @mop_up_found = (SELECT COUNT(*) FROM #stats_to_process WHERE processed = 0);
 
-                /* o2md.5 (maintainer option a): QS-enrich the mop-up rows with the SAME
+                /* tracking issue (maintainer option a): QS-enrich the mop-up rows with the SAME
                    Phase 6 fragment the priority pass uses (@qs_phase6_sql -- one shared
                    string, so the two paths cannot drift).  Fills per-stat qs_* so mop-up
-                   ExtendedInfo rows stop logging QSPlanCount NULL (the o2md.16/W5
+                   ExtendedInfo rows stop logging QSPlanCount NULL (the tracking issue/W5
                    dependency), and feeds the QUERY_STORE re-rank below.  Each database is
                    enriched in its own USE-scoped batch, mirroring staged discovery. */
                 IF @i_qs_enabled = 1 AND @qs_phase6_sql IS NOT NULL AND @mop_up_found > 0
@@ -10918,8 +10918,8 @@ OPTION (RECOMPILE);';
                         SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list WHERE idx > @mop_up_db_idx;
                     END;
 
-                    /* o2md.5: with fresh boosts in hand, honor QUERY_STORE ordering for the
-                       mop-up rows (the non-QS orders were handled at discovery by o2md.49's
+                    /* tracking issue: with fresh boosts in hand, honor QUERY_STORE ordering for the
+                       mop-up rows (the non-QS orders were handled at discovery by tracking issue's
                        @mop_up_order_expr; QUERY_STORE needed enrichment first). */
                     IF @i_sort_order = N'QUERY_STORE'
                     BEGIN
@@ -10979,7 +10979,7 @@ OPTION (RECOMPILE);';
                             ObjectName = stp.table_name,
                             ObjectID = stp.object_id,
                             TablePriority = @phase_a_max_priority + ROW_NUMBER() OVER (
-                                /* o2md.5: inherit the per-stat priority ranking (which now
+                                /* tracking issue: inherit the per-stat priority ranking (which now
                                    honors @SortOrder incl. QUERY_STORE after enrichment)
                                    instead of re-deriving from modification counter. */
                                 ORDER BY MIN(stp.priority) ASC,
@@ -11279,10 +11279,10 @@ OPTION (RECOMPILE);';
 
             SET @mop_up_found = (SELECT COUNT(*) FROM #stats_to_process WHERE processed = 0);
 
-            /* o2md.5 (maintainer option a): QS-enrich the mop-up rows with the SAME
+            /* tracking issue (maintainer option a): QS-enrich the mop-up rows with the SAME
                Phase 6 fragment the priority pass uses (@qs_phase6_sql -- one shared
                string, so the two paths cannot drift).  Fills per-stat qs_* so mop-up
-               ExtendedInfo rows stop logging QSPlanCount NULL (the o2md.16/W5
+               ExtendedInfo rows stop logging QSPlanCount NULL (the tracking issue/W5
                dependency), and feeds the QUERY_STORE re-rank below.  Each database is
                enriched in its own USE-scoped batch, mirroring staged discovery. */
             IF @i_qs_enabled = 1 AND @qs_phase6_sql IS NOT NULL AND @mop_up_found > 0
@@ -11390,8 +11390,8 @@ OPTION (RECOMPILE);';
                     SELECT @mop_up_db_idx = MIN(idx) FROM @mop_up_db_list_s WHERE idx > @mop_up_db_idx;
                 END;
 
-                /* o2md.5: with fresh boosts in hand, honor QUERY_STORE ordering for the
-                   mop-up rows (the non-QS orders were handled at discovery by o2md.49's
+                /* tracking issue: with fresh boosts in hand, honor QUERY_STORE ordering for the
+                   mop-up rows (the non-QS orders were handled at discovery by tracking issue's
                    @mop_up_order_expr; QUERY_STORE needed enrichment first). */
                 IF @i_sort_order = N'QUERY_STORE'
                 BEGIN
@@ -11434,7 +11434,7 @@ OPTION (RECOMPILE);';
     END;
     SkipMopUp: /* #340: GOTO target for pre-flight safety check failures */
 
-    /* o2md.6: priority pass qualified 0 while mop-up (raw modification_counter > 0,
+    /* tracking issue: priority pass qualified 0 while mop-up (raw modification_counter > 0,
        no threshold filtering) found stats to process.  This inversion is never
        legitimate -- it means the priority pass's qualification logic is broken
        (e.g. the icjq effective_counter double-count, gh-502), not that the fleet
@@ -11475,7 +11475,7 @@ OPTION (RECOMPILE);';
         @end_time_display nvarchar(30) = CONVERT(nvarchar(30), SYSDATETIME(), 121);
 
     /*
-    o2md.2: under @skip_discovery = 1 this worker joined an existing queue and
+    tracking issue: under @skip_discovery = 1 this worker joined an existing queue and
     #stats_to_process was never populated, so the COUNT above is structurally 0
     no matter how much queued work is still outstanding.  That is what let a no-op
     run report StatsRemaining = 0 and grade SUCCESS.  Derive remaining from the
@@ -11484,7 +11484,7 @@ OPTION (RECOMPILE);';
     Statement is split under its own IF (matching the @total_stats pattern above)
     so the dbo.QueueStatistic reference is only name-resolved in parallel mode --
     referencing it unconditionally fails with Msg 208 on non-parallel runs where
-    the optional table does not exist (see sp_StatUpdate-isa2).
+    the optional table does not exist (see tracking issue).
     */
     IF @skip_discovery = 1
         SET @remaining_stats =
@@ -11496,7 +11496,7 @@ OPTION (RECOMPILE);';
         );
 
     /*
-    o2md.18 (maintainer decision 2026-07-30): discovery-candidate log.
+    tracking issue (maintainer decision 2026-07-30): discovery-candidate log.
     When qualifying work remains unprocessed at run end (TIME_LIMIT, batch
     limit, early stop, killed-mid-queue recovery...), write ONE compact
     SP_STATUPDATE_REMAINING row whose ExtendedInfo lists the remaining
@@ -11589,19 +11589,19 @@ OPTION (RECOMPILE);';
     END;
 
     /*
-    o2md.3: a run that discovered work and processed none of it is a silent no-op,
+    tracking issue: a run that discovered work and processed none of it is a silent no-op,
     not a success.  At least two distinct mechanisms produce it (zombied parallel
-    queue leadership -- sp_StatUpdate-v31y; and the lazy mop-up fall-through --
-    o2md.1), so classify on the observable outcome rather than on either cause.
+    queue leadership -- tracking issue; and the lazy mop-up fall-through --
+    tracking issue), so classify on the observable outcome rather than on either cause.
     Guarded on @Execute = 'Y' because a dry run legitimately processes nothing.
 
-    o2md.4 refinement (found by the kill-recovery repro): a parallel run that
+    tracking issue refinement (found by the kill-recovery repro): a parallel run that
     joined an existing queue (@skip_discovery = 1), lazily discovered zero
     still-qualifying stats for every carried-over table (the CommandLog
     freshness check confirmed a prior run already updated them -- e.g. the
     previous worker was killed AFTER finishing its stats but BEFORE closing
     its claim), and fully drained the queue (@remaining_stats = 0,
-    queue-derived per o2md.2) is a VERIFIED-COMPLETE recovery, not a no-op.
+    queue-derived per tracking issue) is a VERIFIED-COMPLETE recovery, not a no-op.
     A genuine zombie abandons a non-empty queue and reports remaining > 0,
     so it still classifies.  Serial runs never set @skip_discovery and are
     unaffected.
@@ -11814,7 +11814,7 @@ OPTION (RECOMPILE);';
                     FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan
                     WHERE is_forced_plan = 1'
                     + CASE WHEN @has_plan_forcing_type = 1
-                           THEN N' AND plan_forcing_type = 1 /* MANUAL -- o2md.53 */;'
+                           THEN N' AND plan_forcing_type = 1 /* MANUAL -- tracking issue */;'
                            ELSE N';'
                       END;
 
@@ -11842,7 +11842,7 @@ OPTION (RECOMPILE);';
                     WHERE qsp.is_forced_plan = 1'
                     + CASE WHEN @has_plan_forcing_type = 1
                            THEN N'
-                    AND qsp.plan_forcing_type = 1 /* MANUAL -- o2md.53 */'
+                    AND qsp.plan_forcing_type = 1 /* MANUAL -- tracking issue */'
                            ELSE N''
                       END
                     + N'
@@ -11939,7 +11939,7 @@ OPTION (RECOMPILE);';
                             FROM ' + QUOTENAME(@qs_check_db) + N'.sys.query_store_plan AS qsp
                             WHERE qsp.is_forced_plan = 1'
                             + CASE WHEN @has_plan_forcing_type = 1
-                                   THEN N' AND qsp.plan_forcing_type = 1 /* MANUAL -- int column; o2md.53: comparing to N''MANUAL'' failed with a conversion error on every 2022+ version and was CATCH-swallowed */;'
+                                   THEN N' AND qsp.plan_forcing_type = 1 /* MANUAL -- int column; tracking issue: comparing to N''MANUAL'' failed with a conversion error on every 2022+ version and was CATCH-swallowed */;'
                                    ELSE N';'
                               END;
 
@@ -12106,7 +12106,7 @@ OPTION (RECOMPILE);';
         /* Build JSON summary for monitoring integration (v2.3) */
         DECLARE @json_status nvarchar(10) =
             CASE
-                /* o2md.3: keep the CommandLog footer consistent with the Status column */
+                /* tracking issue: keep the CommandLog footer consistent with the Status column */
                 WHEN @silent_noop = 1 THEN N'ERROR'
                 WHEN @stats_failed > 0 THEN N'ERROR'
                 WHEN @remaining_stats > 0 THEN N'WARNING'
@@ -12151,7 +12151,7 @@ OPTION (RECOMPILE);';
                        error, applock/re-entry) cannot have run any stats so a delta is
                        structurally impossible on those paths. */
                     NULLIF(@qs_forced_failure_delta_total, 0) AS ForcedPlanFailureDelta,
-                    /* o2md.46: self-idle-time buckets in ms.  NULLIF omits the element
+                    /* tracking issue: self-idle-time buckets in ms.  NULLIF omits the element
                        when zero (this block has no XSINIL, so absent == 0) -- Diag can
                        subtract measured idle time from wall-clock instead of inferring
                        "discovery cost" (W6 EXCESSIVE_OVERHEAD attribution). */
@@ -12234,7 +12234,7 @@ OPTION (RECOMPILE);';
           SUCCESS = All discovered stats updated without issues
         */
         Status = CASE
-            /* o2md.3: discovered work but processed none -- never a success */
+            /* tracking issue: discovered work but processed none -- never a success */
             WHEN @silent_noop = 1 THEN N'ERROR'
             WHEN @stats_failed > 0 THEN N'ERROR'
             WHEN @remaining_stats > 0 THEN N'WARNING'
@@ -12284,7 +12284,7 @@ OPTION (RECOMPILE);';
     END;
 
     /*
-    o2md.3: a silent no-op must fail the Agent job too.  Previously these runs
+    tracking issue: a silent no-op must fail the Agent job too.  Previously these runs
     returned 0 and reported SUCCESS, so ~50 nightly windows across the fleet
     passed green while no statistics maintenance happened at all.
     */

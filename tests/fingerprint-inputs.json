@@ -1,0 +1,22 @@
+[
+  {
+    "label": "simulator/check_sql_nested_comments.py",
+    "path": "../.github/scripts/check_sql_nested_comments.py"
+  },
+  {
+    "label": "simulator/test_check_sql_nested_comments.py",
+    "path": "../.github/scripts/test_check_sql_nested_comments.py"
+  },
+  {
+    "label": "simulator-fixture/nested_comment.sql",
+    "path": "../.github/scripts/fixtures/nested_comment.sql"
+  },
+  {
+    "label": "simulator-fixture/pass_comments.sql",
+    "path": "../.github/scripts/fixtures/pass_comments.sql"
+  },
+  {
+    "label": "simulator-fixture/v3_11_2_diag_nested_comment.sql",
+    "path": "../.github/scripts/fixtures/v3_11_2_diag_nested_comment.sql"
+  }
+]

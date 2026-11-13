@@ -18,6 +18,7 @@
 !sp_StatUpdate_XE_Session.sql
 !Invoke-StatUpdateDiag.ps1
 !README.md
+!TESTING.md
 !LICENSE
 !.gitignore
 !.gitattributes
@@ -34,6 +35,17 @@
 !.github/scripts/*.py
 !.github/scripts/fixtures/
 !.github/scripts/fixtures/*.sql
+
+# Portable test suites are public; maintainer tooling stays local.
+!tests/
+!tests/**
+tests-host/
+tests/**/__pycache__/
+tests/**/*.py[cod]
+tests/**/*.log
+tests/**/run-results.json
+tests/**/suite-*.json
+tests/**/results/
 
 # Beads / Dolt files (added by bd init)
 .dolt/

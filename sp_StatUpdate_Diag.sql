@@ -76,14 +76,14 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            decimal(10, 1) overflowed (8115) and killed the
                            run.  Both emission paths now floor the baseline
                            (100 ms CPU / 0.1 ms-per-exec / 1 MB grant /
-                           128 tempdb pages -- aligned with the o2md.22 I8
+                           128 tempdb pages -- aligned with the tracking issue I8
                            headline constants, NULL below floor) and clamp at
                            +1000%.  The raw First/LastCpuPerExec display
                            columns widened decimal(10, 2) -> decimal(18, 2):
                            the regression fixture proved the row itself
                            overflowed (8115) before any pct math.  Trend
                            label columns are unchanged (bounded).
-            2026.07.30.11 - o2md.18 (maintainer decision): W13
+            2026.07.30.11 - tracking issue (maintainer decision): W13
                            PERPETUALLY_SKIPPED consumes the proc v3.11.0
                            SP_STATUPDATE_REMAINING discovery-candidate log as
                            its authoritative source.  When every one of the
@@ -95,7 +95,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            500.  The prior inference (with its documented
                            over-counting) remains as fallback for runs from
                            older proc versions.
-            2026.07.30.10 - o2md.52: @CriticalTables parameter values leaked
+            2026.07.30.10 - tracking issue: @CriticalTables parameter values leaked
                            real table names into the obfuscated SAFE_TO_SHARE
                            report.  The obfuscation pass rewrites
                            #stat_updates and #runs.Databases in place before
@@ -113,10 +113,10 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            hardcoded example was also changed to obviously-
                            fake placeholder names so leakage greps on SAFE
                            reports cannot false-trip on it.  Found by the
-                           standard leakage grep while verifying the o2md.51
+                           standard leakage grep while verifying the tracking issue
                            report styling; regression test added to the
                            obfuscation suite.
-            2026.07.30.9 - o2md.24: I10 RECOMMENDED_CONFIG severity-precedence
+            2026.07.30.9 - tracking issue: I10 RECOMMENDED_CONFIG severity-precedence
                            rewrite (maintainer option a).  I10 -- the "just run
                            this" output -- previously consumed only 4 finding
                            categories and contradicted higher-severity findings
@@ -137,7 +137,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                              caveat gated on max observed VersionKey vs
                              3008002 (3.8.2 mop-up fall-through fix).
                            - PRIORITY_PASS_EMPTY (W12): version-gated per
-                             the o2md.17 convention -- below 3.7.0 emit an
+                             the tracking issue convention -- below 3.7.0 emit an
                              upgrade-first caveat (retuning changes nothing
                              on the effective_counter defect); 3.7.0+ halve
                              @ModificationThreshold (floor 100).
@@ -153,27 +153,27 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                              gate was why 31/40 parallel fleet servers never
                              saw the @MopUpPass their own W12 recommended.
 
-            2026.07.30.8 - Maintainer-decision batch 1 (o2md.19, o2md.14,
-                           o2md.33, o2md.35).  All four implement explicit
+            2026.07.30.8 - Maintainer-decision batch 1 (tracking issue, tracking issue,
+                           tracking issue, tracking issue).  All four implement explicit
                            maintainer choices recorded on the bd issues.
 
-                           o2md.19 - W3 STALE_BACKLOG zero-processed guard:
+                           tracking issue - W3 STALE_BACKLOG zero-processed guard:
                            when EVERY non-killed run in the window confirmed
                            StatsProcessed = 0, W3 defers to C6 (throughput
                            advice is nonsense for pure no-op windows).  Mixed
                            windows keep current behavior including the kzx0
                            un-suppression (untouched on @w3_parallel_complete,
                            so the COMPLETION fast-path effect is unchanged).
-                           NULL StatsProcessed blocks the deferral (o2md.12:
+                           NULL StatsProcessed blocks the deferral (tracking issue:
                            NULL is unconfirmed, not zero).
 
-                           o2md.14 - C4 thin-window cap: either window under
+                           tracking issue - C4 thin-window cap: either window under
                            5 runs caps severity at WARNING (2-run floor still
                            fires).  Evidence gains thin-baseline + explicit
                            survivorship wording (windows contain only runs
                            that completed and processed work).
 
-                           o2md.33 - AG-secondary by-design stops (StopReason
+                           tracking issue - AG-secondary by-design stops (StopReason
                            = AG_SECONDARY with StatsFound = 0) excluded from
                            grading aggregates (completion average +
                            kill/time-limit percentage denominators) and
@@ -186,7 +186,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            hosts are already maintained (per-database
                            deselection, hard stop only when nothing remains).
 
-                           o2md.35 - RS5/RS7 blank-column reason tokens,
+                           tracking issue - RS5/RS7 blank-column reason tokens,
                            additive only (existing column types/positions
                            untouched): RS5 Top Tables gains ImpactDataStatus
                            (OK / NO_QS_DATA) explaining
@@ -195,8 +195,8 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            RESAMPLE_PERSIST) explaining AvgSamplePct NULLs.
                            Applied in both output modes (direct SELECT and
                            FOR JSON).
-            2026.07.30.7 - o2md.50: consume the proc v3.8.5 observability fields
-                           (follow-up to proc-side o2md.46/o2md.49).
+            2026.07.30.7 - tracking issue: consume the proc v3.8.5 observability fields
+                           (follow-up to proc-side tracking issue/tracking issue).
 
                            W6 EXCESSIVE_OVERHEAD now subtracts the four
                            measured self-idle-time buckets (Summary XML
@@ -223,7 +223,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            count as priority-pass evidence.  Pre-3.8.5 runs
                            and unparseable versions keep the QualifyReason
                            inference (this was the exact upgrade path the
-                           o2md.16 comment anticipated).  Cache table gains
+                           tracking issue comment anticipated).  Cache table gains
                            the FromMopUp column via the existing
                            auto-upgrade ALTER path; cache rows written
                            before this upgrade read NULL even if the source
@@ -265,13 +265,13 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                              @i_command_log_retention_days) with no public
                              v3 knob.  Reworded to describe the underlying
                              concept instead of a settable parameter.
-                           - o2md.18(c)'s code comment referenced
+                           - tracking issue(c)'s code comment referenced
                              @LogSkippedToCommandLog, the v2 parameter name
                              for what is now the internal @i_log_skipped
                              variable (off by default, no public toggle).
 
                            Two of the six were self-inflicted: the
-                           immediately-prior 2026.07.30.4 batch (o2md.27)
+                           immediately-prior 2026.07.30.4 batch (tracking issue)
                            introduced the @DelayBetweenStats and
                            @CommandLogRetentionDays references while fixing
                            W6 -- caught only because the user's live report
@@ -279,9 +279,9 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            than trusting the single reported instance.
 
             2026.07.30.5 - Redundant/tautological findings + obfuscation
-                           hardening (o2md.43, o2md.44, o2md.28, o2md.36).
+                           hardening (tracking issue, tracking issue, tracking issue, tracking issue).
 
-                           o2md.43 - W7 HIGH_IMPACT_STATS_DEPRIORITIZED
+                           tracking issue - W7 HIGH_IMPACT_STATS_DEPRIORITIZED
                            compared each top-10 CPU stat's average processing
                            position against the overall median -- true, by
                            construction, for roughly half of any top-10 list
@@ -295,16 +295,16 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            recommendation now points there instead of at a
                            sort order that is already active.
 
-                           o2md.44 - I9 WORKLOAD_CONCENTRATION fired when the
+                           tracking issue - I9 WORKLOAD_CONCENTRATION fired when the
                            top stats reached 80% of workload CPU -- the
                            Pareto principle, true of nearly every workload
                            distribution, not a defect signal. Reframed as
                            neutral descriptive text; no longer suggests
                            enabling @QueryStore=CPU when the most recent run
-                           already has it on (reuses the o2md.43 sort-order
+                           already has it on (reuses the tracking issue sort-order
                            check).
 
-                           o2md.28 - W5 QS_NOT_EFFECTIVE (WARNING), I6
+                           tracking issue - W5 QS_NOT_EFFECTIVE (WARNING), I6
                            QS_EFFICACY, and I8 QS_PERFORMANCE_TREND all
                            independently reported "no QS data" for the same
                            15 servers -- three findings, one fact (~45
@@ -317,7 +317,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            the suppressed case fall through into the
                            has-real-data branch when @Debug = 0.
 
-                           o2md.36 - obfuscation tokens were 6-hex (Schema
+                           tracking issue - obfuscation tokens were 6-hex (Schema
                            tokens were actually 4-hex, the confirmed cause of
                            a fleet-wide SCH_ collision), a trivial dictionary-
                            attack target with no seed. All 20 HASHBYTES call
@@ -332,17 +332,17 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            for existing callers passing @ObfuscationSeed by
                            literal value.
 
-            2026.07.30.4 - Diag correctness batch (o2md.15, o2md.23, o2md.25,
-                           o2md.27).
+            2026.07.30.4 - Diag correctness batch (tracking issue, tracking issue, tracking issue,
+                           tracking issue).
 
-                           o2md.15 - C4 DEGRADING_THROUGHPUT recommendation
+                           tracking issue - C4 DEGRADING_THROUGHPUT recommendation
                            and ExampleCall were constants that always
                            suggested enabling @StatsInParallel, even when the
                            evidence line already prints StatsInParallel=Y
                            (5/5 findings in the fleet sweep). Now conditional
                            on recent_w.parallel_mode.
 
-                           o2md.23 - I8 headline required BOTH an
+                           tracking issue - I8 headline required BOTH an
                            improving-count majority AND a median magnitude
                            below -5% to report "improving" -- when they
                            disagreed (336 improving / 301 degrading, median
@@ -353,7 +353,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            specific regressed/degrading branches so it
                            doesn't preempt them.
 
-                           o2md.25 - I10 TimeLimit jitter normalization only
+                           tracking issue - I10 TimeLimit jitter normalization only
                            rounded when MAX-MIN spread across the whole
                            @DaysBack window was under 300s; a single outlier
                            (rollout run, stray non-killed-but-atypical run)
@@ -363,7 +363,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            rounded-to-minute value), applied unconditionally
                            -- robust to a handful of outliers by construction.
 
-                           o2md.27 - W6 EXCESSIVE_OVERHEAD's guard
+                           tracking issue - W6 EXCESSIVE_OVERHEAD's guard
                            (DurationSeconds > 10 AND StatsProcessed >= 5) was
                            too weak: a 34-stat run still showed 93.4%
                            overhead because fixed startup cost dominates when
@@ -378,7 +378,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            alternative causes before attributing to
                            discovery/environment cost.
 
-            2026.07.30.3 - o2md.12: C6 SILENT_NOOP_RUN evidence + NULL-vs-0
+            2026.07.30.3 - tracking issue: C6 SILENT_NOOP_RUN evidence + NULL-vs-0
                            split.  Evidence previously carried only
                            StartTime/StopReason/StatsFound -- the
                            recommendation text says "upgrade to 3.5.7+"
@@ -397,9 +397,9 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            mis-classified as either a confirmed no-op or
                            dropped entirely.
 
-            2026.07.30.2 - ExampleCall audit sweep, round 1 (o2md.20, o2md.21).
+            2026.07.30.2 - ExampleCall audit sweep, round 1 (tracking issue, tracking issue).
 
-                           o2md.20 - I15 HEAP_TIME_BUDGET referenced
+                           tracking issue - I15 HEAP_TIME_BUDGET referenced
                            @CollectHeapForwarding, a parameter removed in v3
                            -- the emitted example failed with "is not a
                            parameter for procedure sp_StatUpdate" on every
@@ -409,7 +409,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            record_count directly, which is what the removed
                            parameter used to surface anyway.
 
-                           o2md.21 - W2 LONG_RUNNING_STATS ExampleCall omitted
+                           tracking issue - W2 LONG_RUNNING_STATS ExampleCall omitted
                            @Databases, so copy-pasting it silently targeted
                            only the current database instead of the flagged
                            server.  Now built from the finding's own
@@ -419,7 +419,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            @LongRunningSamplePercent overstates what will
                            actually be sampled on very large tables.
 
-            2026.07.30.1 - o2md.42: named PRIMARY KEY constraints on 5 temp
+            2026.07.30.1 - tracking issue: named PRIMARY KEY constraints on 5 temp
                            tables (#stat_updates, #recommendations,
                            #run_version_keys, #forced_plans, #qs_efficacy)
                            unnamed.  Temp table NAMES get a per-session
@@ -431,12 +431,12 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            updates'").  Mechanical: constraints still exist,
                            SQL Server now generates the names.
 
-            2026.07.28.1 - Fleet analysis batch (sp_StatUpdate-o2md).  Findings from the
+            2026.07.28.1 - Fleet analysis batch (tracking issue).  Findings from the
                            40-server production diagnostic sweep of 2026-07-28, all of
                            them cases where a check asserted more than its evidence
                            supported.
 
-                           o2md.10 - W16 CRITICAL_TABLES_NO_MATCH was a 100% false
+                           tracking issue - W16 CRITICAL_TABLES_NO_MATCH was a 100% false
                            positive: sp_StatUpdate serializes parameters with
                            FOR XML ... ELEMENTS XSINIL, so an unset @CriticalTables
                            arrives as '' rather than NULL and the duplicated
@@ -444,7 +444,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            test.  Same XSINIL blast radius fixed in the C4 parallel_mode
                            bucketing, where '' formed a third mode distinct from 'N'.
 
-                           o2md.11 - C6 SILENT_NOOP_RUN asserted one root cause (the
+                           tracking issue - C6 SILENT_NOOP_RUN asserted one root cause (the
                            3.5.7 parallel queue-leadership fix) even for COMPLETED /
                            NATURAL_END runs, a different code path that fix does not
                            touch.  The recommendation now branches on the observed
@@ -453,27 +453,27 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            Flagged runs are materialized once (#c6_noop_runs) instead of
                            duplicating the predicate between count and evidence.
 
-                           o2md.13 - C4 DEGRADING_THROUGHPUT graded parallel windows on
+                           tracking issue - C4 DEGRADING_THROUGHPUT graded parallel windows on
                            sec/stat, which in parallel mode measures this worker's slice
                            against the whole worker lifetime (~10x disagreement with
                            GB/min observed on the fleet).  A parallel window is now only
                            CRITICAL when the slice-independent GB/min metric agrees;
                            otherwise WARNING, with the disagreement stated.
 
-                           o2md.16 - W5 QS_NOT_EFFECTIVE blamed customer Query Store
+                           tracking issue - W5 QS_NOT_EFFECTIVE blamed customer Query Store
                            configuration for a proc-side gap: the mop-up pass carries no
                            QS fields, so a mop-up-only run is indistinguishable from a
                            run with QS disabled.  Mop-up-only runs are excluded from both
                            the numerator and the denominator, and an all-mop-up window
                            now reports QS_NOT_EVALUABLE (INFO) instead.
 
-                           o2md.17 - W12 PRIORITY_PASS_EMPTY recommended lowering
+                           tracking issue - W12 PRIORITY_PASS_EMPTY recommended lowering
                            @ModificationThreshold even when the priority pass qualified
                            EXACTLY zero stats while mop-up found real work -- a state no
                            threshold value produces.  That case is now CRITICAL and
                            version-gated against the 3.7.0 effective_counter fix.
 
-                           o2md.18 - W13 PERPETUALLY_SKIPPED printed "0 of 0 discovered"
+                           tracking issue - W13 PERPETUALLY_SKIPPED printed "0 of 0 discovered"
                            when the position aggregates were unmeasurable (ISNULL(...,0)
                            on missing ProcessingPosition data), and asserted the time
                            limit as the cause even when no run in the window was
@@ -483,7 +483,7 @@ Version:    2026.11.12.2 (CalVer: YYYY.MM.DD; same-day patches append .1, .2, et
                            over-counting sub-issue is documented in place as NOT FIXED --
                            it is not derivable from CommandLog.
 
-                           o2md.22 - I8 QS_PERFORMANCE_TREND emitted impossible
+                           tracking issue - I8 QS_PERFORMANCE_TREND emitted impossible
                            percentages ("avg 9014150.4% change", "1681.8% reduction")
                            because it averaged unbounded ratios with no denominator
                            floor -- one 1 KB -> 20 MB stat dominated the result, and a
@@ -612,7 +612,7 @@ History:    2026.07.23.2 - Empty-CommandLog single-result envelope (0pgq / gh-55
                            and I16 RECURRING_RUNTIME_WARNING (informational codes) fire
                            when a code appears in >= 3 runs or >= 50%% of non-killed
                            runs.  Old runs without element produce zero findings.
-            2026.06.12.1 - Silent no-op parallel run detection (sp_StatUpdate-kzx0,
+            2026.06.12.1 - Silent no-op parallel run detection (tracking issue,
                            validated against the -v31y zombie-queue incident).
                            (1) New CRITICAL check C6 SILENT_NOOP_RUN: flags
                            non-killed runs that report a normal-completion
@@ -640,7 +640,7 @@ History:    2026.07.23.2 - Empty-CommandLog single-result envelope (0pgq / gh-55
                            Genuinely-drained runs (group SUM(processed) >=
                            MAX(found), or remaining = 0) keep the 3j5l
                            (2026.05.28.1) behavior -- no false-F regression.
-            2026.06.10.1 - Catalog completion (sp_StatUpdate-8gzw follow-on to
+            2026.06.10.1 - Catalog completion (tracking issue follow-on to
                            g4c0): added the 10 emitted-but-undocumented checks
                            to the @Help checks catalog -- W7
                            HIGH_IMPACT_STATS_DEPRIORITIZED, W8 MOPUP_INEFFECTIVE,
@@ -652,8 +652,8 @@ History:    2026.07.23.2 - Empty-CommandLog single-result envelope (0pgq / gh-55
                            Phase 3) but never appeared in @Help.  No behavior
                            change to the checks themselves.
             2026.06.08.2 - Cosmetic: added QS_PARALLEL_UNRELIABLE to diagnostic
-                           checks catalog (sp_StatUpdate-g4c0).
-            2026.06.08.1 - sp_StatUpdate-6x80: W5/I10 QS-parallel refinements.
+                           checks catalog (tracking issue).
+            2026.06.08.1 - tracking issue: W5/I10 QS-parallel refinements.
                            (1) W5 parallel-aware: when all QS-priority runs use
                            @StatsInParallel='Y' and QS CPU data IS present in
                            stat updates (QSTotalCpuMs > 0), W5's zero-data-runs
@@ -679,7 +679,7 @@ History:    2026.07.23.2 - Empty-CommandLog single-result envelope (0pgq / gh-55
                            EXEC call listing the top contended tables so the
                            operator can apply per-table priority boost.
             2026.05.28.1 - Two parallel-mode false-positive fixes.
-                           (1) sp_StatUpdate-772k: #runs dedup tiebreaker is now
+                           (1) tracking issue: #runs dedup tiebreaker is now
                            ORDER BY StartTime DESC, IsKilled ASC, EndTime DESC.
                            The prior 2026.04.20.1 EndTime DESC ordering could
                            pick a synthetic KILLED orphan-cleanup END over the
@@ -687,7 +687,7 @@ History:    2026.07.23.2 - Empty-CommandLog single-result envelope (0pgq / gh-55
                            falsely flagging completed parallel runs as killed.
                            IsKilled ASC guarantees the real END (IsKilled = 0)
                            wins.
-                           (2) sp_StatUpdate-3j5l: completion_pct now returns
+                           (2) tracking issue: completion_pct now returns
                            100.0 when StopReason IN (COMPLETED, PARALLEL_COMPLETE).
                            In parallel mode StatsFound is the whole-queue total
                            while StatsProcessed is this worker's slice, so the
@@ -921,7 +921,7 @@ ALTER PROCEDURE
     @DaysBack integer = 30,                     /* history window in days */
     @CommandLogDatabase sysname = NULL,          /* NULL = current DB */
     @Obfuscate bit = 0,                         /* 0 = real names, 1 = hashed names */
-    @ObfuscationSeed nvarchar(128) = NULL,       /* salt for HASHBYTES. NULL = auto-generated random seed (o2md.36), RAISERROR'd so it can be captured -- avoids unsalted hashing */
+    @ObfuscationSeed nvarchar(128) = NULL,       /* salt for HASHBYTES. NULL = auto-generated random seed (tracking issue), RAISERROR'd so it can be captured -- avoids unsalted hashing */
     @ObfuscationMapTable sysname = NULL,          /* persist obfuscation map to this table (auto-creates if missing) */
     @LongRunningMinutes integer = 10,            /* threshold for "long-running stat" detection */
     @FailureThreshold integer = 3,               /* same stat failing N+ times = CRITICAL */
@@ -987,7 +987,7 @@ BEGIN
                     N'NULL, database name (e.g., DBATools, master)', N'NULL (current database)'),
                 (N'@Obfuscate',                N'bit',      N'Hash database/schema/table/stat names for safe external sharing. Uses HASHBYTES MD5. Obfuscation map returned as result set 8 (multi-result-set mode only).',
                     N'0, 1', N'0'),
-                (N'@ObfuscationSeed',          N'nvarchar(128)', N'Salt prepended to names before hashing. Makes tokens unpredictable without the seed but deterministic across runs/servers with the same seed. NULL = a random seed is auto-generated and RAISERROR''d for this run (o2md.36) -- capture it if you need to reproduce or decode tokens later; it is never unsalted.',
+                (N'@ObfuscationSeed',          N'nvarchar(128)', N'Salt prepended to names before hashing. Makes tokens unpredictable without the seed but deterministic across runs/servers with the same seed. NULL = a random seed is auto-generated and RAISERROR''d for this run -- capture it if you need to reproduce or decode tokens later; it is never unsalted.',
                     N'NULL, any string up to 128 chars', N'NULL'),
                 (N'@ObfuscationMapTable',      N'sysname',  N'Persist obfuscation map to this table (auto-creates if missing, merges new entries on subsequent runs). Enables saving the map on prod while exporting only obfuscated results. Requires @Obfuscate=1.',
                     N'NULL, table name (e.g., dbo.DiagMap, tempdb.dbo.diag_map)', N'NULL'),
@@ -1820,7 +1820,7 @@ BEGIN
                        breaks the very next cache write (caught 2026-07-02). */
                     IsCritical          bit             NULL,
                     CriticalSampleOverride bit          NULL,
-                    /* o2md.50: per-row mop-up-origin flag (proc v3.8.5+); NULL = absent
+                    /* tracking issue: per-row mop-up-origin flag (proc v3.8.5+); NULL = absent
                        element (priority-pass row on 3.8.5+, or any pre-3.8.5 row) */
                     FromMopUp           bit             NULL,
                     SourceExtendedInfoHash binary(32)   NULL,
@@ -1854,7 +1854,7 @@ BEGIN
                     ALTER TABLE ' + @cache_ref + N' ADD IsCritical bit NULL;
                 IF COL_LENGTH(N''' + REPLACE(@cache_ref, N'''', N'''''') + N''', N''CriticalSampleOverride'') IS NULL
                     ALTER TABLE ' + @cache_ref + N' ADD CriticalSampleOverride bit NULL;
-                /* o2md.50: FromMopUp added in this batch */
+                /* tracking issue: FromMopUp added in this batch */
                 IF COL_LENGTH(N''' + REPLACE(@cache_ref, N'''', N'''''') + N''', N''FromMopUp'') IS NULL
                     ALTER TABLE ' + @cache_ref + N' ADD FromMopUp bit NULL;
                 IF COL_LENGTH(N''' + REPLACE(@cache_ref, N'''', N'''''') + N''', N''SourceExtendedInfoHash'') IS NULL
@@ -1961,7 +1961,7 @@ BEGIN
         /* END Summary fields added in this batch (70hh, 1h2l) */
         StatsToctou integer NULL,               /* Summary/StatsToctou  -- count of TOCTOU_SKIP catches per run (v3.5.9+) */
         QSEnrichmentSkipped bit NULL,           /* Summary/QSEnrichmentSkipped -- 1 when QS phase was skipped (v3+) */
-        /* o2md.50: self-idle-time buckets from END Summary XML (proc v3.8.5+).
+        /* tracking issue: self-idle-time buckets from END Summary XML (proc v3.8.5+).
            Emitted with NULLIF-omit-when-zero on the proc side, so NULL here means
            EITHER zero (3.8.5+ run) or unmeasured (older run) -- W6 subtracts
            ISNULL(x, 0), which is arithmetically correct in both cases, and gates
@@ -2034,14 +2034,14 @@ BEGIN
         /* sw82: CriticalTables per-stat markers (v3.5.0+); NULL on older rows */
         IsCritical bit NULL,                /* ExtendedInfo/IsCritical -- 1 when stat matched a CriticalTables pattern */
         CriticalSampleOverride bit NULL,    /* ExtendedInfo/CriticalSampleOverride -- 1 when per-table sample override was applied */
-        /* o2md.50: per-row mop-up-origin flag (proc v3.8.5+); NULL on older rows and
+        /* tracking issue: per-row mop-up-origin flag (proc v3.8.5+); NULL on older rows and
            on 3.8.5+ priority-pass rows (NULLIF-omitted element) */
         FromMopUp bit NULL,
         /* 70hh: skip-row flag -- 1 when Command begins 'SKIPPED:' or ErrorMessage begins 'TOCTOU_SKIP'.
            Rows with IsSkip=1 are excluded from duration/appearance/success aggregates. */
         IsSkip bit NOT NULL DEFAULT 0,
 
-        /* o2md.42: unnamed -- named constraints on temp tables don't get the
+        /* tracking issue: unnamed -- named constraints on temp tables don't get the
            session uniquifier that temp table names get, so two concurrent
            sessions collide on the constraint name (2nd session's CREATE fails). */
         PRIMARY KEY NONCLUSTERED (ID)
@@ -2056,12 +2056,12 @@ BEGIN
         Finding nvarchar(500) NOT NULL,
         Evidence nvarchar(2000) NULL,
         Recommendation nvarchar(2000) NULL,
-        /* sp_StatUpdate-6x80: widened from nvarchar(1000) to accommodate
+        /* tracking issue: widened from nvarchar(1000) to accommodate
            @CriticalTables hint appended by I10 RECOMMENDED_CONFIG */
         ExampleCall nvarchar(2000) NULL,
         SortPriority integer NOT NULL DEFAULT 50,
 
-        /* o2md.42: unnamed, see #stat_updates above */
+        /* tracking issue: unnamed, see #stat_updates above */
         PRIMARY KEY CLUSTERED (FindingID)
     );
 
@@ -2164,7 +2164,7 @@ BEGIN
         qs_enrichment_skipped = e.ExtendedInfo.value(N''(Summary/QSEnrichmentSkipped)[1]'', N''bit''),
         /* t8lj: pipe-delimited warning code tokens from END Summary XML (v3.5.9+); NULL on older rows */
         warnings_codes      = e.ExtendedInfo.value(N''(Summary/WarningsCodes)[1]'', N''nvarchar(max)''),
-        /* o2md.50: self-idle-time buckets (proc v3.8.5+); NULL = zero-or-unmeasured (NULLIF-omitted) */
+        /* tracking issue: self-idle-time buckets (proc v3.8.5+); NULL = zero-or-unmeasured (NULLIF-omitted) */
         delay_wait_ms       = e.ExtendedInfo.value(N''(Summary/DelayWaitMs)[1]'', N''bigint''),
         ag_redo_wait_ms     = e.ExtendedInfo.value(N''(Summary/AgRedoWaitMs)[1]'', N''bigint''),
         retry_backoff_ms    = e.ExtendedInfo.value(N''(Summary/RetryBackoffMs)[1]'', N''bigint''),
@@ -2212,7 +2212,7 @@ BEGIN
         @orphan_minutes = @OrphanedRunThresholdMinutes;
 
     /* #216: Dedup -- keep only the most recent START per RunLabel.
-       sp_StatUpdate-772k: IsKilled ASC tiebreaker so a real END (IsKilled = 0)
+       tracking issue: IsKilled ASC tiebreaker so a real END (IsKilled = 0)
        always wins over a synthetic KILLED orphan-cleanup END (IsKilled = 1)
        for the same RunLabel.  The prior v2026.04.20.1 EndTime DESC ordering
        could pick the newer synthetic KILLED row, falsely flagging completed
@@ -2233,7 +2233,7 @@ BEGIN
         CREATE UNIQUE NONCLUSTERED INDEX UX_runs_RunLabel ON #runs (RunLabel);
 
     /* ----------------------------------------------------------------------
-       o2md.11 / o2md.17: sortable numeric key for each run's sp_StatUpdate
+       tracking issue / tracking issue: sortable numeric key for each run's sp_StatUpdate
        version, so checks can gate version-specific advice on evidence instead
        of asserting a fix that may not apply.
 
@@ -2245,7 +2245,7 @@ BEGIN
     (
         RunLabel nvarchar(100) NOT NULL,
         VersionKey integer NULL,
-        /* o2md.42: unnamed, see #stat_updates above */
+        /* tracking issue: unnamed, see #stat_updates above */
         PRIMARY KEY CLUSTERED (RunLabel)
     );
 
@@ -2291,7 +2291,7 @@ BEGIN
     DECLARE @run_count integer = (SELECT COUNT_BIG(*) FROM #runs);
     DECLARE @killed_count integer = (SELECT COUNT_BIG(*) FROM #runs WHERE IsKilled = 1);
 
-    /* o2md.33: legitimate AG-secondary stops -- the proc deselected every selected
+    /* tracking issue: legitimate AG-secondary stops -- the proc deselected every selected
        database because all were secondary replicas on this host, and returned
        StopReason = AG_SECONDARY with StatsFound = 0.  By design, not a failure;
        these runs are excluded from the grading aggregates (completion average +
@@ -2383,7 +2383,7 @@ BEGIN
             /* sw82: IsCritical + CriticalSampleOverride from per-stat ExtendedInfo (v3.5.0+) */
             c.ExtendedInfo.value(N''(ExtendedInfo/IsCritical)[1]'', N''bit''),
             c.ExtendedInfo.value(N''(ExtendedInfo/CriticalSampleOverride)[1]'', N''bit''),
-            /* o2md.50: NULLIF-omitted on the proc side -- NULL = priority-pass row or pre-3.8.5 */
+            /* tracking issue: NULLIF-omitted on the proc side -- NULL = priority-pass row or pre-3.8.5 */
             c.ExtendedInfo.value(N''(ExtendedInfo/FromMopUp)[1]'', N''bit''),
             HASHBYTES(N''SHA2_256'', CONVERT(varbinary(max), CONVERT(nvarchar(max), c.ExtendedInfo)))
         FROM ' + @commandlog_ref + N' AS c
@@ -2427,7 +2427,7 @@ BEGIN
             ca.ProcessingPosition, ca.ObjectId, ca.StatsId,
             /* sw82: read from cache when present; NULL when cache rows predate sw82 (column upgrade handles this) */
             ca.IsCritical, ca.CriticalSampleOverride,
-            /* o2md.50: NULL for cache rows written before this upgrade even if the source
+            /* tracking issue: NULL for cache rows written before this upgrade even if the source
                XML had the element (accepted limitation, same as sw82) */
             ca.FromMopUp
         FROM ' + @cache_ref + N' AS ca
@@ -2703,7 +2703,7 @@ BEGIN
     BEGIN
         RAISERROR(N'Applying obfuscation...', 10, 1) WITH NOWAIT;
 
-        /* o2md.36: an unseeded run hashed raw names with no salt (@seed_prefix = '' below),
+        /* tracking issue: an unseeded run hashed raw names with no salt (@seed_prefix = '' below),
            making tokens a trivial dictionary-attack target -- a SAFE_TO_SHARE label
            overstated the protection. The wrapper (Invoke-StatUpdateDiag.ps1) already
            refuses to run -Obfuscate without -ObfuscationSeed, so this is defense-in-depth
@@ -2799,7 +2799,7 @@ BEGIN
         WHERE r.[Databases] IS NOT NULL
         AND   r.[Databases] NOT IN (N'USER_DATABASES', N'SYSTEM_DATABASES', N'ALL_DATABASES', N'AVAILABILITY_GROUP_DATABASES');
 
-        /* o2md.52: #runs.CriticalTables carries raw table-name patterns from the
+        /* tracking issue: #runs.CriticalTables carries raw table-name patterns from the
            START Parameters XML.  It was never included in this rewrite (the sw82
            ingestion landed after BUG-09), so every downstream echo -- W16
            CRITICAL_TABLES_NO_MATCH, I17 CRITICAL_TABLES_COVERAGE, RS8 Parameter
@@ -2932,7 +2932,7 @@ BEGIN
         DatabaseName sysname NOT NULL,
         ObjectName sysname NOT NULL,
         ForcedPlanCount integer NOT NULL DEFAULT 0,
-        /* o2md.42: unnamed, see #stat_updates above */
+        /* tracking issue: unnamed, see #stat_updates above */
         PRIMARY KEY CLUSTERED (DatabaseName, ObjectName)
     );
 
@@ -3308,7 +3308,7 @@ BEGIN
                 WHEN r.StartTime >= @c4_recent_start THEN N'RECENT'
                 ELSE N'PRIOR'
             END,
-            /* o2md.10 blast radius: XSINIL makes an unset @StatsInParallel arrive as '',
+            /* tracking issue blast radius: XSINIL makes an unset @StatsInParallel arrive as '',
                which would otherwise form a third mode bucket distinct from 'N'. */
             parallel_mode = ISNULL(NULLIF(r.StatsInParallel, N''), N'N'),
             avg_sec_per_stat = CASE
@@ -3339,10 +3339,10 @@ BEGIN
     )
     INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
     SELECT
-        /* o2md.13: sec/stat alone must not raise CRITICAL for parallel windows -- see the
+        /* tracking issue: sec/stat alone must not raise CRITICAL for parallel windows -- see the
            CROSS APPLY below.  (The mode-mismatch ELSE is unreachable: parity is enforced
            in the WHERE clause by gh-479.)
-           o2md.14: thin windows (either side under 5 runs) cap at WARNING -- the 2-run
+           tracking issue: thin windows (either side under 5 runs) cap at WARNING -- the 2-run
            minimum stays as the firing floor, but a 2-run baseline is too noisy to
            justify CRITICAL on its own. */
         CASE
@@ -3365,7 +3365,7 @@ BEGIN
         END,
         N'Recent window: ' + CONVERT(nvarchar(10), recent_w.run_count) + N' runs averaging '
             + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), recent_w.avg_sec)) + N' sec/stat'
-            /* o2md.13: round GB/min at format time, matching how avg_sec is handled -- AVG() of a
+            /* tracking issue: round GB/min at format time, matching how avg_sec is handled -- AVG() of a
                decimal(10,2) widens the scale and was printing values like 53.920769 GB/min. */
             + CASE WHEN recent_w.avg_gb_min IS NOT NULL THEN N' (' + CONVERT(nvarchar(20), CONVERT(decimal(10, 1), recent_w.avg_gb_min)) + N' GB/min)' ELSE N'' END
             + N' (StatsInParallel=' + recent_w.parallel_mode + N'). '
@@ -3382,13 +3382,13 @@ BEGIN
                       THEN N' NOTE: parallel runs -- GB/min did NOT degrade past the 1.5x threshold, so the sec/stat delta is most likely worker slice-composition noise rather than a real slowdown (in parallel mode StatsProcessed is only this worker''s slice while DurationSeconds covers the whole worker lifetime). Reported as WARNING, not CRITICAL.'
                   ELSE N' NOTE: parallel runs -- GB/min was unavailable to corroborate the sec/stat delta, which in parallel mode is dominated by worker slice composition. Reported as WARNING, not CRITICAL.'
               END
-            /* o2md.14: thin-baseline + survivorship caveats in the evidence itself */
+            /* tracking issue: thin-baseline + survivorship caveats in the evidence itself */
             + CASE WHEN recent_w.run_count < 5 OR prior_w.run_count < 5
                   THEN N' NOTE: thin baseline -- a window has fewer than 5 runs, so the averages are noise-prone; capped at WARNING. '
                        + N'Both windows contain only runs that completed and processed work (killed runs are excluded), so a stretch of failing runs can leave a survivor-only average that is not representative of the period.'
                   ELSE N''
               END,
-        /* o2md.15: recent_w.parallel_mode is already computed and printed in Evidence above
+        /* tracking issue: recent_w.parallel_mode is already computed and printed in Evidence above
            (StatsInParallel=Y/N) but the recommendation and ExampleCall were constants that
            always suggested enabling @StatsInParallel -- even for runs whose own evidence
            says it's already Y (5/5 DEGRADING_THROUGHPUT findings in the fleet sweep). */
@@ -3411,7 +3411,7 @@ BEGIN
     CROSS JOIN window_avgs AS prior_w
     CROSS APPLY
     (
-        /* o2md.13: in parallel mode StatsProcessed is only THIS worker's slice while
+        /* tracking issue: in parallel mode StatsProcessed is only THIS worker's slice while
            DurationSeconds covers the whole worker lifetime, so sec/stat is dominated by
            slice composition (observed ~10x disagreement with GB/min on the prod fleet).
            GB/min is derived from TotalGB over the same duration and is slice-independent,
@@ -3441,8 +3441,8 @@ BEGIN
         RAISERROR(N'  [C4] Degrading throughput detected (CRITICAL when corroborated; WARNING for parallel windows where GB/min disagrees)', 10, 1) WITH NOWAIT;
 
     /* ======================================================================
-       C6: SILENT NO-OP RUN (sp_StatUpdate-kzx0)
-       Validated against the sp_StatUpdate-v31y zombie-queue incident: a
+       C6: SILENT NO-OP RUN (tracking issue)
+       Validated against the tracking issue zombie-queue incident: a
        drained parallel queue whose leadership could not be re-claimed made
        every new worker join, claim nothing, and exit PARALLEL_COMPLETE with
        StatsFound > 0 and StatsProcessed = 0 -- maintenance silently stopped
@@ -3464,7 +3464,7 @@ BEGIN
     DECLARE @c6_silent_noop bit = 0;
     DECLARE @c6_count integer = 0;
 
-    /* o2md.11: materialize the flagged runs ONCE.  The detection predicate used to be
+    /* tracking issue: materialize the flagged runs ONCE.  The detection predicate used to be
        written twice (count + evidence) and the recommendation asserted a single root
        cause (parallel queue zombies, fixed in 3.5.7) even for COMPLETED/NATURAL_END
        runs -- an entirely different code path that 3.5.7 does not touch.  Keeping the
@@ -3477,14 +3477,14 @@ BEGIN
         StopReason nvarchar(50) NULL,
         StatsFound integer NULL,
         VersionKey integer NULL,  /* major * 1000000 + minor * 1000 + patch; NULL when unparseable */
-        /* o2md.12: evidence fields the recommendation text references but never showed */
+        /* tracking issue: evidence fields the recommendation text references but never showed */
         [Version] nvarchar(20) NULL,
         StatsInParallel nvarchar(1) NULL,
         DurationSeconds integer NULL,
         StatsRemaining integer NULL
     );
 
-    /* o2md.12: ISNULL(r.StatsProcessed, 0) = 0 treated a genuinely NULL StatsProcessed
+    /* tracking issue: ISNULL(r.StatsProcessed, 0) = 0 treated a genuinely NULL StatsProcessed
        (older proc build, or a truncated/atypical END writer) the same as a confirmed 0 --
        a real no-op and "we don't actually know" were indistinguishable in the evidence.
        CRITICAL C6 below now requires StatsProcessed = 0 explicitly (NULL fails the
@@ -3618,7 +3618,7 @@ BEGIN
 
     /* ======================================================================
        I18: NOOP_UNCONFIRMED -- StatsProcessed missing, not confirmed 0
-       o2md.12: same shape as C6 above (StatsFound > 0, normal-completion
+       tracking issue: same shape as C6 above (StatsFound > 0, normal-completion
        StopReason, no other worker/CommandLog activity nearby) but StatsProcessed
        is NULL rather than confirmed 0 -- an older proc build or a truncated END
        write, not necessarily a no-op.  Reported separately at INFO so it isn't
@@ -3697,7 +3697,7 @@ BEGIN
     END;
 
     /* ======================================================================
-       I19: AG_SECONDARY_BY_DESIGN (o2md.33)
+       I19: AG_SECONDARY_BY_DESIGN (tracking issue)
        Legitimate AG-secondary stops surfaced as INFO instead of silently
        dragging grades: half the fleet was permanently red for doing what a
        secondary is supposed to do.  Excluded from grading aggregates above;
@@ -3938,7 +3938,7 @@ BEGIN
     IF @c6_silent_noop = 1
         SET @w3_parallel_complete = 0;
 
-    /* o2md.19: zero-processed-window guard.  When EVERY non-killed run in the
+    /* tracking issue: zero-processed-window guard.  When EVERY non-killed run in the
        window confirmed StatsProcessed = 0, the backlog is not a throughput
        problem -- it is the no-op problem C6 owns, and W3's advice (raise
        @TimeLimit, enable parallel, raise thresholds) is nonsense for runs that
@@ -3946,13 +3946,13 @@ BEGIN
        windows keep current behavior, including the kzx0 un-suppression above
        (which stays on @w3_parallel_complete so the COMPLETION fast-path effect
        is unchanged).  NULL StatsProcessed rows block the deferral -- per the
-       o2md.12 lesson, NULL is unconfirmed, not zero. */
+       tracking issue lesson, NULL is unconfirmed, not zero. */
     DECLARE @w3_all_noop bit = 0;
     IF EXISTS (SELECT 1 FROM #runs WHERE IsKilled = 0)
     AND NOT EXISTS (SELECT 1 FROM #runs WHERE IsKilled = 0 AND (StatsProcessed IS NULL OR StatsProcessed > 0))
     BEGIN
         SET @w3_all_noop = 1;
-        RAISERROR(N'  W3: all non-killed runs processed 0 stats -- deferring backlog finding to C6 SILENT_NOOP_RUN (o2md.19)', 10, 1) WITH NOWAIT;
+        RAISERROR(N'  W3: all non-killed runs processed 0 stats -- deferring backlog finding to C6 SILENT_NOOP_RUN', 10, 1) WITH NOWAIT;
     END;
 
     IF @w3_all_noop = 0
@@ -4035,7 +4035,7 @@ BEGIN
     IF EXISTS (SELECT 1 FROM #runs WHERE QueryStorePriority = N'Y')
     BEGIN
         /* ------------------------------------------------------------------
-           o2md.16: mop-up rows must not count as evidence that QS enrichment
+           tracking issue: mop-up rows must not count as evidence that QS enrichment
            failed.  The mop-up pass hard-codes the qs_* per-stat fields to NULL,
            so a run whose only stat rows came from mop-up looks identical to a
            run where Query Store was disabled -- and W5 then blames the customer's
@@ -4043,10 +4043,10 @@ BEGIN
            evaluable (non-mop-up, non-skip) stat rows are excluded from BOTH the
            numerator and the denominator.
 
-           TODO (o2md.5): mop-up rows are identified here by the existing
+           TODO (tracking issue): mop-up rows are identified here by the existing
            QualifyReason = 'MOP_UP' tag emitted by sp_StatUpdate (see the
            @in_mop_up CASE in the per-stat ExtendedInfo).
-           o2md.50: proc v3.8.5 (o2md.49) added the anticipated dedicated flag --
+           tracking issue: proc v3.8.5 (tracking issue) added the anticipated dedicated flag --
            per-stat ExtendedInfo/FromMopUp, ingested into #stat_updates.  On
            3.8.5+ runs (VersionKey >= 3008005) it is authoritative: unlike the
            session-scoped @in_mop_up behind QualifyReason, it cannot mislabel
@@ -4096,7 +4096,7 @@ BEGIN
             AND   CASE WHEN rvk.VersionKey >= 3008005
                                  THEN CONVERT(int, ISNULL(su.FromMopUp, 0))
                                  ELSE CASE WHEN ISNULL(su.QualifyReason, N'') = N'MOP_UP' THEN 1 ELSE 0 END
-                            END = 0   /* o2md.16 + o2md.50 */
+                            END = 0   /* tracking issue + tracking issue */
         );
 
         /* 1h2l: QSEnrichmentSkipped direct signal from END Summary XML (v3+ only).
@@ -4111,7 +4111,7 @@ BEGIN
             FROM #runs WHERE IsKilled = 0 AND QSEnrichmentSkipped IS NOT NULL
         );
 
-        /* sp_StatUpdate-6x80: detect whether ALL QS-priority runs are parallel.
+        /* tracking issue: detect whether ALL QS-priority runs are parallel.
            In parallel mode, ProcessingPosition is a per-worker counter (not a
            global rank), so the absence of per-stat QS data in stat updates does
            NOT reliably signal that QS enrichment failed -- it may simply mean
@@ -4144,7 +4144,7 @@ BEGIN
 
         IF @w5_qs_runs = 0
         BEGIN
-            /* o2md.16: every QS-priority run in the window consists solely of mop-up
+            /* tracking issue: every QS-priority run in the window consists solely of mop-up
                (or skipped) stat rows, so there is no evidence either way about QS
                enrichment.  Say so instead of blaming the customer's QS configuration. */
             INSERT INTO #recommendations (Severity, Category, Finding, Evidence, Recommendation, ExampleCall, SortPriority)
@@ -4166,7 +4166,7 @@ BEGIN
         END
         ELSE IF @w5_definitive_skipped = 1 OR @w5_qs_data_runs = 0
         BEGIN
-            /* sp_StatUpdate-6x80: when all QS-priority runs are parallel AND QS
+            /* tracking issue: when all QS-priority runs are parallel AND QS
                CPU data was observed in stat updates, the zero-QSPlanCount signal
                is unreliable (parallel per-worker position counters mask global
                rank).  Emit a softer INFO note and do NOT insert QS_NOT_EFFECTIVE
@@ -4225,7 +4225,7 @@ BEGIN
                 N'QS prioritization was configured across ' + CONVERT(nvarchar(10), @w5_qs_runs)
                     + N' runs, but QS enrichment only executed in ' + CONVERT(nvarchar(10), @w5_qs_data_runs)
                     + N'.  Query Store may have transitioned to READ_ONLY or had no recent runtime stats in some runs.'
-                    /* o2md.16: mop-up-only runs are already excluded from both counts; say so
+                    /* tracking issue: mop-up-only runs are already excluded from both counts; say so
                        so the reader does not chase a QS misconfiguration that is not there. */
                     + CASE WHEN @w5_mopup_only_runs > 0
                            THEN N'  (' + CONVERT(nvarchar(10), @w5_mopup_only_runs)
@@ -4262,7 +4262,7 @@ BEGIN
                 r.DurationSeconds,
                 r.StatsProcessed,
                 stat_seconds = CONVERT(decimal(10,1), ISNULL(su_agg.TotalStatMs, 0) / 1000.0),
-                /* o2md.50: measured self-idle time (proc v3.8.5+ END Summary buckets).
+                /* tracking issue: measured self-idle time (proc v3.8.5+ END Summary buckets).
                    NULL buckets (older proc, or genuinely zero -- NULLIF-omitted) read as 0,
                    which is the arithmetically correct subtraction either way. */
                 idle_seconds = CONVERT(decimal(10,1),
@@ -4271,7 +4271,7 @@ BEGIN
                 /* gh-478: Clamp to [0, 100].  DurationMs sums can exceed wall-clock when stats run
                    in overlapping transactions or when clock skew occurs across workers, producing
                    negative overhead percentages.
-                   o2md.50: measured idle time is subtracted alongside stat time, so the
+                   tracking issue: measured idle time is subtracted alongside stat time, so the
                    percentage is genuinely-unattributed time, not "everything that isn't
                    an UPDATE STATISTICS". */
                 overhead_pct = CASE
@@ -4294,7 +4294,7 @@ BEGIN
                 GROUP BY su.RunLabel
             ) AS su_agg ON su_agg.RunLabel = r.RunLabel
             WHERE r.IsKilled = 0
-            /* o2md.27: DurationSeconds > 10 AND StatsProcessed >= 5 was too weak -- a run
+            /* tracking issue: DurationSeconds > 10 AND StatsProcessed >= 5 was too weak -- a run
                with 34 processed stats still showed 93.4% overhead in the fleet sweep
                because fixed startup cost dominates when the actual measured stat-update
                time is tiny, regardless of how many individual stats were touched. Require
@@ -4318,7 +4318,7 @@ BEGIN
                 SELECT
                     r.RunLabel,
                     /* gh-478: Clamp to [0, 100] (see primary run_overhead CTE above).
-                       o2md.50: idle buckets subtracted -- must match primary CTE's formula. */
+                       tracking issue: idle buckets subtracted -- must match primary CTE's formula. */
                     overhead_pct = CASE
                         WHEN r.DurationSeconds > 0
                         THEN CASE
@@ -4334,7 +4334,7 @@ BEGIN
                     SELECT su.RunLabel, TotalStatMs = SUM(ISNULL(su.DurationMs, 0))
                     FROM #stat_updates AS su WHERE su.EndTime IS NOT NULL GROUP BY su.RunLabel
                 ) AS su_agg ON su_agg.RunLabel = r.RunLabel
-                /* o2md.27: must match the primary run_overhead CTE's guard above */
+                /* tracking issue: must match the primary run_overhead CTE's guard above */
                 WHERE r.IsKilled = 0 AND r.DurationSeconds > 60 AND r.StatsProcessed >= 5
                 AND   ISNULL(su_agg.TotalStatMs, 0) >= 10000
             )
@@ -4345,7 +4345,7 @@ BEGIN
 
         IF @w6_overhead_runs > 0
         BEGIN
-            /* o2md.50: itemize the worst run's measured idle-time buckets (proc v3.8.5+
+            /* tracking issue: itemize the worst run's measured idle-time buckets (proc v3.8.5+
                emits them; already subtracted from the percentage above), and say plainly
                when the run predates measurement so "overhead" is understood to still
                include any delay/AG/retry/claim time. */
@@ -4378,7 +4378,7 @@ BEGIN
                 N'WARNING', N'EXCESSIVE_OVERHEAD',
                 N'Wall clock minus measured stat-update time is disproportionately large',
                 @w6_detail,
-                /* o2md.27: this figure is wall-clock minus measured per-stat UPDATE STATISTICS
+                /* tracking issue: this figure is wall-clock minus measured per-stat UPDATE STATISTICS
                    time -- it is NOT a measurement of what the remaining time was spent on.
                    The inter-stat delay (preset-controlled internal variable, not a public v3
                    parameter), AG-redo wait loops, lock waits, and parallel-worker queue-idle
@@ -4411,7 +4411,7 @@ BEGIN
        W7: HIGH_IMPACT_STATS_DEPRIORITIZED (#263)
        Top CPU stats processed late (high ProcessingPosition).
        ====================================================================== */
-    /* o2md.43: "avg_position > median_position" is true, by construction, for roughly
+    /* tracking issue: "avg_position > median_position" is true, by construction, for roughly
        half of any top-10 CPU list regardless of whether prioritization is working --
        under MODIFICATION_COUNTER (or any non-QS) sort order this fires on essentially
        every server, and the recommendation ("enable Query Store-based prioritization")
@@ -4494,7 +4494,7 @@ BEGIN
                     N'HIGH_IMPACT_STATS_DEPRIORITIZED',
                     N'High-workload statistics processed late despite QUERY_STORE sort order already being active',
                     N'Top CPU stats with high processing positions: ' + @w7_evidence,
-                    /* o2md.43: this fires only when QUERY_STORE sort is already active (see gate above),
+                    /* tracking issue: this fires only when QUERY_STORE sort is already active (see gate above),
                        so "enable QS-based prioritization" is never the right advice here. */
                     N'@SortOrder=QUERY_STORE is already active, so this points at QS scoring/enrichment, not a missing feature. '
                         + N'Check whether Phase 6 QS enrichment is actually finding data for these tables (Query Store enabled/READ_WRITE '
@@ -4529,7 +4529,7 @@ BEGIN
         WHERE ranked.CumulativePct >= 80.0
         ORDER BY ranked.rn;
 
-        /* o2md.44: "top N stats reach 80% of CPU" is the Pareto principle -- true of
+        /* tracking issue: "top N stats reach 80% of CPU" is the Pareto principle -- true of
            nearly every workload distribution, not a defect signal. Reframed as neutral
            descriptive context rather than a recommendation to act, and (reusing
            @w7_qs_sort_active from the W7 check above) no longer suggests enabling
@@ -5039,7 +5039,7 @@ BEGIN
             @w12_avg_mopup   decimal(10, 1),
             @w12_mopup_pct   decimal(5, 1),
             @w12_mod_thresh  bigint,
-            /* o2md.17: newest sp_StatUpdate version seen across the mop-up runs.
+            /* tracking issue: newest sp_StatUpdate version seen across the mop-up runs.
                3.7.0 -> 3007000.  Below that, the priority pass could qualify nothing
                regardless of @ModificationThreshold (effective_counter defect), so the
                "lower the threshold" advice is unactionable and must not be emitted. */
@@ -5074,7 +5074,7 @@ BEGIN
                 ELSE 100.0
             END;
 
-            /* o2md.17: distinguish "few stats qualified" (a tuning problem) from
+            /* tracking issue: distinguish "few stats qualified" (a tuning problem) from
                "EXACTLY zero qualified while mop-up found real work" (a defect).
                The latter is not fixable by any @ModificationThreshold value. */
             SET @w12_severity =
@@ -5213,18 +5213,18 @@ BEGIN
         DECLARE @w13_min_consecutive int = 3;
         DECLARE @w13_skipped_count int = 0;
         DECLARE @w13_run_count int = 0;
-        /* o2md.18(a): these two must stay NULLABLE.  They were ISNULL(...,0), which turned
+        /* tracking issue(a): these two must stay NULLABLE.  They were ISNULL(...,0), which turned
            "no ProcessingPosition data" (parallel / mop-up rows) and "StatsFound = 0" into a
            literal "Average last position processed: 0 of 0 discovered" evidence line under a
            headline claiming thousands of stale stats.  NULL now means "not measurable" and
            the finding is suppressed rather than printed with degenerate evidence. */
         DECLARE @w13_avg_last_position int = NULL;
         DECLARE @w13_avg_total int = NULL;
-        /* o2md.18(b): the stated cause ("the time limit expires before they are reached")
+        /* tracking issue(b): the stated cause ("the time limit expires before they are reached")
            must not be asserted when no run in the window was actually time-limited. */
         DECLARE @w13_time_limited_runs int = 0;
 
-        /* Count non-killed graceful-stop runs.  o2md.18: BATCH_LIMIT/STOP_BY_TIME
+        /* Count non-killed graceful-stop runs.  tracking issue: BATCH_LIMIT/STOP_BY_TIME
            added so the authoritative REMAINING-log path can engage for those runs;
            the inference fallback keeps its own narrower recent_runs filter and its
            degenerate-aggregate suppression, so it is unaffected by this wider gate. */
@@ -5241,7 +5241,7 @@ BEGIN
 
         IF @w13_run_count >= @w13_min_consecutive
         BEGIN
-            /* o2md.18 (maintainer decision 2026-07-30): prefer the authoritative
+            /* tracking issue (maintainer decision 2026-07-30): prefer the authoritative
                discovery-candidate log.  Proc v3.11.0+ writes one
                SP_STATUPDATE_REMAINING row per run listing the qualifying stats
                left unprocessed at run end -- the population that was previously
@@ -5302,7 +5302,7 @@ BEGIN
                     SELECT TOP (@w13_min_consecutive) r.RunLabel
                     FROM #runs AS r
                     WHERE r.IsKilled = 0
-                    AND   r.StopReason IN (N'TIME_LIMIT', N'NATURAL_END', N'COMPLETED', N'BATCH_LIMIT', N'STOP_BY_TIME') /* o2md.18: match the coverage CTE above */
+                    AND   r.StopReason IN (N'TIME_LIMIT', N'NATURAL_END', N'COMPLETED', N'BATCH_LIMIT', N'STOP_BY_TIME') /* tracking issue: match the coverage CTE above */
                     AND   r.StatsProcessed > 0
                     ORDER BY r.StartTime DESC
                 ),
@@ -5407,11 +5407,11 @@ BEGIN
                         AND   us.StatisticsName = su_all.StatisticsName
                     )
                 ),
-                /* o2md.18(a): no ISNULL -- NULL means "not measurable", see the DECLARE above */
+                /* tracking issue(a): no ISNULL -- NULL means "not measurable", see the DECLARE above */
                 @w13_avg_last_position = (SELECT AVG(max_position) FROM run_positions),
                 @w13_avg_total = (SELECT AVG(NULLIF(StatsFound, 0)) FROM recent_runs);
 
-            /* o2md.18(c): the inference below remains the FALLBACK ONLY -- when the
+            /* tracking issue(c): the inference below remains the FALLBACK ONLY -- when the
                recent runs carry the SP_STATUPDATE_REMAINING log (proc v3.11.0+), the
                authoritative branch above replaces it entirely.
                Original caveat, still true for this fallback: @w13_skipped_count counts every distinct
@@ -5423,10 +5423,10 @@ BEGIN
                defaults off and has no public v3 parameter to enable -- @LogSkippedToCommandLog
                was the v2 toggle, removed in the migration).  Fixing this
                properly needs a proc-side discovery-candidate log, not a Diag change.  See the
-               bd issue comment on sp_StatUpdate-o2md.18. */
+               bd issue comment on tracking issue.18. */
 
             IF @w13_skipped_count > 0
-            /* o2md.18(a): suppress entirely when the position aggregate is degenerate --
+            /* tracking issue(a): suppress entirely when the position aggregate is degenerate --
                "0 of 0 discovered" is worse than saying nothing. */
             AND @w13_avg_last_position IS NOT NULL
             AND @w13_avg_total IS NOT NULL
@@ -5438,7 +5438,7 @@ BEGIN
                     N'PERPETUALLY_SKIPPED',
                     CONVERT(nvarchar(10), @w13_skipped_count) + N' stats not updated in the last '
                         + CONVERT(nvarchar(10), @w13_min_consecutive) + N' consecutive runs',
-                    /* o2md.18(b): only claim the time limit is the cause when runs actually ran out of time. */
+                    /* tracking issue(b): only claim the time limit is the cause when runs actually ran out of time. */
                     CASE WHEN @w13_time_limited_runs > 0
                          THEN N'Discovery finds these stats but the time limit expires before they are reached.  '
                          ELSE N'These stats were updated earlier in the analysis window but not in the last '
@@ -5466,7 +5466,7 @@ BEGIN
 
                 RAISERROR(N'  [WARNING] W13: %d stats perpetually skipped across %d runs', 10, 1, @w13_skipped_count, @w13_min_consecutive) WITH NOWAIT;
             END;
-            END; /* o2md.18: ELSE (inference fallback -- no/partial REMAINING log coverage) */
+            END; /* tracking issue: ELSE (inference fallback -- no/partial REMAINING log coverage) */
         END;
     END;
 
@@ -5573,7 +5573,7 @@ BEGIN
                     + N'priority boost and optional per-table FULLSCAN override. Particularly useful for tables '
                     + N'identified via W7 HIGH_IMPACT_STATS_DEPRIORITIZED or W9 LOCK_TIMEOUT_INEFFECTIVE.',
                 N'Specify critical tables to ensure they are always updated early in the run, regardless of sort order.',
-                /* o2md.52: example uses obviously-placeholder names so a leakage
+                /* tracking issue: example uses obviously-placeholder names so a leakage
                    grep on a SAFE report never false-trips on this literal. */
                 N'EXECUTE dbo.sp_StatUpdate @CriticalTables = N''dbo.YourHotTable,dbo.YourBusyTable'', @Databases = N''USER_DATABASES'';',
                 68
@@ -5695,7 +5695,7 @@ BEGIN
         AvgSecPerStat decimal(10, 1) NULL,
         AvgPositionTop10 decimal(10, 1) NULL,
 
-        /* o2md.42: unnamed, see #stat_updates above */
+        /* tracking issue: unnamed, see #stat_updates above */
         PRIMARY KEY NONCLUSTERED (RunLabel)
     );
 
@@ -5818,7 +5818,7 @@ BEGIN
                               ELSE NULL
                           END,
         completion_pct  = CASE
-                              /* sp_StatUpdate-kzx0: PARALLEL_COMPLETE with
+                              /* tracking issue: PARALLEL_COMPLETE with
                                  StatsRemaining > 0 is self-contradictory
                                  telemetry -- only score 100 when the worker
                                  group (overlapping parallel runs, this one
@@ -5830,7 +5830,7 @@ BEGIN
                               AND  ISNULL(r.StatsRemaining, 0) > 0
                               AND  ISNULL(grp.sum_processed, 0) < ISNULL(grp.max_found, 0)
                               THEN CONVERT(decimal(5, 1), ISNULL(grp.sum_processed, 0) * 100.0 / NULLIF(grp.max_found, 0))
-                              /* sp_StatUpdate-3j5l: a run that reached a clean
+                              /* tracking issue: a run that reached a clean
                                  stop is 100% complete regardless of the
                                  StatsProcessed / StatsFound ratio.  In parallel
                                  mode StatsFound is the whole-queue total while
@@ -5902,7 +5902,7 @@ BEGIN
         WHERE e.IsQSRun = 1
         AND   e.HighCpuInFirstQuartilePct IS NOT NULL;
 
-        /* o2md.28: when W5 QS_NOT_EFFECTIVE already fired (a WARNING, inserted earlier in
+        /* tracking issue: when W5 QS_NOT_EFFECTIVE already fired (a WARNING, inserted earlier in
            this batch), that is the same root fact -- "no QS data captured" -- stated more
            prominently. Skip this INFO duplicate rather than reporting the identical
            condition three times (also see I8 below). Nested IF (not ELSE IF/ELSE) so the
@@ -6145,7 +6145,7 @@ BEGIN
             @i8_stable_count integer = 0,
             @i8_regressed_count integer = 0,
             @i8_total_tracked integer = 0,
-            /* o2md.22: this is now a MEDIAN of per-stat deltas, not a mean of ratios, and it
+            /* tracking issue: this is now a MEDIAN of per-stat deltas, not a mean of ratios, and it
                is NULLABLE -- NULL means "no stat had a baseline above the reporting floor".
                Every consumer must ISNULL it before concatenating. */
             @i8_avg_delta_pct decimal(10, 1) = NULL,
@@ -6157,7 +6157,7 @@ BEGIN
             @i8_mem_delta_sample integer = 0;
 
         /* ------------------------------------------------------------------
-           o2md.22: per-stat deltas are materialized so the headline can use a
+           tracking issue: per-stat deltas are materialized so the headline can use a
            MEDIAN (robust to outliers) instead of AVG of ratios.
 
            The old AVG((last - first) * 100.0 / first) had no denominator floor,
@@ -6238,7 +6238,7 @@ BEGIN
             fl.last_cpu_per_exec,
             fl.min_cpu_per_exec,
             fl.appearances,
-            /* o2md.22: denominator floor + clamp */
+            /* tracking issue: denominator floor + clamp */
             delta_pct =
                 CASE
                     WHEN fl.first_cpu_per_exec IS NULL
@@ -6262,7 +6262,7 @@ BEGIN
             @i8_cpu_delta_sample = SUM(CASE WHEN d.delta_pct IS NOT NULL THEN 1 ELSE 0 END)
         FROM #i8_cpu_deltas AS d;
 
-        /* o2md.22: median of the clamped, floored per-stat deltas */
+        /* tracking issue: median of the clamped, floored per-stat deltas */
         SELECT @i8_avg_delta_pct = CONVERT(decimal(10, 1), MAX(m.med))
         FROM
         (
@@ -6304,7 +6304,7 @@ BEGIN
         SELECT
             ml.first_mem,
             ml.last_mem,
-            /* o2md.22: denominator floor + clamp -- this is the "1 KB -> 20 MB" case that
+            /* tracking issue: denominator floor + clamp -- this is the "1 KB -> 20 MB" case that
                produced "avg 1681.8% reduction" (a mathematically impossible label). */
             delta_pct =
                 CASE
@@ -6387,7 +6387,7 @@ BEGIN
                         + CONVERT(nvarchar(10), @i8_improving_count) + N' of ' + CONVERT(nvarchar(10), @i8_total_tracked)
                         + N' tracked statistics show lower per-execution CPU (median '
                         + CONVERT(nvarchar(20), ABS(@i8_avg_delta_pct)) + N'% reduction).'
-                        /* o2md.22: the reduction/increase label comes from the SIGN of the median delta,
+                        /* tracking issue: the reduction/increase label comes from the SIGN of the median delta,
                            never from the improving/degrading counts.  The old code chose the branch on
                            counts and then printed ABS(mean) labelled "reduction", so a net-positive
                            (degrading) mean was reported as a reduction. */
@@ -6426,7 +6426,7 @@ BEGIN
                             THEN N' WARNING: ' + CONVERT(nvarchar(10), @i8_forced_at_risk) + N' forced plan(s) exist on affected tables -- stat updates may have triggered forced plan abandonment.'
                             ELSE N''
                         END
-                    /* o2md.23: the strong-improving branch above requires BOTH a count-majority
+                    /* tracking issue: the strong-improving branch above requires BOTH a count-majority
                        AND the median magnitude to clear -5% -- when they disagree (a real
                        improving-count majority whose median delta is modest), control used to
                        fall straight through to the true-stable ELSE below regardless of the
@@ -6454,7 +6454,7 @@ BEGIN
                         THEN N'. Improved-then-regressed: ' + CONVERT(nvarchar(10), @i8_regressed_count)
                         ELSE N''
                     END
-                    /* o2md.22: median, clamped to +/- the reporting bounds, over stats whose
+                    /* tracking issue: median, clamped to +/- the reporting bounds, over stats whose
                        baseline exceeded the denominator floor.  Sample size disclosed. */
                     + N'. Median per-exec CPU change: ' + ISNULL(CONVERT(nvarchar(20), @i8_avg_delta_pct), N'n/a')
                     + N'% (over ' + CONVERT(nvarchar(10), @i8_cpu_delta_sample) + N' of '
@@ -6496,7 +6496,7 @@ BEGIN
     END
     ELSE
     BEGIN
-        /* o2md.28: same root fact as W5 QS_NOT_EFFECTIVE (WARNING, inserted earlier) and I6
+        /* tracking issue: same root fact as W5 QS_NOT_EFFECTIVE (WARNING, inserted earlier) and I6
            QS_EFFICACY's no-data branch above -- skip this third duplicate when W5 already
            fired. This ELSE is the terminal branch (nothing follows it), so a plain nested
            IF/ELSE here carries no fall-through risk. */
@@ -6558,17 +6558,17 @@ BEGIN
                 @rc_long_pct        integer,
                 @rc_parallel        nvarchar(1),
                 @rc_fail_fast       bit,
-                /* sp_StatUpdate-6x80: widened from nvarchar(1000) to nvarchar(max) to
+                /* tracking issue: widened from nvarchar(1000) to nvarchar(max) to
                    accommodate @CriticalTables hint which can carry multiple table names */
                 @rc_call            nvarchar(max),
                 @rc_rationale       nvarchar(2000) = N'',
                 @rc_safeguards      nvarchar(500),
-                /* o2md.24: conflict/caveat lines rendered as comments inside the call --
+                /* tracking issue: conflict/caveat lines rendered as comments inside the call --
                    when findings disagree about a parameter, say so instead of silently
                    picking one (or worse, echoing a baseline a CRITICAL implicates). */
                 @rc_conflicts       nvarchar(max) = N'';
 
-            /* o2md.24: newest proc version observed in the window -- several precedence
+            /* tracking issue: newest proc version observed in the window -- several precedence
                rules below depend on whether a fix has actually shipped to this host.
                NULL = unparseable/unknown, treated as 'not proven fixed'. */
             DECLARE @rc_max_vkey integer = (
@@ -6591,12 +6591,12 @@ BEGIN
             FROM #runs
             WHERE RunLabel = @rc_baseline;
 
-            /* sp_StatUpdate-6x80 / o2md.25: TimeLimit jitter normalization.
+            /* tracking issue / tracking issue: TimeLimit jitter normalization.
                When @StopByTime is used, each run derives its TimeLimit from
                DATEDIFF(SECOND, start_time, stop_by_time), so a job that starts
                at 23:00:01 vs 23:00:02 yields 21599 vs 21598 instead of 21600.
 
-               o2md.25: the original guard only rounded when MAX-MIN spread across
+               tracking issue: the original guard only rounded when MAX-MIN spread across
                ALL non-killed runs in the whole @DaysBack window was < 300s -- a
                single outlier (a version rollout, a one-off manual run, a killed
                run that slipped past IsKilled) blows the raw spread past 300s and
@@ -6638,7 +6638,7 @@ BEGIN
                 SET @rc_rationale += N'TimeLimit raised from <1h to 5h (too short for workload). ';
             END;
 
-            /* sp_StatUpdate-6x80: W5-conditional QS drop.
+            /* tracking issue: W5-conditional QS drop.
                Only revert @SortOrder and clear @QueryStore when W5 fired due to
                genuine QS absence (QS_NOT_EFFECTIVE category).  When W5 fired as
                a parallel-ordering artifact (QS_PARALLEL_UNRELIABLE category),
@@ -6693,7 +6693,7 @@ BEGIN
             END;
 
             /* W3: Stale backlog -- suggest parallel if not already on.
-               o2md.24 precedence: C6 SILENT_NOOP_RUN (CRITICAL) implicates parallel
+               tracking issue precedence: C6 SILENT_NOOP_RUN (CRITICAL) implicates parallel
                mode, so it beats W3's (WARNING) suggestion to newly enable it --
                conflict is surfaced as a comment instead of silently picking. */
             IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'STALE_BACKLOG')
@@ -6708,10 +6708,10 @@ BEGIN
                 END;
             END;
 
-            /* o2md.24: C6 SILENT_NOOP_RUN with parallel already on in the baseline --
+            /* tracking issue: C6 SILENT_NOOP_RUN with parallel already on in the baseline --
                keep it (the remedy is the version fix, not disabling parallel) but
                carry an explicit caveat gated on whether the no-op fixes have
-               actually shipped to this host (3.8.2 = o2md.1 CONTINUE fix -> key
+               actually shipped to this host (3.8.2 = tracking issue CONTINUE fix -> key
                3008002; 3.5.7 = queue-leadership fix). */
             IF EXISTS (SELECT 1 FROM #recommendations WHERE Category = N'SILENT_NOOP_RUN')
             AND ISNULL(@rc_parallel, N'N') = N'Y'
@@ -6722,7 +6722,7 @@ BEGIN
                     SET @rc_conflicts += N'  /* NOTE: SILENT_NOOP_RUN fired in the window, but the observed proc version already includes the known no-op fixes -- if new no-op runs appear on this version, report it. */' + NCHAR(13) + NCHAR(10);
             END;
 
-            /* o2md.24: W12 PRIORITY_PASS_EMPTY -- version-gated per the o2md.17
+            /* tracking issue: W12 PRIORITY_PASS_EMPTY -- version-gated per the tracking issue
                convention: below 3.7.0 the zero-qualifying state is the
                effective_counter defect and retuning thresholds changes nothing;
                3.7.0+ it is a real tuning signal, so halve the threshold. */
@@ -6740,7 +6740,7 @@ BEGIN
                 END;
             END;
 
-            /* o2md.24: I8 QS_PERFORMANCE_TREND with QS currently off -- historical
+            /* tracking issue: I8 QS_PERFORMANCE_TREND with QS currently off -- historical
                QS-era runs show a measurable trend, so recommend enabling.  Loses to
                W5 QS_NOT_EFFECTIVE (WARNING beats INFO: no point enabling QS
                prioritization while enrichment demonstrably captures nothing) and
@@ -6788,7 +6788,7 @@ BEGIN
                 SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @StatsInParallel = N''Y''';
 
             /* Add @MopUpPass when the mop-up-unused feature check or W12
-               PRIORITY_PASS_EMPTY fired.  o2md.24: the old ISNULL(@rc_parallel)='N'
+               PRIORITY_PASS_EMPTY fired.  tracking issue: the old ISNULL(@rc_parallel)='N'
                gate was stale v2.24-era logic -- v3 fully supports @MopUpPass with
                @StatsInParallel (validation only requires @TimeLimit/@StopByTime,
                which this call always emits).  That gate was why 31/40 parallel
@@ -6800,7 +6800,7 @@ BEGIN
             )
                 SET @rc_call += NCHAR(13) + NCHAR(10) + N'  , @MopUpPass = N''Y''';
 
-            /* sp_StatUpdate-6x80: @CriticalTables hint.
+            /* tracking issue: @CriticalTables hint.
                When W9 LOCK_TIMEOUT_INEFFECTIVE has fired, the contended tables
                are strong @CriticalTables candidates (per-table sample-rate
                override + priority boost in v3.5.0+).  Append a commented-out
@@ -6836,7 +6836,7 @@ BEGIN
 
             SET @rc_call += N';';
 
-            /* o2md.24: append accumulated conflict/caveat comment lines after the call */
+            /* tracking issue: append accumulated conflict/caveat comment lines after the call */
             IF @rc_conflicts <> N''
                 SET @rc_call += NCHAR(13) + NCHAR(10) + RTRIM(@rc_conflicts);
 
@@ -7138,7 +7138,7 @@ BEGIN
         FROM #runs AS r
         WHERE r.IsKilled = 0
         AND   r.CriticalTables IS NOT NULL
-        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* o2md.10: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
+        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* tracking issue: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
                                                            so an unset parameter arrives as '' rather than NULL.  A real emptiness
                                                            test is required -- the former duplicate IS NOT NULL was always true. */
         AND   NOT EXISTS (
@@ -7160,7 +7160,7 @@ BEGIN
         FROM #runs AS r
         WHERE r.IsKilled = 0
         AND   r.CriticalTables IS NOT NULL
-        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* o2md.10: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
+        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* tracking issue: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
                                                            so an unset parameter arrives as '' rather than NULL.  A real emptiness
                                                            test is required -- the former duplicate IS NOT NULL was always true. */
         AND   NOT EXISTS (
@@ -7190,7 +7190,7 @@ BEGIN
                 + N'SELECT name FROM sys.objects WHERE OBJECT_ID IN (SELECT object_id FROM sys.stats) '
                 + N'AND (name LIKE N''<your pattern>''). '
                 + N'Requires sp_StatUpdate v3.5.0+ to log IsCritical in per-stat ExtendedInfo.',
-            /* o2md.52: placeholder names -- leakage greps on SAFE reports must not false-trip */
+            /* tracking issue: placeholder names -- leakage greps on SAFE reports must not false-trip */
             N'EXECUTE dbo.sp_StatUpdate @CriticalTables = N''dbo.YourHotTable,dbo.YourBusyTable'', @Databases = N''USER_DATABASES'';',
             28
         );
@@ -7211,7 +7211,7 @@ BEGIN
         FROM #runs AS r
         WHERE r.IsKilled = 0
         AND   r.CriticalTables IS NOT NULL
-        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* o2md.10: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
+        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* tracking issue: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
                                                            so an unset parameter arrives as '' rather than NULL.  A real emptiness
                                                            test is required -- the former duplicate IS NOT NULL was always true. */
         AND   EXISTS (
@@ -7240,7 +7240,7 @@ BEGIN
             ON r.RunLabel = su.RunLabel
             AND r.IsKilled = 0
             AND r.CriticalTables IS NOT NULL
-            AND LEN(LTRIM(RTRIM(r.CriticalTables))) > 0;   /* o2md.10: XSINIL -- unset params read as '' not NULL */
+            AND LEN(LTRIM(RTRIM(r.CriticalTables))) > 0;   /* tracking issue: XSINIL -- unset params read as '' not NULL */
 
         /* Pull pattern and CriticalTablesFirst from most recent qualifying run */
         SELECT TOP (1)
@@ -7249,7 +7249,7 @@ BEGIN
         FROM #runs AS r
         WHERE r.IsKilled = 0
         AND   r.CriticalTables IS NOT NULL
-        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* o2md.10: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
+        AND   LEN(LTRIM(RTRIM(r.CriticalTables))) > 0   /* tracking issue: sp_StatUpdate serializes params with FOR XML ... ELEMENTS XSINIL,
                                                            so an unset parameter arrives as '' rather than NULL.  A real emptiness
                                                            test is required -- the former duplicate IS NOT NULL was always true. */
         ORDER BY r.StartTime DESC;
@@ -7353,7 +7353,7 @@ BEGIN
             SET @avg_completion = (
                 SELECT AVG(CASE WHEN r.StatsFound > 0 THEN CONVERT(decimal(5, 1), ISNULL(r.StatsProcessed, 0) * 100.0 / r.StatsFound) ELSE 100.0 END)
                 FROM #runs AS r WHERE r.IsKilled = 0
-                /* o2md.33: legitimate AG-secondary stops neither help nor hurt completion
+                /* tracking issue: legitimate AG-secondary stops neither help nor hurt completion
                    (previously counted as 100% via the StatsFound = 0 branch) */
                 AND NOT (r.StopReason = N'AG_SECONDARY' AND ISNULL(r.StatsFound, 0) = 0)
             );
@@ -7368,7 +7368,7 @@ BEGIN
 
             /* #238: If majority of runs hit TIME_LIMIT, cap completion score --
                a 95% avg looks great but means nothing if the window is too short.
-               o2md.33: AG-secondary stops excluded from the denominator. */
+               tracking issue: AG-secondary stops excluded from the denominator. */
             SET @tl_run_pct = @time_limit_runs * 100.0 / NULLIF(@run_count - @ag_secondary_stop_runs, 0);
 
             IF @tl_run_pct >= 80.0 AND @score_completion > 60
@@ -7381,7 +7381,7 @@ BEGIN
     /* Reliability score: penalize killed runs, failures, time limit exhaustion */
     IF @run_count > 0
     BEGIN
-        /* o2md.33: AG-secondary stops excluded from the run-count denominators --
+        /* tracking issue: AG-secondary stops excluded from the run-count denominators --
            they are neither reliable nor unreliable, they are by-design no-ops. */
         DECLARE
             @kill_pct decimal(5, 1) = @killed_count * 100.0 / NULLIF(@run_count - @ag_secondary_stop_runs, 0),
@@ -8273,7 +8273,7 @@ BEGIN
             WorkloadImpactPct = CONVERT(decimal(5, 1), 100.0 * SUM(ISNULL(su.QSTotalCpuMs, 0)) / NULLIF(@total_qs_cpu_ms, 0)),
             /* #255: Percentile rank (0.00-1.00) */
             ImpactScore = MAX(wi.ImpactScore),
-            /* o2md.35: shared reason token for the two QS-derived columns above --
+            /* tracking issue: shared reason token for the two QS-derived columns above --
                additive (existing column types/positions untouched).  NO_QS_DATA:
                the server has no QS CPU data in the window, or this table never
                matched workload-impact enrichment; blank numerics are legitimate,
@@ -8316,7 +8316,7 @@ BEGIN
                     DistinctStats    = COUNT(DISTINCT su2.StatisticsName),
                     WorkloadImpactPct = CONVERT(decimal(5, 1), 100.0 * SUM(ISNULL(su2.QSTotalCpuMs, 0)) / NULLIF(@total_qs_cpu_ms, 0)),
                     ImpactScore      = MAX(wi2.ImpactScore),
-                    /* o2md.35: see direct-SELECT mode above */
+                    /* tracking issue: see direct-SELECT mode above */
                     ImpactDataStatus = CASE
                         WHEN NULLIF(@total_qs_cpu_ms, 0) IS NULL THEN N'NO_QS_DATA'
                         WHEN MAX(wi2.ImpactScore) IS NULL THEN N'NO_QS_DATA'
@@ -8456,7 +8456,7 @@ BEGIN
                 FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N''),
             /* #255: Workload impact percentile */
             ImpactScore = MAX(wi.ImpactScore),
-            /* o2md.35: shared reason token -- AvgSamplePct is NULL when every update
+            /* tracking issue: shared reason token -- AvgSamplePct is NULL when every update
                of this stat used RESAMPLE / persisted sample (no explicit percent to
                average); additive, existing column types/positions untouched. */
             SampleDataStatus = CASE
@@ -8517,7 +8517,7 @@ BEGIN
                         AND   su4.StatisticsName = su2.StatisticsName
                         FOR XML PATH(N''), TYPE).value(N'.', N'nvarchar(max)'), 1, 2, N''),
                     ImpactScore    = MAX(wi3.ImpactScore),
-                    /* o2md.35: see direct-SELECT mode above */
+                    /* tracking issue: see direct-SELECT mode above */
                     SampleDataStatus = CASE
                         WHEN AVG(su2.EffectiveSamplePct) IS NULL THEN N'RESAMPLE_PERSIST'
                         ELSE N'OK'
@@ -9153,7 +9153,7 @@ BEGIN
                 /* 0859.10: every ChangePct below gets a baseline floor (sub-floor baselines make
                    the ratio meaningless -- one 2 ms stat reporting +249,900% swamps the result) and
                    a +1000% clamp (unclamped, CONVERT to decimal(10, 1) overflows with error 8115 and
-                   kills the whole diag run).  Floors match the I8 headline constants (o2md.22). */
+                   kills the whole diag run).  Floors match the I8 headline constants (tracking issue). */
                 CpuChangePct            = CASE WHEN fl.FirstCpuMs < 100 THEN NULL /* floor: 100 ms total CPU */
                                                WHEN (fl.LastCpuMs - fl.FirstCpuMs) * 100.0 / fl.FirstCpuMs > 1000.0 THEN CONVERT(decimal(10, 1), 1000.0)
                                                ELSE CONVERT(decimal(10, 1), (fl.LastCpuMs - fl.FirstCpuMs) * 100.0 / fl.FirstCpuMs)

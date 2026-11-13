@@ -342,7 +342,7 @@ Write-Host "Timeouts:        connect ${ConnectTimeout}s / query ${QueryTimeout}s
 Write-Host "Output:          $OutputPath"
 Write-Host "Format:          $OutputFormat$(if (-not $NoCsv -and $OutputFormat -ne 'CSV') { ' + per-result-set CSV' })"
 
-# o2md.40: prefer Microsoft.Data.SqlClient when resolvable, fall back to the
+# tracking issue: prefer Microsoft.Data.SqlClient when resolvable, fall back to the
 # legacy (but runtime-bundled) System.Data.SqlClient otherwise.  The modern
 # provider is a separate NuGet package, NOT part of the default PowerShell
 # runtime -- a hard switch would break every machine without it installed.
@@ -436,7 +436,7 @@ $Servers | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
             elseif ($cols -contains "TotalRuns") { $map["RunHealth"] = $table }
             elseif ($cols -contains "RunLabel" -and $cols -contains "StopReason" -and $cols -contains "IsKilled") { $map["RunDetail"] = $table }
             elseif ($cols -contains "TotalDurationSec") { $map["TopTables"] = $table }
-            # o2md.39: this heuristic checked for a column named "FailureCount", but RS6's
+            # tracking issue: this heuristic checked for a column named "FailureCount", but RS6's
             # actual column (sp_StatUpdate_Diag.sql "RESULT SET 6: FAILING STATISTICS") is
             # "FailCount" -- the mismatch meant this branch never matched and FailingStats
             # silently fell through to the else/warning branch on every run. Found live by
@@ -450,9 +450,9 @@ $Servers | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
             elseif ($cols -contains "ProcessingPosition" -and $cols -contains "WorkloadRank") { $map["HighCpuPositions"] = $table }
             elseif ($cols -contains "CpuTrend" -and $cols -contains "CpuChangePct") { $map["QSCorrelation"] = $table }
             else {
-                # o2md.39: previously silent -- a future Diag column change would
+                # tracking issue: previously silent -- a future Diag column change would
                 # misroute or drop a result set with no signal, indistinguishable
-                # from o2md.30 (collected but never rendered). PS7's -Parallel
+                # from tracking issue (collected but never rendered). PS7's -Parallel
                 # streams Warning output back to the caller, so this surfaces even
                 # though Map-ResultSets runs inside a parallel runspace per server.
                 Write-Warning "[$server] Map-ResultSets: table with columns ($($cols -join ', ')) matched no known signature -- this result set will be dropped from the report."
@@ -465,7 +465,7 @@ $Servers | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
         # Connection string via the builder, not string concatenation: instance
         # and database names are escaped correctly, and a password containing
         # ; " or = can neither break the string nor inject a keyword.
-        # o2md.40: type literals resolve at runtime, so the modern branch is
+        # tracking issue: type literals resolve at runtime, so the modern branch is
         # only evaluated when the assembly is confirmed loadable.
         $csb = if ($modernSql) { [Microsoft.Data.SqlClient.SqlConnectionStringBuilder]::new() }
                else            { [System.Data.SqlClient.SqlConnectionStringBuilder]::new() }
@@ -553,7 +553,7 @@ $Servers | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
 
             $lastError = $null
             for ($attempt = 0; $attempt -le $Attempts; $attempt++) {
-                # o2md.40: $modernSql resolves from the enclosing scriptblock scope
+                # tracking issue: $modernSql resolves from the enclosing scriptblock scope
                 $c = if ($modernSql) { New-Object Microsoft.Data.SqlClient.SqlConnection($ConnStr) }
                      else            { New-Object System.Data.SqlClient.SqlConnection($ConnStr) }
                 if ($SqlCredential) { $c.Credential = $SqlCredential }
@@ -870,7 +870,7 @@ function ConvertTo-MarkdownTable {
     return ($rows -join "`n") + "`n"
 }
 
-# o2md.51: severity + grade visual markers (theme-agnostic -- render in both
+# tracking issue: severity + grade visual markers (theme-agnostic -- render in both
 # GitHub light/dark modes; a .md cannot force its own theme, the viewer decides).
 function Get-SeverityEmoji {
     param([string]$Severity)
@@ -929,7 +929,7 @@ function Build-MarkdownReport {
     [void]$report.AppendLine("| $(Get-SeverityEmoji 'INFO') INFO | $nfoCount |")
     [void]$report.AppendLine("")
 
-    # o2md.51: top-issues callout -- GitHub-flavored alert block ([!CAUTION] /
+    # tracking issue: top-issues callout -- GitHub-flavored alert block ([!CAUTION] /
     # [!WARNING]); renders as a plain blockquote on renderers without alerts.
     $calloutSeverity = if ($critCount -gt 0) { "CRITICAL" } elseif ($warnCount -gt 0) { "WARNING" } else { $null }
     if ($calloutSeverity) {
@@ -1078,7 +1078,7 @@ function Build-MarkdownReport {
         $detailServers = @($AllResults.Keys | Sort-Object)
     }
 
-    # o2md.51: grade lookup for the collapsible section headers
+    # tracking issue: grade lookup for the collapsible section headers
     $gradeByServer = @{}
     foreach ($row in $scoreboard) { $gradeByServer[$row.Server] = $row.Grade }
 
@@ -1087,7 +1087,7 @@ function Build-MarkdownReport {
         $displayName = Get-DisplayName $server
         $svrGrade = Get-GradeBadge $gradeByServer[$displayName]
 
-        # o2md.51: collapsible so a fleet report opens scannable; the blank line
+        # tracking issue: collapsible so a fleet report opens scannable; the blank line
         # after </summary> is required for Markdown to render inside <details>.
         [void]$report.AppendLine("<details>")
         [void]$report.AppendLine("<summary><strong>Server: $displayName</strong> &mdash; $svrGrade</summary>")
@@ -1491,14 +1491,14 @@ function ConvertTo-HtmlBody {
         if ($line -match '^##\s+(.*)$')     { [void]$out.AppendLine("<h2>$(Format-HtmlInline $Matches[1])</h2>"); $i++; continue }
         if ($line -match '^#\s+(.*)$')      { [void]$out.AppendLine("<h1>$(Format-HtmlInline $Matches[1])</h1>"); $i++; continue }
 
-        # o2md.51: raw <details>/<summary> lines from the collapsible server
+        # tracking issue: raw <details>/<summary> lines from the collapsible server
         # sections pass through unescaped (open attribute added so the dark
         # HTML report renders fully expanded for printing/search).
         if ($line -match '^\s*<details>\s*$')    { [void]$out.AppendLine("<details open>"); $i++; continue }
         if ($line -match '^\s*</details>\s*$')   { [void]$out.AppendLine("</details>"); $i++; continue }
         if ($line -match '^\s*<summary>.*</summary>\s*$') { [void]$out.AppendLine($line.Trim()); $i++; continue }
 
-        # o2md.51: blockquote block -- GitHub alert syntax ([!CAUTION] etc.)
+        # tracking issue: blockquote block -- GitHub alert syntax ([!CAUTION] etc.)
         # becomes a styled callout div; plain blockquotes become <blockquote>.
         if ($line -match '^\s*>') {
             $bq = [System.Collections.Generic.List[string]]::new()
@@ -1556,7 +1556,7 @@ function New-HtmlDocument {
 <meta charset="UTF-8">
 <title>$Title</title>
 <style>
-    /* o2md.51: self-contained dark theme -- zero external assets, so the file
+    /* tracking issue: self-contained dark theme -- zero external assets, so the file
        works offline and nothing leaks from SAFE_TO_SHARE reports. */
     :root {
         --bg: #0d1117; --bg-panel: #161b22; --bg-hover: #1f2733;
@@ -1679,7 +1679,7 @@ if ($Obfuscate) {
             $safeReport | Out-File -FilePath $safePath -Encoding UTF8
             Write-Host "  SAFE_TO_SHARE: $safePath" -ForegroundColor Green
 
-            # o2md.51: the dark-themed HTML twin always ships alongside the .md --
+            # tracking issue: the dark-themed HTML twin always ships alongside the .md --
             # Markdown cannot control its own theme (the viewer decides), so the
             # HTML file is the guaranteed-dark, self-contained deliverable.
             $confHtmlPath = Join-Path $OutputPath "${baseFileName}_CONFIDENTIAL.html"

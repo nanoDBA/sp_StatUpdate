@@ -1,0 +1,117 @@
+name: SQL test gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    paths:
+      - '**.sql'
+      - 'tests/**'
+      - '.github/**'
+      - 'Invoke-StatUpdateDiag.ps1'
+      - 'README.md'
+      - 'TESTING.md'
+
+permissions:
+  contents: read
+
+jobs:
+  privacy-and-unit-tests:
+    name: Privacy and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Check public files for private details
+        run: |
+          python .github/scripts/test_check_no_private_details.py
+          python .github/scripts/check_no_private_details.py
+      - name: Run Python unit tests
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Check SQL comments
+        run: |
+          python .github/scripts/test_check_sql_nested_comments.py
+          python .github/scripts/check_sql_nested_comments.py
+      - name: Parse PowerShell test scripts
+        shell: pwsh
+        run: |
+          $errors = @()
+          Get-ChildItem tests -Recurse -File -Include *.ps1,*.psm1 | ForEach-Object {
+            $tokens = $null
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$parseErrors) | Out-Null
+            foreach ($parseError in $parseErrors) { $errors += "$($_.Name): $($parseError.Message)" }
+          }
+          if ($errors.Count) { $errors; exit 1 }
+          Write-Host 'All PowerShell test scripts parse.'
+
+  sql-version:
+    name: SQL Server ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['2019', '2022', '2025']
+    env:
+      SQL_VERSION: ${{ matrix.version }}
+      MSSQL_SA_PASSWORD: 'TestOnly-Passw0rd!2026'
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Run the full release gate
+        id: gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $results = Join-Path $env:RUNNER_TEMP "spstatupdate-$env:SQL_VERSION"
+          pwsh -NoProfile -File tests/Invoke-ReleaseGate.ps1 `
+            -Version $env:SQL_VERSION `
+            -ResultsDirectory $results `
+            -OrchestrationId public-ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Write check summary
+        if: always()
+        shell: pwsh
+        env:
+          GATE_OUTCOME: ${{ steps.gate.outcome }}
+        run: |
+          $results = Join-Path $env:RUNNER_TEMP "spstatupdate-$env:SQL_VERSION"
+          $resultFile = Join-Path $results 'run-results.json'
+          $summary = [System.Collections.Generic.List[string]]::new()
+          $summary.Add("## SQL Server $env:SQL_VERSION")
+          if (-not (Test-Path -LiteralPath $resultFile)) {
+            $summary.Add("Gate: **$env:GATE_OUTCOME**. No validated result file was saved.")
+          } else {
+            $run = Get-Content -LiteralPath $resultFile -Raw | ConvertFrom-Json
+            $checks = @($run.suites | ForEach-Object { $_.checks })
+            $failed = @($checks | Where-Object { $_.result -eq 'FAIL' })
+            $skipped = @($checks | Where-Object { $_.result -eq 'SKIPPED' })
+            $summary.Add("Gate: **$env:GATE_OUTCOME**")
+            $summary.Add("Checks: $($checks.Count); failed: $($failed.Count); skipped: $($skipped.Count)")
+            $summary.Add("Commit: ``$($run.commit)``")
+            $summary.Add("Suites fingerprint: ``$($run.tooling_sha256)``")
+            $summary.Add("Elapsed: $([math]::Round($run.duration_ms / 60000, 1)) minutes")
+            if ($failed.Count) {
+              $summary.Add('### Failed checks')
+              foreach ($suite in $run.suites) {
+                foreach ($check in $suite.checks | Where-Object { $_.result -eq 'FAIL' }) {
+                  $summary.Add("- **$($suite.suite) / $($check.check):** $($check.reason)")
+                }
+              }
+            }
+          }
+          $summary | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
+      - name: Upload run results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sql-${{ matrix.version }}-results
+          path: ${{ runner.temp }}/spstatupdate-${{ matrix.version }}/
+          if-no-files-found: warn
+          retention-days: 14
