@@ -330,27 +330,81 @@ BEGIN
 END;
 "@ | Out-Null
 
-    # A01a: Parallel run with 1-second TimeLimit -- verify no orphaned rows remain.
-    Invoke-Sql -ServerAddr $Server -Port $port -Pwd $Password -Db $db `
-        -Query "INSERT INTO dbo.Orders (CustomerName, Amount) SELECT TOP 10000 N'AS3a', 1.00 FROM sys.all_columns;" | Out-Null
+    # A01a: Parallel run with a 1-second TimeLimit -- verify no orphaned rows remain.
+    # Use one table with many modified user statistics. A tiny Orders workload can finish
+    # before the deadline on faster runners, making the TIME_LIMIT assertion flaky.
+    $timeoutStatCount = 128
+    $timeoutRowCount = 50000
+    $timeoutColumns = @(1..$timeoutStatCount | ForEach-Object { 'C{0:D3}' -f $_ })
+    $timeoutColumnDefinitions = ($timeoutColumns | ForEach-Object { "[$_] int NOT NULL" }) -join ",`n        "
+    $timeoutInsertColumns = ($timeoutColumns | ForEach-Object { "[$_]" }) -join ', '
+    $timeoutSelectColumns = ($timeoutColumns | ForEach-Object { 'n' }) -join ",`n        "
+    $timeoutStats = ($timeoutColumns | ForEach-Object { "CREATE STATISTICS [AS3_TimeoutWork_$_] ON dbo.AS3_TimeoutWork ([$_]);" }) -join "`n"
+    $timeoutUpdates = ($timeoutColumns | ForEach-Object { "[$_] = [$_] + 1" }) -join ",`n        "
+    $timeoutFixtureSql = @"
+DROP TABLE IF EXISTS dbo.AS3_TimeoutWork;
+CREATE TABLE dbo.AS3_TimeoutWork (
+    RowID int NOT NULL,
+    $timeoutColumnDefinitions
+);
+;WITH source_rows AS (
+    SELECT TOP ($timeoutRowCount)
+        ROW_NUMBER() OVER (ORDER BY a.object_id, b.object_id, c.object_id) AS n
+    FROM sys.all_objects AS a
+    CROSS JOIN sys.all_objects AS b
+    CROSS JOIN sys.all_objects AS c
+)
+INSERT dbo.AS3_TimeoutWork (RowID, $timeoutInsertColumns)
+SELECT n, $timeoutSelectColumns
+FROM source_rows;
+$timeoutStats
+UPDATE dbo.AS3_TimeoutWork
+SET $timeoutUpdates;
+SELECT
+    (SELECT COUNT(*) FROM dbo.AS3_TimeoutWork) AS fixture_rows,
+    (SELECT COUNT(*) FROM sys.stats
+     WHERE object_id = OBJECT_ID(N'dbo.AS3_TimeoutWork')
+       AND name LIKE N'AS3_TimeoutWork_C%') AS fixture_stats;
+"@
+    $rTimeoutFixture = Invoke-Sql -ServerAddr $Server -Port $port -Pwd $Password -Db $db `
+        -Query $timeoutFixtureSql -Timeout 180
+    $timeoutFixtureReady = $false
+    if ($rTimeoutFixture.ExitCode -eq 0 -and $rTimeoutFixture.DataSet.Tables.Count -gt 0 -and
+        $rTimeoutFixture.DataSet.Tables[0].Rows.Count -gt 0) {
+        $fixtureRow = $rTimeoutFixture.DataSet.Tables[0].Rows[0]
+        $timeoutFixtureReady = [int]$fixtureRow['fixture_rows'] -eq $timeoutRowCount -and
+            [int]$fixtureRow['fixture_stats'] -eq $timeoutStatCount
+    }
     Invoke-Sql -ServerAddr $Server -Port $port -Pwd $Password -Db "master" `
         -Query $lockCleanSql | Out-Null
 
     $runParallelSql = @"
 DECLARE @sro nvarchar(50);
+DECLARE @sf int, @sp int;
 EXEC dbo.sp_StatUpdate
     @Databases             = N'$db',
+    @Tables                = N'dbo.AS3_TimeoutWork',
     @Execute               = N'Y',
     @LogToTable            = N'N',
     @StatsInParallel       = N'Y',
+    @StatisticsSample      = 100,
     @ModificationThreshold = 1,
     @TimeLimit             = 1,
-    @StopReasonOut         = @sro OUTPUT;
-SELECT ISNULL(@sro, N'NULL') AS StopReason;
+    @StopReasonOut         = @sro OUTPUT,
+    @StatsFoundOut         = @sf OUTPUT,
+    @StatsProcessedOut     = @sp OUTPUT;
+SELECT ISNULL(@sro, N'NULL') AS StopReason,
+       ISNULL(@sf, 0) AS StatsFound,
+       ISNULL(@sp, 0) AS StatsProcessed;
 "@
-    $rParallel = Invoke-Sql -ServerAddr $Server -Port $port -Pwd $Password `
-        -Query $runParallelSql -Timeout 60
-    $parallelStopReason = Get-LastTableScalar -DataSet $rParallel.DataSet -Column 'StopReason'
+    if (-not $timeoutFixtureReady) {
+        $rParallel = $rTimeoutFixture
+        $parallelStopReason = 'FIXTURE_SETUP_FAILED'
+    } else {
+        $rParallel = Invoke-Sql -ServerAddr $Server -Port $port -Pwd $Password `
+            -Query $runParallelSql -Timeout 120
+        $parallelStopReason = Get-LastTableScalar -DataSet $rParallel.DataSet -Column 'StopReason'
+    }
     Invoke-Sql -ServerAddr $Server -Port $port -Pwd $Password -Db "master" `
         -Query $lockCleanSql | Out-Null
 
@@ -390,6 +444,9 @@ ELSE
             Add-Result "A01a: No orphaned QueueStatistic after TIME_LIMIT" "FAIL" "Found $orphanRows orphaned row(s) after TIME_LIMIT stop"
         }
     }
+
+    Invoke-Sql -ServerAddr $Server -Port $port -Pwd $Password -Db $db `
+        -Query "DROP TABLE IF EXISTS dbo.AS3_TimeoutWork;" | Out-Null
 
     # A01b: Inject a fake stale claim (dead SessionID) and verify the next
     #       parallel worker reclaims it (ClaimLoginTime liveness check).
