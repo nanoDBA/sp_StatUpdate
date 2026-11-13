@@ -339,7 +339,9 @@ try {
     # C4: Degrading throughput -- seed data has serial recent runs at ~19-30 sec/stat
     # vs serial prior runs at ~5-7 sec/stat (>50% threshold) so C4 MUST fire.
     $hasC4 = $categories -contains "DEGRADING_THROUGHPUT"
-    Write-TestResult -Name "C4: Degrading throughput detected" -Passed $hasC4
+    $c4FindingCount = @($recommendations.Rows | Where-Object { $_["Category"].ToString() -eq "DEGRADING_THROUGHPUT" }).Count
+    $categorySummary = if ($categories.Count -gt 0) { $categories -join "," } else { "none" }
+    Write-TestResult -Name "C4: Degrading throughput detected" -Passed $hasC4 -Detail "C4 findings=$c4FindingCount; categories=$categorySummary"
 
     # W1: Suboptimal params
     $hasW1 = $categories -contains "SUBOPTIMAL_PARAMS"
@@ -419,7 +421,7 @@ try {
     $c4At15 = @($ds15.Tables[1].Rows | Where-Object { $_["Category"].ToString() -eq "DEGRADING_THROUGHPUT" })
     $c4At30 = @($ds30.Tables[1].Rows | Where-Object { $_["Category"].ToString() -eq "DEGRADING_THROUGHPUT" })
 
-    Write-TestResult -Name "C4: fires with @DaysBack = 15 (two complete windows)" -Passed ($c4At15.Count -gt 0)
+    Write-TestResult -Name "C4: fires with @DaysBack = 15 (two complete windows)" -Passed ($c4At15.Count -gt 0) -Detail "15d C4 findings=$($c4At15.Count); 7-day prior and recent windows"
     Write-TestResult -Name "C4: same finding count at @DaysBack 15 and 30" -Passed ($c4At15.Count -eq $c4At30.Count) -Detail "15d: $($c4At15.Count), 30d: $($c4At30.Count)"
 
     $evidenceMatches = $true

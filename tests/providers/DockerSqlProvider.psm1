@@ -59,15 +59,8 @@ function Start-SpStatUpdateSqlTestEnvironment {
         while ([DateTimeOffset]::Now -lt $deadline) {
             $connection = $null
             try {
-                $builder = [System.Data.SqlClient.SqlConnectionStringBuilder]::new()
-                $builder.DataSource = "$($environment.Server),$($environment.Port)"
-                $builder.InitialCatalog = 'master'
-                $builder.UserID = 'sa'
-                $builder.Password = $Password
-                $builder.Encrypt = $false
-                $builder.TrustServerCertificate = $true
-                $builder.ConnectTimeout = 5
-                $connection = [System.Data.SqlClient.SqlConnection]::new($builder.ConnectionString)
+                $connectionString = "Data Source=$($environment.Server),$($environment.Port);Initial Catalog=master;User ID=sa;Password=$Password;Encrypt=False;TrustServerCertificate=True;Connect Timeout=5;Pooling=False;"
+                $connection = [System.Data.SqlClient.SqlConnection]::new($connectionString)
                 $connection.Open()
                 $command = $connection.CreateCommand()
                 $command.CommandText = 'SELECT 1'

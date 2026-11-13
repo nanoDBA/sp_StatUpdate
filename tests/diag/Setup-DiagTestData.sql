@@ -87,6 +87,8 @@ DECLARE @anchor datetime2(3) = DATEADD(
     -(DATEDIFF(DAY, CONVERT(date, '19000101'), @server_today) % 7),
     CONVERT(datetime2(3), @server_today)
 );
+/* C4 windows are relative to execution time, not the Monday date anchor. */
+DECLARE @throughput_seed_anchor datetime2(3) = SYSDATETIME();
 
 /* Helper variables */
 DECLARE @run_label nvarchar(100);
@@ -96,7 +98,7 @@ DECLARE @end_time datetime2(3);
 /* =========================================================================
    RUN 1: Healthy completed run, good parameters, 10 days ago (PRIOR window)
    ========================================================================= */
-SET @start = DATEADD(DAY, -10, @anchor);
+SET @start = DATEADD(DAY, -10, @throughput_seed_anchor);
 SET @run_label = N'test_run01_healthy';
 SET @end_time = DATEADD(SECOND, 600, @start);  /* Fast: 600s / 100 stats = 6 sec/stat */
 
@@ -269,7 +271,7 @@ RAISERROR(N'  Run 4: Orphan-cleaned killed run (4 days ago)', 10, 1) WITH NOWAIT
 /* =========================================================================
    RUN 5: Run with repeated failures, 3 days ago
    ========================================================================= */
-SET @start = DATEADD(DAY, -3, @anchor);
+SET @start = DATEADD(DAY, -3, @throughput_seed_anchor);
 SET @run_label = N'test_run05';
 SET @end_time = DATEADD(SECOND, 2400, @start);
 
@@ -338,7 +340,7 @@ RAISERROR(N'  Run 5: Run with failures (3 days ago)', 10, 1) WITH NOWAIT;
 DECLARE @day_offset int = -2;
 WHILE @day_offset <= -1
 BEGIN
-    SET @start = DATEADD(DAY, @day_offset, @anchor);
+    SET @start = DATEADD(DAY, @day_offset, @throughput_seed_anchor);
     SET @run_label = N'test_' + CONVERT(varchar(8), @start, 112) + N'_000000';
     SET @end_time = DATEADD(SECOND, 1900, @start);
 
@@ -401,16 +403,13 @@ RAISERROR(N'  Runs 6-7: Additional failures for C2 threshold (2-1 days ago)', 10
 /* =========================================================================
    RUNS 8-9: Old runs with FASTER throughput (for C4 degrading check)
    Using older version to also seed version history
-   gh-558: C4's PRIOR window is now the 7 days immediately before the recent
-   window (days 7-14 back from diag execution time).  The -14-day run falls
-   just outside that lower bound (seeded from midnight, diag runs later), so
-   only the -13-day run still feeds PRIOR -- alongside the other fast serial
-   runs seeded in the 8-13 day range (runs 1, 15, 21, 24, 25).
+   gh-558: These runs are anchored to execution time so they reliably land
+   inside C4's prior window regardless of the weekday the suite runs.
    ========================================================================= */
-SET @day_offset = -14;
-WHILE @day_offset <= -13
+SET @day_offset = -9;
+WHILE @day_offset <= -8
 BEGIN
-    SET @start = DATEADD(DAY, @day_offset, @anchor);
+    SET @start = DATEADD(DAY, @day_offset, @throughput_seed_anchor);
     SET @run_label = N'test_' + CONVERT(varchar(8), @start, 112) + N'_000000';
     SET @end_time = DATEADD(SECOND, 600, @start);  /* Fast: 600s for 100 stats = 6 sec/stat */
 
@@ -473,13 +472,13 @@ BEGIN
     SET @day_offset = @day_offset + 1;
 END;
 
-RAISERROR(N'  Runs 8-9: Fast old runs for throughput comparison (14-13 days ago)', 10, 1) WITH NOWAIT;
+RAISERROR(N'  Runs 8-9: Fast old runs for throughput comparison (9-8 days ago)', 10, 1) WITH NOWAIT;
 
 /* =========================================================================
    RUN 10: Overlapping run with Run 5 (for W4 detection)
    Starts 5 minutes into Run 5 and ends before Run 5
    ========================================================================= */
-SET @start = DATEADD(MINUTE, 5, DATEADD(DAY, -3, @anchor));
+SET @start = DATEADD(MINUTE, 5, DATEADD(DAY, -3, @throughput_seed_anchor));
 SET @run_label = N'test_run10_overlap';
 SET @end_time = DATEADD(MINUTE, 20, @start);
 
@@ -510,7 +509,7 @@ VALUES (N'SP_STATUPDATE_END', N'EXECUTE dbo.sp_StatUpdate', @start, @end_time,
         <StopReason>COMPLETED</StopReason>
     </Summary>');
 
-RAISERROR(N'  Run 10: Overlapping run (concurrent with run 1)', 10, 1) WITH NOWAIT;
+RAISERROR(N'  Run 10: Overlapping run (concurrent with run 5)', 10, 1) WITH NOWAIT;
 
 /* =========================================================================
    RUN 11: Run with no TimeLimit and TieredThresholds off (for W1).

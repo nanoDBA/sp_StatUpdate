@@ -265,12 +265,15 @@ class CoverageReportTests(unittest.TestCase):
                     continue  # A named future regression suite stays a visible coverage gap.
                 self.assertIn((proof["suite"], proof["check"]), listed, row["id"])
 
-    def test_diag_fixture_dates_use_server_week_anchor(self):
+    def test_diag_fixture_uses_week_and_execution_anchors(self):
         setup = (Path(__file__).resolve().parent / "diag" / "Setup-DiagTestData.sql").read_text(encoding="utf-8-sig")
         compact = re.sub(r"\s+", " ", setup)
         self.assertIn("DECLARE @server_today date = CONVERT(date, SYSDATETIME());", compact)
         self.assertRegex(compact, r"DATEDIFF\(DAY, CONVERT\(date, '19000101'\), @server_today\) % 7")
         self.assertRegex(compact, r"SET @start = DATEADD\(DAY, -?\d+, @anchor\)")
+        self.assertIn("DECLARE @throughput_seed_anchor datetime2(3) = SYSDATETIME();", compact)
+        self.assertRegex(compact, r"SET @start = DATEADD\(DAY, -10, @throughput_seed_anchor\)")
+        self.assertRegex(compact, r"SET @start = DATEADD\(DAY, @day_offset, @throughput_seed_anchor\)")
         self.assertNotRegex(setup, r"(?<!\d)20\d{2}-\d{2}-\d{2}(?!\d)")
 
     def test_helpcontent_deprecated_list_excludes_current_public_parameters(self):
