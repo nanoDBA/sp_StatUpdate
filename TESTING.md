@@ -16,7 +16,7 @@ From a PowerShell prompt in the folder where you want the clone and results, run
 
 ```powershell
 git clone https://github.com/nanoDBA/sp_StatUpdate.git
-pwsh -NoProfile -File .\sp_StatUpdate\tests\Invoke-ReleaseGate.ps1 -Version 2022 -ResultsDirectory .\sp_StatUpdate-results\2022
+pwsh -NoProfile -File .\sp_StatUpdate\tests\Invoke-ReleaseGate.ps1 -Version 2022 -ResultsDirectory .\results\2022
 ```
 
 Replace `2022` with `2019` or `2025` to choose a version. This command runs every declared suite for that version, in sequence. To run the complete release matrix yourself, repeat it for each version. Reserve up to 90 minutes per version; the first run also downloads the SQL Server image. GitHub Actions runs the three versions in parallel, gives each job a 90-minute limit, and reports the measured time, check totals, and any failures in its summary.
