@@ -349,10 +349,12 @@ CREATE TABLE dbo.AS3_TimeoutWork (
 );
 ;WITH source_rows AS (
     SELECT TOP ($timeoutRowCount)
-        ROW_NUMBER() OVER (ORDER BY a.object_id, b.object_id, c.object_id) AS n
-    FROM sys.all_objects AS a
-    CROSS JOIN sys.all_objects AS b
-    CROSS JOIN sys.all_objects AS c
+        a.n + (b.n * 10) + (c.n * 100) + (d.n * 1000) + (e.n * 10000) + 1 AS n
+    FROM (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS a(n)
+    CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS b(n)
+    CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS c(n)
+    CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS d(n)
+    CROSS JOIN (VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)) AS e(n)
 )
 INSERT dbo.AS3_TimeoutWork (RowID, $timeoutInsertColumns)
 SELECT n, $timeoutSelectColumns
