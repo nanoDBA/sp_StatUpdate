@@ -70,7 +70,7 @@ $suiteScripts = [ordered]@{
 }
 $requiredCounts = @{
     QSCacheKey = 14
-    HelpContent = 2
+    HelpContent = 24
     ParamSweep = 46
     QSEnrichmentSafety = 7
     V3Bugs = 16
