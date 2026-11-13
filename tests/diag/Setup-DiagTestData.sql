@@ -87,8 +87,8 @@ DECLARE @anchor datetime2(3) = DATEADD(
     -(DATEDIFF(DAY, CONVERT(date, '19000101'), @server_today) % 7),
     CONVERT(datetime2(3), @server_today)
 );
-/* C4 windows are relative to execution time, not the Monday date anchor. */
-DECLARE @throughput_seed_anchor datetime2(3) = SYSDATETIME();
+/* Week-shaped fixtures use the Monday anchor. Recent throughput/C4 samples and the latest-run W1 fixture use execution time. */
+DECLARE @execution_anchor datetime2(3) = SYSDATETIME();
 
 /* Helper variables */
 DECLARE @run_label nvarchar(100);
@@ -98,7 +98,7 @@ DECLARE @end_time datetime2(3);
 /* =========================================================================
    RUN 1: Healthy completed run, good parameters, 10 days ago (PRIOR window)
    ========================================================================= */
-SET @start = DATEADD(DAY, -10, @throughput_seed_anchor);
+SET @start = DATEADD(DAY, -10, @execution_anchor);
 SET @run_label = N'test_run01_healthy';
 SET @end_time = DATEADD(SECOND, 600, @start);  /* Fast: 600s / 100 stats = 6 sec/stat */
 
@@ -271,7 +271,7 @@ RAISERROR(N'  Run 4: Orphan-cleaned killed run (4 days ago)', 10, 1) WITH NOWAIT
 /* =========================================================================
    RUN 5: Run with repeated failures, 3 days ago
    ========================================================================= */
-SET @start = DATEADD(DAY, -3, @throughput_seed_anchor);
+SET @start = DATEADD(DAY, -3, @execution_anchor);
 SET @run_label = N'test_run05';
 SET @end_time = DATEADD(SECOND, 2400, @start);
 
@@ -340,7 +340,7 @@ RAISERROR(N'  Run 5: Run with failures (3 days ago)', 10, 1) WITH NOWAIT;
 DECLARE @day_offset int = -2;
 WHILE @day_offset <= -1
 BEGIN
-    SET @start = DATEADD(DAY, @day_offset, @throughput_seed_anchor);
+    SET @start = DATEADD(DAY, @day_offset, @execution_anchor);
     SET @run_label = N'test_' + CONVERT(varchar(8), @start, 112) + N'_000000';
     SET @end_time = DATEADD(SECOND, 1900, @start);
 
@@ -409,7 +409,7 @@ RAISERROR(N'  Runs 6-7: Additional failures for C2 threshold (2-1 days ago)', 10
 SET @day_offset = -9;
 WHILE @day_offset <= -8
 BEGIN
-    SET @start = DATEADD(DAY, @day_offset, @throughput_seed_anchor);
+    SET @start = DATEADD(DAY, @day_offset, @execution_anchor);
     SET @run_label = N'test_' + CONVERT(varchar(8), @start, 112) + N'_000000';
     SET @end_time = DATEADD(SECOND, 600, @start);  /* Fast: 600s for 100 stats = 6 sec/stat */
 
@@ -478,7 +478,7 @@ RAISERROR(N'  Runs 8-9: Fast old runs for throughput comparison (9-8 days ago)',
    RUN 10: Overlapping run with Run 5 (for W4 detection)
    Starts 5 minutes into Run 5 and ends before Run 5
    ========================================================================= */
-SET @start = DATEADD(MINUTE, 5, DATEADD(DAY, -3, @throughput_seed_anchor));
+SET @start = DATEADD(MINUTE, 5, DATEADD(DAY, -3, @execution_anchor));
 SET @run_label = N'test_run10_overlap';
 SET @end_time = DATEADD(MINUTE, 20, @start);
 
@@ -516,7 +516,7 @@ RAISERROR(N'  Run 10: Overlapping run (concurrent with run 5)', 10, 1) WITH NOWA
    Version 2.24 (>= 2.15 full param logging) so 9ufm version-gating lets
    W1 reason about the ABSENT TimeLimit element (genuinely NULL).
    ========================================================================= */
-SET @start = DATEADD(HOUR, -12, @anchor);
+SET @start = DATEADD(HOUR, -12, @execution_anchor);
 SET @run_label = N'test_run_12_hours_ago';
 SET @end_time = DATEADD(SECOND, 5400, @start);
 

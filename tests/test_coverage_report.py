@@ -271,9 +271,10 @@ class CoverageReportTests(unittest.TestCase):
         self.assertIn("DECLARE @server_today date = CONVERT(date, SYSDATETIME());", compact)
         self.assertRegex(compact, r"DATEDIFF\(DAY, CONVERT\(date, '19000101'\), @server_today\) % 7")
         self.assertRegex(compact, r"SET @start = DATEADD\(DAY, -?\d+, @anchor\)")
-        self.assertIn("DECLARE @throughput_seed_anchor datetime2(3) = SYSDATETIME();", compact)
-        self.assertRegex(compact, r"SET @start = DATEADD\(DAY, -10, @throughput_seed_anchor\)")
-        self.assertRegex(compact, r"SET @start = DATEADD\(DAY, @day_offset, @throughput_seed_anchor\)")
+        self.assertIn("DECLARE @execution_anchor datetime2(3) = SYSDATETIME();", compact)
+        self.assertRegex(compact, r"SET @start = DATEADD\(DAY, -10, @execution_anchor\)")
+        self.assertRegex(compact, r"SET @start = DATEADD\(DAY, @day_offset, @execution_anchor\)")
+        self.assertRegex(compact, r"SET @start = DATEADD\(HOUR, -12, @execution_anchor\)")
         self.assertNotRegex(setup, r"(?<!\d)20\d{2}-\d{2}-\d{2}(?!\d)")
 
     def test_helpcontent_deprecated_list_excludes_current_public_parameters(self):
