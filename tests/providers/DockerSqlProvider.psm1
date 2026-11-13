@@ -54,6 +54,7 @@ function Start-SpStatUpdateSqlTestEnvironment {
 
     try {
         $deadline = [DateTimeOffset]::Now.AddSeconds($ReadyTimeoutSec)
+        $lastConnectionError = ''
         $ready = $false
         while ([DateTimeOffset]::Now -lt $deadline) {
             $connection = $null
@@ -74,12 +75,19 @@ function Start-SpStatUpdateSqlTestEnvironment {
                 $ready = $true
                 break
             } catch {
+                $lastConnectionError = $_.Exception.Message
                 Start-Sleep -Seconds 5
             } finally {
                 if ($connection) { $connection.Dispose() }
             }
         }
-        if (-not $ready) { throw "SQL Server $Version did not accept logins within $ReadyTimeoutSec seconds." }
+        if (-not $ready) {
+            $state = @(& $docker.Source inspect --format '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}' $containerId 2>&1)
+            $logs = @(& $docker.Source logs --tail 80 $containerId 2>&1)
+            $details = @("Last login error: $lastConnectionError") + $state + $logs
+            $diagnostic = (($details | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Replace($Password, '***')
+            throw "SQL Server $Version did not accept logins within $ReadyTimeoutSec seconds.`nContainer startup diagnostics:`n$diagnostic"
+        }
         Write-Host "sql_provider=docker version=$Version image=$image endpoint=127.0.0.1,$port"
         return $environment
     } catch {

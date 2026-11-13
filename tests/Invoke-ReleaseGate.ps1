@@ -147,7 +147,7 @@ try {
         } elseif ($suiteName -eq 'QSForcedBaselineAndWaitCpu') {
             $args += @('-Port', $Port)
         } elseif ($suiteName -eq 'Compile') {
-            $args += @('-PortOverride', $Port, '-Password', $Password)
+            $args += @('-PortOverride', $Port, '-Password', $Password, '-Versions', $Version)
         } elseif ($suiteName -in @('DenialAndGuards', 'ExcludeTablesWildcards', 'FilteredStats', 'WhatIfNorecompute',
                 'StopReasonsCoverage', 'OutputParamCoverage', 'PresetStopByTime', 'LockTimeout',
                 'QueryStoreStates', 'SortOrderCoverage', 'AbortOnIntegrityError', 'FreshStatQualification', 'WarningsContract')) {
