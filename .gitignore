@@ -19,6 +19,9 @@
 !Invoke-StatUpdateDiag.ps1
 !README.md
 !TESTING.md
+!docs/
+!docs/agents/
+!docs/agents/*.md
 !LICENSE
 !.gitignore
 !.gitattributes
